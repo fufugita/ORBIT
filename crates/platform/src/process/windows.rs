@@ -30,11 +30,11 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::*;
-#[cfg(all(test, feature = "registry-witness"))]
-use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
+#[cfg(all(test, feature = "registry-witness"))]
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo};
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
@@ -503,6 +503,43 @@ fn check_object(handle: HANDLE, directory: bool) -> io::Result<()> {
         || (!directory && standard.NumberOfLinks != 1)
     {
         return Err(invalid("resource is linked, replaced or of the wrong kind"));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "registry-witness"))]
+fn verify_file_link_count(handle: HANDLE, expected: u32) -> io::Result<()> {
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    let mut standard = FILE_STANDARD_INFO::default();
+    unsafe {
+        ok(
+            "GetFileInformationByHandleEx(hardlink attributes)",
+            GetFileInformationByHandleEx(
+                handle,
+                FileAttributeTagInfo,
+                (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            ),
+        )?;
+        ok(
+            "GetFileInformationByHandleEx(hardlink standard info)",
+            GetFileInformationByHandleEx(
+                handle,
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            ),
+        )?;
+    }
+    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || standard.DeletePending
+        || standard.Directory
+        || standard.NumberOfLinks != expected
+    {
+        return Err(io::Error::other(format!(
+            "hardlink target kind or link count changed: links={}",
+            standard.NumberOfLinks
+        )));
     }
     Ok(())
 }
@@ -2038,6 +2075,7 @@ if($complete -and $mustDeny){[Console]::WriteLine('REGISTRY_PROBE_COMPLETE');exi
 #[cfg(all(test, feature = "registry-witness"))]
 mod registry_witness_tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::io::{Read, Seek};
     use std::os::windows::io::IntoRawHandle;
@@ -2446,6 +2484,27 @@ mod registry_witness_tests {
 
     fn win32_query_value(key: &OwnedRegKey, name: &str) -> Result<Vec<u8>, u32> {
         win32_query_value_handle(key.raw(), name)
+    }
+
+    fn win32_query_value_type(key: HKEY, name: &str) -> Result<u32, u32> {
+        let name = wide(OsStr::new(name)).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        let mut value_type = 0u32;
+        let mut length = 0u32;
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                null_mut(),
+                &mut value_type,
+                null_mut(),
+                &mut length,
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(value_type)
+        } else {
+            Err(status)
+        }
     }
 
     fn win32_query_value_handle(key: HKEY, name: &str) -> Result<Vec<u8>, u32> {
@@ -3204,6 +3263,7 @@ mod registry_witness_tests {
         directory_handle: Option<OwnedHandle>,
         file: Option<File>,
         metadata_anchor: Option<OwnedHandle>,
+        control_dacl_handle: Option<OwnedHandle>,
         directory_identity: (u64, [u8; 16]),
         identity: (u64, [u8; 16]),
         expected_length: u64,
@@ -3222,11 +3282,19 @@ mod registry_witness_tests {
 
     const JOB_OBJECT_QUERY_ONLY: u32 = 0x0004;
 
+    struct JobQueryObservation<'a> {
+        native_counts: &'a Cell<[Option<u32>; 2]>,
+        index: usize,
+        injected_error: Option<&'a Cell<Option<&'static str>>>,
+    }
+
     #[derive(Default)]
     struct CleanupJobGate {
         normal: Option<JobFence>,
         cancel: Option<JobFence>,
         unobserved: bool,
+        injected_query_error_once: Cell<Option<&'static str>>,
+        last_native_active_counts: Cell<[Option<u32>; 2]>,
     }
 
     impl CleanupJobGate {
@@ -3234,11 +3302,38 @@ mod registry_witness_tests {
             if self.unobserved {
                 return Err(invalid("a registry witness Job shutdown was not observed"));
             }
-            for fence in [self.normal.as_ref(), self.cancel.as_ref()] {
+            self.last_native_active_counts.set([None, None]);
+            for (index, fence) in [self.normal.as_ref(), self.cancel.as_ref()]
+                .into_iter()
+                .enumerate()
+            {
                 let fence = fence.ok_or_else(|| invalid("both exact Job fences are required"))?;
-                fence.require_zero(phase)?;
+                fence.require_zero_observed(
+                    phase,
+                    Some(&JobQueryObservation {
+                        native_counts: &self.last_native_active_counts,
+                        index,
+                        injected_error: (index == 1).then_some(&self.injected_query_error_once),
+                    }),
+                )?;
             }
             Ok(())
+        }
+
+        fn inject_query_error_once(&self, message: &'static str) {
+            self.injected_query_error_once.set(Some(message));
+        }
+
+        fn clear_query_error_injection(&self) {
+            self.injected_query_error_once.set(None);
+        }
+
+        fn reset_last_native_active_counts(&self) {
+            self.last_native_active_counts.set([None, None]);
+        }
+
+        fn last_native_active_counts(&self) -> [Option<u32>; 2] {
+            self.last_native_active_counts.get()
         }
 
         fn close_fences(&mut self) -> Vec<String> {
@@ -3260,15 +3355,16 @@ mod registry_witness_tests {
     }
 
     impl JobFence {
-        fn require_zero(&self, phase: &str) -> io::Result<()> {
-            if !self.process_waited {
-                return Err(io::Error::other(format!(
-                    "{} exact child process wait not observed before {phase}: pid={} creation={}",
-                    self.role, self.pid, self.creation
-                )));
-            }
+        fn require_zero(&self, phase: &str) -> io::Result<u32> {
+            self.require_zero_observed(phase, None)
+        }
+
+        fn query_accounting(
+            &self,
+            observation: Option<&JobQueryObservation<'_>>,
+        ) -> io::Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> {
             let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-            unsafe {
+            let native_result = unsafe {
                 ok(
                     "QueryInformationJobObject(cleanup fence)",
                     QueryInformationJobObject(
@@ -3278,15 +3374,43 @@ mod registry_witness_tests {
                         size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
                         null_mut(),
                     ),
-                )?;
+                )
+            };
+            match native_result {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    if let Some(observation) = observation {
+                        let mut counts = observation.native_counts.get();
+                        counts[observation.index] = Some(info.ActiveProcesses);
+                        observation.native_counts.set(counts);
+                        if let Some(message) = observation.injected_error.and_then(Cell::take) {
+                            return Err(invalid(message));
+                        }
+                    }
+                    Ok(info)
+                }
             }
+        }
+
+        fn require_zero_observed(
+            &self,
+            phase: &str,
+            observation: Option<&JobQueryObservation<'_>>,
+        ) -> io::Result<u32> {
+            let info = self.query_accounting(observation)?;
             if info.ActiveProcesses != 0 {
                 return Err(io::Error::other(format!(
                     "{} Job is not empty before {phase}: pid={} creation={} active={}",
                     self.role, self.pid, self.creation, info.ActiveProcesses
                 )));
             }
-            Ok(())
+            if !self.process_waited {
+                return Err(io::Error::other(format!(
+                    "{} exact child process wait not observed before {phase}: pid={} creation={}",
+                    self.role, self.pid, self.creation
+                )));
+            }
+            Ok(info.ActiveProcesses)
         }
     }
 
@@ -3297,6 +3421,15 @@ mod registry_witness_tests {
         size: i64,
         last_write: i64,
         attributes: u32,
+    }
+
+    struct ControlHardlinkExpectation<'a> {
+        image_path: &'a str,
+        alias_path: &'a str,
+        identity: (u64, [u8; 16]),
+        length: u64,
+        sha256: &'a str,
+        dacl: &'a [u8],
     }
 
     struct ProfileCleanupAnchor {
@@ -3380,6 +3513,17 @@ mod registry_witness_tests {
         access: u32,
         share: u32,
     ) -> io::Result<OwnedHandle> {
+        relative_open_with_status(parent, leaf, directory, access, share, &mut None)
+    }
+
+    fn relative_open_with_status(
+        parent: HANDLE,
+        leaf: &str,
+        directory: bool,
+        access: u32,
+        share: u32,
+        native_status: &mut Option<i32>,
+    ) -> io::Result<OwnedHandle> {
         validate_component(OsStr::new(leaf))?;
         let (mut storage, mut object_name) = nt_unicode(leaf)?;
         let mut attributes = OBJECT_ATTRIBUTES::default();
@@ -3411,14 +3555,110 @@ mod registry_witness_tests {
         };
         std::hint::black_box(&mut storage);
         if result < 0 {
+            *native_status = Some(result);
             return Err(operation_error(
                 "NtCreateFile(FILE_OPEN relative cleanup object)",
                 io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32),
             ));
         }
         let owned = own("NtCreateFile(relative cleanup object)", handle)?;
-        check_object(owned.as_raw_handle(), directory)?;
+        if let Err(primary) = check_object(owned.as_raw_handle(), directory) {
+            return match close_checked(
+                owned,
+                "CloseHandle(relative object after verification failure)",
+            ) {
+                Ok(()) => Err(primary),
+                Err(close) => Err(io::Error::other(format!(
+                    "relative object verification failed: {primary}; handle close failed: {close}"
+                ))),
+            };
+        }
         Ok(owned)
+    }
+
+    fn relative_open_hardlink_control(parent: HANDLE, leaf: &str) -> io::Result<OwnedHandle> {
+        validate_component(OsStr::new(leaf))?;
+        let (mut storage, mut object_name) = nt_unicode(leaf)?;
+        let mut attributes = OBJECT_ATTRIBUTES::default();
+        attributes.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+        attributes.RootDirectory = parent;
+        attributes.ObjectName = &mut object_name;
+        attributes.Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE;
+        let mut handle = null_mut();
+        let mut status = IO_STATUS_BLOCK::default();
+        let result = unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+                &attributes,
+                &mut status,
+                null(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                null(),
+                0,
+            )
+        };
+        std::hint::black_box(&mut storage);
+        if result < 0 {
+            return Err(operation_error(
+                "NtCreateFile(FILE_OPEN hardlink control observation)",
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32),
+            ));
+        }
+        own("NtCreateFile(hardlink control observation)", handle)
+    }
+
+    fn observe_control_hardlink_entry(
+        parent: HANDLE,
+        leaf: &str,
+        expected: &ControlHardlinkExpectation<'_>,
+    ) -> io::Result<ProfileEntryFact> {
+        let mut file = File::from(relative_open_hardlink_control(parent, leaf)?);
+        let observation = (|| -> io::Result<ProfileEntryFact> {
+            let handle = file.as_raw_handle();
+            verify_file_link_count(handle, 2)?;
+            let fact = profile_fact(handle, false)?;
+            if fact.identity != expected.identity
+                || fact.size < 0
+                || fact.size as u64 != expected.length
+            {
+                return Err(invalid(
+                    "hardlink profile name differs from the expected full image identity or size",
+                ));
+            }
+            if resource_dacl_bytes(handle)? != expected.dacl {
+                return Err(invalid(
+                    "hardlink profile name DACL differs from the held image",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(expected.length as usize);
+            (&mut file)
+                .take(expected.length.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != expected.length || digest(&bytes)? != expected.sha256 {
+                return Err(invalid(
+                    "hardlink profile name content differs from the held image",
+                ));
+            }
+            Ok(fact)
+        })();
+        let close = close_checked(
+            file.into(),
+            "CloseHandle(hardlink profile control observer)",
+        );
+        match (observation, close) {
+            (Ok(fact), Ok(())) => Ok(fact),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(close)) => Err(io::Error::other(format!(
+                "hardlink profile observer checked-close failure: {close}"
+            ))),
+            (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                "hardlink profile observer failed: {primary}; checked-close failure: {close}"
+            ))),
+        }
     }
 
     fn relative_create_file(
@@ -3460,13 +3700,26 @@ mod registry_witness_tests {
             ));
         }
         let owned = own("NtCreateFile(relative helper image)", handle)?;
-        if status.Information != FILE_CREATED as usize {
-            return Err(operation_error(
-                "NtCreateFile(FILE_CREATE relative helper image result)",
-                invalid("FILE_CREATE did not return FILE_CREATED"),
-            ));
+        let verify = (|| -> io::Result<()> {
+            if status.Information != FILE_CREATED as usize {
+                return Err(operation_error(
+                    "NtCreateFile(FILE_CREATE relative helper image result)",
+                    invalid("FILE_CREATE did not return FILE_CREATED"),
+                ));
+            }
+            check_object(owned.as_raw_handle(), false)
+        })();
+        if let Err(primary) = verify {
+            return match close_checked(
+                owned,
+                "CloseHandle(relative image after verification failure)",
+            ) {
+                Ok(()) => Err(primary),
+                Err(close) => Err(io::Error::other(format!(
+                    "relative image verification failed: {primary}; handle close failed: {close}"
+                ))),
+            };
         }
-        check_object(owned.as_raw_handle(), false)?;
         Ok(owned)
     }
 
@@ -3548,6 +3801,108 @@ mod registry_witness_tests {
         } else {
             Ok(())
         }
+    }
+
+    fn set_relative_name_information(
+        handle: HANDLE,
+        parent: HANDLE,
+        leaf: &str,
+        information_class: i32,
+        operation: &'static str,
+        native_status: &mut Option<i32>,
+    ) -> io::Result<()> {
+        validate_component(OsStr::new(leaf))?;
+        let name: Vec<u16> = OsStr::new(leaf).encode_wide().collect();
+        let name_bytes = name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| invalid("relative file name length overflow"))?;
+        let root_alignment = std::mem::align_of::<HANDLE>();
+        let root_offset = (size_of::<u8>() + root_alignment - 1) & !(root_alignment - 1);
+        let length_offset = root_offset + size_of::<HANDLE>();
+        let name_offset = length_offset + size_of::<u32>();
+        let information_length = name_offset
+            .checked_add(name_bytes as usize)
+            .ok_or_else(|| invalid("relative namespace information size overflow"))?;
+        let minimum_header = (name_offset + size_of::<u16>() + std::mem::align_of::<HANDLE>() - 1)
+            & !(std::mem::align_of::<HANDLE>() - 1);
+        let total = information_length.max(minimum_header);
+        let mut storage = vec![0u64; total.div_ceil(size_of::<u64>())];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), total) };
+        unsafe {
+            std::ptr::write_unaligned(bytes.as_mut_ptr().cast::<u8>(), 0);
+            std::ptr::write_unaligned(bytes.as_mut_ptr().add(root_offset).cast::<HANDLE>(), parent);
+            std::ptr::write_unaligned(
+                bytes.as_mut_ptr().add(length_offset).cast::<u32>(),
+                name_bytes,
+            );
+        }
+        for (index, unit) in name.iter().enumerate() {
+            unsafe {
+                std::ptr::write_unaligned(
+                    bytes
+                        .as_mut_ptr()
+                        .add(name_offset + index * size_of::<u16>())
+                        .cast::<u16>(),
+                    *unit,
+                );
+            }
+        }
+        let mut status = IO_STATUS_BLOCK::default();
+        let result = unsafe {
+            NtSetInformationFile(
+                handle,
+                &mut status,
+                bytes.as_mut_ptr().cast(),
+                total as u32,
+                information_class,
+            )
+        };
+        if result < 0 {
+            *native_status = Some(result);
+            Err(operation_error(
+                operation,
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rename_relative(
+        handle: HANDLE,
+        parent: HANDLE,
+        leaf: &str,
+        native_status: &mut Option<i32>,
+    ) -> io::Result<()> {
+        const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+        set_relative_name_information(
+            handle,
+            parent,
+            leaf,
+            FILE_RENAME_INFORMATION_CLASS,
+            "NtSetInformationFile(FileRenameInformation relative)",
+            native_status,
+        )
+    }
+
+    fn link_relative(
+        handle: HANDLE,
+        parent: HANDLE,
+        leaf: &str,
+        native_status: &mut Option<i32>,
+    ) -> io::Result<()> {
+        const FILE_LINK_INFORMATION_CLASS: i32 = 11;
+        set_relative_name_information(
+            handle,
+            parent,
+            leaf,
+            FILE_LINK_INFORMATION_CLASS,
+            "NtSetInformationFile(FileLinkInformation relative)",
+            native_status,
+        )
     }
 
     fn resource_dacl_bytes(handle: HANDLE) -> io::Result<Vec<u8>> {
@@ -3688,7 +4043,7 @@ mod registry_witness_tests {
                         .checked_add(length)
                         .ok_or_else(|| invalid("profile enumeration name size overflow"))?;
                     if children.len() >= 512 || name_bytes > 1024 * 1024 {
-                        return Err(invalid("profile enumeration bound exceeded"));
+                        return Err(invalid("fresh profile entry bound exceeded"));
                     }
                     if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                         return Err(invalid("reparse entry in fresh profile tree"));
@@ -3724,6 +4079,26 @@ mod registry_witness_tests {
         total_bytes: &mut u64,
         result: &mut BTreeMap<String, ProfileEntryFact>,
     ) -> io::Result<()> {
+        collect_profile_baseline_with_hardlink_control(
+            handle,
+            prefix,
+            depth,
+            count,
+            total_bytes,
+            result,
+            None,
+        )
+    }
+
+    fn collect_profile_baseline_with_hardlink_control(
+        handle: HANDLE,
+        prefix: &str,
+        depth: usize,
+        count: &mut usize,
+        total_bytes: &mut u64,
+        result: &mut BTreeMap<String, ProfileEntryFact>,
+        hardlink: Option<&ControlHardlinkExpectation<'_>>,
+    ) -> io::Result<()> {
         if depth > 16 {
             return Err(invalid("fresh profile nesting bound exceeded"));
         }
@@ -3732,6 +4107,35 @@ mod registry_witness_tests {
             if *count > 512 {
                 return Err(invalid("fresh profile entry bound exceeded"));
             }
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}\\{name}")
+            };
+            let hardlink_entry = hardlink.filter(|expected| {
+                relative == expected.image_path || relative == expected.alias_path
+            });
+            if let Some(expected) = hardlink_entry {
+                if directory || listed_id != expected.identity.1 {
+                    return Err(invalid(
+                        "hardlink profile namespace kind or file ID differs from its exact expectation",
+                    ));
+                }
+                *total_bytes = total_bytes
+                    .checked_add(expected.length)
+                    .ok_or_else(|| invalid("fresh profile byte count overflow"))?;
+                if *total_bytes > 128 * 1024 * 1024 {
+                    return Err(invalid("fresh profile byte bound exceeded"));
+                }
+                let fact = observe_control_hardlink_entry(handle, &name, expected)?;
+                if result.insert(relative, fact).is_some() {
+                    return Err(invalid(
+                        "duplicate hardlink profile name during enumeration",
+                    ));
+                }
+                continue;
+            }
+
             let child = relative_open(
                 handle,
                 &name,
@@ -3745,69 +4149,85 @@ mod registry_witness_tests {
                     },
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             )?;
-            let identity = script_identity(child.as_raw_handle())?;
-            if identity.1 != listed_id {
-                return Err(invalid("profile entry changed during held enumeration"));
-            }
-            let mut standard = FILE_STANDARD_INFO::default();
-            let mut basic = FILE_BASIC_INFO::default();
-            unsafe {
-                ok(
-                    "GetFileInformationByHandleEx(profile standard info)",
-                    GetFileInformationByHandleEx(
+            let observation = (|| -> io::Result<()> {
+                let identity = script_identity(child.as_raw_handle())?;
+                if identity.1 != listed_id {
+                    return Err(invalid("profile entry changed during held enumeration"));
+                }
+                let mut standard = FILE_STANDARD_INFO::default();
+                let mut basic = FILE_BASIC_INFO::default();
+                unsafe {
+                    ok(
+                        "GetFileInformationByHandleEx(profile standard info)",
+                        GetFileInformationByHandleEx(
+                            child.as_raw_handle(),
+                            FileStandardInfo,
+                            (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                            size_of::<FILE_STANDARD_INFO>() as u32,
+                        ),
+                    )?;
+                    ok(
+                        "GetFileInformationByHandleEx(profile basic info)",
+                        GetFileInformationByHandleEx(
+                            child.as_raw_handle(),
+                            FileBasicInfo,
+                            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                            size_of::<FILE_BASIC_INFO>() as u32,
+                        ),
+                    )?;
+                }
+                if standard.DeletePending
+                    || standard.Directory != directory
+                    || standard.EndOfFile < 0
+                {
+                    return Err(invalid("profile entry changed kind or is delete-pending"));
+                }
+                if !directory {
+                    *total_bytes = total_bytes
+                        .checked_add(standard.EndOfFile as u64)
+                        .ok_or_else(|| invalid("fresh profile byte count overflow"))?;
+                    if *total_bytes > 128 * 1024 * 1024 {
+                        return Err(invalid("fresh profile byte bound exceeded"));
+                    }
+                }
+                result.insert(
+                    relative.clone(),
+                    ProfileEntryFact {
+                        identity,
+                        directory,
+                        size: standard.EndOfFile,
+                        last_write: basic.LastWriteTime,
+                        attributes: basic.FileAttributes,
+                    },
+                );
+                if directory {
+                    collect_profile_baseline_with_hardlink_control(
                         child.as_raw_handle(),
-                        FileStandardInfo,
-                        (&mut standard as *mut FILE_STANDARD_INFO).cast(),
-                        size_of::<FILE_STANDARD_INFO>() as u32,
-                    ),
-                )?;
-                ok(
-                    "GetFileInformationByHandleEx(profile basic info)",
-                    GetFileInformationByHandleEx(
-                        child.as_raw_handle(),
-                        FileBasicInfo,
-                        (&mut basic as *mut FILE_BASIC_INFO).cast(),
-                        size_of::<FILE_BASIC_INFO>() as u32,
-                    ),
-                )?;
-            }
-            if standard.DeletePending || standard.Directory != directory || standard.EndOfFile < 0 {
-                return Err(invalid("profile entry changed kind or is delete-pending"));
-            }
-            if !directory {
-                *total_bytes = total_bytes
-                    .checked_add(standard.EndOfFile as u64)
-                    .ok_or_else(|| invalid("fresh profile byte count overflow"))?;
-                if *total_bytes > 128 * 1024 * 1024 {
-                    return Err(invalid("fresh profile byte bound exceeded"));
+                        &relative,
+                        depth + 1,
+                        count,
+                        total_bytes,
+                        result,
+                        hardlink,
+                    )?;
+                }
+                Ok(())
+            })();
+            let close = close_checked(child, "CloseHandle(profile baseline entry)");
+            match (observation, close) {
+                (Ok(()), Ok(())) => {}
+                (Err(primary), Ok(())) => return Err(primary),
+                (Ok(()), Err(close)) => {
+                    return Err(io::Error::other(format!(
+                        "profile baseline checked-close failure: {close}"
+                    )));
+                }
+                (Err(primary), Err(close)) => {
+                    return Err(io::Error::other(format!(
+                        "profile baseline checked-close failure after observation error: {primary}; close: {close}"
+                    )));
                 }
             }
-            let relative = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}\\{name}")
-            };
-            result.insert(
-                relative.clone(),
-                ProfileEntryFact {
-                    identity,
-                    directory,
-                    size: standard.EndOfFile,
-                    last_write: basic.LastWriteTime,
-                    attributes: basic.FileAttributes,
-                },
-            );
-            if directory {
-                collect_profile_baseline(
-                    child.as_raw_handle(),
-                    &relative,
-                    depth + 1,
-                    count,
-                    total_bytes,
-                    result,
-                )?;
-            }
-            close_checked(child, "CloseHandle(profile baseline entry)")?;
         }
         Ok(())
     }
@@ -3828,6 +4248,56 @@ mod registry_witness_tests {
         // remain compared; only this directly affected parent timestamp is ignored.
         ac.last_write = 0;
         Ok(result)
+    }
+
+    fn profile_baseline_with_control_hardlink(
+        handle: HANDLE,
+        expected: &ControlHardlinkExpectation<'_>,
+    ) -> io::Result<BTreeMap<String, ProfileEntryFact>> {
+        let mut result = BTreeMap::new();
+        let mut count = 0;
+        let mut total_bytes = 0;
+        collect_profile_baseline_with_hardlink_control(
+            handle,
+            "",
+            0,
+            &mut count,
+            &mut total_bytes,
+            &mut result,
+            Some(expected),
+        )?;
+        for path in [expected.image_path, expected.alias_path] {
+            if result
+                .get(path)
+                .is_none_or(|fact| fact.identity != expected.identity || fact.directory)
+            {
+                return Err(invalid(
+                    "hardlink control did not observe both exact expected image names",
+                ));
+            }
+        }
+        let ac = result
+            .get_mut("AC")
+            .ok_or_else(|| invalid("fresh profile baseline has no AC directory"))?;
+        if !ac.directory {
+            return Err(invalid("fresh profile AC entry is not a directory"));
+        }
+        ac.last_write = 0;
+        Ok(result)
+    }
+
+    fn profile_baseline_direct_children(
+        baseline: &BTreeMap<String, ProfileEntryFact>,
+        parent: &str,
+    ) -> Vec<(String, [u8; 16], bool)> {
+        let prefix = format!("{parent}\\");
+        baseline
+            .iter()
+            .filter_map(|(path, fact)| {
+                let leaf = path.strip_prefix(&prefix)?;
+                (!leaf.contains('\\')).then(|| (leaf.to_owned(), fact.identity.1, fact.directory))
+            })
+            .collect()
     }
 
     fn profile_fact(handle: HANDLE, directory: bool) -> io::Result<ProfileEntryFact> {
@@ -3981,6 +4451,14 @@ mod registry_witness_tests {
         ) -> io::Result<()> {
             gate.require_zero("owned-resource cleanup preflight")?;
             image.verify_preflight(gate)?;
+            self.verify_profile_baseline_with_control_extras(image, &[])
+        }
+
+        fn verify_profile_baseline_with_control_extras(
+            &self,
+            image: &HeldHelperImage,
+            extras: &[(String, ProfileEntryFact)],
+        ) -> io::Result<()> {
             let entry = self
                 .entry
                 .as_ref()
@@ -4015,9 +4493,183 @@ mod registry_witness_tests {
                 profile_fact(directory.as_raw_handle(), true)?,
             );
             expected.insert(file_key, profile_fact(file.as_raw_handle(), false)?);
-            if profile_baseline(entry.as_raw_handle())? != expected {
+            for (path, fact) in extras {
+                if expected.insert(path.clone(), fact.clone()).is_some() {
+                    return Err(invalid(
+                        "cleanup control profile extra duplicates an owned path",
+                    ));
+                }
+            }
+            let observed = profile_baseline(entry.as_raw_handle())?;
+            if let Some(observed_directory) = observed.get(&format!("AC\\{}", image.directory_leaf))
+            {
+                let held_directory = expected
+                    .get(&format!("AC\\{}", image.directory_leaf))
+                    .expect("held helper directory fact inserted");
+                if observed_directory.identity != held_directory.identity
+                    || !observed_directory.directory
+                {
+                    return Err(invalid(
+                        "helper directory entry identity differs from its held original",
+                    ));
+                }
+            } else {
+                return Err(invalid(
+                    "helper directory entry identity differs from its held original",
+                ));
+            }
+            if observed != expected {
                 return Err(invalid(
                     "fresh profile contains unknown or changed entries before deletion",
+                ));
+            }
+            Ok(())
+        }
+
+        fn verify_profile_baseline_with_control_hardlink(
+            &self,
+            image: &HeldHelperImage,
+            alias_leaf: &str,
+        ) -> io::Result<()> {
+            validate_component(OsStr::new(alias_leaf))?;
+            let entry = self
+                .entry
+                .as_ref()
+                .ok_or_else(|| invalid("profile entry anchor closed"))?;
+            if script_identity(entry.as_raw_handle())? != self.entry_identity {
+                return Err(invalid(
+                    "recorded profile entry identity changed before cleanup",
+                ));
+            }
+            let ac = self
+                .ac
+                .as_ref()
+                .ok_or_else(|| invalid("profile AC anchor closed"))?;
+            if script_identity(ac.as_raw_handle())? != self.ac_identity {
+                return Err(invalid(
+                    "recorded profile AC identity changed before cleanup",
+                ));
+            }
+            let directory = image
+                .directory_handle
+                .as_ref()
+                .ok_or_else(|| invalid("owned helper directory keeper missing"))?;
+            let file = image
+                .file
+                .as_ref()
+                .ok_or_else(|| invalid("owned helper immutable reader missing"))?;
+            let directory_path = format!("AC\\{}", image.directory_leaf);
+            let image_path = format!("{directory_path}\\{}", image.image_leaf);
+            let alias_path = format!("AC\\{alias_leaf}");
+            let hardlink = ControlHardlinkExpectation {
+                image_path: &image_path,
+                alias_path: &alias_path,
+                identity: image.identity,
+                length: image.expected_length,
+                sha256: &image.sha256,
+                dacl: &image.expected_resource_dacl,
+            };
+            let observed =
+                profile_baseline_with_control_hardlink(entry.as_raw_handle(), &hardlink)?;
+            let mut expected = self.baseline.clone();
+            expected.insert(
+                directory_path.clone(),
+                profile_fact(directory.as_raw_handle(), true)?,
+            );
+            expected.insert(
+                image_path.clone(),
+                profile_fact(file.as_raw_handle(), false)?,
+            );
+            let original_fact = observed
+                .get(&image_path)
+                .ok_or_else(|| invalid("expected original helper image name is absent"))?;
+            let alias_fact = observed
+                .get(&alias_path)
+                .ok_or_else(|| invalid("expected hardlink AC alias is absent"))?
+                .clone();
+            if &alias_fact != original_fact {
+                return Err(invalid(
+                    "hardlink original and alias metadata differ after setup",
+                ));
+            }
+            if expected.insert(alias_path, alias_fact).is_some() {
+                return Err(invalid(
+                    "hardlink control alias duplicates an existing profile path",
+                ));
+            }
+            let observed_directory = observed
+                .get(&directory_path)
+                .ok_or_else(|| invalid("helper directory profile entry is absent"))?;
+            let held_directory = expected
+                .get(&directory_path)
+                .expect("held helper directory fact inserted");
+            if observed_directory.identity != held_directory.identity
+                || !observed_directory.directory
+            {
+                return Err(invalid(
+                    "helper directory entry identity differs from its held original",
+                ));
+            }
+            if observed != expected {
+                return Err(invalid(
+                    "fresh profile contains unknown or changed entries before deletion",
+                ));
+            }
+            Ok(())
+        }
+
+        fn verify_profile_inventory_with_control_entries(
+            &self,
+            entries: &[(String, ProfileEntryFact)],
+        ) -> io::Result<()> {
+            let entry = self
+                .entry
+                .as_ref()
+                .ok_or_else(|| invalid("profile entry anchor closed"))?;
+            let ac = self
+                .ac
+                .as_ref()
+                .ok_or_else(|| invalid("profile AC anchor closed"))?;
+            if script_identity(entry.as_raw_handle())? != self.entry_identity
+                || script_identity(ac.as_raw_handle())? != self.ac_identity
+            {
+                return Err(invalid("profile anchor identities changed during control"));
+            }
+            let mut expected = self.baseline.clone();
+            for (path, fact) in entries {
+                if expected.insert(path.clone(), fact.clone()).is_some() {
+                    return Err(invalid(
+                        "control profile inventory duplicated a baseline path",
+                    ));
+                }
+            }
+            if profile_baseline(entry.as_raw_handle())? != expected {
+                return Err(invalid(
+                    "profile control inventory differs from installed namespace state",
+                ));
+            }
+            Ok(())
+        }
+
+        fn verify_profile_bindings(&self) -> io::Result<()> {
+            let packages = self
+                .packages
+                .as_ref()
+                .ok_or_else(|| invalid("Packages observation anchor closed"))?;
+            let entry = self
+                .entry
+                .as_ref()
+                .ok_or_else(|| invalid("profile entry anchor closed"))?;
+            let ac = self
+                .ac
+                .as_ref()
+                .ok_or_else(|| invalid("profile AC anchor closed"))?;
+            if script_identity(packages.as_raw_handle())? != self.packages_identity
+                || script_identity(entry.as_raw_handle())? != self.entry_identity
+                || script_identity(ac.as_raw_handle())? != self.ac_identity
+            {
+                return Err(invalid(
+                    "retained profile Packages/entry/AC identity changed",
                 ));
             }
             Ok(())
@@ -4930,6 +5582,7 @@ mod registry_witness_tests {
         nonce: &str,
         user_sid: &str,
         package_sid: &str,
+        control: Option<CleanupControl>,
     ) -> io::Result<HeldHelperImage> {
         let leaf = format!("registry-helper-{nonce}");
         let directory = session.folder.join(&leaf);
@@ -4947,6 +5600,7 @@ mod registry_witness_tests {
         let mut directory_owner = Some(directory_handle);
         let mut image_writer: Option<File> = None;
         let mut metadata_anchor: Option<OwnedHandle> = None;
+        let mut control_dacl_handle: Option<OwnedHandle> = None;
         let mut immutable_reader: Option<File> = None;
         let mut security: Option<LocalSecurityDescriptor> = None;
 
@@ -5082,6 +5736,16 @@ mod registry_witness_tests {
             };
             close_checked(writer, "CloseHandle(helper image writer)")?;
 
+            if control == Some(CleanupControl::ChangedImageDacl) {
+                control_dacl_handle = Some(relative_open(
+                    directory_raw,
+                    "orbit-registry-helper.exe",
+                    false,
+                    WRITE_DAC | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                )?);
+            }
+
             immutable_reader = Some(File::from(relative_open(
                 directory_raw,
                 "orbit-registry-helper.exe",
@@ -5133,6 +5797,7 @@ mod registry_witness_tests {
                 directory_handle: directory_owner.take(),
                 file: immutable_reader.take(),
                 metadata_anchor: metadata_anchor.take(),
+                control_dacl_handle: control_dacl_handle.take(),
                 directory_identity,
                 identity,
                 expected_length: source_meta.len(),
@@ -5174,6 +5839,14 @@ mod registry_witness_tests {
                         errors.push(format!("metadata anchor close failed: {error}"));
                     }
                 }
+                if let Some(handle) = image.control_dacl_handle.take() {
+                    if let Err(error) = close_checked(
+                        handle,
+                        "CloseHandle(image DACL control after setup failure)",
+                    ) {
+                        errors.push(format!("image DACL control close failed: {error}"));
+                    }
+                }
                 if let Some(directory) = image.directory_handle.take() {
                     if let Err(error) =
                         close_checked(directory, "CloseHandle(directory after setup failure)")
@@ -5202,6 +5875,13 @@ mod registry_witness_tests {
                 close_checked(anchor, "CloseHandle(remaining helper metadata anchor)")
             {
                 errors.push(format!("remaining metadata anchor close failed: {error}"));
+            }
+        }
+        if let Some(handle) = control_dacl_handle.take() {
+            if let Err(error) = close_checked(handle, "CloseHandle(remaining image DACL control)") {
+                errors.push(format!(
+                    "remaining image DACL control close failed: {error}"
+                ));
             }
         }
         if let Some(directory) = directory_owner.take() {
@@ -5240,16 +5920,6 @@ mod registry_witness_tests {
             if resource_dacl_bytes(directory.as_raw_handle())? != self.expected_directory_dacl {
                 return Err(invalid("held helper directory descriptor changed"));
             }
-            let children = profile_children(directory.as_raw_handle())?;
-            if children.len() != 1
-                || children[0].0 != self.image_leaf
-                || children[0].1 != self.identity.1
-                || children[0].2
-            {
-                return Err(invalid(
-                    "helper directory contents differ from the exact owned image",
-                ));
-            }
             let reader = self
                 .file
                 .as_mut()
@@ -5261,6 +5931,24 @@ mod registry_witness_tests {
                 &self.sha256,
                 &self.expected_resource_dacl,
             )?;
+            let children = profile_children(directory.as_raw_handle())?;
+            if children.iter().any(|(name, identity, is_directory)| {
+                name == &self.image_leaf && (*is_directory || *identity != self.identity.1)
+            }) {
+                return Err(invalid(
+                    "helper image directory entry identity differs from its held original",
+                ));
+            }
+            if children.len() != 1 || children[0].0 != self.image_leaf || children[0].2 {
+                if children.iter().any(|(name, identity, is_directory)| {
+                    name != &self.image_leaf && !*is_directory && *identity == self.identity.1
+                }) {
+                    return Err(invalid("resource is linked, replaced or of the wrong kind"));
+                }
+                return Err(invalid(
+                    "helper directory contents differ from the exact owned image",
+                ));
+            }
             let anchor = self
                 .metadata_anchor
                 .as_ref()
@@ -5706,6 +6394,11 @@ mod registry_witness_tests {
             let policy = format!(
                 "O:{user_sid}D:P(D;;0x000D0026;;;{package_sid})(A;;RC;;;OW)(A;;KA;;;{user_sid})(A;;KR;;;{package_sid})"
             );
+            if win32_open_status(root.raw(), "ForeignCanary", KEY_READ) != ERROR_FILE_NOT_FOUND {
+                return Err(invalid(
+                    "foreign registry key canary was not absent before setup",
+                ));
+            }
             let key = create_acl_key(root.raw(), "ForeignCanary", &policy)?;
             let result = (|| {
                 set_string(key.raw(), "Marker", "ORBIT-FOREIGN-CANARY-V1")?;
@@ -5755,6 +6448,88 @@ mod registry_witness_tests {
                 ))),
                 (Err(primary), Err(close)) => Err(io::Error::other(format!(
                     "foreign canary verification failed: {primary}; observer close failed: {close}"
+                ))),
+            }
+        }
+
+        fn create_unknown_value_canary(&self) -> io::Result<PrivateCanaryFacts> {
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture root owner missing"))?;
+            let key = win32_open_key(root.raw(), "MachineView\\Metadata", KEY_ALL_ACCESS)
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let result = (|| {
+                match win32_query_value(&key, "UnexpectedControlValue") {
+                    Err(ERROR_FILE_NOT_FOUND) => {}
+                    Ok(_) => {
+                        return Err(invalid(
+                            "unknown registry value canary existed before setup",
+                        ));
+                    }
+                    Err(status) => return Err(io::Error::from_raw_os_error(status as i32)),
+                }
+                set_string(
+                    key.raw(),
+                    "UnexpectedControlValue",
+                    "ORBIT-UNKNOWN-VALUE-V1",
+                )?;
+                let value = win32_query_value(&key, "UnexpectedControlValue")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+                if win32_query_value_type(key.raw(), "UnexpectedControlValue")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?
+                    != REG_SZ
+                {
+                    return Err(invalid("unknown registry value canary is not REG_SZ"));
+                }
+                let descriptor = registry_key_security(key.raw())?;
+                Ok(PrivateCanaryFacts {
+                    value_sha256: digest(&value)?,
+                    descriptor_sha256: digest(&descriptor)?,
+                })
+            })();
+            let close = key.close();
+            match (result, close) {
+                (Ok(facts), Ok(())) => Ok(facts),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(close)) => Err(io::Error::other(format!(
+                    "unexpected registry value setup close failed: {close}"
+                ))),
+                (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                    "unexpected registry value setup failed: {primary}; key close failed: {close}"
+                ))),
+            }
+        }
+
+        fn unknown_value_canary_facts(&self) -> io::Result<PrivateCanaryFacts> {
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture root owner missing"))?;
+            let key = win32_open_key(
+                root.raw(),
+                "MachineView\\Metadata",
+                KEY_QUERY_VALUE | READ_CONTROL,
+            )
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let result = (|| {
+                let value = win32_query_value(&key, "UnexpectedControlValue")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+                let descriptor = registry_key_security(key.raw())?;
+                Ok(PrivateCanaryFacts {
+                    value_sha256: digest(&value)?,
+                    descriptor_sha256: digest(&descriptor)?,
+                })
+            })();
+            let close = key.close();
+            match (result, close) {
+                (Ok(facts), Ok(())) => Ok(facts),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(close)) => Err(io::Error::other(format!(
+                    "unexpected registry value observation close failed: {close}"
+                ))),
+                (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                    "unexpected registry value observation failed: {primary}; key close failed: {close}"
                 ))),
             }
         }
@@ -7212,6 +7987,8 @@ mod registry_witness_tests {
         parent_creation: &str,
         fixture_digest: &str,
         fixture_identity_sha256: &str,
+        control: Option<CleanupControl>,
+        early_control_target: &mut Option<String>,
     ) -> io::Result<()> {
         let machine_root = fixture.root_handle("MachineView", KEY_READ)?;
         let user_root = fixture.root_handle("UserView", KEY_READ)?;
@@ -7329,6 +8106,35 @@ mod registry_witness_tests {
             ));
         }
 
+        if control == Some(CleanupControl::LiveNonzeroJob) {
+            match gate.require_zero("live nonzero cleanup") {
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("cancel Job is not empty before live nonzero cleanup")
+                        && error.to_string().contains("active=1") =>
+                {
+                    *early_control_target = Some(error.to_string());
+                }
+                Err(error) => {
+                    return Err(cancel_child_after_failure_with_output(
+                        child,
+                        error,
+                        child_pid,
+                        &child_creation,
+                    ));
+                }
+                Ok(()) => {
+                    return Err(cancel_child_after_failure_with_output(
+                        child,
+                        invalid("live nonzero cleanup control did not observe an active member"),
+                        child_pid,
+                        &child_creation,
+                    ));
+                }
+            }
+        }
+
         if let Err(primary) = child.stop() {
             return Err(stop_child_after_failure(&mut child, primary));
         }
@@ -7388,6 +8194,20 @@ mod registry_witness_tests {
     enum CleanupControl {
         WrongImageHash,
         UnknownRegistryKey,
+        WrongImageId,
+        WrongDirectoryId,
+        WrongProfileId,
+        ChangedImageDacl,
+        UnknownRegistryValue,
+        UnknownHelperEntry,
+        UnknownProfileEntry,
+        ProfileEnumerationLimit,
+        ImageLeafSwap,
+        DirectorySwap,
+        ImageHardlink,
+        MissingJobFence,
+        LiveNonzeroJob,
+        JobQueryError,
     }
 
     impl CleanupControl {
@@ -7395,6 +8215,20 @@ mod registry_witness_tests {
             match self {
                 Self::WrongImageHash => "wrong_image_hash",
                 Self::UnknownRegistryKey => "unknown_registry_key",
+                Self::WrongImageId => "wrong_image_id",
+                Self::WrongDirectoryId => "wrong_directory_id",
+                Self::WrongProfileId => "wrong_profile_id",
+                Self::ChangedImageDacl => "changed_image_dacl",
+                Self::UnknownRegistryValue => "unknown_registry_value",
+                Self::UnknownHelperEntry => "unknown_helper_entry",
+                Self::UnknownProfileEntry => "unknown_profile_entry",
+                Self::ProfileEnumerationLimit => "profile_enumeration_limit",
+                Self::ImageLeafSwap => "image_leaf_swap",
+                Self::DirectorySwap => "directory_swap",
+                Self::ImageHardlink => "image_hardlink",
+                Self::MissingJobFence => "missing_job_fence",
+                Self::LiveNonzeroJob => "live_nonzero_job",
+                Self::JobQueryError => "job_query_error",
             }
         }
 
@@ -7402,6 +8236,52 @@ mod registry_witness_tests {
             match self {
                 Self::WrongImageHash => "helper image bounded length or SHA-256 differs",
                 Self::UnknownRegistryKey => "private fixture inventory changed",
+                Self::WrongImageId => "helper image identity differs from its captured full ID",
+                Self::ImageLeafSwap => {
+                    "helper image directory entry identity differs from its held original"
+                }
+                Self::WrongDirectoryId => "held helper directory identity changed",
+                Self::WrongProfileId => "recorded profile entry identity changed before cleanup",
+                Self::ChangedImageDacl => {
+                    "helper image DACL differs from the captured protected policy"
+                }
+                Self::UnknownRegistryValue => "private fixture inventory changed",
+                Self::UnknownHelperEntry => {
+                    "helper directory contents differ from the exact owned image"
+                }
+                Self::UnknownProfileEntry => {
+                    "fresh profile contains unknown or changed entries before deletion"
+                }
+                Self::ProfileEnumerationLimit => "fresh profile entry bound exceeded",
+                Self::DirectorySwap => {
+                    "helper directory entry identity differs from its held original"
+                }
+                Self::ImageHardlink => "resource is linked, replaced or of the wrong kind",
+                Self::MissingJobFence => "both exact Job fences are required",
+                Self::LiveNonzeroJob => "cancel Job is not empty before live nonzero cleanup",
+                Self::JobQueryError => "injected Job query error after native zero observation",
+            }
+        }
+
+        fn rejection(self) -> &'static str {
+            match self {
+                Self::WrongImageHash => "helper_image_hash_differs",
+                Self::UnknownRegistryKey | Self::UnknownRegistryValue => {
+                    "private_fixture_inventory_changed"
+                }
+                Self::WrongImageId => "helper_image_identity_differs",
+                Self::WrongDirectoryId => "helper_directory_identity_changed",
+                Self::WrongProfileId => "profile_entry_identity_changed",
+                Self::ChangedImageDacl => "helper_image_dacl_changed",
+                Self::UnknownHelperEntry => "helper_directory_inventory_changed",
+                Self::UnknownProfileEntry => "profile_inventory_changed",
+                Self::ProfileEnumerationLimit => "profile_entry_bound_exceeded",
+                Self::ImageLeafSwap => "helper_image_leaf_swap_refused",
+                Self::DirectorySwap => "helper_directory_swap_refused",
+                Self::ImageHardlink => "helper_image_hardlink_refused",
+                Self::MissingJobFence => "cleanup_job_fence_missing",
+                Self::LiveNonzeroJob => "cancel_job_live_nonzero_refused",
+                Self::JobQueryError => "cleanup_job_query_error_injected",
             }
         }
     }
@@ -7418,6 +8298,420 @@ mod registry_witness_tests {
     struct PrivateCanaryFacts {
         value_sha256: String,
         descriptor_sha256: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ControlFileFacts {
+        leaf: String,
+        identity: (u64, [u8; 16]),
+        length: u64,
+        content_sha256: String,
+        descriptor_sha256: String,
+        profile_fact: ProfileEntryFact,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CleanupControlDetail {
+        setup_verified: bool,
+        target_reached: bool,
+        final_verified: bool,
+        state: String,
+        native_status: String,
+        active_count: String,
+        object_name: String,
+        object_id: String,
+        content_sha256: String,
+        descriptor_sha256: String,
+        expected_id: String,
+        observed_id: String,
+        inventory_count: String,
+        inventory_sha256: String,
+    }
+
+    impl CleanupControlDetail {
+        fn empty() -> Self {
+            Self {
+                setup_verified: false,
+                target_reached: false,
+                final_verified: false,
+                state: "not_applicable".to_owned(),
+                native_status: "not_applicable".to_owned(),
+                active_count: "not_applicable".to_owned(),
+                object_name: "not_applicable".to_owned(),
+                object_id: "not_applicable".to_owned(),
+                content_sha256: "not_applicable".to_owned(),
+                descriptor_sha256: "not_applicable".to_owned(),
+                expected_id: "not_applicable".to_owned(),
+                observed_id: "not_applicable".to_owned(),
+                inventory_count: "not_applicable".to_owned(),
+                inventory_sha256: "not_applicable".to_owned(),
+            }
+        }
+    }
+
+    fn create_control_file_canary(
+        parent: HANDLE,
+        leaf: &str,
+        content: &[u8],
+        user_sid: &str,
+        package_sid: &str,
+    ) -> io::Result<ControlFileFacts> {
+        if content.len() > 4096 {
+            return Err(invalid("cleanup control file canary exceeds its bound"));
+        }
+        let mut descriptor = helper_image_security_descriptor(user_sid, package_sid)?;
+        let created = (|| {
+            let handle = relative_create_file(
+                parent,
+                leaf,
+                FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                descriptor.0,
+            )?;
+            let mut file = File::from(handle);
+            let result = (|| {
+                file.write_all(content)?;
+                file.flush()?;
+                let identity = script_identity(file.as_raw_handle())?;
+                let descriptor_sha256 = digest(&resource_dacl_bytes(file.as_raw_handle())?)?;
+                let profile_fact = profile_fact(file.as_raw_handle(), false)?;
+                file.seek(std::io::SeekFrom::Start(0))?;
+                let mut observed = Vec::with_capacity(content.len());
+                (&mut file)
+                    .take(content.len() as u64 + 1)
+                    .read_to_end(&mut observed)?;
+                if observed != content {
+                    return Err(invalid(
+                        "cleanup control canary bytes differ after creation",
+                    ));
+                }
+                Ok(ControlFileFacts {
+                    leaf: leaf.to_owned(),
+                    identity,
+                    length: content.len() as u64,
+                    content_sha256: digest(content)?,
+                    descriptor_sha256,
+                    profile_fact,
+                })
+            })();
+            let close = close_file_checked(file, "CloseHandle(cleanup control canary writer)");
+            match (result, close) {
+                (Ok(facts), Ok(())) => Ok(facts),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(close)) => Err(close),
+                (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                    "cleanup control canary setup failed: {primary}; writer close failed: {close}"
+                ))),
+            }
+        })();
+        let release = descriptor.free();
+        match (created, release) {
+            (Ok(facts), Ok(())) => Ok(facts),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(release)) => Err(release),
+            (Err(primary), Err(release)) => Err(io::Error::other(format!(
+                "cleanup control canary setup failed: {primary}; descriptor release failed: {release}"
+            ))),
+        }
+    }
+
+    fn verify_control_file_canary(parent: HANDLE, facts: &ControlFileFacts) -> io::Result<()> {
+        let opened = relative_open(
+            parent,
+            &facts.leaf,
+            false,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        let mut file = File::from(opened);
+        let observed = (|| {
+            check_object(file.as_raw_handle(), false)?;
+            let identity = script_identity(file.as_raw_handle())?;
+            let descriptor_sha256 = digest(&resource_dacl_bytes(file.as_raw_handle())?)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(facts.length as usize);
+            (&mut file)
+                .take(facts.length.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            let standard = profile_fact(file.as_raw_handle(), false)?;
+            if identity != facts.identity
+                || standard.size as u64 != facts.length
+                || digest(&bytes)? != facts.content_sha256
+                || descriptor_sha256 != facts.descriptor_sha256
+                || standard != facts.profile_fact
+            {
+                return Err(invalid(
+                    "cleanup control canary identity or preimage changed",
+                ));
+            }
+            Ok(())
+        })();
+        let close = close_file_checked(file, "CloseHandle(cleanup control canary observer)");
+        match (observed, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(close)) => Err(close),
+            (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                "cleanup control canary observation failed: {primary}; observer close failed: {close}"
+            ))),
+        }
+    }
+
+    fn verify_held_image_base(
+        image: &mut HeldHelperImage,
+        expected_resource_dacl: &[u8],
+    ) -> io::Result<()> {
+        let directory = image
+            .directory_handle
+            .as_ref()
+            .ok_or_else(|| invalid("held helper directory keeper missing"))?;
+        if script_identity(directory.as_raw_handle())? != image.directory_identity {
+            return Err(invalid("held helper directory identity changed"));
+        }
+        check_object(directory.as_raw_handle(), true)?;
+        if resource_dacl_bytes(directory.as_raw_handle())? != image.expected_directory_dacl {
+            return Err(invalid("held helper directory descriptor changed"));
+        }
+        let reader = image
+            .file
+            .as_mut()
+            .ok_or_else(|| invalid("immutable helper image reader missing"))?;
+        verify_image_file(
+            reader,
+            image.identity,
+            image.expected_length,
+            &image.sha256,
+            expected_resource_dacl,
+        )?;
+        let anchor = image
+            .metadata_anchor
+            .as_ref()
+            .ok_or_else(|| invalid("helper image identity bridge missing"))?;
+        if script_identity(anchor.as_raw_handle())? != image.identity {
+            return Err(invalid("helper image identity bridge changed"));
+        }
+        Ok(())
+    }
+
+    fn verify_held_directory_identity(image: &HeldHelperImage) -> io::Result<()> {
+        let directory = image
+            .directory_handle
+            .as_ref()
+            .ok_or_else(|| invalid("held helper directory keeper missing"))?;
+        if script_identity(directory.as_raw_handle())? != image.directory_identity {
+            return Err(invalid("held helper directory identity changed"));
+        }
+        check_object(directory.as_raw_handle(), true)?;
+        if resource_dacl_bytes(directory.as_raw_handle())? != image.expected_directory_dacl {
+            return Err(invalid("held helper directory descriptor changed"));
+        }
+        Ok(())
+    }
+
+    fn verify_image_content_without_singlelink(image: &mut HeldHelperImage) -> io::Result<()> {
+        let reader = image
+            .file
+            .as_mut()
+            .ok_or_else(|| invalid("immutable helper image reader missing"))?;
+        if script_identity(reader.as_raw_handle())? != image.identity
+            || resource_dacl_bytes(reader.as_raw_handle())? != image.expected_resource_dacl
+        {
+            return Err(invalid("hardlink target image identity or DACL changed"));
+        }
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(image.expected_length as usize);
+        (&mut *reader)
+            .take(image.expected_length.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != image.expected_length || digest(&bytes)? != image.sha256 {
+            return Err(invalid("hardlink target image content changed"));
+        }
+        if script_identity(reader.as_raw_handle())? != image.identity {
+            return Err(invalid(
+                "hardlink target image identity changed while hashing",
+            ));
+        }
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    fn create_control_directory(
+        parent: HANDLE,
+        leaf: &str,
+        user_sid: &str,
+        package_sid: &str,
+    ) -> io::Result<OwnedHandle> {
+        let mut descriptor = helper_directory_security_descriptor(user_sid, package_sid)?;
+        let mut handle_owner = None;
+        let result = (|| {
+            let expected_dacl = descriptor_dacl_bytes(descriptor.0)?;
+            let (mut storage, mut object_name) = nt_unicode(leaf)?;
+            let mut attributes = OBJECT_ATTRIBUTES::default();
+            attributes.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+            attributes.RootDirectory = parent;
+            attributes.ObjectName = &mut object_name;
+            attributes.Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE;
+            attributes.SecurityDescriptor = descriptor.0.cast();
+            let mut raw = null_mut();
+            let mut status = IO_STATUS_BLOCK::default();
+            let ntstatus = unsafe {
+                NtCreateFile(
+                    &mut raw,
+                    DELETE
+                        | FILE_LIST_DIRECTORY
+                        | FILE_TRAVERSE
+                        | FILE_READ_ATTRIBUTES
+                        | READ_CONTROL
+                        | SYNCHRONIZE,
+                    &attributes,
+                    &mut status,
+                    null(),
+                    FILE_ATTRIBUTE_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    FILE_CREATE,
+                    FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                    null(),
+                    0,
+                )
+            };
+            std::hint::black_box(&mut storage);
+            if ntstatus < 0 {
+                return Err(operation_error(
+                    "NtCreateFile(FILE_CREATE cleanup control directory)",
+                    io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(ntstatus) } as i32),
+                ));
+            }
+            handle_owner = Some(own("NtCreateFile(cleanup control directory)", raw)?);
+            let handle = handle_owner
+                .as_ref()
+                .expect("cleanup control directory owner retained");
+            if status.Information != FILE_CREATED as usize {
+                return Err(invalid(
+                    "cleanup control directory did not report FILE_CREATED",
+                ));
+            }
+            check_object(handle.as_raw_handle(), true)?;
+            if resource_dacl_bytes(handle.as_raw_handle())? != expected_dacl {
+                return Err(invalid(
+                    "cleanup control directory DACL differs from its private policy",
+                ));
+            }
+            Ok(handle_owner
+                .take()
+                .expect("verified cleanup control directory owner retained"))
+        })();
+        let result = match result {
+            Ok(handle) => Ok(handle),
+            Err(primary) => match handle_owner.take() {
+                Some(handle) => match close_checked(
+                    handle,
+                    "CloseHandle(cleanup control directory after verification failure)",
+                ) {
+                    Ok(()) => Err(primary),
+                    Err(close) => Err(io::Error::other(format!(
+                        "cleanup control directory verification failed: {primary}; handle close failed: {close}"
+                    ))),
+                },
+                None => Err(primary),
+            },
+        };
+        let release = descriptor.free();
+        match (result, release) {
+            (Ok(handle), Ok(())) => Ok(handle),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(handle), Err(release)) => {
+                let close =
+                    close_checked(handle, "CloseHandle(directory after descriptor failure)");
+                match close {
+                    Ok(()) => Err(release),
+                    Err(close) => Err(io::Error::other(format!(
+                        "control directory descriptor release failed: {release}; handle close failed: {close}"
+                    ))),
+                }
+            }
+            (Err(primary), Err(release)) => Err(io::Error::other(format!(
+                "control directory creation failed: {primary}; descriptor release failed: {release}"
+            ))),
+        }
+    }
+
+    fn remove_package_ace_from_control_image(
+        handle: HANDLE,
+        user_sid: &str,
+    ) -> io::Result<Vec<u8>> {
+        let descriptor_text = wide(OsStr::new(&format!("O:{user_sid}D:P(A;;FA;;;{user_sid})")))?;
+        let mut descriptor_raw = null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                descriptor_text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor_raw,
+                null_mut(),
+            )
+        };
+        if converted == 0 {
+            let primary = operation_error(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW(control DACL)",
+                io::Error::last_os_error(),
+            );
+            let mut descriptor = LocalSecurityDescriptor(descriptor_raw);
+            return match descriptor.free() {
+                Ok(()) => Err(primary),
+                Err(release) => Err(io::Error::other(format!(
+                    "control DACL conversion failed: {primary}; descriptor release failed: {release}"
+                ))),
+            };
+        }
+        if descriptor_raw.is_null() {
+            return Err(invalid("control DACL descriptor is null"));
+        }
+        let mut descriptor = LocalSecurityDescriptor(descriptor_raw);
+        let dacl_result = (|| {
+            let mut present = 0;
+            let mut dacl = null_mut();
+            let mut defaulted = 0;
+            if unsafe {
+                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
+            } == 0
+                || present == 0
+                || dacl.is_null()
+            {
+                return Err(operation_error(
+                    "GetSecurityDescriptorDacl(control DACL)",
+                    io::Error::last_os_error(),
+                ));
+            }
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    dacl,
+                    null_mut(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(operation_error(
+                    "SetSecurityInfo(cleanup control image DACL)",
+                    io::Error::from_raw_os_error(status as i32),
+                ));
+            }
+            resource_dacl_bytes(handle)
+        })();
+        let release = descriptor.free();
+        match (dacl_result, release) {
+            (Ok(actual), Ok(())) => Ok(actual),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(release)) => Err(release),
+            (Err(primary), Err(release)) => Err(io::Error::other(format!(
+                "control image DACL change failed: {primary}; descriptor release failed: {release}"
+            ))),
+        }
     }
 
     fn parent_marker_canary_facts() -> io::Result<ParentMarkerCanaryFacts> {
@@ -7511,6 +8805,21 @@ mod registry_witness_tests {
         };
         let mut control_target_error: Option<String> = None;
         let mut control_private_canary: Option<PrivateCanaryFacts> = None;
+        let mut control_detail = CleanupControlDetail::empty();
+        let mut control_file_canary: Option<ControlFileFacts> = None;
+        let mut control_original_file_canary: Option<ControlFileFacts> = None;
+        let mut control_secondary_name: Option<String> = None;
+        let mut control_replacement_directory: Option<OwnedHandle> = None;
+        let mut profile_limit_directory: Option<OwnedHandle> = None;
+        let mut profile_limit_directory_profile_fact: Option<ProfileEntryFact> = None;
+        let mut profile_limit_files: Vec<ControlFileFacts> = Vec::new();
+        let mut control_expected_image_identity: Option<(u64, [u8; 16])> = None;
+        let mut control_expected_directory_identity: Option<(u64, [u8; 16])> = None;
+        let mut control_expected_profile_identity: Option<(u64, [u8; 16])> = None;
+        let mut control_expected_image_hash: Option<String> = None;
+        let mut control_removed_job_fence: Option<JobFence> = None;
+        let mut control_image_dacl_after: Option<Vec<u8>> = None;
+        let mut control_namespace_share_refused = false;
         let mut control_check_errors = Vec::new();
         let mut control_preflight_verified = false;
         let mut control_known_preimages_verified = false;
@@ -7536,6 +8845,7 @@ mod registry_witness_tests {
                 &nonce,
                 &user_sid,
                 &package_sid,
+                control,
             )?);
             let fixture_ref = fixture.as_ref().expect("fixture initialized");
             let image_ref = image.as_ref().expect("held image initialized");
@@ -7667,6 +8977,8 @@ mod registry_witness_tests {
                 &parent_creation,
                 &marker_digest,
                 &fixture_identity,
+                control,
+                &mut control_target_error,
             )?;
             job_gate.require_zero("registry witness cleanup preflight")?;
             Ok(())
@@ -7728,24 +9040,582 @@ mod registry_witness_tests {
                 } else {
                     None
                 };
-                if control == Some(CleanupControl::UnknownRegistryKey) {
-                    let session_ref = session
-                        .as_ref()
-                        .ok_or_else(|| invalid("profile owner missing for control"))?;
-                    control_private_canary = Some(fixture.create_unknown_key_canary(
-                        &user_sid,
-                        &sid_text(session_ref.sid.as_ptr().cast_mut().cast())?,
-                    )?);
-                }
-                let original_image_hash = image.as_ref().map(|held| held.sha256.clone());
-                if control == Some(CleanupControl::WrongImageHash) {
-                    if let Some(held) = image.as_mut() {
-                        held.sha256 = if held.sha256 == "0".repeat(64) {
-                            "f".repeat(64)
-                        } else {
-                            "0".repeat(64)
-                        };
+                let session_ref = session
+                    .as_ref()
+                    .ok_or_else(|| invalid("profile owner missing for control"))?;
+                let package_sid = sid_text(session_ref.sid.as_ptr().cast_mut().cast())?;
+                match control {
+                    Some(CleanupControl::UnknownRegistryKey) => {
+                        control_private_canary =
+                            Some(fixture.create_unknown_key_canary(&user_sid, &package_sid)?);
+                        control_detail.state =
+                            "absent_before_installed_registry_key_canary".to_owned();
+                        control_detail.native_status = "RegCreateKeyExW_SUCCESS".to_owned();
+                        control_detail.object_name =
+                            "Software\\ORBIT_WITNESS/ForeignCanary".to_owned();
+                        control_detail.content_sha256 = control_private_canary
+                            .as_ref()
+                            .expect("private canary retained")
+                            .value_sha256
+                            .clone();
+                        control_detail.descriptor_sha256 = control_private_canary
+                            .as_ref()
+                            .expect("private canary retained")
+                            .descriptor_sha256
+                            .clone();
                     }
+                    Some(CleanupControl::UnknownRegistryValue) => {
+                        control_private_canary = Some(fixture.create_unknown_value_canary()?);
+                        control_detail.state = "absent_before_installed_reg_sz_canary".to_owned();
+                        control_detail.native_status = "RegSetValueExW_SUCCESS_REG_SZ".to_owned();
+                        control_detail.object_name =
+                            "MachineView/Metadata/UnexpectedControlValue".to_owned();
+                        control_detail.content_sha256 = control_private_canary
+                            .as_ref()
+                            .expect("private canary retained")
+                            .value_sha256
+                            .clone();
+                        control_detail.descriptor_sha256 = control_private_canary
+                            .as_ref()
+                            .expect("private canary retained")
+                            .descriptor_sha256
+                            .clone();
+                    }
+                    Some(CleanupControl::WrongImageHash) => {
+                        if let Some(held) = image.as_mut() {
+                            control_detail.object_name = held.image_leaf.clone();
+                            control_detail.object_id = identity_text(held.identity);
+                            control_detail.content_sha256 = held.sha256.clone();
+                            control_expected_image_hash = Some(held.sha256.clone());
+                            held.sha256 = if held.sha256 == "0".repeat(64) {
+                                "f".repeat(64)
+                            } else {
+                                "0".repeat(64)
+                            };
+                            control_detail.state = "expected_hash_corrupted".to_owned();
+                            control_detail.expected_id = control_expected_image_hash
+                                .as_ref()
+                                .expect("image hash captured")
+                                .clone();
+                            control_detail.observed_id = held.sha256.clone();
+                        }
+                    }
+                    Some(CleanupControl::WrongImageId) => {
+                        let held = image
+                            .as_mut()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        control_expected_image_identity = Some(held.identity);
+                        control_detail.object_name = held.image_leaf.clone();
+                        control_detail.object_id = identity_text(held.identity);
+                        let mut wrong = held.identity;
+                        wrong.1[0] ^= 0x80;
+                        held.identity = wrong;
+                        control_detail.state = "expected_id_corrupted".to_owned();
+                        control_detail.expected_id = identity_text(
+                            control_expected_image_identity.expect("image identity captured"),
+                        );
+                        control_detail.observed_id = identity_text(wrong);
+                    }
+                    Some(CleanupControl::WrongDirectoryId) => {
+                        let held = image
+                            .as_mut()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        control_expected_directory_identity = Some(held.directory_identity);
+                        control_detail.object_name = held.directory_leaf.clone();
+                        control_detail.object_id = identity_text(held.directory_identity);
+                        let mut wrong = held.directory_identity;
+                        wrong.1[0] ^= 0x80;
+                        held.directory_identity = wrong;
+                        control_detail.state = "expected_id_corrupted".to_owned();
+                        control_detail.expected_id = identity_text(
+                            control_expected_directory_identity
+                                .expect("directory identity captured"),
+                        );
+                        control_detail.observed_id = identity_text(wrong);
+                    }
+                    Some(CleanupControl::WrongProfileId) => {
+                        let anchor = profile_anchor
+                            .as_mut()
+                            .ok_or_else(|| invalid("profile anchor missing"))?;
+                        control_expected_profile_identity = Some(anchor.entry_identity);
+                        control_detail.object_name = anchor.entry_leaf.clone();
+                        control_detail.object_id = identity_text(anchor.entry_identity);
+                        let mut wrong = anchor.entry_identity;
+                        wrong.1[0] ^= 0x80;
+                        anchor.entry_identity = wrong;
+                        control_detail.state = "expected_id_corrupted".to_owned();
+                        control_detail.expected_id = identity_text(
+                            control_expected_profile_identity.expect("profile identity captured"),
+                        );
+                        control_detail.observed_id = identity_text(wrong);
+                    }
+                    Some(CleanupControl::ChangedImageDacl) => {
+                        let held = image
+                            .as_mut()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        let original = digest(&held.expected_resource_dacl)?;
+                        let mutator = held
+                            .control_dacl_handle
+                            .as_ref()
+                            .ok_or_else(|| invalid("test image DACL mutator missing"))?;
+                        let changed = remove_package_ace_from_control_image(
+                            mutator.as_raw_handle(),
+                            &user_sid,
+                        )?;
+                        let changed_digest = digest(&changed)?;
+                        if changed == held.expected_resource_dacl {
+                            return Err(invalid(
+                                "changed-image-DACL control did not change the DACL",
+                            ));
+                        }
+                        control_image_dacl_after = Some(changed);
+                        control_detail.state = "package_ace_removed".to_owned();
+                        control_detail.object_name = "helper_image".to_owned();
+                        control_detail.object_id = identity_text(held.identity);
+                        control_detail.expected_id = original;
+                        control_detail.observed_id = changed_digest.clone();
+                        control_detail.descriptor_sha256 = changed_digest;
+                    }
+                    Some(CleanupControl::UnknownHelperEntry) => {
+                        let held = image
+                            .as_ref()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        let directory = held
+                            .directory_handle
+                            .as_ref()
+                            .ok_or_else(|| invalid("held helper directory missing"))?;
+                        let leaf = format!("ORBIT-CANARY-{}", &nonce[..8]);
+                        let content = format!("ORBIT-UNKNOWN-HELPER-{nonce}").into_bytes();
+                        control_file_canary = Some(create_control_file_canary(
+                            directory.as_raw_handle(),
+                            &leaf,
+                            &content,
+                            &user_sid,
+                            &package_sid,
+                        )?);
+                        let facts = control_file_canary
+                            .as_ref()
+                            .expect("helper canary retained");
+                        control_detail.state = "absent_before_installed_helper_entry".to_owned();
+                        control_detail.object_name = facts.leaf.clone();
+                        control_detail.object_id = identity_text(facts.identity);
+                        control_detail.content_sha256 = facts.content_sha256.clone();
+                        control_detail.descriptor_sha256 = facts.descriptor_sha256.clone();
+                    }
+                    Some(CleanupControl::UnknownProfileEntry) => {
+                        let anchor = profile_anchor
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile anchor missing"))?;
+                        let ac = anchor
+                            .ac
+                            .as_ref()
+                            .ok_or_else(|| invalid("AC anchor missing"))?;
+                        let leaf = format!("ORBIT-PROFILE-{}", &nonce[..8]);
+                        let content = format!("ORBIT-UNKNOWN-PROFILE-{nonce}").into_bytes();
+                        control_file_canary = Some(create_control_file_canary(
+                            ac.as_raw_handle(),
+                            &leaf,
+                            &content,
+                            &user_sid,
+                            &package_sid,
+                        )?);
+                        let facts = control_file_canary
+                            .as_ref()
+                            .expect("profile canary retained");
+                        control_detail.state = "absent_before_installed_profile_entry".to_owned();
+                        control_detail.object_name = facts.leaf.clone();
+                        control_detail.object_id = identity_text(facts.identity);
+                        control_detail.content_sha256 = facts.content_sha256.clone();
+                        control_detail.descriptor_sha256 = facts.descriptor_sha256.clone();
+                    }
+                    Some(CleanupControl::ProfileEnumerationLimit) => {
+                        let anchor = profile_anchor
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile anchor missing"))?;
+                        let ac = anchor
+                            .ac
+                            .as_ref()
+                            .ok_or_else(|| invalid("AC anchor missing"))?;
+                        let directory_leaf = format!("ORBIT-LIMIT-{}", &nonce[..8]);
+                        profile_limit_directory = Some(create_control_directory(
+                            ac.as_raw_handle(),
+                            &directory_leaf,
+                            &user_sid,
+                            &package_sid,
+                        )?);
+                        let child = profile_limit_directory
+                            .as_ref()
+                            .expect("limit directory retained")
+                            .as_raw_handle();
+                        for index in 0..513usize {
+                            let leaf = format!("F{index:03}");
+                            profile_limit_files.push(create_control_file_canary(
+                                child,
+                                &leaf,
+                                &[],
+                                &user_sid,
+                                &package_sid,
+                            )?);
+                        }
+                        profile_limit_directory_profile_fact = Some(profile_fact(child, true)?);
+                        let mut inventory = String::new();
+                        for facts in &profile_limit_files {
+                            use std::fmt::Write as _;
+                            write!(
+                                inventory,
+                                "{}|{}|{}\n",
+                                facts.leaf,
+                                identity_text(facts.identity),
+                                facts.content_sha256
+                            )
+                            .map_err(|_| invalid("profile-limit inventory formatting failed"))?;
+                        }
+                        control_detail.state = "installed_513_bounded_empty_files".to_owned();
+                        control_detail.object_name = directory_leaf;
+                        control_detail.object_id = identity_text(script_identity(child)?);
+                        control_detail.descriptor_sha256 = digest(&resource_dacl_bytes(child)?)?;
+                        control_detail.inventory_count = "513".to_owned();
+                        control_detail.inventory_sha256 = digest(inventory.as_bytes())?;
+                    }
+                    Some(CleanupControl::MissingJobFence) => {
+                        job_gate.require_zero("missing Job fence control pre-arm")?;
+                        control_detail.native_status =
+                            "STATUS_SUCCESS_both_jobs_zero_before_owner_move".to_owned();
+                        control_detail.active_count = "0,0".to_owned();
+                        control_removed_job_fence = job_gate.cancel.take();
+                        if control_removed_job_fence.is_none() {
+                            return Err(invalid("cancellation Job fence missing before control"));
+                        }
+                        control_detail.state = "one_fence_removed_for_shared_gate".to_owned();
+                    }
+                    Some(CleanupControl::JobQueryError) => {
+                        let control = control.expect("job query error control selected");
+                        job_gate.require_zero("Job query error control pre-arm")?;
+                        job_gate.reset_last_native_active_counts();
+                        job_gate.inject_query_error_once(control.target_error());
+                        control_detail.state = "shared_job_query_error_injection_armed".to_owned();
+                    }
+                    Some(CleanupControl::LiveNonzeroJob) => {
+                        if control_target_error.is_none() {
+                            return Err(invalid(
+                                "live Job control did not record its early refusal",
+                            ));
+                        }
+                        control_detail.state =
+                            "actual_cancel_job_singleton_refused_before_stop".to_owned();
+                        control_detail.active_count = "1".to_owned();
+                    }
+                    Some(CleanupControl::ImageLeafSwap) => {
+                        let held = image
+                            .as_ref()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        let directory = held
+                            .directory_handle
+                            .as_ref()
+                            .ok_or_else(|| invalid("held helper directory missing"))?;
+                        let reader = held
+                            .file
+                            .as_ref()
+                            .ok_or_else(|| invalid("held image reader missing"))?;
+                        let mut original = ControlFileFacts {
+                            leaf: held.image_leaf.clone(),
+                            identity: held.identity,
+                            length: held.expected_length,
+                            content_sha256: held.sha256.clone(),
+                            descriptor_sha256: digest(&resource_dacl_bytes(
+                                reader.as_raw_handle(),
+                            )?)?,
+                            profile_fact: profile_fact(reader.as_raw_handle(), false)?,
+                        };
+                        let backup = format!("ORBIT-OLD-IMAGE-{}", &nonce[..8]);
+                        let mut rename_native_status = None;
+                        let mut rename_handle_close_failed = false;
+                        let rename_result = (|| -> io::Result<()> {
+                            let rename_handle = relative_open_with_status(
+                                directory.as_raw_handle(),
+                                &held.image_leaf,
+                                false,
+                                DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                &mut rename_native_status,
+                            )?;
+                            let renamed = rename_relative(
+                                rename_handle.as_raw_handle(),
+                                directory.as_raw_handle(),
+                                &backup,
+                                &mut rename_native_status,
+                            );
+                            let close =
+                                close_checked(rename_handle, "CloseHandle(image rename control)");
+                            match (renamed, close) {
+                                (Ok(()), Ok(())) => Ok(()),
+                                (Err(primary), Ok(())) => Err(primary),
+                                (Ok(()), Err(close)) => {
+                                    rename_handle_close_failed = true;
+                                    Err(close)
+                                }
+                                (Err(primary), Err(close)) => {
+                                    rename_handle_close_failed = true;
+                                    Err(io::Error::other(format!(
+                                        "image rename failed: {primary}; rename handle close failed: {close}"
+                                    )))
+                                }
+                            }
+                        })();
+                        if let Err(error) = rename_result {
+                            if rename_native_status == Some(0xC000_0043u32 as i32)
+                                && !rename_handle_close_failed
+                            {
+                                control_namespace_share_refused = true;
+                                control_detail.state =
+                                    "rename_prevented_by_exact_sharing_violation".to_owned();
+                                control_detail.native_status = format!(
+                                    "NtStatus={:#010x}_Win32=32",
+                                    rename_native_status.expect("sharing status captured") as u32
+                                );
+                                control_detail.object_name = held.image_leaf.clone();
+                                control_detail.expected_id = identity_text(held.identity);
+                                control_detail.observed_id = identity_text(held.identity);
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                        if control_namespace_share_refused {
+                            control_secondary_name = Some(backup);
+                        } else {
+                            original.leaf = backup.clone();
+                            control_original_file_canary = Some(original);
+                            control_secondary_name = Some(backup.clone());
+                            let replacement = create_control_file_canary(
+                                directory.as_raw_handle(),
+                                &held.image_leaf,
+                                format!("ORBIT-IMAGE-SWAP-{nonce}").as_bytes(),
+                                &user_sid,
+                                &package_sid,
+                            )?;
+                            control_detail.state =
+                                "held_image_renamed_and_replacement_installed".to_owned();
+                            control_detail.object_name = held.image_leaf.clone();
+                            control_detail.object_id = identity_text(replacement.identity);
+                            control_detail.expected_id = identity_text(held.identity);
+                            control_detail.observed_id = identity_text(replacement.identity);
+                            control_detail.content_sha256 = replacement.content_sha256.clone();
+                            control_detail.descriptor_sha256 =
+                                replacement.descriptor_sha256.clone();
+                            control_file_canary = Some(replacement);
+                            control_secondary_name = Some(backup);
+                        }
+                    }
+                    Some(CleanupControl::DirectorySwap) => {
+                        let held = image
+                            .as_ref()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        let anchor = profile_anchor
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile anchor missing"))?;
+                        let ac = anchor
+                            .ac
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile AC anchor missing"))?;
+                        let original_directory = held
+                            .directory_handle
+                            .as_ref()
+                            .ok_or_else(|| invalid("held helper directory missing"))?;
+                        let backup = format!("ORBIT-OLD-DIR-{}", &nonce[..8]);
+                        let mut rename_native_status = None;
+                        let mut rename_handle_close_failed = false;
+                        let rename_result = (|| -> io::Result<()> {
+                            let rename_handle = relative_open_with_status(
+                                ac.as_raw_handle(),
+                                &held.directory_leaf,
+                                true,
+                                DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                &mut rename_native_status,
+                            )?;
+                            let renamed = rename_relative(
+                                rename_handle.as_raw_handle(),
+                                ac.as_raw_handle(),
+                                &backup,
+                                &mut rename_native_status,
+                            );
+                            let close = close_checked(
+                                rename_handle,
+                                "CloseHandle(directory rename control)",
+                            );
+                            match (renamed, close) {
+                                (Ok(()), Ok(())) => Ok(()),
+                                (Err(primary), Ok(())) => Err(primary),
+                                (Ok(()), Err(close)) => {
+                                    rename_handle_close_failed = true;
+                                    Err(close)
+                                }
+                                (Err(primary), Err(close)) => {
+                                    rename_handle_close_failed = true;
+                                    Err(io::Error::other(format!(
+                                        "directory rename failed: {primary}; rename handle close failed: {close}"
+                                    )))
+                                }
+                            }
+                        })();
+                        if let Err(error) = rename_result {
+                            if rename_native_status == Some(0xC000_0043u32 as i32)
+                                && !rename_handle_close_failed
+                            {
+                                control_namespace_share_refused = true;
+                                control_detail.state =
+                                    "rename_prevented_by_exact_sharing_violation".to_owned();
+                                control_detail.native_status = format!(
+                                    "NtStatus={:#010x}_Win32=32",
+                                    rename_native_status.expect("sharing status captured") as u32
+                                );
+                                control_detail.object_name = held.directory_leaf.clone();
+                                control_detail.expected_id = identity_text(held.directory_identity);
+                                control_detail.observed_id = identity_text(held.directory_identity);
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                        if control_namespace_share_refused {
+                            control_secondary_name = Some(backup);
+                        } else {
+                            control_replacement_directory = Some(create_control_directory(
+                                ac.as_raw_handle(),
+                                &held.directory_leaf,
+                                &user_sid,
+                                &package_sid,
+                            )?);
+                            let replacement = control_replacement_directory
+                                .as_ref()
+                                .ok_or_else(|| invalid("replacement directory owner missing"))?;
+                            let replacement_identity =
+                                script_identity(replacement.as_raw_handle())?;
+                            control_detail.state =
+                                "held_directory_renamed_and_replacement_installed".to_owned();
+                            control_detail.object_name = held.directory_leaf.clone();
+                            control_detail.object_id = identity_text(replacement_identity);
+                            control_detail.expected_id = identity_text(held.directory_identity);
+                            control_detail.observed_id = identity_text(replacement_identity);
+                            control_detail.descriptor_sha256 =
+                                digest(&resource_dacl_bytes(replacement.as_raw_handle())?)?;
+                            control_secondary_name = Some(backup);
+                            // The held old directory remains anchored and must still contain
+                            // its exact helper image after its profile name is replaced.
+                            if profile_children(original_directory.as_raw_handle())?.len() != 1 {
+                                return Err(invalid(
+                                    "renamed original helper directory contents changed",
+                                ));
+                            }
+                        }
+                    }
+                    Some(CleanupControl::ImageHardlink) => {
+                        let held = image
+                            .as_ref()
+                            .ok_or_else(|| invalid("held image missing"))?;
+                        let anchor = profile_anchor
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile anchor missing"))?;
+                        let ac = anchor
+                            .ac
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile AC anchor missing"))?;
+                        let entry = anchor
+                            .entry
+                            .as_ref()
+                            .ok_or_else(|| invalid("profile entry anchor missing"))?;
+                        let leaf = format!("ORBIT-LINK-{}", &nonce[..8]);
+                        let source = held
+                            .file
+                            .as_ref()
+                            .ok_or_else(|| invalid("held image reader missing"))?;
+                        if !relative_probe_absent(ac.as_raw_handle(), &leaf, false)? {
+                            return Err(invalid(
+                                "hardlink control target leaf unexpectedly exists",
+                            ));
+                        }
+                        let link_parent = relative_open(
+                            entry.as_raw_handle(),
+                            "AC",
+                            true,
+                            FILE_WRITE_DATA
+                                | FILE_LIST_DIRECTORY
+                                | FILE_TRAVERSE
+                                | FILE_READ_ATTRIBUTES
+                                | SYNCHRONIZE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        )?;
+                        let parent_access =
+                            query_directory_handle_access(link_parent.as_raw_handle());
+                        let source_access = query_directory_handle_access(source.as_raw_handle());
+                        let Some(granted_parent) = parent_access.granted_access else {
+                            let close = close_checked(
+                                link_parent,
+                                "CloseHandle(hardlink target parent after access query failure)",
+                            );
+                            return match close {
+                                Ok(()) => Err(invalid(
+                                    "hardlink target parent granted-access query unavailable",
+                                )),
+                                Err(close) => Err(io::Error::other(format!(
+                                    "hardlink target parent granted-access query unavailable; close failed: {close}"
+                                ))),
+                            };
+                        };
+                        if granted_parent & FILE_WRITE_DATA == 0 {
+                            let close = close_checked(
+                                link_parent,
+                                "CloseHandle(hardlink target parent after access refusal)",
+                            );
+                            return match close {
+                                Ok(()) => Err(invalid(
+                                    "hardlink target parent handle lacks file-create access",
+                                )),
+                                Err(close) => Err(io::Error::other(format!(
+                                    "hardlink target parent handle lacks file-create access; close failed: {close}"
+                                ))),
+                            };
+                        }
+                        let mut link_native_status = None;
+                        let link_result = link_relative(
+                            source.as_raw_handle(),
+                            link_parent.as_raw_handle(),
+                            &leaf,
+                            &mut link_native_status,
+                        );
+                        let link_parent_close =
+                            close_checked(link_parent, "CloseHandle(hardlink target parent)");
+                        match (link_result, link_parent_close) {
+                            (Ok(()), Ok(())) => {}
+                            (Err(primary), Ok(())) => return Err(primary),
+                            (Ok(()), Err(close)) => return Err(close),
+                            (Err(primary), Err(close)) => {
+                                return Err(io::Error::other(format!(
+                                    "hardlink control failed: {primary}; parent close failed: {close}"
+                                )));
+                            }
+                        }
+                        verify_file_link_count(source.as_raw_handle(), 2)?;
+                        control_secondary_name = Some(leaf.clone());
+                        control_detail.state = "same_volume_hardlink_installed".to_owned();
+                        control_detail.native_status = format!(
+                            "NtSetInformationFile=STATUS_SUCCESS_source_access={}_parent_access={:#010x}",
+                            source_access.granted_access.map_or_else(
+                                || "unknown".to_owned(),
+                                |value| format!("{value:#010x}")
+                            ),
+                            granted_parent
+                        );
+                        control_detail.object_name = leaf;
+                        control_detail.object_id = identity_text(held.identity);
+                        control_detail.expected_id = identity_text(held.identity);
+                        control_detail.observed_id = identity_text(held.identity);
+                        control_detail.content_sha256 = held.sha256.clone();
+                        control_detail.descriptor_sha256 = digest(&held.expected_resource_dacl)?;
+                    }
+                    None => {}
+                }
+                if control.is_some() && control != Some(CleanupControl::JobQueryError) {
+                    control_detail.setup_verified = true;
                 }
                 let inventory = fixture.verify_unchanged();
                 let predelete =
@@ -7755,19 +9625,105 @@ mod registry_witness_tests {
                             "prelaunch profile anchor or held helper image missing",
                         )),
                     });
-                if let (Some(original), Some(held)) = (original_image_hash, image.as_mut()) {
-                    held.sha256 = original;
+                if control == Some(CleanupControl::JobQueryError) {
+                    let counts = job_gate.last_native_active_counts();
+                    let native_zero = counts == [Some(0), Some(0)];
+                    let injected_error_reached = predelete.as_ref().err().is_some_and(|error| {
+                        error.to_string()
+                            == control
+                                .expect("query error control selected")
+                                .target_error()
+                    });
+                    control_detail.state = if native_zero && injected_error_reached {
+                        "both_native_job_queries_zero_then_shared_gate_error_injected"
+                    } else if native_zero {
+                        "native_queries_zero_but_shared_gate_injection_not_reached"
+                    } else {
+                        "job_query_control_did_not_reach_both_native_zero_results"
+                    }
+                    .to_owned();
+                    control_detail.native_status = if native_zero {
+                        "native_query_success"
+                    } else {
+                        "native_query_results_not_both_zero"
+                    }
+                    .to_owned();
+                    control_detail.active_count = format!(
+                        "{},{}",
+                        counts[0]
+                            .map_or_else(|| "unobserved".to_owned(), |count| count.to_string()),
+                        counts[1]
+                            .map_or_else(|| "unobserved".to_owned(), |count| count.to_string()),
+                    );
+                    control_detail.setup_verified = native_zero && injected_error_reached;
+                    job_gate.clear_query_error_injection();
                 }
-                predelete
+                if let Some(expected) = control_expected_image_identity.take() {
+                    if let Some(held) = image.as_mut() {
+                        held.identity = expected;
+                    }
+                }
+                if let Some(expected) = control_expected_directory_identity.take() {
+                    if let Some(held) = image.as_mut() {
+                        held.directory_identity = expected;
+                    }
+                }
+                if let Some(expected) = control_expected_profile_identity.take() {
+                    if let Some(anchor) = profile_anchor.as_mut() {
+                        anchor.entry_identity = expected;
+                    }
+                }
+                if let Some(expected) = control_expected_image_hash.take() {
+                    if let Some(held) = image.as_mut() {
+                        held.sha256 = expected;
+                    }
+                }
+                if let Some(fence) = control_removed_job_fence.take() {
+                    job_gate.cancel = Some(fence);
+                }
+                match predelete {
+                    Err(error) => Err(error),
+                    Ok(()) if control_namespace_share_refused => {
+                        let target = "namespace rename refused with ERROR_SHARING_VIOLATION";
+                        control_target_error = Some(target.to_owned());
+                        Err(invalid(target))
+                    }
+                    Ok(()) if control == Some(CleanupControl::LiveNonzeroJob) => Err(invalid(
+                        control.expect("live Job control selected").target_error(),
+                    )),
+                    Ok(()) if control.is_some() => Err(invalid(
+                        "cleanup fault did not trigger its expected preflight refusal",
+                    )),
+                    Ok(()) => Ok(()),
+                }
             })();
+            let preflight_checked_close_failure = preflight.as_ref().err().is_some_and(|error| {
+                error
+                    .to_string()
+                    .contains("profile baseline checked-close failure")
+            });
+            if preflight_checked_close_failure {
+                control_check_errors.push(format!(
+                    "profile baseline traversal close failure: {}",
+                    preflight.as_ref().err().expect("close failure detected")
+                ));
+            }
             match preflight {
                 Err(error)
                     if control.is_some()
+                        && !preflight_checked_close_failure
                         && error
                             .to_string()
-                            .contains(control.expect("control present").target_error()) =>
+                            .contains(if control_namespace_share_refused {
+                                control_target_error
+                                    .as_deref()
+                                    .unwrap_or_else(|| control.expect("control present").target_error())
+                            } else {
+                                control.expect("control present").target_error()
+                            }) =>
                 {
                     control_target_error = Some(error.to_string());
+                    control_detail.target_reached = true;
                     if let (Some(fixture), Some(anchor), Some(image)) = (
                         fixture.as_ref(),
                         profile_anchor.as_ref(),
@@ -7780,7 +9736,252 @@ mod registry_witness_tests {
                             )),
                         }
                         let root_result = fixture.verify_root_present();
-                        let profile_image_result = anchor.verify_predelete(image, &job_gate);
+                        let profile_image_result = (|| -> io::Result<()> {
+                            match control.expect("control present") {
+                            CleanupControl::ChangedImageDacl => verify_held_image_base(
+                                image,
+                                control_image_dacl_after
+                                    .as_deref()
+                                    .ok_or_else(|| invalid("changed DACL postimage missing"))?,
+                            )
+                            .and_then(|()| {
+                                anchor.verify_profile_baseline_with_control_extras(image, &[])
+                            }),
+                            CleanupControl::UnknownHelperEntry => {
+                                let facts = control_file_canary.as_ref().ok_or_else(|| {
+                                    invalid("helper-entry canary facts missing")
+                                })?;
+                                let directory = image
+                                    .directory_handle
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("helper directory keeper missing"))?;
+                                let mut children = profile_children(directory.as_raw_handle())?;
+                                children.sort_by(|left, right| left.0.cmp(&right.0));
+                                let mut expected_children = vec![
+                                    (image.image_leaf.clone(), image.identity.1, false),
+                                    (facts.leaf.clone(), facts.identity.1, false),
+                                ];
+                                expected_children.sort_by(|left, right| left.0.cmp(&right.0));
+                                if children != expected_children {
+                                    return Err(invalid(
+                                        "helper-entry control inventory changed after refusal",
+                                    ));
+                                }
+                                verify_control_file_canary(directory.as_raw_handle(), facts)?;
+                                let profile_extra = vec![(
+                                    format!("AC\\{}\\{}", image.directory_leaf, facts.leaf),
+                                    facts.profile_fact.clone(),
+                                )];
+                                let expected_dacl = image.expected_resource_dacl.clone();
+                                verify_held_image_base(image, &expected_dacl)
+                                    .and_then(|()| {
+                                        anchor.verify_profile_baseline_with_control_extras(
+                                            image,
+                                            &profile_extra,
+                                        )
+                                    })
+                            }
+                            CleanupControl::UnknownProfileEntry => {
+                                let facts = control_file_canary.as_ref().ok_or_else(|| {
+                                    invalid("profile-entry canary facts missing")
+                                })?;
+                                let ac = anchor
+                                    .ac
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("profile AC anchor missing"))?;
+                                verify_control_file_canary(ac.as_raw_handle(), facts)?;
+                                let profile_extra = vec![
+                                    (format!("AC\\{}", facts.leaf), facts.profile_fact.clone()),
+                                ];
+                                image.verify_preflight(&job_gate).and_then(|()| {
+                                    anchor.verify_profile_baseline_with_control_extras(
+                                        image,
+                                        &profile_extra,
+                                    )
+                                })
+                            }
+                            CleanupControl::ProfileEnumerationLimit => {
+                                let entry = anchor
+                                    .entry
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("profile entry anchor missing"))?;
+                                let ac = anchor
+                                    .ac
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("profile AC anchor missing"))?;
+                                let limit_directory = profile_limit_directory
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("limit directory owner missing"))?;
+                                let expected_limit_directory_fact = profile_limit_directory_profile_fact
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("limit directory post-setup fact missing"))?;
+                                if profile_fact(limit_directory.as_raw_handle(), true)?
+                                    != *expected_limit_directory_fact
+                                {
+                                    return Err(invalid("profile-limit directory post-setup metadata changed"));
+                                }
+                                let limit_name = control_detail.object_name.as_str();
+                                let mut entry_children = profile_children(entry.as_raw_handle())?;
+                                entry_children.sort_by(|left, right| left.0.cmp(&right.0));
+                                if entry_children.len() != 1
+                                    || entry_children[0].0 != "AC"
+                                    || !entry_children[0].2
+                                {
+                                    return Err(invalid("profile entry contents changed around limit canary"));
+                                }
+                                let mut ac_children = profile_children(ac.as_raw_handle())?;
+                                ac_children.sort_by(|left, right| left.0.cmp(&right.0));
+                                let mut expected_ac_children = profile_baseline_direct_children(
+                                    &anchor.baseline,
+                                    "AC",
+                                );
+                                expected_ac_children.extend(vec![
+                                    (
+                                        image.directory_leaf.clone(),
+                                        image.directory_identity.1,
+                                        true,
+                                    ),
+                                    (
+                                        limit_name.to_owned(),
+                                        script_identity(limit_directory.as_raw_handle())?.1,
+                                        true,
+                                    ),
+                                ]);
+                                expected_ac_children
+                                    .sort_by(|left, right| left.0.cmp(&right.0));
+                                if ac_children != expected_ac_children {
+                                    return Err(invalid("AC contents changed around limit canary"));
+                                }
+                                if profile_limit_files.len() != 513 {
+                                    return Err(invalid("profile-limit control did not retain exactly 513 setup records"));
+                                }
+                                for facts in &profile_limit_files {
+                                    verify_control_file_canary(
+                                        limit_directory.as_raw_handle(),
+                                        facts,
+                                    )?;
+                                }
+                                anchor
+                                    .verify_profile_bindings()
+                                    .and_then(|()| image.verify_preflight(&job_gate))
+                            }
+                            CleanupControl::ImageLeafSwap if control_namespace_share_refused => {
+                                let directory = image.directory_handle.as_ref().ok_or_else(|| invalid("held helper directory missing"))?;
+                                let backup = control_secondary_name.as_ref().ok_or_else(|| invalid("image backup name missing"))?;
+                                if !relative_probe_absent(directory.as_raw_handle(), backup, false)? {
+                                    return Err(invalid("sharing-prevented image rename left an alternate name"));
+                                }
+                                let expected_dacl = image.expected_resource_dacl.clone();
+                                verify_held_image_base(image, &expected_dacl)
+                                    .and_then(|()| anchor.verify_predelete(image, &job_gate))
+                            }
+                            CleanupControl::ImageLeafSwap => {
+                                let directory = image.directory_handle.as_ref().ok_or_else(|| invalid("held helper directory missing"))?;
+                                let original = control_original_file_canary.as_ref().ok_or_else(|| invalid("renamed original image facts missing"))?;
+                                let replacement = control_file_canary.as_ref().ok_or_else(|| invalid("replacement image facts missing"))?;
+                                let backup = control_secondary_name.as_ref().ok_or_else(|| invalid("image backup name missing"))?;
+                                let mut children = profile_children(directory.as_raw_handle())?;
+                                children.sort_by(|left, right| left.0.cmp(&right.0));
+                                let mut expected_children = vec![
+                                    (backup.clone(), original.identity.1, false),
+                                    (image.image_leaf.clone(), replacement.identity.1, false),
+                                ];
+                                expected_children.sort_by(|left, right| left.0.cmp(&right.0));
+                                if children != expected_children {
+                                    return Err(invalid("image-leaf swap postimage inventory differs"));
+                                }
+                                verify_control_file_canary(directory.as_raw_handle(), original)?;
+                                verify_control_file_canary(directory.as_raw_handle(), replacement)?;
+                                let directory_path = format!("AC\\{}", image.directory_leaf);
+                                let directory_fact = profile_fact(directory.as_raw_handle(), true)?;
+                                let expected_dacl = image.expected_resource_dacl.clone();
+                                verify_held_image_base(image, &expected_dacl)?;
+                                let entries = vec![
+                                    (directory_path, directory_fact),
+                                    (format!("AC\\{}\\{}", image.directory_leaf, backup), original.profile_fact.clone()),
+                                    (format!("AC\\{}\\{}", image.directory_leaf, image.image_leaf), replacement.profile_fact.clone()),
+                                ];
+                                anchor.verify_profile_inventory_with_control_entries(&entries)
+                            }
+                            CleanupControl::DirectorySwap if control_namespace_share_refused => {
+                                let ac = anchor.ac.as_ref().ok_or_else(|| invalid("profile AC anchor missing"))?;
+                                let backup = control_secondary_name.as_ref().ok_or_else(|| invalid("directory backup name missing"))?;
+                                if !relative_probe_absent(ac.as_raw_handle(), backup, true)? {
+                                    return Err(invalid("sharing-prevented directory rename left an alternate name"));
+                                }
+                                let expected_dacl = image.expected_resource_dacl.clone();
+                                verify_held_image_base(image, &expected_dacl)
+                                    .and_then(|()| anchor.verify_predelete(image, &job_gate))
+                            }
+                            CleanupControl::DirectorySwap => {
+                                let directory = image.directory_handle.as_ref().ok_or_else(|| invalid("held helper directory missing"))?;
+                                let replacement = control_replacement_directory.as_ref().ok_or_else(|| invalid("replacement directory owner missing"))?;
+                                let backup = control_secondary_name.as_ref().ok_or_else(|| invalid("directory backup name missing"))?;
+                                if script_identity(directory.as_raw_handle())? != image.directory_identity
+                                    || resource_dacl_bytes(directory.as_raw_handle())? != image.expected_directory_dacl
+                                {
+                                    return Err(invalid("renamed original directory identity or DACL changed"));
+                                }
+                                let original_file = image.file.as_ref().ok_or_else(|| invalid("held image reader missing"))?;
+                                let original_facts = ControlFileFacts {
+                                    leaf: image.image_leaf.clone(),
+                                    identity: image.identity,
+                                    length: image.expected_length,
+                                    content_sha256: image.sha256.clone(),
+                                    descriptor_sha256: digest(&resource_dacl_bytes(original_file.as_raw_handle())?)?,
+                                    profile_fact: profile_fact(original_file.as_raw_handle(), false)?,
+                                };
+                                verify_control_file_canary(directory.as_raw_handle(), &original_facts)?;
+                                if !profile_children(replacement.as_raw_handle())?.is_empty()
+                                    || resource_dacl_bytes(replacement.as_raw_handle())? != image.expected_directory_dacl
+                                {
+                                    return Err(invalid("replacement helper directory contents or DACL changed"));
+                                }
+                                let ac = anchor.ac.as_ref().ok_or_else(|| invalid("profile AC anchor missing"))?;
+                                let mut ac_children = profile_children(ac.as_raw_handle())?;
+                                ac_children.sort_by(|left, right| left.0.cmp(&right.0));
+                                let mut expected_ac_children = profile_baseline_direct_children(
+                                    &anchor.baseline,
+                                    "AC",
+                                );
+                                expected_ac_children.extend(vec![
+                                    (backup.clone(), image.directory_identity.1, true),
+                                    (image.directory_leaf.clone(), script_identity(replacement.as_raw_handle())?.1, true),
+                                ]);
+                                expected_ac_children.sort_by(|left, right| left.0.cmp(&right.0));
+                                if ac_children != expected_ac_children {
+                                    return Err(invalid("directory-swap postimage inventory differs"));
+                                }
+                                let entries = vec![
+                                    (format!("AC\\{}", backup), profile_fact(directory.as_raw_handle(), true)?),
+                                    (format!("AC\\{}\\{}", backup, image.image_leaf), original_facts.profile_fact),
+                                    (format!("AC\\{}", image.directory_leaf), profile_fact(replacement.as_raw_handle(), true)?),
+                                ];
+                                anchor.verify_profile_inventory_with_control_entries(&entries)
+                            }
+                            CleanupControl::ImageHardlink => {
+                                let directory = image.directory_handle.as_ref().ok_or_else(|| invalid("held helper directory missing"))?;
+                                let link_name = control_secondary_name.as_ref().ok_or_else(|| invalid("hardlink name missing"))?;
+                                let ac = anchor.ac.as_ref().ok_or_else(|| invalid("profile AC anchor missing"))?;
+                                let mut children = profile_children(directory.as_raw_handle())?;
+                                children.sort_by(|left, right| left.0.cmp(&right.0));
+                                if children != vec![(image.image_leaf.clone(), image.identity.1, false)] {
+                                    return Err(invalid("hardlink changed the helper directory inventory"));
+                                }
+                                let image_reader = image.file.as_ref().ok_or_else(|| invalid("held image reader missing"))?;
+                                verify_file_link_count(image_reader.as_raw_handle(), 2)?;
+                                verify_image_content_without_singlelink(image)?;
+                                let ac_children = profile_children(ac.as_raw_handle())?;
+                                if !ac_children.iter().any(|(name, id, directory)| name == link_name && id == &image.identity.1 && !directory) {
+                                    return Err(invalid("hardlink AC directory entry ID differs from the original image"));
+                                }
+                                verify_held_directory_identity(image).and_then(|()| {
+                                    anchor.verify_profile_baseline_with_control_hardlink(image, link_name)
+                                })
+                            }
+                            _ => anchor.verify_predelete(image, &job_gate),
+                            }
+                        })();
                         control_preflight_verified =
                             root_result.is_ok() && profile_image_result.is_ok();
                         if let Err(error) = root_result {
@@ -7810,10 +10011,21 @@ mod registry_witness_tests {
                                 "MachineView/UserView post-rejection snapshot: {error}"
                             )),
                         }
-                        if control == Some(CleanupControl::UnknownRegistryKey) {
+                        if matches!(
+                            control,
+                            Some(CleanupControl::UnknownRegistryKey)
+                                | Some(CleanupControl::UnknownRegistryValue)
+                        ) {
+                            let canary_observation = if control
+                                == Some(CleanupControl::UnknownRegistryValue)
+                            {
+                                fixture.unknown_value_canary_facts()
+                            } else {
+                                fixture.unknown_key_canary_facts()
+                            };
                             match (
                                 control_private_canary.as_ref(),
-                                fixture.unknown_key_canary_facts(),
+                                canary_observation,
                             ) {
                                 (Some(before), Ok(after)) if &after == before => {
                                     control_private_canary_unchanged = true;
@@ -7924,6 +10136,16 @@ mod registry_witness_tests {
                     ));
                 }
             }
+            if let Some(control_dacl) = image.control_dacl_handle.take() {
+                if let Err(error) = close_checked(
+                    control_dacl,
+                    "CloseHandle(retained helper image DACL control)",
+                ) {
+                    cleanup_errors.push(format!(
+                        "retained helper image DACL control close failed: {error}"
+                    ));
+                }
+            }
             if let Some(directory) = image.directory_handle.take() {
                 if let Err(error) =
                     close_checked(directory, "CloseHandle(retained helper directory keeper)")
@@ -7932,6 +10154,26 @@ mod registry_witness_tests {
                         "retained helper directory keeper close failed: {error}"
                     ));
                 }
+            }
+        }
+        if let Some(replacement) = control_replacement_directory.take() {
+            if let Err(error) = close_checked(
+                replacement,
+                "CloseHandle(retained replacement helper directory)",
+            ) {
+                cleanup_errors.push(format!(
+                    "retained replacement helper directory close failed: {error}"
+                ));
+            }
+        }
+        if let Some(limit_directory) = profile_limit_directory.take() {
+            if let Err(error) = close_checked(
+                limit_directory,
+                "CloseHandle(retained profile-limit directory)",
+            ) {
+                cleanup_errors.push(format!(
+                    "retained profile-limit directory close failed: {error}"
+                ));
             }
         }
         if let Some(anchor) = profile_anchor.as_mut() {
@@ -8016,8 +10258,10 @@ mod registry_witness_tests {
                 && control_preflight_verified
                 && control_known_preimages_verified
                 && control_view_preimages_unchanged
-                && (control != CleanupControl::UnknownRegistryKey
-                    || control_private_canary_unchanged)
+                && (!matches!(
+                    control,
+                    CleanupControl::UnknownRegistryKey | CleanupControl::UnknownRegistryValue
+                ) || control_private_canary_unchanged)
                 && control_job_fences_present
                 && host_marker_result.is_ok()
                 && parent_canary_unchanged
@@ -8030,6 +10274,7 @@ mod registry_witness_tests {
                 && control_check_errors.is_empty()
                 && cleanup_errors.is_empty();
             if expected_control {
+                control_detail.final_verified = true;
                 let image = image.as_ref().expect("validated held image retained");
                 let private_value = control_private_canary.as_ref().map_or_else(
                     || "not_applicable".to_owned(),
@@ -8046,9 +10291,10 @@ mod registry_witness_tests {
                     nonce,
                     parent_pid,
                     parent_creation,
-                    match control {
-                        CleanupControl::WrongImageHash => "helper_image_hash_differs",
-                        CleanupControl::UnknownRegistryKey => "private_fixture_inventory_changed",
+                    if control_namespace_share_refused {
+                        "namespace_rename_share_violation"
+                    } else {
+                        control.rejection()
                     },
                     private_value,
                     private_descriptor,
@@ -8065,9 +10311,30 @@ mod registry_witness_tests {
                     "registry_witness_finalization status=retained control={} profile_absent=false sdk_called=false registry_fixture_retained=true image_retained=true helper_directory_retained=true normal_job_zero=true cancel_job_zero=true cleanup_errors=0",
                     control.name()
                 );
+                let detail_record = format!(
+                    "registry_witness_control_detail case={} setup_verified={} target_reached={} final_verified={} state={} native_status={} active_count={} object_name={} object_id={} content_sha256={} descriptor_sha256={} expected_id={} observed_id={} inventory_count={} inventory_sha256={}",
+                    control.name(),
+                    control_detail.setup_verified,
+                    control_detail.target_reached,
+                    control_detail.final_verified,
+                    control_detail.state,
+                    control_detail.native_status,
+                    control_detail.active_count,
+                    control_detail.object_name,
+                    control_detail.object_id,
+                    control_detail.content_sha256,
+                    control_detail.descriptor_sha256,
+                    control_detail.expected_id,
+                    control_detail.observed_id,
+                    control_detail.inventory_count,
+                    control_detail.inventory_sha256
+                );
                 let mut emission_errors = Vec::new();
                 if let Err(error) = emit_witness_record(&control_record) {
                     emission_errors.push(format!("cleanup control receipt emission: {error}"));
+                }
+                if let Err(error) = emit_witness_record(&detail_record) {
+                    emission_errors.push(format!("cleanup control detail emission: {error}"));
                 }
                 if let Err(error) = emit_witness_record(&finalization) {
                     emission_errors.push(format!("cleanup control finalization emission: {error}"));
@@ -8334,6 +10601,34 @@ mod registry_witness_tests {
     #[test]
     fn registry_witness_cleanup_control_unknown_registry_key() -> io::Result<()> {
         registry_witness_stage_a_run(Some(CleanupControl::UnknownRegistryKey))
+    }
+
+    macro_rules! registry_witness_cleanup_control_tests {
+        ($($test_name:ident => $control:ident),+ $(,)?) => {
+            $(
+                #[test]
+                fn $test_name() -> io::Result<()> {
+                    registry_witness_stage_a_run(Some(CleanupControl::$control))
+                }
+            )+
+        };
+    }
+
+    registry_witness_cleanup_control_tests! {
+        registry_witness_cleanup_control_wrong_image_id => WrongImageId,
+        registry_witness_cleanup_control_wrong_directory_id => WrongDirectoryId,
+        registry_witness_cleanup_control_wrong_profile_id => WrongProfileId,
+        registry_witness_cleanup_control_changed_image_dacl => ChangedImageDacl,
+        registry_witness_cleanup_control_unknown_registry_value => UnknownRegistryValue,
+        registry_witness_cleanup_control_unknown_helper_entry => UnknownHelperEntry,
+        registry_witness_cleanup_control_unknown_profile_entry => UnknownProfileEntry,
+        registry_witness_cleanup_control_profile_enumeration_limit => ProfileEnumerationLimit,
+        registry_witness_cleanup_control_image_leaf_swap => ImageLeafSwap,
+        registry_witness_cleanup_control_directory_swap => DirectorySwap,
+        registry_witness_cleanup_control_image_hardlink => ImageHardlink,
+        registry_witness_cleanup_control_missing_job_fence => MissingJobFence,
+        registry_witness_cleanup_control_live_nonzero_job => LiveNonzeroJob,
+        registry_witness_cleanup_control_job_query_error => JobQueryError,
     }
 
     fn cancellation_child_readiness(

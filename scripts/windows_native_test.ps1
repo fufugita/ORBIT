@@ -443,15 +443,18 @@ public static class OrbitRegistryWitnessFixture {
             @($cleanupCaseManifest | Select-Object -Unique).Count -ne 25){
             throw 'Internal closed cleanup-control manifest must contain 25 unique cases'
         }
-        $cleanupImplemented=@('wrong_image_hash','unknown_registry_key')
+        $cleanupImplemented=@(
+            'wrong_image_hash','unknown_registry_key','wrong_image_id','wrong_directory_id',
+            'wrong_profile_id','changed_image_dacl','unknown_registry_value',
+            'unknown_helper_entry','unknown_profile_entry','profile_enumeration_limit',
+            'image_leaf_swap','directory_swap','image_hardlink','missing_job_fence',
+            'live_nonzero_job','job_query_error'
+        )
         $cleanupPending=@($cleanupCaseManifest | Where-Object {$_ -notin $cleanupImplemented})
-        if($cleanupPending.Count -ne 23){throw 'Expected exactly 23 not-yet-implemented cleanup controls'}
+        if($cleanupImplemented.Count -ne 16 -or $cleanupPending.Count -ne 9){throw 'Expected exactly 16 implemented and 9 pending cleanup controls'}
         function InvokeCleanupControl([string]$controlName) {
-            $caseName=if($controlName -ceq 'wrong_image_hash'){
-                'process::windows::registry_witness_tests::registry_witness_cleanup_control_wrong_image_hash'
-            }elseif($controlName -ceq 'unknown_registry_key'){
-                'process::windows::registry_witness_tests::registry_witness_cleanup_control_unknown_registry_key'
-            }else{$null}
+            if($controlName -notin $cleanupImplemented){throw "Cleanup control is not implemented: $controlName"}
+            $caseName='process::windows::registry_witness_tests::registry_witness_cleanup_control_'+$controlName
             $controlDir=Join-Path $EvidenceDir 'registry-cleanup-controls'
             $controlLog=Join-Path $controlDir ($controlName+'.log')
             $controlRecordsPath=Join-Path $controlDir ($controlName+'.records.txt')
@@ -485,9 +488,6 @@ public static class OrbitRegistryWitnessFixture {
             $caseResult=$null
             $caseFailure=$null
             try {
-                if($controlName -notin $cleanupImplemented -or $null -eq $caseName){
-                    throw "Cleanup control is not implemented: $controlName"
-                }
                 New-Item -ItemType Directory -Force $controlDir | Out-Null
                 $controlNonce=[guid]::NewGuid().ToString('N')
                 $controlMachineName='ORBIT_WITNESS_MACHINE_'+$controlNonce
@@ -550,7 +550,7 @@ public static class OrbitRegistryWitnessFixture {
                 }
                 $payload=$controlReport.Substring($payloadStart,$length)
                 if($payload -match '[^\x20-\x7e]' -or
-                    $payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup|registry_witness_control)(?: |$)'){
+                    $payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup|registry_witness_control|registry_witness_control_detail)(?: |$)'){
                     throw "$controlName unknown or malformed framed record"
                 }
                 $controlFrames.Add($payload)
@@ -628,9 +628,128 @@ public static class OrbitRegistryWitnessFixture {
                 'registry_root_retained','image_profile_retained','image_id','image_sha256','fixture_id',
                 'disposition_attempted','sdk_called')
             WitnessExactFields $controlRecord $controlFields
-            $expectedRejection=if($controlName -ceq 'wrong_image_hash'){
-                'helper_image_hash_differs'
-            }else{'private_fixture_inventory_changed'}
+            $expectedRejections=@{
+                wrong_image_hash='helper_image_hash_differs';unknown_registry_key='private_fixture_inventory_changed'
+                wrong_image_id='helper_image_identity_differs';wrong_directory_id='helper_directory_identity_changed'
+                wrong_profile_id='profile_entry_identity_changed';changed_image_dacl='helper_image_dacl_changed'
+                unknown_registry_value='private_fixture_inventory_changed';unknown_helper_entry='helper_directory_inventory_changed'
+                unknown_profile_entry='profile_inventory_changed';profile_enumeration_limit='profile_entry_bound_exceeded'
+                image_leaf_swap='helper_image_leaf_swap_refused';directory_swap='helper_directory_swap_refused'
+                image_hardlink='helper_image_hardlink_refused';missing_job_fence='cleanup_job_fence_missing'
+                live_nonzero_job='cancel_job_live_nonzero_refused';job_query_error='cleanup_job_query_error_injected'
+            }
+            $expectedRejection=$expectedRejections[$controlName]
+            $controlDetailFrames=@($controlFrames | Where-Object {$_ -match '^registry_witness_control_detail(?: |$)'})
+            if($controlDetailFrames.Count -ne 1){throw "$controlName did not emit exactly one control detail record"}
+            $controlDetail=$controlDetailFrames[0]
+            WitnessExactFields $controlDetail @('case','setup_verified','target_reached','final_verified','state',
+                'native_status','active_count','object_name','object_id','content_sha256','descriptor_sha256',
+                'expected_id','observed_id','inventory_count','inventory_sha256')
+            if((WitnessField $controlDetail 'case') -cne $controlName -or
+                (WitnessField $controlDetail 'setup_verified') -cne 'true' -or
+                (WitnessField $controlDetail 'target_reached') -cne 'true' -or
+                (WitnessField $controlDetail 'final_verified') -cne 'true'){
+                throw "$controlName did not separate and prove setup, target refusal, and retained postchecks"
+            }
+            $detailState=WitnessField $controlDetail 'state'
+            $detailObjectId=WitnessField $controlDetail 'object_id'
+            $detailExpected=WitnessField $controlDetail 'expected_id'
+            $detailObserved=WitnessField $controlDetail 'observed_id'
+            $detailContent=WitnessField $controlDetail 'content_sha256'
+            $detailDescriptor=WitnessField $controlDetail 'descriptor_sha256'
+            $detailNativeStatus=WitnessField $controlDetail 'native_status'
+            $fullFileId='^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$'
+            $sha256='^[0-9A-Fa-f]{64}$'
+            switch -CaseSensitive ($controlName) {
+                {$_ -in @('wrong_image_hash')} {
+                    if($detailState -cne 'expected_hash_corrupted' -or
+                        $detailObjectId -notmatch $fullFileId -or
+                        $detailObjectId -cne (WitnessField $controlRecord 'image_id') -or
+                        $detailContent -cne (WitnessField $controlRecord 'image_sha256') -or
+                        $detailExpected -notmatch $sha256 -or $detailObserved -notmatch $sha256 -or
+                        $detailExpected -ceq $detailObserved){throw 'Wrong-image-hash control did not bind a distinct expected hash to the held image'}
+                }
+                {$_ -in @('wrong_image_id','wrong_directory_id','wrong_profile_id')} {
+                    if($detailState -cne 'expected_id_corrupted' -or $detailObjectId -notmatch $fullFileId -or
+                        $detailExpected -cne $detailObjectId -or $detailObserved -notmatch $fullFileId -or
+                        $detailExpected -ceq $detailObserved){throw "$controlName did not prove a distinct corrupted expected full ID"}
+                    if($controlName -ceq 'wrong_image_id' -and $detailObjectId -cne (WitnessField $controlRecord 'image_id')){
+                        throw 'Wrong-image-ID control did not bind the held image full ID'
+                    }
+                }
+                {$_ -in @('changed_image_dacl')} {
+                    if($detailState -cne 'package_ace_removed' -or $detailObjectId -notmatch $fullFileId -or
+                        $detailExpected -notmatch $sha256 -or $detailObserved -notmatch $sha256 -or
+                        $detailExpected -ceq $detailObserved -or $detailDescriptor -cne $detailObserved){
+                        throw 'Changed-DACL control did not prove a real changed descriptor postimage'
+                    }
+                }
+                {$_ -in @('unknown_registry_key','unknown_registry_value')} {
+                    $expectedRegistryState=if($controlName -ceq 'unknown_registry_key'){
+                        'absent_before_installed_registry_key_canary'
+                    }else{'absent_before_installed_reg_sz_canary'}
+                    $expectedRegistryStatus=if($controlName -ceq 'unknown_registry_key'){
+                        'RegCreateKeyExW_SUCCESS'
+                    }else{'RegSetValueExW_SUCCESS_REG_SZ'}
+                    if($detailState -cne $expectedRegistryState -or $detailNativeStatus -cne $expectedRegistryStatus -or
+                        $detailObjectId -cne 'not_applicable' -or $detailContent -notmatch $sha256 -or
+                        $detailDescriptor -notmatch $sha256){throw "$controlName missing actual registry canary value and descriptor preimage"}
+                }
+                {$_ -in @('unknown_helper_entry','unknown_profile_entry')} {
+                    if($detailState -notin @('absent_before_installed_helper_entry','absent_before_installed_profile_entry') -or
+                        $detailObjectId -notmatch $fullFileId -or $detailContent -notmatch $sha256 -or
+                        $detailDescriptor -notmatch $sha256){throw "$controlName missing actual file identity, content, or descriptor preimage"}
+                }
+                {$_ -in @('profile_enumeration_limit')} {
+                    if($detailState -cne 'installed_513_bounded_empty_files' -or
+                        $detailObjectId -notmatch $fullFileId -or $detailDescriptor -notmatch $sha256 -or
+                        (WitnessField $controlDetail 'inventory_count') -cne '513' -or
+                        (WitnessField $controlDetail 'inventory_sha256') -notmatch $sha256){
+                        throw 'Profile enumeration-limit control did not prove the bounded 513-file setup'
+                    }
+                }
+                {$_ -in @('image_leaf_swap','directory_swap')} {
+                    if($detailState -ceq 'rename_prevented_by_exact_sharing_violation'){
+                        $expectedRejection='namespace_rename_share_violation'
+                        if($detailNativeStatus -cne 'NtStatus=0xc0000043_Win32=32' -or
+                            $detailExpected -notmatch $fullFileId -or $detailObserved -cne $detailExpected){
+                            throw "$controlName sharing prevention was not the exact STATUS_SHARING_VIOLATION branch"
+                        }
+                    } elseif($detailState -in @('held_image_renamed_and_replacement_installed','held_directory_renamed_and_replacement_installed')){
+                        if($detailExpected -notmatch $fullFileId -or $detailObserved -notmatch $fullFileId -or
+                            $detailExpected -ceq $detailObserved){throw "$controlName did not distinguish the original and replacement identities"}
+                    } else {throw "$controlName setup neither installed the namespace change nor proved exact sharing prevention"}
+                }
+                {$_ -in @('image_hardlink')} {
+                    if($detailState -cne 'same_volume_hardlink_installed' -or
+                        $detailObjectId -notmatch $fullFileId -or $detailObjectId -cne $detailExpected -or
+                        $detailObjectId -cne $detailObserved -or $detailContent -notmatch $sha256 -or
+                        $detailDescriptor -notmatch $sha256 -or
+                        $detailNativeStatus -notmatch '^NtSetInformationFile=STATUS_SUCCESS_source_access=0x[0-9A-Fa-f]{8}_parent_access=0x[0-9A-Fa-f]{8}$'){
+                        throw 'Hardlink control did not prove successful native installation on the held reader and write-enabled AC parent'
+                    }
+                }
+                {$_ -in @('missing_job_fence')} {
+                    if($detailState -cne 'one_fence_removed_for_shared_gate' -or
+                        $detailNativeStatus -cne 'STATUS_SUCCESS_both_jobs_zero_before_owner_move' -or
+                        (WitnessField $controlDetail 'active_count') -cne '0,0'){
+                        throw 'Missing-fence control did not prove both native Jobs were empty before owner transfer'
+                    }
+                }
+                {$_ -in @('live_nonzero_job')} {
+                    if($detailState -cne 'actual_cancel_job_singleton_refused_before_stop' -or
+                        (WitnessField $controlDetail 'active_count') -cne '1'){
+                        throw 'Live-job control did not prove the actual singleton refusal'
+                    }
+                }
+                {$_ -in @('job_query_error')} {
+                    if($detailState -cne 'both_native_job_queries_zero_then_shared_gate_error_injected' -or
+                        $detailNativeStatus -cne 'native_query_success' -or
+                        (WitnessField $controlDetail 'active_count') -cne '0,0'){
+                        throw 'Job-query-error control did not distinguish native zero from the injected error'
+                    }
+                }
+            }
             $caseContext.target_reached=(WitnessField $controlRecord 'reached') -ceq 'true'
             $caseContext.primary_probes=69
             if((WitnessField $controlRecord 'case') -cne $controlName -or
@@ -656,7 +775,7 @@ public static class OrbitRegistryWitnessFixture {
                 (WitnessField $controlRecord 'sdk_called') -cne 'false'){
                 throw "$controlName target seam or retained-object receipt failed"
             }
-            if($controlName -ceq 'unknown_registry_key'){
+            if($controlName -in @('unknown_registry_key','unknown_registry_value')){
                 if((WitnessField $controlRecord 'private_canary_value_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
                     (WitnessField $controlRecord 'private_canary_descriptor_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
                     (WitnessField $controlRecord 'private_canary_unchanged') -cne 'true'){
@@ -665,7 +784,7 @@ public static class OrbitRegistryWitnessFixture {
             } elseif((WitnessField $controlRecord 'private_canary_value_sha256') -cne 'not_applicable' -or
                 (WitnessField $controlRecord 'private_canary_descriptor_sha256') -cne 'not_applicable' -or
                 (WitnessField $controlRecord 'private_canary_unchanged') -cne 'false'){
-                throw 'Wrong-image-hash control contained an unexpected private-key canary'
+                throw "$controlName contained an unexpected private-key canary"
             }
             $controlStatus=@($controlFrames | Where-Object {$_ -match '^registry_witness_status(?: |$)'})
             if($controlStatus.Count -ne 1){throw "$controlName status record is not unique"}
@@ -1234,7 +1353,7 @@ public static class OrbitRegistryWitnessFixture {
         # with controls that are still pending. Every invocation gets fresh nonce
         # marker names and a separate exact Rust unit selection.
         $controlFailures=[Collections.Generic.List[object]]::new()
-        foreach($controlName in @('wrong_image_hash','unknown_registry_key')){
+        foreach($controlName in $cleanupImplemented){
             try {
                 $caseSummary=InvokeCleanupControl $controlName
                 if($caseSummary -isnot [System.Management.Automation.PSCustomObject] -or
@@ -1252,11 +1371,7 @@ public static class OrbitRegistryWitnessFixture {
                     catch {$controlError+="; case metadata parse: $($_.Exception.Message)"}
                 }
                 if($null -eq $caseFailureRecord){
-                    $caseUnit=if($controlName -ceq 'wrong_image_hash'){
-                        'process::windows::registry_witness_tests::registry_witness_cleanup_control_wrong_image_hash'
-                    }else{
-                        'process::windows::registry_witness_tests::registry_witness_cleanup_control_unknown_registry_key'
-                    }
+                    $caseUnit='process::windows::registry_witness_tests::registry_witness_cleanup_control_'+$controlName
                     $caseFailureRecord=[ordered]@{
                         case=$controlName;source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID
                         selected_unit=$caseUnit;nonce=$null;user_sid=$parentIdentity.user_sid
