@@ -28,8 +28,8 @@ fn lock_namespace_is_reserved_consistently() {
 #[cfg(windows)]
 mod windows {
     use orbit_platform::fs::{
-        Directory, EnumerationLimits, InspectionLimits, LockMode, OwnedContainer,
-        PrivateFileAccess, RemovalState, SourceDirectory,
+        Directory, EnumerationLimits, FileIdentity, InspectionLimits, LockMode, OwnedContainer,
+        PrivateFileAccess, RemovalState, SourceDirectory, SourceKind,
     };
     use std::ffi::{OsStr, c_void};
     use std::fs;
@@ -48,6 +48,7 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::*;
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
     struct Home {
         base: PathBuf,
@@ -294,6 +295,198 @@ mod windows {
         );
     }
 
+    fn set_container_sddl(path: &Path, sddl: &str) {
+        let descriptor_text = wide(OsStr::new(sddl));
+        let mut descriptor = null_mut();
+        let mut descriptor_length = 0;
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    descriptor_text.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    &mut descriptor_length,
+                )
+            },
+            0,
+            "building owned-container ACL fixture failed: {}",
+            unsafe { GetLastError() }
+        );
+        let descriptor = LocalSecurityAllocation(descriptor.cast());
+        let mut owner = null_mut();
+        let mut owner_defaulted = 0;
+        let mut present = 0;
+        let mut dacl = null_mut();
+        let mut dacl_defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorOwner(descriptor.0.cast(), &mut owner, &mut owner_defaulted)
+            },
+            0,
+            "reading fixture owner failed: {}",
+            unsafe { GetLastError() }
+        );
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.0.cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut dacl_defaulted,
+                )
+            },
+            0,
+            "reading fixture DACL failed: {}",
+            unsafe { GetLastError() }
+        );
+        assert!(!owner.is_null());
+        let handle = fixture_handle(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER, true);
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
+                null_mut(),
+                if present != 0 { dacl } else { null_mut() },
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            result, ERROR_SUCCESS,
+            "installing fixture ACL failed: {result}"
+        );
+    }
+
+    fn fixture_has_ace(path: &Path, sid_text: &str, mask: u32, flags: u8, ace_type: u8) -> bool {
+        let handle = fixture_handle(path, READ_CONTROL, true);
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        let code = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS);
+        let _descriptor = LocalSecurityAllocation(descriptor);
+        assert!(!dacl.is_null(), "installed fixture DACL must be non-null");
+        let sid = sid_from_text(sid_text);
+        let mut info = ACL_SIZE_INFORMATION::default();
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        (0..info.AceCount).any(|index| {
+            let mut ace = null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceType != ace_type || header.AceFlags != flags {
+                return false;
+            }
+            let actual_mask = unsafe { *ace.cast::<u32>().add(1) };
+            let sid_ptr = unsafe {
+                ace.cast::<u8>()
+                    .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                    .cast()
+            };
+            actual_mask == mask && unsafe { EqualSid(sid_ptr, sid.0.cast()) } != 0
+        })
+    }
+
+    fn fixture_container_sddl(owner: &str, grants: &str) -> String {
+        format!("O:{owner}D:P(A;;FA;;;{owner}){grants}")
+    }
+
+    fn fixture_dacl_is_null(path: &Path) -> bool {
+        let handle = fixture_handle(path, READ_CONTROL, true);
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        let code = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS);
+        let _descriptor = LocalSecurityAllocation(descriptor);
+        let mut present = 0;
+        let mut descriptor_dacl = null_mut();
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor,
+                    &mut present,
+                    &mut descriptor_dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        present != 0 && descriptor_dacl.is_null() && dacl.is_null()
+    }
+
+    fn delete_capability_open(path: &Path) -> std::io::Result<OwnedHandle> {
+        let path = wide(path.as_os_str());
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+
+    fn set_fixture_owner(path: &Path, owner_sid_text: &str, directory: bool) {
+        let owner = sid_from_text(owner_sid_text);
+        let handle = fixture_handle(path, READ_CONTROL | WRITE_OWNER, directory);
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                owner.0.cast(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            result, ERROR_SUCCESS,
+            "setting only the fixture owner failed: {result}"
+        );
+    }
+
     fn set_public_source_acl(path: &Path, sid: &str, directory: bool) {
         let inheritance = if directory { "OICI" } else { "" };
         let sddl = wide(OsStr::new(&format!(
@@ -520,6 +713,44 @@ mod windows {
         }
     }
 
+    fn fixture_normalized_dacl(snapshot: &FixtureAclSnapshot) -> &[u8] {
+        let normalized = &snapshot.normalized_descriptor;
+        assert!(
+            normalized.len() >= 7,
+            "normalized descriptor must contain the owner length"
+        );
+        let owner_length = u32::from_le_bytes(normalized[3..7].try_into().unwrap()) as usize;
+        let length_offset = 7usize.checked_add(owner_length).unwrap();
+        let data_offset = length_offset.checked_add(4).unwrap();
+        assert!(
+            normalized.len() >= data_offset,
+            "normalized descriptor must contain the DACL length"
+        );
+        let dacl_length =
+            u32::from_le_bytes(normalized[length_offset..data_offset].try_into().unwrap()) as usize;
+        let dacl_end = data_offset.checked_add(dacl_length).unwrap();
+        assert_eq!(
+            normalized.len(),
+            dacl_end,
+            "normalized descriptor must have no trailing bytes"
+        );
+        &normalized[data_offset..dacl_end]
+    }
+
+    fn assert_fixture_acl_unchanged(
+        path: &Path,
+        current_sid: &str,
+        directory: bool,
+        before: &FixtureAclSnapshot,
+        context: &str,
+    ) {
+        let after = fixture_acl_snapshot(path, current_sid, directory);
+        assert_eq!(
+            before.normalized_descriptor, after.normalized_descriptor,
+            "{context} must leave the full owner and DACL unchanged"
+        );
+    }
+
     fn assert_fixture_acl(
         path: &Path,
         sid: &str,
@@ -739,17 +970,396 @@ mod windows {
     }
 
     #[test]
+    fn source_directory_enumerates_nested_unicode_and_preserves_metadata() {
+        let home = Home::new();
+        let root = home.base.join("public traversal 雪 root");
+        fs::create_dir(&root).unwrap();
+        let nested = root.join("nested folder");
+        fs::create_dir(&nested).unwrap();
+        let name = OsStr::new("source entry 雪 file.txt");
+        let file_path = nested.join(name);
+        fs::write(&file_path, b"nested public bytes").unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&root, &sid, true);
+        set_public_source_acl(&nested, &sid, true);
+        set_public_source_acl(&file_path, &sid, false);
+
+        let source = SourceDirectory::open_with_depth(&root, 1).unwrap();
+        let limits = EnumerationLimits {
+            max_entries: 16,
+            max_name_bytes: 4096,
+        };
+        let root_entries = source.enumerate(limits).unwrap();
+        let root_again = source.enumerate(limits).unwrap();
+        assert_eq!(
+            root_entries, root_again,
+            "a repeated bounded enumeration is stable"
+        );
+        let root_identity = source.identity();
+        let repeated_ancestor = FileIdentity {
+            volume: root_identity.volume,
+            file: root_identity.file,
+        };
+        assert!(
+            source
+                .child_expected(OsStr::new("nested folder"), repeated_ancestor)
+                .is_err()
+        );
+        let cross_volume = FileIdentity {
+            volume: root_identity.volume ^ 1,
+            file: [0xA5; 16],
+        };
+        assert!(
+            source
+                .child_expected(OsStr::new("nested folder"), cross_volume)
+                .is_err()
+        );
+        let child = root_entries
+            .iter()
+            .find(|entry| entry.name == OsStr::new("nested folder"))
+            .expect("nested source directory was enumerated");
+        assert_eq!(child.kind, SourceKind::Directory);
+        assert_eq!(child.snapshot.kind, SourceKind::Directory);
+        assert_eq!(child.identity, child.snapshot.identity);
+        assert!(child.snapshot.link_count >= 1);
+
+        let nested_source = source
+            .child_expected(OsStr::new("nested folder"), child.identity)
+            .unwrap();
+        let entries = nested_source.enumerate(limits).unwrap();
+        let file = entries.iter().find(|entry| entry.name == name).unwrap();
+        assert_eq!(file.kind, SourceKind::File);
+        assert_eq!(file.snapshot.kind, SourceKind::File);
+        assert_eq!(file.snapshot.length, b"nested public bytes".len() as u64);
+        assert_eq!(file.snapshot.link_count, 1);
+        assert_eq!(file.snapshot.identity, file.identity);
+        let mut held = nested_source
+            .open_file_expected(name, file.identity)
+            .unwrap();
+        let before = held.snapshot().unwrap();
+        assert_eq!(before.kind, SourceKind::File);
+        assert_eq!(before.link_count, 1);
+        assert_eq!(held.read_limited(128).unwrap(), b"nested public bytes");
+        assert_eq!(held.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn source_directory_carries_depth_budget_and_rejects_stale_child_identity() {
+        let home = Home::new();
+        let root = home.base.join("public bounded-depth root");
+        fs::create_dir(&root).unwrap();
+        let child_path = root.join("child");
+        fs::create_dir(&child_path).unwrap();
+        let grandchild_path = child_path.join("grandchild");
+        fs::create_dir(&grandchild_path).unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&root, &sid, true);
+        set_public_source_acl(&child_path, &sid, true);
+        set_public_source_acl(&grandchild_path, &sid, true);
+        let limits = EnumerationLimits {
+            max_entries: 8,
+            max_name_bytes: 1024,
+        };
+
+        let exhausted = SourceDirectory::open_with_depth(&root, 0).unwrap();
+        let initial = exhausted
+            .enumerate(limits)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == OsStr::new("child"))
+            .unwrap();
+        assert!(
+            exhausted
+                .child_expected(OsStr::new("child"), initial.identity)
+                .is_err()
+        );
+
+        let source = SourceDirectory::open_with_depth(&root, 1).unwrap();
+        let old = source
+            .enumerate(limits)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == OsStr::new("child"))
+            .unwrap();
+        assert_eq!(old.identity, initial.identity);
+        fs::remove_dir_all(&child_path).unwrap();
+        fs::create_dir(&child_path).unwrap();
+        fs::create_dir(&grandchild_path).unwrap();
+        set_public_source_acl(&child_path, &sid, true);
+        set_public_source_acl(&grandchild_path, &sid, true);
+        let replacement = source
+            .enumerate(limits)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == OsStr::new("child"))
+            .unwrap();
+        assert_ne!(
+            replacement.identity, old.identity,
+            "replacement must have a new full identity"
+        );
+        let error = match source.child_expected(OsStr::new("child"), old.identity) {
+            Ok(_) => panic!("stale directory identity was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let child = source
+            .child_expected(OsStr::new("child"), replacement.identity)
+            .unwrap();
+        let grandchild = child
+            .enumerate(limits)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == OsStr::new("grandchild"))
+            .unwrap();
+        assert!(
+            child
+                .child_expected(OsStr::new("grandchild"), grandchild.identity)
+                .is_err(),
+            "the child capability cannot replenish the root's exhausted depth budget"
+        );
+    }
+
+    #[test]
+    fn source_directory_rejects_hardlinks_and_reparse_entries_without_following_them() {
+        let home = Home::new();
+        let root = home.base.join("public unsafe entries root");
+        fs::create_dir(&root).unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&root, &sid, true);
+
+        let linked = root.join("linked file");
+        fs::write(&linked, b"same object").unwrap();
+        set_public_source_acl(&linked, &sid, false);
+        fs::hard_link(&linked, root.join("hardlink alias")).unwrap();
+        let source = SourceDirectory::open(&root).unwrap();
+        assert!(
+            source
+                .enumerate(EnumerationLimits {
+                    max_entries: 16,
+                    max_name_bytes: 4096
+                })
+                .is_err(),
+            "a regular source file with two links must be rejected"
+        );
+        fs::remove_file(root.join("hardlink alias")).unwrap();
+        fs::remove_file(&linked).unwrap();
+
+        let outside = home.base.join("outside source canary");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("canary"), b"unchanged").unwrap();
+        let junction = root.join("directory junction");
+        let output = Command::new(command("cmd.exe"))
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction fixture must really be created: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fs::symlink_metadata(&junction).unwrap().file_attributes() & 0x400 != 0);
+        assert!(
+            source
+                .enumerate(EnumerationLimits {
+                    max_entries: 16,
+                    max_name_bytes: 4096
+                })
+                .is_err(),
+            "a listed reparse source entry must be rejected"
+        );
+        assert_eq!(fs::read(outside.join("canary")).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn source_directory_enumeration_enforces_entry_and_name_bounds_without_changes() {
+        let home = Home::new();
+        let root = home.base.join("public source limit root");
+        fs::create_dir(&root).unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&root, &sid, true);
+        for name in ["a", "a longer source name"] {
+            let path = root.join(name);
+            fs::write(&path, b"unchanged").unwrap();
+            set_public_source_acl(&path, &sid, false);
+        }
+        let before = tree_snapshot(&root);
+        let source = SourceDirectory::open(&root).unwrap();
+        assert!(
+            source
+                .enumerate(EnumerationLimits {
+                    max_entries: 1,
+                    max_name_bytes: 4096
+                })
+                .is_err()
+        );
+        assert!(
+            source
+                .enumerate(EnumerationLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&root), before);
+    }
+
+    #[test]
+    fn source_directory_holds_root_and_ancestors_while_walking() {
+        let home = Home::new();
+        let public_ancestor = home.base.join("public ancestor");
+        fs::create_dir(&public_ancestor).unwrap();
+        let root = public_ancestor.join("source root");
+        fs::create_dir(&root).unwrap();
+        let child_path = root.join("held child");
+        fs::create_dir(&child_path).unwrap();
+        let canary_path = child_path.join("canary");
+        fs::write(&canary_path, b"held-canary").unwrap();
+
+        let sid = current_sid();
+        set_public_source_acl(&public_ancestor, &sid, true);
+        set_public_source_acl(&root, &sid, true);
+        set_public_source_acl(&child_path, &sid, true);
+        set_public_source_acl(&canary_path, &sid, false);
+
+        let ancestor_id = SourceDirectory::open(&public_ancestor).unwrap().identity();
+        let root_id = SourceDirectory::open(&root).unwrap().identity();
+        let child_id = SourceDirectory::open(&child_path).unwrap().identity();
+        let ancestor_acl = fixture_acl_snapshot(&public_ancestor, &sid, true).normalized_descriptor;
+        let root_acl = fixture_acl_snapshot(&root, &sid, true).normalized_descriptor;
+        let child_acl = fixture_acl_snapshot(&child_path, &sid, true).normalized_descriptor;
+        let canary_acl = fixture_acl_snapshot(&canary_path, &sid, false).normalized_descriptor;
+        let canary_before = fs::read(&canary_path).unwrap();
+
+        for path in [&public_ancestor, &root] {
+            let handle =
+                delete_capability_open(path).expect("DELETE control must open before source caps");
+            drop(handle);
+        }
+
+        let source = SourceDirectory::open(&root).unwrap();
+        let entry = source
+            .enumerate(EnumerationLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == OsStr::new("held child"))
+            .unwrap();
+        let child = source
+            .child_expected(OsStr::new("held child"), entry.identity)
+            .unwrap();
+        assert_eq!(child.identity(), child_id);
+        let mut canary = child.open_file(OsStr::new("canary")).unwrap();
+        assert_eq!(canary.read_limited(64).unwrap(), canary_before);
+        drop(canary);
+        drop(source);
+
+        for path in [&public_ancestor, &root] {
+            let error = delete_capability_open(path)
+                .expect_err("child-held walk must retain ancestor capabilities");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(32),
+                "expected exact ERROR_SHARING_VIOLATION from the same DELETE opener"
+            );
+        }
+
+        let moved_root = public_ancestor.join("source root moved");
+        let moved_ancestor = home.base.join("public ancestor moved");
+        assert!(!moved_root.exists());
+        assert!(!moved_ancestor.exists());
+        assert_eq!(fs::read(&canary_path).unwrap(), canary_before);
+        assert_eq!(
+            fixture_acl_snapshot(&public_ancestor, &sid, true).normalized_descriptor,
+            ancestor_acl
+        );
+        assert_eq!(
+            fixture_acl_snapshot(&root, &sid, true).normalized_descriptor,
+            root_acl
+        );
+        assert_eq!(
+            fixture_acl_snapshot(&child_path, &sid, true).normalized_descriptor,
+            child_acl
+        );
+        assert_eq!(
+            fixture_acl_snapshot(&canary_path, &sid, false).normalized_descriptor,
+            canary_acl
+        );
+        assert_eq!(
+            SourceDirectory::open(&public_ancestor).unwrap().identity(),
+            ancestor_id
+        );
+        assert_eq!(SourceDirectory::open(&root).unwrap().identity(), root_id);
+        assert_eq!(
+            SourceDirectory::open(&child_path).unwrap().identity(),
+            child_id
+        );
+
+        drop(child);
+        for path in [&public_ancestor, &root] {
+            let handle = delete_capability_open(path)
+                .expect("DELETE opener must succeed after dropping child");
+            drop(handle);
+        }
+        fs::rename(&root, &moved_root).expect("root rename must succeed after dropping child");
+        fs::rename(&public_ancestor, &moved_ancestor)
+            .expect("ancestor rename must succeed after dropping child");
+
+        let final_root = moved_ancestor.join("source root moved");
+        let moved_root_id = SourceDirectory::open(&final_root).unwrap().identity();
+        let moved_child = final_root.join("held child");
+        assert_eq!(moved_root_id, root_id);
+        assert_eq!(
+            SourceDirectory::open(&moved_child).unwrap().identity(),
+            child_id
+        );
+        assert_eq!(
+            SourceDirectory::open(&moved_ancestor).unwrap().identity(),
+            ancestor_id
+        );
+        let moved_canary = moved_child.join("canary");
+        assert_eq!(fs::read(&moved_canary).unwrap(), canary_before);
+        assert_eq!(
+            fixture_acl_snapshot(&final_root, &sid, true).normalized_descriptor,
+            root_acl
+        );
+        assert_eq!(
+            fixture_acl_snapshot(&moved_child, &sid, true).normalized_descriptor,
+            child_acl
+        );
+        assert_eq!(
+            fixture_acl_snapshot(&moved_canary, &sid, false).normalized_descriptor,
+            canary_acl
+        );
+        assert_eq!(
+            fixture_acl_snapshot(&moved_ancestor, &sid, true).normalized_descriptor,
+            ancestor_acl
+        );
+    }
+
+    #[test]
     fn owned_container_accepts_owner_safe_readable_root() {
         let home = Home::new();
+        let sid = current_sid();
+        let before_private = fixture_acl_snapshot(&home.path(), &sid, true);
         let private = OwnedContainer::open(&home.path()).unwrap();
         private.check().unwrap();
         assert_eq!(private.identity(), home.dir().identity());
+        let after_private = fixture_acl_snapshot(&home.path(), &sid, true);
+        assert_eq!(
+            before_private.normalized_descriptor,
+            after_private.normalized_descriptor
+        );
 
         let public_root = home.base.join("owner safe readable container");
         fs::create_dir(&public_root).unwrap();
-        let sid = current_sid();
         set_public_source_acl(&public_root, &sid, true);
-        let facts = fixture_acl_snapshot(&public_root, &sid, true).facts;
+        let before = fixture_acl_snapshot(&public_root, &sid, true);
+        let facts = &before.facts;
         assert!(facts.owner_matches_current, "container owner: {facts:?}");
         assert!(
             !facts.owner_matches_administrators,
@@ -768,17 +1378,405 @@ mod windows {
         assert!(!facts.has_everyone_full_control_ace);
 
         let private_policy_error = match Directory::open(&public_root) {
-            Ok(_) => panic!("private Directory accepted the readable container fixture"),
+            Ok(_) => panic!("private Directory accepted the public-readable container fixture"),
             Err(error) => error,
         };
         assert_eq!(
             private_policy_error.kind(),
             std::io::ErrorKind::PermissionDenied
         );
+        let after_private_refusal = fixture_acl_snapshot(&public_root, &sid, true);
+        assert_eq!(
+            before.normalized_descriptor,
+            after_private_refusal.normalized_descriptor
+        );
 
         let container = OwnedContainer::open(&public_root)
             .expect("owner-safe readable container should pass its separate policy");
         container.check().unwrap();
+        let after_acceptance = fixture_acl_snapshot(&public_root, &sid, true);
+        assert_eq!(
+            before.normalized_descriptor,
+            after_acceptance.normalized_descriptor
+        );
+    }
+
+    #[test]
+    fn owned_container_accepts_system_admin_and_inherited_effective_read_grants() {
+        let home = Home::new();
+        let sid = current_sid();
+        let system = "S-1-5-18";
+        let administrators = "S-1-5-32-544";
+        let direct = home.base.join("system and administrators container");
+        fs::create_dir(&direct).unwrap();
+        let grants = format!("(A;;FA;;;{system})(A;;FA;;;{administrators})(A;;0x00120089;;;WD)");
+        set_container_sddl(&direct, &fixture_container_sddl(&sid, &grants));
+        assert!(fixture_has_ace(
+            &direct,
+            system,
+            FILE_ALL_ACCESS,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+        assert!(fixture_has_ace(
+            &direct,
+            administrators,
+            FILE_ALL_ACCESS,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+        assert!(fixture_has_ace(
+            &direct,
+            "S-1-1-0",
+            0x0012_0089,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+        let before_direct_open = fixture_acl_snapshot(&direct, &sid, true);
+        let direct_container = OwnedContainer::open(&direct).unwrap();
+        assert_fixture_acl_unchanged(
+            &direct,
+            &sid,
+            true,
+            &before_direct_open,
+            "SYSTEM/Admin container open",
+        );
+        let before_direct_check = fixture_acl_snapshot(&direct, &sid, true);
+        direct_container.check().unwrap();
+        assert_fixture_acl_unchanged(
+            &direct,
+            &sid,
+            true,
+            &before_direct_check,
+            "SYSTEM/Admin container check",
+        );
+        assert!(fixture_has_ace(
+            &direct,
+            system,
+            FILE_ALL_ACCESS,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+        assert!(fixture_has_ace(
+            &direct,
+            administrators,
+            FILE_ALL_ACCESS,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+
+        let parent = home.base.join("inherited effective container parent");
+        fs::create_dir(&parent).unwrap();
+        let inherited_grants = format!("(A;CI;FA;;;{sid})(A;CI;0x00120089;;;WD)");
+        set_container_sddl(&parent, &fixture_container_sddl(&sid, &inherited_grants));
+        let child = parent.join("inherited child");
+        fs::create_dir(&child).unwrap();
+        let before_owner_change = fixture_acl_snapshot(&child, &sid, true);
+        set_fixture_owner(&child, &sid, true);
+        let after_owner_change = fixture_acl_snapshot(&child, &sid, true);
+        assert!(after_owner_change.facts.owner_matches_current);
+        assert!(!after_owner_change.facts.owner_matches_administrators);
+        assert!(
+            !after_owner_change.facts.dacl_protected,
+            "the inherited DACL must remain unprotected"
+        );
+        assert_eq!(
+            before_owner_change.facts.dacl_present,
+            after_owner_change.facts.dacl_present
+        );
+        assert_eq!(
+            before_owner_change.facts.dacl_protected,
+            after_owner_change.facts.dacl_protected
+        );
+        assert_eq!(
+            fixture_normalized_dacl(&before_owner_change),
+            fixture_normalized_dacl(&after_owner_change),
+            "owner-only adjustment must preserve the exact inherited DACL bytes and ACE flags"
+        );
+        let inherited_flags = (INHERITED_ACE | CONTAINER_INHERIT_ACE) as u8;
+        assert!(fixture_has_ace(
+            &child,
+            &sid,
+            FILE_ALL_ACCESS,
+            inherited_flags,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+        assert!(
+            fixture_has_ace(
+                &child,
+                "S-1-1-0",
+                0x0012_0089,
+                inherited_flags,
+                ACCESS_ALLOWED_ACE_TYPE
+            ),
+            "fixture must install and read back genuine inherited-effective ACEs"
+        );
+        let before_open = fixture_acl_snapshot(&child, &sid, true);
+        let container = OwnedContainer::open(&child)
+            .expect("an effective inherited read grant owned by TokenUser is acceptable");
+        assert_fixture_acl_unchanged(&child, &sid, true, &before_open, "inherited container open");
+        let before_check = fixture_acl_snapshot(&child, &sid, true);
+        container.check().unwrap();
+        assert_fixture_acl_unchanged(
+            &child,
+            &sid,
+            true,
+            &before_check,
+            "inherited container check",
+        );
+    }
+
+    #[test]
+    fn owned_container_excludes_valid_inherit_only_grants_from_current_policy() {
+        let home = Home::new();
+        let sid = current_sid();
+        let path = home.base.join("inherit-only container");
+        fs::create_dir(&path).unwrap();
+        let grants = "(A;IOCI;0x001F01FF;;;WD)";
+        set_container_sddl(&path, &fixture_container_sddl(&sid, grants));
+        let expected_flags = (INHERIT_ONLY_ACE | CONTAINER_INHERIT_ACE) as u8;
+        assert!(
+            fixture_has_ace(
+                &path,
+                "S-1-1-0",
+                FILE_ALL_ACCESS,
+                expected_flags,
+                ACCESS_ALLOWED_ACE_TYPE
+            ),
+            "fixture must install and read back a valid inherit-only full-control ACE"
+        );
+        let before_open = fixture_acl_snapshot(&path, &sid, true);
+        let container = OwnedContainer::open(&path)
+            .expect("inherit-only ACE is not an effective grant on the container");
+        assert_fixture_acl_unchanged(
+            &path,
+            &sid,
+            true,
+            &before_open,
+            "inherit-only container open",
+        );
+        let before_check = fixture_acl_snapshot(&path, &sid, true);
+        container.check().unwrap();
+        assert_fixture_acl_unchanged(
+            &path,
+            &sid,
+            true,
+            &before_check,
+            "inherit-only container check",
+        );
+        assert!(fixture_has_ace(
+            &path,
+            "S-1-1-0",
+            FILE_ALL_ACCESS,
+            expected_flags,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+    }
+
+    #[test]
+    fn owned_container_rejects_dangerous_generic_concrete_and_unknown_rights() {
+        let home = Home::new();
+        let sid = current_sid();
+        let grants = [
+            ("generic-write", 0x4000_0000),
+            ("generic-all", 0x1000_0000),
+            ("write-data", 0x0000_0002),
+            ("append-data", 0x0000_0004),
+            ("write-ea", 0x0000_0010),
+            ("delete-child", 0x0000_0040),
+            ("write-attributes", 0x0000_0100),
+            ("delete", 0x0001_0000),
+            ("write-dac", 0x0004_0000),
+            ("write-owner", 0x0008_0000),
+            ("maximum-allowed", 0x0200_0000),
+            ("system-security", 0x0100_0000),
+        ];
+        for (label, mask) in grants {
+            let path = home.base.join(format!("unsafe container {label}"));
+            fs::create_dir(&path).unwrap();
+            let deny_write_data = if label == "write-data" {
+                format!("(D;;0x{mask:08X};;;WD)")
+            } else {
+                String::new()
+            };
+            let acl = fixture_container_sddl(
+                &sid,
+                &format!("(A;;0x00120089;;;WD){deny_write_data}(A;;0x{mask:08X};;;WD)"),
+            );
+            set_container_sddl(&path, &acl);
+            assert!(
+                fixture_has_ace(&path, "S-1-1-0", mask, 0, ACCESS_ALLOWED_ACE_TYPE),
+                "the Windows fixture must retain {label} mask {mask:#010x}"
+            );
+            if label == "write-data" {
+                assert!(
+                    fixture_has_ace(&path, "S-1-1-0", mask, 0, ACCESS_DENIED_ACE_TYPE),
+                    "the real deny ACE must precede the unsafe allow fixture"
+                );
+            }
+            let before = fixture_acl_snapshot(&path, &sid, true);
+            let error = match OwnedContainer::open(&path) {
+                Ok(_) => panic!("OwnedContainer accepted {label} access mask {mask:#010x}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{label}"
+            );
+            let expected_cause = if matches!(label, "maximum-allowed" | "system-security") {
+                "container ACE contains unsupported access bits"
+            } else {
+                "container grants an untrusted principal mutation rights"
+            };
+            assert_eq!(error.to_string(), expected_cause, "{label}");
+            assert_fixture_acl_unchanged(&path, &sid, true, &before, &format!("{label} refusal"));
+        }
+    }
+
+    #[test]
+    fn owned_container_rejects_null_dacl_and_wrong_owner() {
+        let home = Home::new();
+        let sid = current_sid();
+        let null_dacl = home.base.join("null dacl container");
+        fs::create_dir(&null_dacl).unwrap();
+        set_container_sddl(&null_dacl, &format!("O:{sid}D:NO_ACCESS_CONTROL"));
+        assert!(
+            fixture_dacl_is_null(&null_dacl),
+            "fixture must retain a present null DACL"
+        );
+        let before_null_refusal = fixture_acl_snapshot(&null_dacl, &sid, true);
+        let null_error = match OwnedContainer::open(&null_dacl) {
+            Ok(_) => panic!("OwnedContainer accepted a null DACL"),
+            Err(error) => error,
+        };
+        assert_eq!(null_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            null_error.to_string(),
+            "container requires a present, non-null DACL"
+        );
+        assert_fixture_acl_unchanged(
+            &null_dacl,
+            &sid,
+            true,
+            &before_null_refusal,
+            "null-DACL refusal",
+        );
+        assert!(
+            fixture_dacl_is_null(&null_dacl),
+            "refusal must not repair the null DACL"
+        );
+
+        let wrong_owner = home.base.join("wrong owner container");
+        fs::create_dir(&wrong_owner).unwrap();
+        set_container_sddl(
+            &wrong_owner,
+            &fixture_container_sddl("S-1-5-32-544", "(A;;0x00120089;;;WD)"),
+        );
+        let wrong_owner_facts = fixture_acl_snapshot(&wrong_owner, &sid, true).facts;
+        assert!(
+            !wrong_owner_facts.owner_matches_current,
+            "fixture owner must differ from TokenUser: {wrong_owner_facts:?}"
+        );
+        assert!(
+            wrong_owner_facts.owner_matches_administrators,
+            "fixture owner must be the explicit Administrators SID: {wrong_owner_facts:?}"
+        );
+        assert!(
+            fixture_has_ace(
+                &wrong_owner,
+                "S-1-1-0",
+                0x0012_0089,
+                0,
+                ACCESS_ALLOWED_ACE_TYPE
+            ),
+            "wrong-owner fixture must retain the readable access ACE"
+        );
+        let before_wrong_owner = fixture_acl_snapshot(&wrong_owner, &sid, true);
+        let owner_error = match OwnedContainer::open(&wrong_owner) {
+            Ok(_) => panic!("OwnedContainer accepted an Administrators-owned container"),
+            Err(error) => error,
+        };
+        assert_eq!(owner_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            owner_error.to_string(),
+            "container owner is not the effective token user"
+        );
+        assert_fixture_acl_unchanged(
+            &wrong_owner,
+            &sid,
+            true,
+            &before_wrong_owner,
+            "wrong-owner refusal",
+        );
+    }
+
+    #[test]
+    fn owned_container_rechecks_identity_and_dacl_without_repair() {
+        let home = Home::new();
+        let sid = current_sid();
+        let path = home.base.join("container policy recheck");
+        fs::create_dir(&path).unwrap();
+        set_container_sddl(&path, &fixture_container_sddl(&sid, "(A;;0x00120089;;;WD)"));
+        let before_open = fixture_acl_snapshot(&path, &sid, true);
+        let container = OwnedContainer::open(&path).unwrap();
+        assert_fixture_acl_unchanged(&path, &sid, true, &before_open, "container open");
+        let original_identity = container.identity();
+        assert!(
+            fs::rename(&path, home.base.join("container replacement")).is_err(),
+            "the held container handle must block root replacement"
+        );
+        assert_eq!(container.identity(), original_identity);
+
+        set_container_sddl(
+            &path,
+            &fixture_container_sddl(&sid, "(A;;0x00120089;;;WD)(A;;0x40000000;;;WD)"),
+        );
+        assert!(fixture_has_ace(
+            &path,
+            "S-1-1-0",
+            0x4000_0000,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE
+        ));
+        let before_mutation_recheck = fixture_acl_snapshot(&path, &sid, true);
+        let mutation_error = container.check().unwrap_err();
+        assert_eq!(mutation_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            mutation_error.to_string(),
+            "container grants an untrusted principal mutation rights"
+        );
+        assert_fixture_acl_unchanged(
+            &path,
+            &sid,
+            true,
+            &before_mutation_recheck,
+            "mutating-DACL recheck",
+        );
+        assert_eq!(container.identity(), original_identity);
+
+        set_container_sddl(&path, &fixture_container_sddl(&sid, "(A;;0x00120089;;;WD)"));
+        let before_reopen = fixture_acl_snapshot(&path, &sid, true);
+        let reopened = OwnedContainer::open(&path).unwrap();
+        assert_fixture_acl_unchanged(&path, &sid, true, &before_reopen, "container reopen");
+        set_container_sddl(
+            &path,
+            &fixture_container_sddl("S-1-5-32-544", "(A;;0x00120089;;;WD)"),
+        );
+        let before_owner_recheck = fixture_acl_snapshot(&path, &sid, true);
+        let owner_error = reopened.check().unwrap_err();
+        assert_eq!(owner_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            owner_error.to_string(),
+            "container owner is not the effective token user"
+        );
+        assert_fixture_acl_unchanged(
+            &path,
+            &sid,
+            true,
+            &before_owner_recheck,
+            "wrong-owner recheck",
+        );
     }
 
     #[test]

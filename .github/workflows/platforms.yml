@@ -144,10 +144,23 @@ jobs:
             'fs::windows::tests::shared_reader_is_excluded_from_actual_two_rename_gap',
             'windows::published_candidate_cannot_be_republished_without_a_guard',
             'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
-            'windows::simultaneous_publication_preserves_the_only_successful_name'
+            'windows::simultaneous_publication_preserves_the_only_successful_name',
+            'windows::owned_container_accepts_system_admin_and_inherited_effective_read_grants',
+            'windows::owned_container_excludes_valid_inherit_only_grants_from_current_policy',
+            'windows::owned_container_rejects_dangerous_generic_concrete_and_unknown_rights',
+            'windows::owned_container_rejects_null_dacl_and_wrong_owner',
+            'windows::owned_container_rechecks_identity_and_dacl_without_repair',
+            'windows::source_directory_enumerates_nested_unicode_and_preserves_metadata',
+            'windows::source_directory_carries_depth_budget_and_rejects_stale_child_identity',
+            'windows::source_directory_rejects_hardlinks_and_reparse_entries_without_following_them',
+            'windows::source_directory_holds_root_and_ancestors_while_walking',
+            'windows::source_directory_enumeration_enforces_entry_and_name_bounds_without_changes',
+            'fs::windows::tests::container_ace_layout_parser_only_rejects_malformed_unknown_and_callback_forms',
+            'fs::windows::tests::source_component_policy_is_separate_from_private_names',
+            'fs::windows::tests::source_snapshot_rejects_link_added_after_initial_kind_check'
           )
-          if ($required.Count -ne 47 -or @($required | Select-Object -Unique).Count -ne 47) {
-            throw "Foundation's exact required-name manifest must contain 47 unique cases; found $($required.Count)"
+          if ($required.Count -ne 60 -or @($required | Select-Object -Unique).Count -ne 60) {
+            throw "Foundation's exact required-name manifest must contain 60 unique cases; found $($required.Count)"
           }
           foreach ($case in $required) {
             $pattern = '(?m)^test ' + [regex]::Escape($case) + ' \.\.\. ok\r?$'

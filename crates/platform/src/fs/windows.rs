@@ -844,26 +844,317 @@ impl Directory {
     }
 }
 
-/// A separately named capability for an owner-controlled, readable container.
-///
-/// This initial tracer delegates to the stricter private directory policy; the
-/// container-specific owner and access policy is introduced after its native
-/// positive contract is captured.
+fn open_owner_container(path: &Path) -> io::Result<OwnedContainer> {
+    let security = Security::current()?;
+    let mut components = path.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return Err(unsupported("container requires a local drive")),
+        },
+        _ => return Err(invalid("container path must be an absolute drive path")),
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(invalid("drive-relative container path"));
+    }
+    let names: Vec<_> = components
+        .map(|component| match component {
+            Component::Normal(name) => {
+                validate_component(name)?;
+                Ok(name.to_os_string())
+            }
+            _ => Err(invalid("ambiguous container path")),
+        })
+        .collect::<io::Result<_>>()?;
+    if names.is_empty() {
+        return Err(invalid("a drive root cannot be an owned container"));
+    }
+    if names.len() > 128 {
+        return Err(invalid("container ancestor limit exceeded"));
+    }
+    let root = wide(OsStr::new(&format!("\\\\?\\{}:\\", char::from(drive))));
+    let drive_path = wide(OsStr::new(&format!("{}:\\", char::from(drive))));
+    if unsafe { GetDriveTypeW(drive_path.as_ptr()) } != DRIVE_FIXED {
+        return Err(unsupported("container requires a fixed local drive"));
+    }
+    let raw = unsafe {
+        CreateFileW(
+            root.as_ptr(),
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let first = unsafe { OwnedHandle::from_raw_handle(raw) };
+    ensure_kind(first.as_raw_handle(), true)?;
+    let mut filesystem = [0u16; 32];
+    unsafe {
+        ok(GetVolumeInformationByHandleW(
+            first.as_raw_handle(),
+            null_mut(),
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        ))?
+    };
+    let fs_len = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filesystem.len());
+    if String::from_utf16_lossy(&filesystem[..fs_len]) != "NTFS" {
+        return Err(unsupported("container requires NTFS semantics"));
+    }
+    let mut chain = vec![Arc::new(first)];
+    let mut identities = vec![identity(chain[0].as_raw_handle())?];
+    let volume = identities[0].volume;
+    for name in names {
+        let parent = chain.last().expect("root handle retained");
+        let handle = relative(
+            parent.as_raw_handle(),
+            &name,
+            true,
+            FILE_OPEN,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            null(),
+        )?;
+        let child_identity = identity(handle.as_raw_handle())?;
+        if child_identity.volume != volume || identities.contains(&child_identity) {
+            return Err(denied(
+                "container path crossed volume or repeated an ancestor",
+            ));
+        }
+        chain.push(Arc::new(handle));
+        identities.push(child_identity);
+    }
+    let container = OwnedContainer {
+        chain,
+        identities,
+        security,
+    };
+    container.check()?;
+    Ok(container)
+}
+
+fn validate_container_ace_header(ace_type: u8, ace_flags: u8, ace_size: usize) -> io::Result<()> {
+    let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+    let supported_flags = OBJECT_INHERIT_ACE as u8
+        | CONTAINER_INHERIT_ACE as u8
+        | NO_PROPAGATE_INHERIT_ACE as u8
+        | INHERIT_ONLY_ACE as u8
+        | INHERITED_ACE as u8;
+    if !matches!(ace_type, 0 | 1) || ace_flags & !supported_flags != 0 || ace_size < sid_offset + 8
+    {
+        return Err(denied("unsupported or malformed container ACE"));
+    }
+    Ok(())
+}
+
+fn validate_container_ace_layout(
+    ace_type: u8,
+    ace_flags: u8,
+    ace_size: usize,
+    sid_bytes: &[u8],
+) -> io::Result<usize> {
+    validate_container_ace_header(ace_type, ace_flags, ace_size)?;
+    if sid_bytes.len() < 8 {
+        return Err(denied("container ACE SID prefix is truncated"));
+    }
+    let revision = sid_bytes[0];
+    let sub_authority_count = sid_bytes[1] as usize;
+    let sid_len = 8usize
+        .checked_add(
+            sub_authority_count
+                .checked_mul(4)
+                .ok_or_else(|| denied("container SID length overflow"))?,
+        )
+        .ok_or_else(|| denied("container SID length overflow"))?;
+    if revision != 1 || sub_authority_count > 15 || sid_len > sid_bytes.len() || sid_len > 68 {
+        return Err(denied("container ACE SID exceeds its bounded record"));
+    }
+    Ok(sid_len)
+}
+
+fn check_container_access(security: &Security, handle: HANDLE) -> io::Result<()> {
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    let code = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let _allocation = LocalAllocation(descriptor);
+    if descriptor.is_null() || owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+        return Err(denied("container owner descriptor is invalid"));
+    }
+    let owner_len = unsafe { GetLengthSid(owner) } as usize;
+    let token_sid = security.sid.as_ptr().cast_mut().cast();
+    if owner_len == 0
+        || owner_len > 68
+        || unsafe { IsValidSid(token_sid) } == 0
+        || unsafe { GetLengthSid(token_sid) } as usize != security.sid.len() * size_of::<u32>()
+        || unsafe { EqualSid(owner, token_sid) } == 0
+    {
+        return Err(denied("container owner is not the effective token user"));
+    }
+
+    let mut present = 0;
+    let mut descriptor_dacl = null_mut();
+    let mut defaulted = 0;
+    unsafe {
+        ok(GetSecurityDescriptorDacl(
+            descriptor,
+            &mut present,
+            &mut descriptor_dacl,
+            &mut defaulted,
+        ))?
+    };
+    if present == 0 || descriptor_dacl.is_null() || descriptor_dacl != dacl {
+        return Err(denied("container requires a present, non-null DACL"));
+    }
+    let acl = unsafe { &*descriptor_dacl };
+    let acl_size = acl.AclSize as usize;
+    if acl_size < size_of::<ACL>()
+        || (acl.AclRevision != ACL_REVISION as u8 && acl.AclRevision != ACL_REVISION_DS as u8)
+        || unsafe { IsValidAcl(descriptor_dacl) } == 0
+    {
+        return Err(denied("container ACL header is invalid"));
+    }
+    let mut size_info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        ok(GetAclInformation(
+            descriptor_dacl,
+            (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ))?
+    };
+    let bytes_in_use = size_info.AclBytesInUse as usize;
+    if bytes_in_use < size_of::<ACL>()
+        || bytes_in_use > acl_size
+        || size_info.AclBytesFree as usize > acl_size
+        || size_info.AceCount > 4096
+    {
+        return Err(denied("container ACL bounds are invalid"));
+    }
+
+    let known_file_rights = FILE_ALL_ACCESS;
+    let readable_rights = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+
+    for index in 0..size_info.AceCount {
+        let mut ace_ptr = null_mut();
+        unsafe { ok(GetAce(descriptor_dacl, index, &mut ace_ptr))? };
+        if ace_ptr.is_null() {
+            return Err(denied("container ACL contains a null ACE"));
+        }
+        let acl_start = descriptor_dacl.cast::<u8>() as usize;
+        let ace_start = ace_ptr as usize;
+        let acl_end = acl_start
+            .checked_add(bytes_in_use)
+            .ok_or_else(|| denied("container ACL bounds overflow"))?;
+        let header_end = ace_start
+            .checked_add(size_of::<ACE_HEADER>())
+            .ok_or_else(|| denied("container ACE bounds overflow"))?;
+        if ace_start < acl_start || header_end > acl_end {
+            return Err(denied("container ACE header exceeds its ACL"));
+        }
+        let header = unsafe { &*ace_ptr.cast::<ACE_HEADER>() };
+        let ace_size = header.AceSize as usize;
+        let ace_end = ace_start
+            .checked_add(ace_size)
+            .ok_or_else(|| denied("container ACE bounds overflow"))?;
+        if ace_end > acl_end {
+            return Err(denied("container ACE exceeds its bounded ACL record"));
+        }
+        validate_container_ace_header(header.AceType, header.AceFlags, ace_size)?;
+        let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let mask = unsafe { *ace_ptr.cast::<u32>().add(1) };
+        let sid_bytes_ptr = unsafe { ace_ptr.cast::<u8>().add(sid_offset) };
+        let sid_available = ace_size - sid_offset;
+        // The ACE end was bounded against AclBytesInUse before forming this slice.
+        let sid_bytes = unsafe { std::slice::from_raw_parts(sid_bytes_ptr, sid_available) };
+        let sid_len =
+            validate_container_ace_layout(header.AceType, header.AceFlags, ace_size, sid_bytes)?;
+        let sid = sid_bytes_ptr.cast::<SID>();
+        if unsafe { IsValidSid(sid.cast()) } == 0
+            || unsafe { GetLengthSid(sid.cast()) } as usize != sid_len
+        {
+            return Err(denied("container ACE SID is malformed"));
+        }
+
+        let mut mapped = mask;
+        unsafe { MapGenericMask(&mut mapped, &mapping) };
+        if mapped & !known_file_rights != 0 {
+            return Err(denied("container ACE contains unsupported access bits"));
+        }
+        if header.AceType == 0 && header.AceFlags & INHERIT_ONLY_ACE as u8 == 0 {
+            let trusted = unsafe {
+                EqualSid(sid.cast(), token_sid) != 0
+                    || IsWellKnownSid(sid.cast(), WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid.cast(), WinBuiltinAdministratorsSid) != 0
+            };
+            if !trusted && mapped & !readable_rights != 0 {
+                return Err(denied(
+                    "container grants an untrusted principal mutation rights",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A validation-only capability for an owner-owned readable container.
+/// It exposes no private-state mutation operations and never repairs ACLs. Effective grants
+/// to the captured TokenUser, LocalSystem, and Administrators SIDs are trusted by policy;
+/// other effective grants are limited to file read and execute rights.
 pub struct OwnedContainer {
-    directory: Directory,
+    chain: Vec<Arc<OwnedHandle>>,
+    identities: Vec<FileIdentity>,
+    security: Security,
 }
 
 impl OwnedContainer {
     pub fn open(path: &Path) -> io::Result<Self> {
-        Directory::open(path).map(|directory| Self { directory })
+        open_owner_container(path)
     }
 
     pub fn identity(&self) -> FileIdentity {
-        self.directory.identity()
+        *self.identities.last().expect("container has a target")
     }
 
     pub fn check(&self) -> io::Result<()> {
-        self.directory.check()
+        check_source_anchors(&self.chain, &self.identities)?;
+        let handle = self
+            .chain
+            .last()
+            .ok_or_else(|| invalid("empty container chain"))?;
+        ensure_kind(handle.as_raw_handle(), true)?;
+        check_container_access(&self.security, handle.as_raw_handle())
     }
 }
 
@@ -1074,6 +1365,21 @@ struct RawEntry {
 }
 
 fn directory_entries(handle: HANDLE, limits: EnumerationLimits) -> io::Result<Vec<RawEntry>> {
+    directory_entries_with_policy(handle, limits, true)
+}
+
+fn source_directory_entries(
+    handle: HANDLE,
+    limits: EnumerationLimits,
+) -> io::Result<Vec<RawEntry>> {
+    directory_entries_with_policy(handle, limits, false)
+}
+
+fn directory_entries_with_policy(
+    handle: HANDLE,
+    limits: EnumerationLimits,
+    private_names: bool,
+) -> io::Result<Vec<RawEntry>> {
     if limits.max_entries == 0
         || limits.max_entries > 4096
         || limits.max_name_bytes == 0
@@ -1103,11 +1409,14 @@ fn directory_entries(handle: HANDLE, limits: EnumerationLimits) -> io::Result<Ve
         let mut offset = 0usize;
         loop {
             if offset % std::mem::align_of::<FILE_ID_EXTD_DIR_INFO>() != 0
-                || offset + size_of::<FILE_ID_EXTD_DIR_INFO>() > capacity
+                || offset
+                    .checked_add(size_of::<FILE_ID_EXTD_DIR_INFO>())
+                    .is_none_or(|end| end > capacity)
             {
                 return Err(invalid("invalid directory entry layout"));
             }
-            // Aligned OS-written record, with its variable name bounded below.
+            // SAFETY: the output buffer is aligned, the fixed record fits, and the
+            // variable name length is checked against the same buffer below.
             let entry = unsafe {
                 &*buffer
                     .as_ptr()
@@ -1118,12 +1427,13 @@ fn directory_entries(handle: HANDLE, limits: EnumerationLimits) -> io::Result<Ve
             let length = entry.FileNameLength as usize;
             let end = offset
                 .checked_add(header)
-                .and_then(|v| v.checked_add(length))
-                .filter(|v| *v <= capacity)
+                .and_then(|value| value.checked_add(length))
+                .filter(|value| *value <= capacity)
                 .ok_or_else(|| invalid("directory name exceeds its buffer"))?;
             if length == 0 || length % 2 != 0 {
                 return Err(invalid("invalid directory name length"));
             }
+            // SAFETY: FileNameLength is even and the complete name was bounded above.
             let name = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), length / 2) };
             if name != [46] && name != [46, 46] {
                 name_bytes = name_bytes
@@ -1133,10 +1443,14 @@ fn directory_entries(handle: HANDLE, limits: EnumerationLimits) -> io::Result<Ve
                     return Err(invalid("directory enumeration limit exceeded"));
                 }
                 if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(denied("reparse entry in private directory"));
+                    return Err(denied("reparse entry in source directory"));
                 }
                 let name = OsString::from_wide(name);
-                validate_component(&name)?;
+                if private_names {
+                    validate_component(&name)?;
+                } else {
+                    validate_source_component(&name)?;
+                }
                 entries.push(RawEntry {
                     name,
                     identity: entry.FileId.Identifier,
@@ -1383,16 +1697,51 @@ impl PrivateFile {
 }
 
 /// Snapshot facts retained by a held source file.
-pub type SourceSnapshot = FileSnapshot;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceKind {
+    File,
+    Directory,
+}
+
+/// By-handle metadata observed for one source object; not an atomic tree snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceSnapshot {
+    pub identity: FileIdentity,
+    pub length: u64,
+    pub last_write_time: i64,
+    pub change_time: i64,
+    pub attributes: u32,
+    pub kind: SourceKind,
+    pub link_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEntry {
+    pub name: OsString,
+    pub identity: FileIdentity,
+    pub kind: SourceKind,
+    pub snapshot: SourceSnapshot,
+}
 
 /// A held source-directory capability with no private-state authority.
 pub struct SourceDirectory {
     chain: Vec<Arc<OwnedHandle>>,
     identities: Vec<FileIdentity>,
+    remaining_depth: usize,
+    enumeration: Mutex<()>,
 }
 
 impl SourceDirectory {
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_depth(path, 64)
+    }
+
+    /// Open a source root with a fixed maximum number of directory descents.
+    /// Child capabilities carry and decrement this budget; it cannot be reset.
+    pub fn open_with_depth(path: &Path, max_depth: usize) -> io::Result<Self> {
+        if max_depth > 64 {
+            return Err(invalid("source depth limit exceeds the hard ceiling"));
+        }
         let mut components = path.components();
         let drive = match components.next() {
             Some(Component::Prefix(prefix)) => match prefix.kind() {
@@ -1417,15 +1766,26 @@ impl SourceDirectory {
                 _ => Err(invalid("ambiguous source root path")),
             })
             .collect::<io::Result<_>>()?;
+        if names.len() > 128 {
+            return Err(invalid("source ancestor limit exceeded"));
+        }
         let root = wide(OsStr::new(&format!("\\\\?\\{}:\\", char::from(drive))));
         let drive_path = wide(OsStr::new(&format!("{}:\\", char::from(drive))));
         if unsafe { GetDriveTypeW(drive_path.as_ptr()) } != DRIVE_FIXED {
             return Err(unsupported("source requires a fixed local drive"));
         }
+        let root_access = FILE_TRAVERSE
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE
+            | if names.is_empty() {
+                FILE_LIST_DIRECTORY
+            } else {
+                0
+            };
         let raw = unsafe {
             CreateFileW(
                 root.as_ptr(),
-                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                root_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
@@ -1451,41 +1811,140 @@ impl SourceDirectory {
                 filesystem.len() as u32,
             ))?
         };
-        if String::from_utf16_lossy(
-            &filesystem[..filesystem
-                .iter()
-                .position(|value| *value == 0)
-                .unwrap_or(filesystem.len())],
-        ) != "NTFS"
-        {
+        let fs_len = filesystem
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(filesystem.len());
+        if String::from_utf16_lossy(&filesystem[..fs_len]) != "NTFS" {
             return Err(unsupported("source requires NTFS semantics"));
         }
         let root_identity = identity(first.as_raw_handle())?;
         let mut chain = vec![Arc::new(first)];
         let mut identities = vec![root_identity];
-        for name in names {
-            let parent = chain.last().unwrap();
-            let handle = relative_source(
-                parent.as_raw_handle(),
-                &name,
-                true,
-                FILE_OPEN,
-                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            )?;
+        for (index, name) in names.iter().enumerate() {
+            let is_leaf = index + 1 == names.len();
+            let parent = chain.last().expect("root handle retained");
+            let access = FILE_TRAVERSE
+                | FILE_READ_ATTRIBUTES
+                | SYNCHRONIZE
+                | if is_leaf { FILE_LIST_DIRECTORY } else { 0 };
+            let handle = relative_source(parent.as_raw_handle(), name, true, FILE_OPEN, access)?;
             let child_identity = identity(handle.as_raw_handle())?;
-            if child_identity.volume != root_identity.volume {
-                return Err(denied("source path crossed its fixed volume"));
+            if child_identity.volume != root_identity.volume || identities.contains(&child_identity)
+            {
+                return Err(denied("source path crossed volume or repeated an ancestor"));
             }
             chain.push(Arc::new(handle));
             identities.push(child_identity);
         }
-        let source = Self { chain, identities };
+        let source = Self {
+            chain,
+            identities,
+            remaining_depth: max_depth,
+            enumeration: Mutex::new(()),
+        };
         source.check()?;
         Ok(source)
     }
 
     pub fn identity(&self) -> FileIdentity {
         *self.identities.last().unwrap()
+    }
+
+    /// Enumerate bounded observations and reopen every listed object by its full identity.
+    /// A call checks each observed entry; it does not make a whole-tree atomic snapshot.
+    pub fn enumerate(&self, limits: EnumerationLimits) -> io::Result<Vec<SourceEntry>> {
+        self.check()?;
+        let _guard = self
+            .enumeration
+            .lock()
+            .map_err(|_| invalid("source enumeration lock poisoned"))?;
+        self.check()?;
+        let parent = self
+            .chain
+            .last()
+            .ok_or_else(|| invalid("empty source chain"))?;
+        let entries = source_directory_entries(parent.as_raw_handle(), limits)?;
+        let volume = self.identity().volume;
+        let mut observed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let expected = FileIdentity {
+                volume,
+                file: entry.identity,
+            };
+            let access = FILE_READ_ATTRIBUTES
+                | SYNCHRONIZE
+                | if entry.directory {
+                    FILE_TRAVERSE | FILE_LIST_DIRECTORY
+                } else {
+                    FILE_READ_DATA
+                };
+            let handle = relative_source(
+                parent.as_raw_handle(),
+                &entry.name,
+                entry.directory,
+                FILE_OPEN,
+                access,
+            )?;
+            let actual = identity(handle.as_raw_handle())?;
+            if actual != expected || actual.volume != volume {
+                return Err(denied("source entry identity changed during enumeration"));
+            }
+            ensure_kind(handle.as_raw_handle(), entry.directory)?;
+            let snapshot = source_snapshot(handle.as_raw_handle(), expected, entry.directory)?;
+            observed.push(SourceEntry {
+                name: entry.name,
+                identity: expected,
+                kind: snapshot.kind,
+                snapshot,
+            });
+        }
+        self.check()?;
+        Ok(observed)
+    }
+
+    /// Open a directory child only when its full observed identity still matches.
+    pub fn child_expected(
+        &self,
+        name: &OsStr,
+        expected: FileIdentity,
+    ) -> io::Result<SourceDirectory> {
+        self.check()?;
+        validate_source_component(name)?;
+        if self.remaining_depth == 0 {
+            return Err(invalid("source directory depth budget exhausted"));
+        }
+        if expected.volume != self.identity().volume || self.identities.contains(&expected) {
+            return Err(denied("source child crosses volume or repeats an ancestor"));
+        }
+        let parent = self
+            .chain
+            .last()
+            .ok_or_else(|| invalid("empty source chain"))?;
+        let handle = relative_source(
+            parent.as_raw_handle(),
+            name,
+            true,
+            FILE_OPEN,
+            FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?;
+        let actual = identity(handle.as_raw_handle())?;
+        if actual != expected {
+            return Err(denied("source directory identity changed before open"));
+        }
+        ensure_kind(handle.as_raw_handle(), true)?;
+        let mut chain = self.chain.clone();
+        chain.push(Arc::new(handle));
+        let mut identities = self.identities.clone();
+        identities.push(expected);
+        let child = SourceDirectory {
+            chain,
+            identities,
+            remaining_depth: self.remaining_depth - 1,
+            enumeration: Mutex::new(()),
+        };
+        child.check()?;
+        Ok(child)
     }
 
     pub fn open_file(&self, name: &OsStr) -> io::Result<SourceFile> {
@@ -1547,7 +2006,7 @@ impl SourceFile {
 
     pub fn snapshot(&self) -> io::Result<SourceSnapshot> {
         self.check()?;
-        file_snapshot(self.file.as_raw_handle(), self.identity)
+        source_snapshot(self.file.as_raw_handle(), self.identity, false)
     }
 
     /// Read from the held file and reject metadata changes across the read.
@@ -1765,6 +2224,64 @@ fn relative_validated(
     ensure_kind(handle.as_raw_handle(), directory)?;
     Ok(handle)
 }
+#[cfg(test)]
+struct SourceSnapshotTestHook {
+    expected: FileIdentity,
+    source_path: std::path::PathBuf,
+    link_path: std::path::PathBuf,
+    ran: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static SOURCE_SNAPSHOT_TEST_HOOK: Mutex<Option<SourceSnapshotTestHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_source_snapshot_test_hook(expected: FileIdentity) -> io::Result<()> {
+    let hook = {
+        let mut slot = SOURCE_SNAPSHOT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|hook| hook.expected == expected) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        std::fs::hard_link(&hook.source_path, &hook.link_path)?;
+        hook.ran.store(true, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+fn source_snapshot(
+    handle: HANDLE,
+    expected: FileIdentity,
+    directory: bool,
+) -> io::Result<SourceSnapshot> {
+    ensure_kind(handle, directory)?;
+    #[cfg(test)]
+    run_source_snapshot_test_hook(expected)?;
+    let standard: FILE_STANDARD_INFO = information(handle, FileStandardInfo)?;
+    let basic: FILE_BASIC_INFO = information(handle, FileBasicInfo)?;
+    if standard.EndOfFile < 0 || identity(handle)? != expected || standard.NumberOfLinks < 1 {
+        return Err(denied("source snapshot identity, kind, or length changed"));
+    }
+    Ok(SourceSnapshot {
+        identity: expected,
+        length: standard.EndOfFile as u64,
+        last_write_time: basic.LastWriteTime,
+        change_time: basic.ChangeTime,
+        attributes: basic.FileAttributes,
+        kind: if directory {
+            SourceKind::Directory
+        } else {
+            SourceKind::File
+        },
+        link_count: standard.NumberOfLinks as u32,
+    })
+}
+
 fn file_snapshot(handle: HANDLE, expected: FileIdentity) -> io::Result<FileSnapshot> {
     ensure_kind(handle, false)?;
     let standard: FILE_STANDARD_INFO = information(handle, FileStandardInfo)?;
@@ -1911,6 +2428,161 @@ mod tests {
             INSPECTION_DACL_MUTATION_APPLIED.store(false, Ordering::SeqCst);
             INSPECTION_REPLACE_AFTER_ENUMERATION.store(false, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn container_ace_layout_parser_only_rejects_malformed_unknown_and_callback_forms() {
+        let valid_sid = [1, 0, 0, 0, 0, 0, 0, 5];
+        assert_eq!(
+            validate_container_ace_layout(0, 0, 16, &valid_sid).unwrap(),
+            8
+        );
+        assert_eq!(
+            validate_container_ace_layout(0, INHERIT_ONLY_ACE as u8, 16, &valid_sid).unwrap(),
+            8,
+            "well-formed inherit-only ACE layout is parsed"
+        );
+        assert!(
+            validate_container_ace_layout(5, 0, 16, &valid_sid).is_err(),
+            "object ACE form is unsupported"
+        );
+        assert!(
+            validate_container_ace_layout(5, INHERIT_ONLY_ACE as u8, 16, &valid_sid).is_err(),
+            "object ACE form is rejected even when inherit-only"
+        );
+        assert!(
+            validate_container_ace_layout(9, INHERIT_ONLY_ACE as u8, 16, &valid_sid).is_err(),
+            "callback ACE form is rejected even when inherit-only"
+        );
+        assert!(
+            validate_container_ace_layout(0, 0x80, 16, &valid_sid).is_err(),
+            "unknown ACE flags are rejected"
+        );
+        assert!(
+            validate_container_ace_layout(0, 0, 15, &valid_sid).is_err(),
+            "ACE size shorter than the SID prefix is rejected"
+        );
+        assert!(
+            validate_container_ace_layout(0, 0, 16, &valid_sid[..7]).is_err(),
+            "truncated SID prefix is rejected"
+        );
+
+        let mut excessive_sid = valid_sid;
+        excessive_sid[1] = 16;
+        assert!(
+            validate_container_ace_layout(0, 0, 16, &excessive_sid).is_err(),
+            "SID subauthority count is bounded before IsValidSid/GetLengthSid"
+        );
+        let mut invalid_revision = valid_sid;
+        invalid_revision[0] = 2;
+        assert!(
+            validate_container_ace_layout(0, 0, 16, &invalid_revision).is_err(),
+            "invalid SID revision is rejected"
+        );
+    }
+
+    struct ResetSourceSnapshotTestHook;
+    impl Drop for ResetSourceSnapshotTestHook {
+        fn drop(&mut self) {
+            SOURCE_SNAPSHOT_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+
+    fn install_source_snapshot_test_hook(
+        hook: SourceSnapshotTestHook,
+    ) -> ResetSourceSnapshotTestHook {
+        let mut slot = SOURCE_SNAPSHOT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(slot.is_none(), "source snapshot hook slot must be empty");
+        *slot = Some(hook);
+        ResetSourceSnapshotTestHook
+    }
+
+    #[test]
+    fn source_component_policy_is_separate_from_private_names() {
+        for name in ["trailing.", "CON", "name "] {
+            let component = OsStr::new(name);
+            assert!(
+                super::validate_component(component).is_err(),
+                "private state must keep rejecting {name:?}"
+            );
+            assert!(
+                validate_source_component(component).is_ok(),
+                "public source component should retain {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_snapshot_rejects_link_added_after_initial_kind_check() {
+        let home = Home::new();
+        let root = home.base.join("race source");
+        std::fs::create_dir(&root).unwrap();
+        let source_path = root.join("record");
+        let link_path = home.base.join("outside hardlink");
+        std::fs::write(&source_path, b"hardlink race canary").unwrap();
+        let source = SourceDirectory::open(&root).unwrap();
+        let initial = source
+            .enumerate(EnumerationLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+            })
+            .unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].snapshot.link_count, 1);
+        let expected = initial[0].identity;
+        let ran = Arc::new(AtomicBool::new(false));
+        let _reset_hook = install_source_snapshot_test_hook(SourceSnapshotTestHook {
+            expected,
+            source_path: source_path.clone(),
+            link_path: link_path.clone(),
+            ran: Arc::clone(&ran),
+        });
+
+        let result = source.enumerate(EnumerationLimits {
+            max_entries: 8,
+            max_name_bytes: 1024,
+        });
+
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "one-shot hardlink hook did not run"
+        );
+        assert_eq!(
+            std::fs::read(&source_path).unwrap(),
+            b"hardlink race canary"
+        );
+        assert_eq!(std::fs::read(&link_path).unwrap(), b"hardlink race canary");
+        let original = File::open(&source_path).unwrap();
+        let alias = File::open(&link_path).unwrap();
+        let original_standard: FILE_STANDARD_INFO =
+            information(original.as_raw_handle(), FileStandardInfo).unwrap();
+        let alias_standard: FILE_STANDARD_INFO =
+            information(alias.as_raw_handle(), FileStandardInfo).unwrap();
+        assert_eq!(original_standard.NumberOfLinks, 2, "real source link count");
+        assert_eq!(alias_standard.NumberOfLinks, 2, "real alias link count");
+        let original_identity = identity(original.as_raw_handle()).unwrap();
+        let alias_identity = identity(alias.as_raw_handle()).unwrap();
+        assert_eq!(
+            original_identity, expected,
+            "original must retain the same full file identity"
+        );
+        assert_eq!(
+            alias_identity, original_identity,
+            "alias must name the same full file identity"
+        );
+        let observed = result.as_ref().ok().and_then(|entries| entries.first());
+        assert!(
+            matches!(&result, Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && error.to_string() == "source snapshot link count changed"),
+            "expected policy rejection after verified real hardlink setup; got {result:?}, observed_link_count={}, full_identity={expected:?} original_identity={original_identity:?} alias_identity={alias_identity:?}",
+            observed.map_or(0, |entry| entry.snapshot.link_count)
+        );
     }
 
     #[test]
