@@ -2081,9 +2081,11 @@ mod registry_witness_tests {
     use std::os::windows::io::IntoRawHandle;
     use windows_sys::Wdk::Foundation::NtClose;
     use windows_sys::Wdk::System::Registry::{
-        KeyValuePartialInformation, NtOpenKey, NtQueryValueKey,
+        KeyNameInformation, KeyValuePartialInformation, NtOpenKey, NtQueryKey, NtQueryValueKey,
     };
-    use windows_sys::Wdk::System::SystemServices::KEY_VALUE_PARTIAL_INFORMATION;
+    use windows_sys::Wdk::System::SystemServices::{
+        KEY_NAME_INFORMATION, KEY_VALUE_PARTIAL_INFORMATION,
+    };
     use windows_sys::Win32::Security::Authorization::{SDDL_REVISION_1, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::Cryptography::{
         BCRYPT_OBJECT_LENGTH, BCRYPT_SHA256_ALGORITHM, BCryptCloseAlgorithmProvider,
@@ -2108,6 +2110,58 @@ mod registry_witness_tests {
         output.write_all(payload.as_bytes())?;
         output.write_all(&[WITNESS_FRAME_END])?;
         output.flush()
+    }
+
+    fn native_registry_key_name(key: HKEY) -> io::Result<String> {
+        let mut required = 0u32;
+        let first_status =
+            unsafe { NtQueryKey(key.cast(), KeyNameInformation, null_mut(), 0, &mut required) };
+        if first_status != 0xC0000023u32 as i32 || !(4..=65_536).contains(&required) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "NtQueryKey sizing failed: status=0x{:08X} required={required}",
+                    first_status as u32
+                ),
+            ));
+        }
+        let mut aligned = vec![0u64; required.div_ceil(size_of::<u64>() as u32) as usize];
+        let mut returned = 0u32;
+        let status = unsafe {
+            NtQueryKey(
+                key.cast(),
+                KeyNameInformation,
+                aligned.as_mut_ptr().cast(),
+                required,
+                &mut returned,
+            )
+        };
+        if status != 0 || returned < 4 || returned > required {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "NtQueryKey name query failed: status=0x{:08X} returned={returned}",
+                    status as u32
+                ),
+            ));
+        }
+        let info = aligned.as_ptr().cast::<KEY_NAME_INFORMATION>();
+        let byte_len = unsafe { (*info).NameLength };
+        if byte_len % 2 != 0 || byte_len.checked_add(4) != Some(returned) {
+            return Err(invalid(
+                "NtQueryKey returned a malformed KEY_NAME_INFORMATION length",
+            ));
+        }
+        let units =
+            unsafe { std::slice::from_raw_parts((*info).Name.as_ptr(), (byte_len / 2) as usize) };
+        let name = String::from_utf16(units)
+            .map_err(|_| invalid("NtQueryKey returned a non-UTF16 native key name"))?;
+        if name.is_empty() || !name.is_ascii() || name.bytes().any(|byte| byte == 0) {
+            return Err(invalid(
+                "NtQueryKey native key name is empty or outside bounded ASCII grammar",
+            ));
+        }
+        Ok(name)
     }
 
     fn escape_diagnostic(bytes: &[u8]) -> String {
@@ -3352,6 +3406,115 @@ mod registry_witness_tests {
             }
             errors
         }
+
+        fn close_fences_with_late(
+            &mut self,
+            mut late: Option<&mut LateControlState>,
+        ) -> Vec<String> {
+            let mut errors = Vec::new();
+            if let Some(fence) = self.normal.take() {
+                match close_checked(fence.handle, "CloseHandle(normal Job fence)") {
+                    Ok(())
+                        if late.as_deref().is_some_and(|state| {
+                            state.control == CleanupControl::JobFenceCloseError
+                        }) =>
+                    {
+                        if let Some(state) = late.as_deref_mut() {
+                            state.native_executed = true;
+                            state.native_domain = "close".to_owned();
+                            state.native_result = "close_succeeded".to_owned();
+                            state.reported_result = "injected_close_error".to_owned();
+                            state.injected = true;
+                            late_set(&mut state.fields, "normal_job_fence_state", "closed");
+                            late_set(
+                                &mut state.fields,
+                                "normal_job_fence_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut state.fields,
+                                "normal_job_fence_close_reported_result",
+                                "injected_close_error",
+                            );
+                            state.target(
+                                "normal_job_fence_close", "receipt", "injected_close",
+                                "normal Job close succeeded after both Job counts reached zero; injected error",
+                            );
+                        }
+                        errors.push("normal Job fence close: injected close error after native close succeeded".to_owned());
+                    }
+                    Ok(()) => {
+                        if let Some(state) = late.as_deref_mut() {
+                            late_set(&mut state.fields, "normal_job_fence_state", "closed");
+                            late_set(
+                                &mut state.fields,
+                                "normal_job_fence_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut state.fields,
+                                "normal_job_fence_close_reported_result",
+                                "not_injected",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(state) = late.as_deref_mut() {
+                            state.unexpected(
+                                "normal_job_fence_close",
+                                "close",
+                                "native_close_error",
+                                &error.to_string(),
+                            );
+                            late_set(&mut state.fields, "normal_job_fence_state", "close_failed");
+                            late_set(
+                                &mut state.fields,
+                                "normal_job_fence_close_native_result",
+                                "error",
+                            );
+                        }
+                        errors.push(format!("normal Job fence close: {error}"));
+                    }
+                }
+            }
+            if let Some(fence) = self.cancel.take() {
+                match close_checked(fence.handle, "CloseHandle(cancellation Job fence)") {
+                    Ok(()) => {
+                        if let Some(state) = late.as_deref_mut() {
+                            late_set(&mut state.fields, "cancel_job_fence_state", "closed");
+                            late_set(
+                                &mut state.fields,
+                                "cancel_job_fence_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut state.fields,
+                                "cancel_job_fence_close_reported_result",
+                                "not_injected",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(state) = late.as_deref_mut() {
+                            state.unexpected(
+                                "cancel_job_fence_close",
+                                "close",
+                                "native_close_error",
+                                &error.to_string(),
+                            );
+                            late_set(&mut state.fields, "cancel_job_fence_state", "close_failed");
+                            late_set(
+                                &mut state.fields,
+                                "cancel_job_fence_close_native_result",
+                                "error",
+                            );
+                        }
+                        errors.push(format!("cancellation Job fence close: {error}"));
+                    }
+                }
+            }
+            errors
+        }
     }
 
     impl JobFence {
@@ -3723,7 +3886,16 @@ mod registry_witness_tests {
         Ok(owned)
     }
 
-    fn relative_probe_absent(parent: HANDLE, leaf: &str, directory: bool) -> io::Result<bool> {
+    enum RelativeObjectObservation {
+        Absent,
+        Present { identity: (u64, [u8; 16]) },
+    }
+
+    fn relative_probe_observe(
+        parent: HANDLE,
+        leaf: &str,
+        directory: bool,
+    ) -> io::Result<RelativeObjectObservation> {
         validate_component(OsStr::new(leaf))?;
         let (mut storage, mut object_name) = nt_unicode(leaf)?;
         let mut attributes = OBJECT_ATTRIBUTES::default();
@@ -3755,7 +3927,7 @@ mod registry_witness_tests {
         };
         std::hint::black_box(&mut storage);
         if result == 0xC000_0034u32 as i32 {
-            return Ok(true);
+            return Ok(RelativeObjectObservation::Absent);
         }
         if result < 0 {
             return Err(operation_error(
@@ -3764,19 +3936,29 @@ mod registry_witness_tests {
             ));
         }
         let owned = own("NtCreateFile(relative absence probe)", handle)?;
-        let identity = script_identity(owned.as_raw_handle());
-        let close = close_checked(owned, "CloseHandle(relative absence probe)");
-        match (identity, close) {
-            (Ok(identity), Ok(())) => Err(io::Error::other(format!(
-                "cleanup leaf still exists or was replaced: directory={directory} identity={}",
-                identity_text(identity)
-            ))),
+        let observed = (|| -> io::Result<_> {
+            check_object(owned.as_raw_handle(), directory)?;
+            script_identity(owned.as_raw_handle())
+        })();
+        let close = close_checked(owned, "CloseHandle(relative object observation)");
+        match (observed, close) {
+            (Ok(identity), Ok(())) => Ok(RelativeObjectObservation::Present { identity }),
             (Err(primary), Ok(())) => Err(primary),
             (Ok(_), Err(close)) => Err(io::Error::other(format!(
-                "existing cleanup leaf observation handle close failed: {close}"
+                "relative object observation close failed: {close}"
             ))),
             (Err(primary), Err(close)) => Err(io::Error::other(format!(
-                "cleanup leaf identity probe failed: {primary}; observation close failed: {close}"
+                "relative object observation failed: {primary}; checked close failed: {close}"
+            ))),
+        }
+    }
+
+    fn relative_probe_absent(parent: HANDLE, leaf: &str, directory: bool) -> io::Result<bool> {
+        match relative_probe_observe(parent, leaf, directory)? {
+            RelativeObjectObservation::Absent => Ok(true),
+            RelativeObjectObservation::Present { identity } => Err(io::Error::other(format!(
+                "cleanup leaf still exists or was replaced: directory={directory} identity={}",
+                identity_text(identity)
             ))),
         }
     }
@@ -4697,7 +4879,77 @@ mod registry_witness_tests {
             }
         }
 
-        fn require_entry_absent(&self) -> io::Result<()> {
+        fn close_internal_with_late(&mut self, late: &mut LateControlState) -> io::Result<()> {
+            let mut errors = Vec::new();
+            if let Some(ac) = self.ac.take() {
+                match close_checked(ac, "CloseHandle(profile AC anchor)") {
+                    Ok(()) => {
+                        late_set(&mut late.fields, "profile_ac_anchor_state", "closed");
+                        late_set(
+                            &mut late.fields,
+                            "profile_ac_anchor_close_native_result",
+                            "success",
+                        );
+                    }
+                    Err(error) => {
+                        late.unexpected(
+                            "profile_ac_anchor_close",
+                            "close",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                        late_set(&mut late.fields, "profile_ac_anchor_state", "close_failed");
+                        late_set(
+                            &mut late.fields,
+                            "profile_ac_anchor_close_native_result",
+                            "error",
+                        );
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+            if let Some(entry) = self.entry.take() {
+                match close_checked(entry, "CloseHandle(profile entry anchor)") {
+                    Ok(()) => {
+                        late_set(&mut late.fields, "profile_entry_anchor_state", "closed");
+                        late_set(
+                            &mut late.fields,
+                            "profile_entry_anchor_close_native_result",
+                            "success",
+                        );
+                    }
+                    Err(error) => {
+                        late.unexpected(
+                            "profile_entry_anchor_close",
+                            "close",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "profile_entry_anchor_state",
+                            "close_failed",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "profile_entry_anchor_close_native_result",
+                            "error",
+                        );
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "profile anchor checked closes failed: {}",
+                    errors.join("; ")
+                )))
+            }
+        }
+
+        fn require_entry_present(&self) -> io::Result<()> {
             let packages = self
                 .packages
                 .as_ref()
@@ -4705,8 +4957,19 @@ mod registry_witness_tests {
             if script_identity(packages.as_raw_handle())? != self.packages_identity {
                 return Err(invalid("Packages parent identity changed"));
             }
-            relative_probe_absent(packages.as_raw_handle(), &self.entry_leaf, true)?;
-            Ok(())
+            match relative_probe_observe(packages.as_raw_handle(), &self.entry_leaf, true)? {
+                RelativeObjectObservation::Present { identity }
+                    if identity == self.entry_identity =>
+                {
+                    Ok(())
+                }
+                RelativeObjectObservation::Present { .. } => Err(invalid(
+                    "profile entry identity changed beneath held Packages observer",
+                )),
+                RelativeObjectObservation::Absent => Err(invalid(
+                    "profile entry unexpectedly absent beneath held Packages observer",
+                )),
+            }
         }
     }
 
@@ -4715,7 +4978,10 @@ mod registry_witness_tests {
         mut anchor: ProfileCleanupAnchor,
         gate: &CleanupJobGate,
         receipt: &mut CleanupReceipt,
+        control: Option<CleanupControl>,
+        late: Option<&mut LateControlState>,
     ) -> io::Result<()> {
+        let mut late = late;
         receipt.profile_packages_identity = Some(anchor.packages_identity);
         receipt.profile_entry_leaf = Some(anchor.entry_leaf.clone());
         let transition = (|| -> io::Result<()> {
@@ -4745,27 +5011,349 @@ mod registry_witness_tests {
                 .verify()?;
             anchor.verify_baseline()?;
             gate.require_zero("profile internal-handle close")?;
-            anchor.close_internal()?;
+            if let Some(late_state) = late.as_deref_mut() {
+                anchor.close_internal_with_late(late_state)?;
+            } else {
+                anchor.close_internal()?;
+            }
+            if let Some(late) = late.as_deref_mut() {
+                late_set(&mut late.fields, "profile_ac_anchor_state", "closed");
+                late_set(
+                    &mut late.fields,
+                    "profile_ac_anchor_close_native_result",
+                    "success",
+                );
+                late_set(
+                    &mut late.fields,
+                    "profile_ac_anchor_close_reported_result",
+                    "not_injected",
+                );
+                late_set(&mut late.fields, "profile_entry_anchor_state", "closed");
+                late_set(
+                    &mut late.fields,
+                    "profile_entry_anchor_close_native_result",
+                    "success",
+                );
+                late_set(
+                    &mut late.fields,
+                    "profile_entry_anchor_close_reported_result",
+                    "not_injected",
+                );
+            }
+            if control == Some(CleanupControl::ProfileAnchorCloseError) {
+                anchor.require_entry_present()?;
+                if let Some(late) = late.as_deref_mut() {
+                    let descriptor = late
+                        .fields
+                        .get("profile_entry_observed_descriptor_sha256")
+                        .cloned()
+                        .ok_or_else(|| {
+                            invalid("profile entry expected descriptor missing from late snapshot")
+                        })?;
+                    late_observe_object(
+                        late,
+                        "profile_entry",
+                        anchor
+                            .packages
+                            .as_ref()
+                            .ok_or_else(|| invalid("Packages observer missing"))?
+                            .as_raw_handle(),
+                        &anchor.entry_leaf,
+                        true,
+                        anchor.entry_identity,
+                        "",
+                        &descriptor,
+                        anchor.packages_identity,
+                        false,
+                    )?;
+                    late_set(
+                        &mut late.fields,
+                        "profile_absence_probe",
+                        "relative_success",
+                    );
+                    late_set(&mut late.fields, "sdk_executed", "false");
+                    late_set(&mut late.fields, "sdk_native_hresult", "not_called");
+                    late_set(&mut late.fields, "sdk_reported_hresult", "not_called");
+                    late.native_executed = true;
+                    late.native_domain = "close".to_owned();
+                    late.native_result = "close_succeeded".to_owned();
+                    late.reported_result = "injected_close_error".to_owned();
+                    late.injected = true;
+                    late_set(
+                        &mut late.fields,
+                        "profile_ac_anchor_close_reported_result",
+                        "injected_close_error",
+                    );
+                    late.target(
+                        "sdk_suppressed_profile_present",
+                        "receipt",
+                        "injected_close",
+                        "anchors closed; injected close error; profile entry remains present",
+                    );
+                }
+                return Err(invalid(
+                    "injected profile AC-anchor close error after native close success",
+                ));
+            }
             if let Some(root) = session.root.take() {
-                close_checked(root, "CloseHandle(profile root before SDK teardown)")?;
+                if let Err(error) =
+                    close_checked(root, "CloseHandle(profile root before SDK teardown)")
+                {
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_root_close",
+                            "close",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
             }
 
             gate.require_zero("DeleteAppContainerProfile")?;
-            let name = wide(OsStr::new(&session.name))?;
-            let result = unsafe { DeleteAppContainerProfile(name.as_ptr()) };
-            receipt.profile_sdk_result = Some(result);
-            if result != 0 {
+            let injected_result = match control {
+                Some(CleanupControl::SdkError) => Some(0x8000_4005u32 as i32),
+                Some(CleanupControl::SdkSOkNoEffect) => Some(0),
+                _ => None,
+            };
+            let native_result = if injected_result.is_some() {
+                None
+            } else {
+                let name = wide(OsStr::new(&session.name))?;
+                Some(unsafe { DeleteAppContainerProfile(name.as_ptr()) })
+            };
+            let reported_result = native_result
+                .or(injected_result)
+                .ok_or_else(|| invalid("SDK result seam has neither native nor injected result"))?;
+            receipt.profile_sdk_result = native_result;
+            if let Some(late) = late.as_deref_mut() {
+                late_set(
+                    &mut late.fields,
+                    "sdk_executed",
+                    native_result.is_some().to_string(),
+                );
+                late_set(
+                    &mut late.fields,
+                    "sdk_native_hresult",
+                    native_result.map_or_else(
+                        || "not_called".to_owned(),
+                        |value| format!("0x{:08X}", value as u32),
+                    ),
+                );
+                late_set(
+                    &mut late.fields,
+                    "sdk_reported_hresult",
+                    format!("0x{:08X}", reported_result as u32),
+                );
+                late.native_executed = native_result.is_some();
+                late.native_domain = "hresult".to_owned();
+                late.native_result = native_result.map_or_else(
+                    || "not_called".to_owned(),
+                    |value| format!("0x{:08X}", value as u32),
+                );
+                late.reported_result = format!("0x{:08X}", reported_result as u32);
+                late.injected = injected_result.is_some();
+            }
+            let packages_raw = match anchor.packages.as_ref() {
+                Some(packages) => packages.as_raw_handle(),
+                None => {
+                    let error = invalid("Packages parent anchor missing at SDK result seam");
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_presence_probe",
+                            "receipt",
+                            "missing_parent_anchor",
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            match script_identity(packages_raw) {
+                Ok(identity) if identity == anchor.packages_identity => {}
+                Ok(_) => {
+                    let error = invalid("Packages parent identity changed at SDK result seam");
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_presence_probe",
+                            "identity",
+                            "parent_changed",
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_presence_probe",
+                            "identity",
+                            "native_query_error",
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+            let presence = match relative_probe_observe(packages_raw, &anchor.entry_leaf, true) {
+                Ok(presence) => presence,
+                Err(error) => {
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_presence_probe",
+                            "probe",
+                            "native_or_close_error",
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let profile_present = match presence {
+                RelativeObjectObservation::Absent => false,
+                RelativeObjectObservation::Present { identity }
+                    if identity == anchor.entry_identity =>
+                {
+                    true
+                }
+                RelativeObjectObservation::Present { .. } => {
+                    let error = invalid("profile entry identity changed at SDK result seam");
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_presence_probe",
+                            "identity",
+                            "entry_changed",
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(late) = late.as_deref_mut() {
+                let descriptor = match late
+                    .fields
+                    .get("profile_entry_observed_descriptor_sha256")
+                    .cloned()
+                {
+                    Some(descriptor) => descriptor,
+                    None => {
+                        let error =
+                            invalid("profile entry expected descriptor missing from late snapshot");
+                        late.unexpected(
+                            "profile_presence_detail",
+                            "receipt",
+                            "missing_descriptor",
+                            &error.to_string(),
+                        );
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = late_observe_object(
+                    late,
+                    "profile_entry",
+                    packages_raw,
+                    &anchor.entry_leaf,
+                    true,
+                    anchor.entry_identity,
+                    "",
+                    &descriptor,
+                    anchor.packages_identity,
+                    false,
+                ) {
+                    late.unexpected(
+                        "profile_presence_detail",
+                        "probe",
+                        "native_or_close_error",
+                        &error.to_string(),
+                    );
+                    return Err(error);
+                }
+                let detailed_state = late.fields.get("profile_entry_state").map(String::as_str);
+                if detailed_state != Some(if profile_present { "+" } else { "-" }) {
+                    let error = invalid(
+                        "profile entry detail observation disagrees with typed SDK presence result",
+                    );
+                    late.unexpected(
+                        "profile_presence_detail",
+                        "receipt",
+                        "observation_mismatch",
+                        &error.to_string(),
+                    );
+                    return Err(error);
+                }
+                late_set(
+                    &mut late.fields,
+                    "profile_absence_probe",
+                    if profile_present {
+                        "relative_success"
+                    } else {
+                        "relative_not_found"
+                    },
+                );
+            }
+            if reported_result != 0 {
+                if control == Some(CleanupControl::SdkError)
+                    && injected_result.is_some()
+                    && profile_present
+                {
+                    if let Some(late) = late.as_deref_mut() {
+                        late.target(
+                            "sdk_reported_result",
+                            "hresult",
+                            "fixed_non_s_ok",
+                            "SDK skipped; fixed non-S_OK reported; profile entry remains present",
+                        );
+                    }
+                } else if let Some(late) = late.as_deref_mut() {
+                    late.unexpected(
+                        "sdk_reported_result",
+                        "hresult",
+                        "non_s_ok",
+                        "non-S_OK result or profile preimage differs from fixed SDK error control",
+                    );
+                }
                 return Err(operation_error(
                     "DeleteAppContainerProfile(literal S_OK required)",
-                    if result < 0 {
-                        io::Error::other(format!("SDK HRESULT {result:#x}"))
+                    if reported_result < 0 {
+                        io::Error::other(format!("SDK HRESULT {reported_result:#x}"))
                     } else {
-                        io::Error::other(format!("SDK returned non-S_OK success {result:#x}"))
+                        io::Error::other(format!(
+                            "SDK returned non-S_OK success {reported_result:#x}"
+                        ))
                     },
                 ));
             }
-            anchor.require_entry_absent()?;
+            if profile_present {
+                if control == Some(CleanupControl::SdkSOkNoEffect) && injected_result == Some(0) {
+                    if let Some(late) = late.as_deref_mut() {
+                        late.target(
+                            "profile_presence_postprobe",
+                            "hresult",
+                            "S_OK",
+                            "SDK skipped; injected S_OK; expected profile identity remains present",
+                        );
+                    }
+                } else if let Some(late) = late.as_deref_mut() {
+                    late.unexpected(
+                        "profile_absence_probe",
+                        "receipt",
+                        "still_present",
+                        "literal S_OK did not produce profile absence",
+                    );
+                }
+                return Err(invalid(
+                    "profile entry remained present at the shared SDK absence-result gate",
+                ));
+            }
             receipt.profile_absent = true;
+            if let Some(late) = late.as_deref_mut() {
+                late_set(
+                    &mut late.fields,
+                    "profile_absence_probe",
+                    "relative_not_found",
+                );
+            }
             let registry = receipt
                 .registry
                 .as_mut()
@@ -4773,6 +5361,43 @@ mod registry_witness_tests {
             registry.verify()?;
             registry.absence_proven = true;
             session.closed = true;
+            if control == Some(CleanupControl::ObservationParentCloseError) {
+                let packages = anchor.packages.take().ok_or_else(|| {
+                    invalid("Packages observer missing before close-fault control")
+                })?;
+                close_checked(
+                    packages,
+                    "CloseHandle(Packages after actual SDK absence proof)",
+                )?;
+                receipt.profile_packages_close_succeeded = true;
+                if let Some(late) = late.as_deref_mut() {
+                    late_set(&mut late.fields, "packages_observer_state", "closed");
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_reported_result",
+                        "injected_close_error",
+                    );
+                    late.native_executed = true;
+                    late.native_domain = "close".to_owned();
+                    late.native_result = "close_succeeded".to_owned();
+                    late.reported_result = "injected_close_error".to_owned();
+                    late.injected = true;
+                    late.target(
+                        "packages_observer_close",
+                        "receipt",
+                        "injected_close",
+                        "Packages close succeeded after profile absence; injected close error",
+                    );
+                }
+                return Err(invalid(
+                    "injected Packages observer close error after native close success",
+                ));
+            }
             receipt.profile_packages = anchor.packages.take();
             receipt.profile_packages_identity = Some(anchor.packages_identity);
             receipt.profile_entry_leaf = Some(anchor.entry_leaf.clone());
@@ -4781,7 +5406,12 @@ mod registry_witness_tests {
 
         let mut close_errors = Vec::new();
         if transition.is_err() {
-            if let Err(error) = anchor.close_internal() {
+            let anchor_close = if let Some(late_state) = late.as_deref_mut() {
+                anchor.close_internal_with_late(late_state)
+            } else {
+                anchor.close_internal()
+            };
+            if let Err(error) = anchor_close {
                 close_errors.push(error.to_string());
             }
             if let Some(packages) = anchor.packages.take() {
@@ -4789,14 +5419,53 @@ mod registry_witness_tests {
                     packages,
                     "CloseHandle(Packages after profile finalization failure)",
                 ) {
-                    Ok(()) => receipt.profile_packages_close_succeeded = true,
-                    Err(error) => close_errors.push(error.to_string()),
+                    Ok(()) => {
+                        receipt.profile_packages_close_succeeded = true;
+                        if let Some(late) = late.as_deref_mut() {
+                            late_set(&mut late.fields, "packages_observer_state", "closed");
+                            late_set(
+                                &mut late.fields,
+                                "packages_observer_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "packages_observer_close_reported_result",
+                                "not_injected",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(late) = late.as_deref_mut() {
+                            late.unexpected(
+                                "packages_observer_close",
+                                "close",
+                                "native_close_error",
+                                &error.to_string(),
+                            );
+                            late_set(&mut late.fields, "packages_observer_state", "close_failed");
+                            late_set(
+                                &mut late.fields,
+                                "packages_observer_close_native_result",
+                                "error",
+                            );
+                        }
+                        close_errors.push(error.to_string());
+                    }
                 }
             }
             if let Some(root) = session.root.take() {
                 if let Err(error) =
                     close_checked(root, "CloseHandle(profile root after finalization failure)")
                 {
+                    if let Some(late) = late.as_deref_mut() {
+                        late.unexpected(
+                            "profile_root_close",
+                            "close",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                    }
                     close_errors.push(error.to_string());
                 }
             }
@@ -5963,6 +6632,9 @@ mod registry_witness_tests {
             mut self,
             session: &SandboxSession,
             gate: &CleanupJobGate,
+            control: Option<CleanupControl>,
+            profile_ac: Option<(HANDLE, (u64, [u8; 16]))>,
+            late: Option<&mut LateControlState>,
         ) -> ImageDirectoryAbsence {
             let mut receipt = ImageDirectoryAbsence {
                 image_disposition_succeeded: false,
@@ -5973,6 +6645,7 @@ mod registry_witness_tests {
                 directory_absent: false,
                 errors: Vec::new(),
             };
+            let mut late = late;
             let mut deletion_file: Option<File> = None;
             let mut deletion_handle: Option<OwnedHandle> = None;
             let outcome = (|| -> io::Result<()> {
@@ -5994,14 +6667,174 @@ mod registry_witness_tests {
                     self.file.take().expect("validated immutable reader"),
                     "CloseHandle(immutable helper image reader)",
                 )?;
+                if let Some(late) = late.as_deref_mut() {
+                    late_set(&mut late.fields, "helper_image_reader_state", "closed");
+                    late_set(
+                        &mut late.fields,
+                        "helper_image_reader_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "helper_image_reader_close_reported_result",
+                        "not_injected",
+                    );
+                }
+                if control == Some(CleanupControl::ReaderCloseError) {
+                    if let Some(late) = late.as_deref_mut() {
+                        let expected_descriptor = digest(&self.expected_resource_dacl)?;
+                        late_observe_object(
+                            late,
+                            "image",
+                            directory_raw,
+                            &self.image_leaf,
+                            false,
+                            self.identity,
+                            &self.sha256,
+                            &expected_descriptor,
+                            self.directory_identity,
+                            false,
+                        )?;
+                        late.native_executed = true;
+                        late.native_domain = "close".to_owned();
+                        late.native_result = "close_succeeded".to_owned();
+                        late.reported_result = "injected_close_error".to_owned();
+                        late.injected = true;
+                        late_set(
+                            &mut late.fields,
+                            "helper_image_reader_close_reported_result",
+                            "injected_close_error",
+                        );
+                        late.target(
+                            "image_reader_close",
+                            "receipt",
+                            "injected_close",
+                            "image reader close succeeded; injected close error",
+                        );
+                    }
+                    return Err(invalid(
+                        "injected immutable image-reader close error after native success",
+                    ));
+                }
                 gate.require_zero("helper image delete-capability open")?;
-                deletion_handle = Some(relative_open(
-                    directory_raw,
-                    &self.image_leaf,
-                    false,
-                    FILE_GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                    FILE_SHARE_READ,
-                )?);
+                let mut delete_open_status = None;
+                deletion_handle = Some(
+                    relative_open_with_status(
+                        directory_raw,
+                        &self.image_leaf,
+                        false,
+                        FILE_GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        FILE_SHARE_READ,
+                        &mut delete_open_status,
+                    )
+                    .or_else(|error| {
+                        if control == Some(CleanupControl::HeldReaderSharing)
+                            && delete_open_status == Some(0xC000_0043u32 as i32)
+                        {
+                            if let Some(late) = late.as_deref_mut() {
+                                late.native_executed = true;
+                                late.native_domain = "ntstatus".to_owned();
+                                late.native_result = "0xC0000043".to_owned();
+                                late.reported_result = "native_status".to_owned();
+                                late.injected = false;
+                                late.target(
+                                    "image_delete_open",
+                                    "ntstatus",
+                                    "0xC0000043",
+                                    "STATUS_SHARING_VIOLATION blocked image DELETE open",
+                                );
+                                if let Some(blocker) = late.held_reader_blocker.take() {
+                                    match close_checked(
+                                        blocker,
+                                        "CloseHandle(held image reader blocker)",
+                                    ) {
+                                        Ok(()) => {
+                                            late.fields.insert(
+                                                "held_reader_blocker_state".to_owned(),
+                                                "opened_retained_then_closed".to_owned(),
+                                            );
+                                            late.fields.insert(
+                                                "held_reader_blocker_close_native_result"
+                                                    .to_owned(),
+                                                "success".to_owned(),
+                                            );
+                                            late.fields.insert(
+                                                "held_reader_blocker_close_reported_result"
+                                                    .to_owned(),
+                                                "not_injected".to_owned(),
+                                            );
+                                        }
+                                        Err(close) => {
+                                            late.unexpected(
+                                                "held_reader_blocker_close",
+                                                "close",
+                                                "native_close_error",
+                                                &close.to_string(),
+                                            );
+                                            late.fields.insert(
+                                                "held_reader_blocker_state".to_owned(),
+                                                "close_failed".to_owned(),
+                                            );
+                                            late.fields.insert(
+                                                "held_reader_blocker_close_native_result"
+                                                    .to_owned(),
+                                                "error".to_owned(),
+                                            );
+                                        }
+                                    }
+                                }
+                                let expected_descriptor = digest(&self.expected_resource_dacl)?;
+                                if let Err(postcheck) = late_observe_object(
+                                    late,
+                                    "image",
+                                    directory_raw,
+                                    &self.image_leaf,
+                                    false,
+                                    self.identity,
+                                    &self.sha256,
+                                    &expected_descriptor,
+                                    self.directory_identity,
+                                    false,
+                                ) {
+                                    late.unexpected(
+                                        "image_postprobe",
+                                        "probe",
+                                        "postcheck_error",
+                                        &postcheck.to_string(),
+                                    );
+                                }
+                                let directory_descriptor = digest(&self.expected_directory_dacl)?;
+                                if let Some((ac, ac_identity)) = profile_ac {
+                                    if let Err(postcheck) = late_observe_object(
+                                        late,
+                                        "helper_directory",
+                                        ac,
+                                        &self.directory_leaf,
+                                        true,
+                                        self.directory_identity,
+                                        "",
+                                        &directory_descriptor,
+                                        ac_identity,
+                                        true,
+                                    ) {
+                                        late.unexpected(
+                                            "helper_directory_postprobe",
+                                            "probe",
+                                            "postcheck_error",
+                                            &postcheck.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error)
+                        } else {
+                            Err(error)
+                        }
+                    })?,
+                );
+                if let Some(late) = late.as_deref_mut() {
+                    late_set(&mut late.fields, "image_delete_handle_state", "opened");
+                }
                 let delete_raw = deletion_handle
                     .as_ref()
                     .expect("delete-capability handle retained")
@@ -6039,13 +6872,47 @@ mod registry_witness_tests {
                     "CloseHandle(helper image identity bridge)",
                 )?;
                 gate.require_zero("helper image disposition")?;
-                disposition_once(
-                    deletion_handle
-                        .as_ref()
-                        .expect("delete-capability owner retained")
-                        .as_raw_handle(),
-                )?;
-                receipt.image_disposition_succeeded = true;
+                if control == Some(CleanupControl::ImageDispositionNoEffect) {
+                    if let Some(late) = late.as_deref_mut() {
+                        late_set(&mut late.fields, "image_disposition_executed", "false");
+                        late_set(
+                            &mut late.fields,
+                            "image_disposition_native_result",
+                            "not_called",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "image_disposition_reported_result",
+                            "success",
+                        );
+                        late.native_executed = false;
+                        late.native_domain = "ntstatus".to_owned();
+                        late.native_result = "not_called".to_owned();
+                        late.reported_result = "success".to_owned();
+                        late.injected = true;
+                    }
+                } else {
+                    disposition_once(
+                        deletion_handle
+                            .as_ref()
+                            .expect("delete-capability owner retained")
+                            .as_raw_handle(),
+                    )?;
+                    receipt.image_disposition_succeeded = true;
+                    if let Some(late) = late.as_deref_mut() {
+                        late_set(&mut late.fields, "image_disposition_executed", "true");
+                        late_set(
+                            &mut late.fields,
+                            "image_disposition_native_result",
+                            "STATUS_SUCCESS",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "image_disposition_reported_result",
+                            "STATUS_SUCCESS",
+                        );
+                    }
+                }
                 close_checked(
                     deletion_handle
                         .take()
@@ -6053,9 +6920,73 @@ mod registry_witness_tests {
                     "CloseHandle(helper image deletion capability)",
                 )?;
                 receipt.image_close_succeeded = true;
+                if let Some(late) = late.as_deref_mut() {
+                    late_set(&mut late.fields, "image_delete_handle_state", "closed");
+                    late_set(
+                        &mut late.fields,
+                        "image_delete_handle_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "image_delete_handle_close_reported_result",
+                        "not_injected",
+                    );
+                }
                 gate.require_zero("helper image absence probe")?;
-                receipt.image_absent =
-                    relative_probe_absent(directory_raw, &self.image_leaf, false)?;
+                receipt.image_absent = if control == Some(CleanupControl::ImageDispositionNoEffect)
+                {
+                    matches!(
+                        relative_probe_observe(directory_raw, &self.image_leaf, false)?,
+                        RelativeObjectObservation::Absent
+                    )
+                } else {
+                    relative_probe_absent(directory_raw, &self.image_leaf, false)?
+                };
+                if control == Some(CleanupControl::ImageDispositionNoEffect) {
+                    if !receipt.image_absent {
+                        if let Some(late) = late.as_deref_mut() {
+                            let expected_descriptor = digest(&self.expected_resource_dacl)?;
+                            late_observe_object(
+                                late,
+                                "image",
+                                directory_raw,
+                                &self.image_leaf,
+                                false,
+                                self.identity,
+                                &self.sha256,
+                                &expected_descriptor,
+                                self.directory_identity,
+                                false,
+                            )?;
+                            late.target(
+                                "image_presence_postprobe",
+                                "receipt",
+                                "image_present",
+                                "image remains after reported-success no-effect disposition",
+                            );
+                        }
+                        return Err(invalid(
+                            "image remained present after injected successful no-effect disposition",
+                        ));
+                    }
+                    return Err(invalid("image no-effect control did not retain the image"));
+                }
+                if let Some(late) = late.as_deref_mut() {
+                    let expected_descriptor = digest(&self.expected_resource_dacl)?;
+                    late_observe_object(
+                        late,
+                        "image",
+                        directory_raw,
+                        &self.image_leaf,
+                        false,
+                        self.identity,
+                        &self.sha256,
+                        &expected_descriptor,
+                        self.directory_identity,
+                        false,
+                    )?;
+                }
 
                 gate.require_zero("helper directory pre-disposition")?;
                 if script_identity(directory_raw)? != self.directory_identity
@@ -6067,8 +6998,42 @@ mod registry_witness_tests {
                     invalid("profile root closed before helper directory absence")
                 })?;
                 gate.require_zero("helper directory disposition")?;
-                disposition_once(directory_raw)?;
-                receipt.directory_disposition_succeeded = true;
+                if control == Some(CleanupControl::DirectoryDispositionNoEffect) {
+                    if let Some(late) = late.as_deref_mut() {
+                        late_set(&mut late.fields, "directory_disposition_executed", "false");
+                        late_set(
+                            &mut late.fields,
+                            "directory_disposition_native_result",
+                            "not_called",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "directory_disposition_reported_result",
+                            "success",
+                        );
+                        late.native_executed = false;
+                        late.native_domain = "ntstatus".to_owned();
+                        late.native_result = "not_called".to_owned();
+                        late.reported_result = "success".to_owned();
+                        late.injected = true;
+                    }
+                } else {
+                    disposition_once(directory_raw)?;
+                    receipt.directory_disposition_succeeded = true;
+                    if let Some(late) = late.as_deref_mut() {
+                        late_set(&mut late.fields, "directory_disposition_executed", "true");
+                        late_set(
+                            &mut late.fields,
+                            "directory_disposition_native_result",
+                            "STATUS_SUCCESS",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "directory_disposition_reported_result",
+                            "STATUS_SUCCESS",
+                        );
+                    }
+                }
                 close_checked(
                     self.directory_handle
                         .take()
@@ -6076,14 +7041,121 @@ mod registry_witness_tests {
                     "CloseHandle(helper directory deletion capability)",
                 )?;
                 receipt.directory_close_succeeded = true;
+                if let Some(late) = late.as_deref_mut() {
+                    late_set(&mut late.fields, "helper_directory_keeper_state", "closed");
+                    late_set(
+                        &mut late.fields,
+                        "helper_directory_keeper_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "helper_directory_keeper_close_reported_result",
+                        "not_injected",
+                    );
+                }
                 gate.require_zero("helper directory absence probe")?;
-                receipt.directory_absent =
-                    relative_probe_absent(root.as_raw_handle(), &self.directory_leaf, true)?;
+                receipt.directory_absent = if control
+                    == Some(CleanupControl::DirectoryDispositionNoEffect)
+                {
+                    matches!(
+                        relative_probe_observe(root.as_raw_handle(), &self.directory_leaf, true)?,
+                        RelativeObjectObservation::Absent
+                    )
+                } else {
+                    relative_probe_absent(root.as_raw_handle(), &self.directory_leaf, true)?
+                };
+                if control == Some(CleanupControl::DirectoryDispositionNoEffect) {
+                    if !receipt.directory_absent {
+                        if let Some(late) = late.as_deref_mut() {
+                            if let Some((ac, ac_identity)) = profile_ac {
+                                late_observe_object(
+                                    late,
+                                    "helper_directory",
+                                    ac,
+                                    &self.directory_leaf,
+                                    true,
+                                    self.directory_identity,
+                                    "",
+                                    &digest(&self.expected_directory_dacl)?,
+                                    ac_identity,
+                                    true,
+                                )?;
+                            }
+                            late.target(
+                                "directory_presence_postprobe",
+                                "receipt",
+                                "dir_present",
+                                "directory remains after reported-success no-effect disposition",
+                            );
+                        }
+                        return Err(invalid(
+                            "helper directory remained present after injected successful no-effect disposition",
+                        ));
+                    }
+                    return Err(invalid(
+                        "directory no-effect control did not retain the directory",
+                    ));
+                }
+                if let Some(late) = late.as_deref_mut() {
+                    if let Some((ac, ac_identity)) = profile_ac {
+                        late_observe_object(
+                            late,
+                            "helper_directory",
+                            ac,
+                            &self.directory_leaf,
+                            true,
+                            self.directory_identity,
+                            "",
+                            &digest(&self.expected_directory_dacl)?,
+                            ac_identity,
+                            true,
+                        )?;
+                    }
+                }
                 if !receipt.image_absent || !receipt.directory_absent {
                     return Err(invalid("helper image/directory absence was not proved"));
                 }
                 Ok(())
             })();
+
+            if let (Some(late), Some((ac, ac_identity)), Some(directory)) = (
+                late.as_deref_mut(),
+                profile_ac,
+                self.directory_handle.as_ref(),
+            ) {
+                let observation = digest(&self.expected_directory_dacl).and_then(|descriptor| {
+                    late_observe_object(
+                        late,
+                        "helper_directory",
+                        ac,
+                        &self.directory_leaf,
+                        true,
+                        self.directory_identity,
+                        "",
+                        &descriptor,
+                        ac_identity,
+                        true,
+                    )
+                });
+                if let Err(error) = observation {
+                    late.unexpected(
+                        "helper_directory_postprobe",
+                        "probe",
+                        "postcheck_error",
+                        &error.to_string(),
+                    );
+                } else if script_identity(directory.as_raw_handle()).ok()
+                    != Some(self.directory_identity)
+                {
+                    late.unexpected(
+                        "helper_directory_keeper",
+                        "identity",
+                        "changed",
+                        "held helper directory keeper identity changed during cleanup",
+                    );
+                }
+            }
 
             if let Some(file) = deletion_file.take() {
                 if let Err(error) =
@@ -6095,12 +7167,45 @@ mod registry_witness_tests {
                 }
             }
             if let Some(handle) = deletion_handle.take() {
-                if let Err(error) =
-                    close_checked(handle, "CloseHandle(partial image delete capability)")
-                {
-                    receipt.errors.push(format!(
-                        "partial image delete-capability close failed: {error}"
-                    ));
+                match close_checked(handle, "CloseHandle(partial image delete capability)") {
+                    Ok(()) => {
+                        if let Some(late) = late.as_deref_mut() {
+                            late_set(&mut late.fields, "image_delete_handle_state", "closed");
+                            late_set(
+                                &mut late.fields,
+                                "image_delete_handle_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "image_delete_handle_close_reported_result",
+                                "not_injected",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(late) = late.as_deref_mut() {
+                            late.unexpected(
+                                "image_delete_handle_close",
+                                "close",
+                                "native_close_error",
+                                &error.to_string(),
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "image_delete_handle_state",
+                                "close_failed",
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "image_delete_handle_close_native_result",
+                                "error",
+                            );
+                        }
+                        receipt.errors.push(format!(
+                            "partial image delete-capability close failed: {error}"
+                        ));
+                    }
                 }
             }
             if let Some(reader) = self.file.take() {
@@ -6123,12 +7228,45 @@ mod registry_witness_tests {
                 }
             }
             if let Some(directory) = self.directory_handle.take() {
-                if let Err(error) =
-                    close_checked(directory, "CloseHandle(remaining helper directory keeper)")
-                {
-                    receipt.errors.push(format!(
-                        "remaining helper directory keeper close failed: {error}"
-                    ));
+                match close_checked(directory, "CloseHandle(remaining helper directory keeper)") {
+                    Ok(()) => {
+                        if let Some(late) = late.as_deref_mut() {
+                            late_set(&mut late.fields, "helper_directory_keeper_state", "closed");
+                            late_set(
+                                &mut late.fields,
+                                "helper_directory_keeper_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "helper_directory_keeper_close_reported_result",
+                                "not_injected",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(late) = late.as_deref_mut() {
+                            late.unexpected(
+                                "helper_directory_keeper_close",
+                                "close",
+                                "native_close_error",
+                                &error.to_string(),
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "helper_directory_keeper_state",
+                                "close_failed",
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "helper_directory_keeper_close_native_result",
+                                "error",
+                            );
+                        }
+                        receipt.errors.push(format!(
+                            "remaining helper directory keeper close failed: {error}"
+                        ));
+                    }
                 }
             }
             if let Err(error) = outcome {
@@ -8208,6 +9346,15 @@ mod registry_witness_tests {
         MissingJobFence,
         LiveNonzeroJob,
         JobQueryError,
+        HeldReaderSharing,
+        ReaderCloseError,
+        ProfileAnchorCloseError,
+        ObservationParentCloseError,
+        JobFenceCloseError,
+        ImageDispositionNoEffect,
+        DirectoryDispositionNoEffect,
+        SdkError,
+        SdkSOkNoEffect,
     }
 
     impl CleanupControl {
@@ -8229,6 +9376,15 @@ mod registry_witness_tests {
                 Self::MissingJobFence => "missing_job_fence",
                 Self::LiveNonzeroJob => "live_nonzero_job",
                 Self::JobQueryError => "job_query_error",
+                Self::HeldReaderSharing => "held_reader_sharing",
+                Self::ReaderCloseError => "reader_close_error",
+                Self::ProfileAnchorCloseError => "profile_anchor_close_error",
+                Self::ObservationParentCloseError => "observation_parent_close_error",
+                Self::JobFenceCloseError => "job_fence_close_error",
+                Self::ImageDispositionNoEffect => "image_disposition_noeffect",
+                Self::DirectoryDispositionNoEffect => "directory_disposition_noeffect",
+                Self::SdkError => "sdk_error",
+                Self::SdkSOkNoEffect => "sdk_s_ok_noeffect",
             }
         }
 
@@ -8260,6 +9416,21 @@ mod registry_witness_tests {
                 Self::MissingJobFence => "both exact Job fences are required",
                 Self::LiveNonzeroJob => "cancel Job is not empty before live nonzero cleanup",
                 Self::JobQueryError => "injected Job query error after native zero observation",
+                Self::HeldReaderSharing => {
+                    "helper image delete open rejected by actual sharing violation"
+                }
+                Self::ReaderCloseError => "injected immutable image-reader close error",
+                Self::ProfileAnchorCloseError => "injected profile AC-anchor close error",
+                Self::ObservationParentCloseError => "injected Packages observer close error",
+                Self::JobFenceCloseError => "injected normal Job-fence close error",
+                Self::ImageDispositionNoEffect => {
+                    "image disposition reported success but image remains present"
+                }
+                Self::DirectoryDispositionNoEffect => {
+                    "directory disposition reported success but directory remains present"
+                }
+                Self::SdkError => "injected non-S_OK profile SDK result",
+                Self::SdkSOkNoEffect => "SDK reported S_OK but profile entry remains present",
             }
         }
 
@@ -8282,7 +9453,31 @@ mod registry_witness_tests {
                 Self::MissingJobFence => "cleanup_job_fence_missing",
                 Self::LiveNonzeroJob => "cancel_job_live_nonzero_refused",
                 Self::JobQueryError => "cleanup_job_query_error_injected",
+                Self::HeldReaderSharing => "image_delete_open_share_violation",
+                Self::ReaderCloseError => "image_reader_close_error_injected",
+                Self::ProfileAnchorCloseError => "profile_ac_close_error_injected",
+                Self::ObservationParentCloseError => "packages_close_error_injected",
+                Self::JobFenceCloseError => "normal_job_close_error_injected",
+                Self::ImageDispositionNoEffect => "image_absence_postprobe_found_object",
+                Self::DirectoryDispositionNoEffect => "directory_absence_postprobe_found_object",
+                Self::SdkError => "sdk_reported_non_s_ok_injected",
+                Self::SdkSOkNoEffect => "packages_absence_postprobe_found_object",
             }
+        }
+
+        fn is_late(self) -> bool {
+            matches!(
+                self,
+                Self::HeldReaderSharing
+                    | Self::ReaderCloseError
+                    | Self::ProfileAnchorCloseError
+                    | Self::ObservationParentCloseError
+                    | Self::JobFenceCloseError
+                    | Self::ImageDispositionNoEffect
+                    | Self::DirectoryDispositionNoEffect
+                    | Self::SdkError
+                    | Self::SdkSOkNoEffect
+            )
         }
     }
 
@@ -8308,6 +9503,15 @@ mod registry_witness_tests {
         content_sha256: String,
         descriptor_sha256: String,
         profile_fact: ProfileEntryFact,
+    }
+
+    struct LateExternalCanary {
+        parent: Option<OwnedHandle>,
+        directory: Option<OwnedHandle>,
+        directory_leaf: String,
+        directory_identity: (u64, [u8; 16]),
+        directory_descriptor_sha256: String,
+        facts: ControlFileFacts,
     }
 
     #[derive(Clone, Debug)]
@@ -8347,6 +9551,1039 @@ mod registry_witness_tests {
                 inventory_sha256: "not_applicable".to_owned(),
             }
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct LateErrorEvent {
+        phase: String,
+        domain: String,
+        code: String,
+        message: String,
+    }
+
+    struct LateControlState {
+        control: CleanupControl,
+        fault_phase: String,
+        target_refusal_phase: String,
+        native_executed: bool,
+        native_domain: String,
+        native_result: String,
+        reported_result: String,
+        injected: bool,
+        target_events: Vec<LateErrorEvent>,
+        unexpected_events: Vec<LateErrorEvent>,
+        fields: BTreeMap<String, String>,
+        held_reader_blocker: Option<OwnedHandle>,
+        external_canary: Option<LateExternalCanary>,
+    }
+
+    impl LateControlState {
+        fn new(control: CleanupControl) -> Self {
+            let (fault_phase, target_refusal_phase) = match control {
+                CleanupControl::HeldReaderSharing => ("held_reader_open", "image_delete_open"),
+                CleanupControl::ReaderCloseError => ("image_reader_close", "image_reader_close"),
+                CleanupControl::ProfileAnchorCloseError => {
+                    ("profile_ac_anchor_close", "sdk_suppressed_profile_present")
+                }
+                CleanupControl::ObservationParentCloseError => {
+                    ("packages_observer_close", "packages_observer_close")
+                }
+                CleanupControl::JobFenceCloseError => {
+                    ("normal_job_fence_close", "normal_job_fence_close")
+                }
+                CleanupControl::ImageDispositionNoEffect => {
+                    ("image_disposition", "image_presence_postprobe")
+                }
+                CleanupControl::DirectoryDispositionNoEffect => {
+                    ("directory_disposition", "directory_presence_postprobe")
+                }
+                CleanupControl::SdkError => ("sdk_call", "sdk_reported_result"),
+                CleanupControl::SdkSOkNoEffect => ("sdk_call", "profile_presence_postprobe"),
+                _ => ("not_late", "not_late"),
+            };
+            Self {
+                control,
+                fault_phase: fault_phase.to_owned(),
+                target_refusal_phase: target_refusal_phase.to_owned(),
+                native_executed: false,
+                native_domain: "not_reached".to_owned(),
+                native_result: "not_called".to_owned(),
+                reported_result: "not_injected".to_owned(),
+                injected: false,
+                target_events: Vec::new(),
+                unexpected_events: Vec::new(),
+                fields: BTreeMap::new(),
+                held_reader_blocker: None,
+                external_canary: None,
+            }
+        }
+
+        fn target(&mut self, phase: &str, domain: &str, code: &str, message: &str) {
+            let event = LateErrorEvent {
+                phase: phase.to_owned(),
+                domain: domain.to_owned(),
+                code: code.to_owned(),
+                message: message.to_owned(),
+            };
+            if self.target_events.is_empty() {
+                self.target_events.push(event);
+            } else {
+                self.unexpected_events.push(event);
+            }
+        }
+
+        fn unexpected(&mut self, phase: &str, domain: &str, code: &str, message: &str) {
+            self.unexpected_events.push(LateErrorEvent {
+                phase: phase.to_owned(),
+                domain: domain.to_owned(),
+                code: code.to_owned(),
+                message: message.to_owned(),
+            });
+        }
+
+        fn initialize_fields(
+            &mut self,
+            nonce: &str,
+            parent_pid: u32,
+            parent_creation: &str,
+        ) -> io::Result<()> {
+            for name in late_detail_field_names() {
+                self.fields.insert(name, "not_reached".to_owned());
+            }
+            let source = std::env::var("GITHUB_SHA")
+                .map_err(|_| invalid("late control source SHA missing"))?;
+            let run = std::env::var("GITHUB_RUN_ID")
+                .map_err(|_| invalid("late control run ID missing"))?;
+            if source.len() != 40
+                || !source.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || run.is_empty()
+                || !run.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(invalid("late control source/run binding has invalid form"));
+            }
+            self.fields
+                .insert("case".to_owned(), self.control.name().to_owned());
+            self.fields.insert("nonce".to_owned(), nonce.to_owned());
+            self.fields
+                .insert("source".to_owned(), source.to_ascii_lowercase());
+            self.fields.insert("run".to_owned(), run);
+            self.fields.insert(
+                "selected_unit".to_owned(),
+                format!(
+                    "process::windows::registry_witness_tests::registry_witness_cleanup_control_{}",
+                    self.control.name()
+                ),
+            );
+            self.fields
+                .insert("parent_pid".to_owned(), parent_pid.to_string());
+            self.fields.insert(
+                "parent_creation".to_owned(),
+                parent_creation.to_ascii_uppercase(),
+            );
+            self.fields
+                .insert("setup_verified".to_owned(), "false".to_owned());
+            self.fields
+                .insert("target_reached".to_owned(), "false".to_owned());
+            self.fields
+                .insert("partial_verified".to_owned(), "false".to_owned());
+            self.fields
+                .insert("fault_phase".to_owned(), self.fault_phase.clone());
+            self.fields.insert(
+                "target_refusal_phase".to_owned(),
+                self.target_refusal_phase.clone(),
+            );
+            self.fields
+                .insert("native_executed".to_owned(), "false".to_owned());
+            self.fields
+                .insert("native_domain".to_owned(), "not_reached".to_owned());
+            self.fields
+                .insert("native_result".to_owned(), "not_called".to_owned());
+            self.fields
+                .insert("reported_result".to_owned(), "not_injected".to_owned());
+            self.fields
+                .insert("injected".to_owned(), "false".to_owned());
+            self.fields
+                .insert("target_count".to_owned(), "0".to_owned());
+            self.fields
+                .insert("unexpected_error_count".to_owned(), "0".to_owned());
+            self.fields.insert("errors".to_owned(), "v1|0|".to_owned());
+            Ok(())
+        }
+
+        fn sync_event_fields(&mut self) -> io::Result<()> {
+            self.fields.insert(
+                "target_count".to_owned(),
+                self.target_events.len().to_string(),
+            );
+            self.fields.insert(
+                "unexpected_error_count".to_owned(),
+                self.unexpected_events.len().to_string(),
+            );
+            self.fields.insert(
+                "native_executed".to_owned(),
+                self.native_executed.to_string(),
+            );
+            self.fields
+                .insert("native_domain".to_owned(), self.native_domain.clone());
+            self.fields
+                .insert("native_result".to_owned(), self.native_result.clone());
+            self.fields
+                .insert("reported_result".to_owned(), self.reported_result.clone());
+            self.fields
+                .insert("injected".to_owned(), self.injected.to_string());
+            self.fields.insert("errors".to_owned(), self.errors_wire()?);
+            Ok(())
+        }
+
+        fn errors_wire(&self) -> io::Result<String> {
+            let count = self.target_events.len() + self.unexpected_events.len();
+            if count > 16 {
+                return Err(invalid("late control error event bound exceeded"));
+            }
+            let mut output = format!("v1|{count}|");
+            for (index, event) in self
+                .target_events
+                .iter()
+                .chain(self.unexpected_events.iter())
+                .enumerate()
+            {
+                if index != 0 {
+                    output.push(';');
+                }
+                if event.phase.is_empty()
+                    || event.domain.is_empty()
+                    || event.code.is_empty()
+                    || event
+                        .phase
+                        .bytes()
+                        .any(|b| !b.is_ascii_alphanumeric() && b != b'_')
+                    || event
+                        .domain
+                        .bytes()
+                        .any(|b| !b.is_ascii_alphanumeric() && b != b'_')
+                    || event
+                        .code
+                        .bytes()
+                        .any(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'-')
+                {
+                    return Err(invalid("late control error event has an invalid token"));
+                }
+                if event.message.len() > 256 {
+                    return Err(invalid("late control error message exceeds 256-byte bound"));
+                }
+                output.push_str(&event.phase);
+                output.push(',');
+                output.push_str(&event.domain);
+                output.push(',');
+                output.push_str(&event.code);
+                output.push(',');
+                for byte in event.message.as_bytes() {
+                    use std::fmt::Write as _;
+                    write!(output, "{byte:02X}").expect("string write");
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    fn late_expected_event_admitted(
+        control: CleanupControl,
+        cleanup_errors: &[String],
+        late: &LateControlState,
+    ) -> bool {
+        if cleanup_errors.len() != 1
+            || late.target_events.len() != 1
+            || !late.unexpected_events.is_empty()
+        {
+            return false;
+        }
+        let expected = match control {
+            CleanupControl::HeldReaderSharing => ("image_delete_open", "ntstatus", "0xC0000043"),
+            CleanupControl::ReaderCloseError => ("image_reader_close", "receipt", "injected_close"),
+            CleanupControl::ProfileAnchorCloseError => (
+                "sdk_suppressed_profile_present",
+                "receipt",
+                "injected_close",
+            ),
+            CleanupControl::ObservationParentCloseError => {
+                ("packages_observer_close", "receipt", "injected_close")
+            }
+            CleanupControl::JobFenceCloseError => {
+                ("normal_job_fence_close", "receipt", "injected_close")
+            }
+            CleanupControl::ImageDispositionNoEffect => {
+                ("image_presence_postprobe", "receipt", "image_present")
+            }
+            CleanupControl::DirectoryDispositionNoEffect => {
+                ("directory_presence_postprobe", "receipt", "dir_present")
+            }
+            CleanupControl::SdkError => ("sdk_reported_result", "hresult", "fixed_non_s_ok"),
+            CleanupControl::SdkSOkNoEffect => ("profile_presence_postprobe", "hresult", "S_OK"),
+            _ => return false,
+        };
+        let event = &late.target_events[0];
+        late.control == control
+            && (
+                event.phase.as_str(),
+                event.domain.as_str(),
+                event.code.as_str(),
+            ) == expected
+            && event.message.len() <= 96
+    }
+
+    fn late_detail_field_names() -> BTreeSet<String> {
+        let mut names: BTreeSet<String> = [
+            "case",
+            "nonce",
+            "source",
+            "run",
+            "selected_unit",
+            "parent_pid",
+            "parent_creation",
+            "setup_verified",
+            "target_reached",
+            "partial_verified",
+            "fault_phase",
+            "target_refusal_phase",
+            "target_count",
+            "unexpected_error_count",
+            "native_executed",
+            "native_domain",
+            "native_result",
+            "reported_result",
+            "injected",
+            "registry_fixture_id",
+            "registry_root_state",
+            "registry_key_leaf_utf8_bytes",
+            "registry_key_leaf_utf8_hex",
+            "registry_native_key_name_utf8_bytes",
+            "registry_native_key_name_utf8_hex",
+            "registry_software_parent_native_name_utf8_bytes",
+            "registry_software_parent_native_name_utf8_hex",
+            "registry_parent_hkey_provenance",
+            "registry_software_hkey_handle_value",
+            "registry_software_hkey_before_native_name_utf8_bytes",
+            "registry_software_hkey_before_native_name_utf8_hex",
+            "registry_software_hkey_before_result",
+            "registry_software_hkey_after_native_name_utf8_bytes",
+            "registry_software_hkey_after_native_name_utf8_hex",
+            "registry_software_hkey_after_result",
+            "registry_preclose_absence_result",
+            "registry_predelete_machine_view_sha256",
+            "registry_predelete_user_view_sha256",
+            "registry_key_descriptor_sha256",
+            "image_disposition_executed",
+            "image_disposition_native_result",
+            "image_disposition_reported_result",
+            "directory_disposition_executed",
+            "directory_disposition_native_result",
+            "directory_disposition_reported_result",
+            "sdk_executed",
+            "sdk_native_hresult",
+            "sdk_reported_hresult",
+            "profile_absence_probe",
+            "control_directory_volume_id",
+            "control_directory_file_id",
+            "control_directory_descriptor_sha256",
+            "foreign_canary_name_utf8_bytes",
+            "foreign_canary_name_utf8_hex",
+            "foreign_canary_expected_volume_id",
+            "foreign_canary_expected_file_id",
+            "foreign_canary_observed_volume_id",
+            "foreign_canary_observed_file_id",
+            "foreign_canary_expected_content_sha256",
+            "foreign_canary_observed_content_sha256",
+            "foreign_canary_expected_descriptor_sha256",
+            "foreign_canary_observed_descriptor_sha256",
+            "foreign_canary_setup_result",
+            "foreign_canary_preimage_matches",
+            "foreign_canary_postimage_matches",
+            "held_reader_blocker_open_native_result",
+            "errors",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for object in ["image", "helper_directory", "profile_entry"] {
+            for suffix in [
+                "state",
+                "expected_volume_id",
+                "expected_file_id",
+                "observed_volume_id",
+                "observed_file_id",
+                "observed_kind",
+                "observed_content_sha256",
+                "observed_descriptor_sha256",
+                "held_parent_volume_id",
+                "held_parent_file_id",
+                "relative_probe_result",
+                "inventory_count",
+                "inventory_sha256",
+            ] {
+                names.insert(format!("{object}_{suffix}"));
+            }
+        }
+        for owner in [
+            "helper_image_reader",
+            "held_reader_blocker",
+            "image_delete_handle",
+            "helper_directory_keeper",
+            "profile_ac_anchor",
+            "profile_entry_anchor",
+            "packages_observer",
+            "software_registry_parent_hkey",
+            "registry_fixture_hkey",
+            "normal_job_fence",
+            "cancel_job_fence",
+        ] {
+            names.insert(format!("{owner}_state"));
+            names.insert(format!("{owner}_close_native_result"));
+            names.insert(format!("{owner}_close_reported_result"));
+        }
+        names
+    }
+
+    fn late_detail_payload(fields: &BTreeMap<String, String>) -> io::Result<String> {
+        let expected = late_detail_field_names();
+        if expected.len() != 139
+            || fields.len() != expected.len()
+            || fields.keys().any(|name| !expected.contains(name))
+            || expected.iter().any(|name| !fields.contains_key(name))
+        {
+            return Err(invalid(
+                "late detail field set differs from the fixed 139-field contract",
+            ));
+        }
+        let mut payload = String::from("registry_witness_control_late_detail");
+        for (name, value) in fields {
+            if value.is_empty() || value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+                return Err(invalid(
+                    "late detail value is empty or not printable single-token ASCII",
+                ));
+            }
+            use std::fmt::Write as _;
+            write!(payload, " {name}={value}").expect("string write");
+        }
+        if payload.len() > 8192 {
+            return Err(invalid("complete late detail frame exceeds 8192-byte cap"));
+        }
+        for name in &expected {
+            if registry_record_field(&payload, name)? != fields[name] {
+                return Err(invalid("late detail field failed lossless roundtrip"));
+            }
+        }
+        Ok(payload)
+    }
+
+    fn late_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+    }
+
+    fn late_profile_entry_identity(late: &LateControlState) -> io::Result<(u64, [u8; 16])> {
+        let volume = late
+            .fields
+            .get("profile_entry_expected_volume_id")
+            .ok_or_else(|| invalid("late profile expected volume ID missing"))?;
+        let file_id = late
+            .fields
+            .get("profile_entry_expected_file_id")
+            .ok_or_else(|| invalid("late profile expected file ID missing"))?;
+        if volume.len() != 16
+            || !volume.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || file_id.len() != 32
+            || !file_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "late profile expected identity fields have invalid form",
+            ));
+        }
+        let volume = u64::from_str_radix(volume, 16)
+            .map_err(|_| invalid("late profile volume ID parsing failed"))?;
+        let mut identifier = [0u8; 16];
+        for (index, byte) in identifier.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&file_id[index * 2..index * 2 + 2], 16)
+                .map_err(|_| invalid("late profile file ID parsing failed"))?;
+        }
+        Ok((volume, identifier))
+    }
+
+    fn late_set(fields: &mut BTreeMap<String, String>, key: &str, value: impl Into<String>) {
+        fields.insert(key.to_owned(), value.into());
+    }
+
+    fn late_inventory(handle: HANDLE) -> io::Result<(usize, String)> {
+        let mut children = profile_children(handle)?;
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut bytes = Vec::new();
+        for (name, file_id, directory) in &children {
+            let encoded = name.as_bytes();
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(encoded);
+            bytes.extend_from_slice(file_id);
+            bytes.push(u8::from(*directory));
+        }
+        Ok((children.len(), digest(&bytes)?))
+    }
+
+    fn duplicate_late_observer(handle: HANDLE) -> io::Result<OwnedHandle> {
+        let mut duplicate = null_mut();
+        unsafe {
+            ok(
+                "DuplicateHandle(late bounded resource observer)",
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                ),
+            )?;
+        }
+        own("DuplicateHandle(late resource observer)", duplicate)
+    }
+
+    fn late_observe_object(
+        late: &mut LateControlState,
+        object: &str,
+        parent: HANDLE,
+        leaf: &str,
+        directory: bool,
+        expected: (u64, [u8; 16]),
+        expected_hash: &str,
+        expected_descriptor: &str,
+        held_parent: (u64, [u8; 16]),
+        inventory: bool,
+    ) -> io::Result<()> {
+        let prefix = object;
+        let presence = relative_probe_observe(parent, leaf, directory)?;
+        let observed_path_identity = match presence {
+            RelativeObjectObservation::Absent => None,
+            RelativeObjectObservation::Present { identity } => Some(identity),
+        };
+        let present = observed_path_identity.is_some();
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_expected_volume_id"),
+            format!("{:016X}", expected.0),
+        );
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_expected_file_id"),
+            late_hex(&expected.1),
+        );
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_held_parent_volume_id"),
+            format!("{:016X}", held_parent.0),
+        );
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_held_parent_file_id"),
+            late_hex(&held_parent.1),
+        );
+        if !present {
+            late_set(&mut late.fields, &format!("{prefix}_state"), "-");
+            for suffix in [
+                "observed_volume_id",
+                "observed_file_id",
+                "observed_kind",
+                "observed_content_sha256",
+                "observed_descriptor_sha256",
+            ] {
+                late_set(
+                    &mut late.fields,
+                    &format!("{prefix}_{suffix}"),
+                    "not_observed_absent",
+                );
+            }
+            late_set(
+                &mut late.fields,
+                &format!("{prefix}_relative_probe_result"),
+                "relative_not_found",
+            );
+            late_set(
+                &mut late.fields,
+                &format!("{prefix}_inventory_count"),
+                if inventory {
+                    "not_observed_absent"
+                } else {
+                    "not_applicable_fixed_case"
+                },
+            );
+            late_set(
+                &mut late.fields,
+                &format!("{prefix}_inventory_sha256"),
+                if inventory {
+                    "not_observed_absent"
+                } else {
+                    "not_applicable_fixed_case"
+                },
+            );
+            return Ok(());
+        }
+        if observed_path_identity != Some(expected) {
+            return Err(invalid(
+                "late resource path full identity differs from its captured expected object",
+            ));
+        }
+        let handle = relative_open(
+            parent,
+            leaf,
+            directory,
+            if directory {
+                FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE
+            } else {
+                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+            },
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        let observed = (|| -> io::Result<((u64, [u8; 16]), String, String, String, Option<(usize, String)>)> {
+            check_object(handle.as_raw_handle(), directory)?;
+            let identity = script_identity(handle.as_raw_handle())?;
+            let descriptor = digest(&resource_dacl_bytes(handle.as_raw_handle())?)?;
+            let (content, inventory_facts) = if directory {
+                let inventory_facts = late_inventory(handle.as_raw_handle())?;
+                (inventory_facts.1.clone(), Some(inventory_facts))
+            } else {
+                let duplicate = duplicate_late_observer(handle.as_raw_handle())?;
+                let mut file = File::from(duplicate);
+                let read_result = (|| -> io::Result<String> {
+                    file.seek(std::io::SeekFrom::Start(0))?;
+                    let mut bytes = Vec::new();
+                    (&mut file).take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() > 16 * 1024 * 1024 { return Err(invalid("late image observation exceeded its file bound")); }
+                    digest(&bytes)
+                })();
+                let close = close_file_checked(file, "CloseHandle(late observed image duplicate)");
+                let content = match (read_result, close) {
+                    (Ok(value), Ok(())) => value,
+                    (Err(primary), Ok(())) => return Err(primary),
+                    (Ok(_), Err(close)) => return Err(close),
+                    (Err(primary), Err(close)) => return Err(io::Error::other(format!("late image read failed: {primary}; duplicate close failed: {close}"))),
+                };
+                (content, None)
+            };
+            if identity != expected || (!expected_hash.is_empty() && content != expected_hash) || descriptor != expected_descriptor {
+                return Err(invalid("late resource observation differs from captured expected identity/content/DACL"));
+            }
+            let kind = if directory { "directory" } else { "regular_file" }.to_owned();
+            Ok((identity, kind, content, descriptor, inventory_facts))
+        })();
+        let close = close_checked(handle, "CloseHandle(late resource observer)");
+        let (observed_identity, kind, content, observed_descriptor, inventory_facts) = match (
+            observed, close,
+        ) {
+            (Ok(value), Ok(())) => value,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(close)) => return Err(close),
+            (Err(primary), Err(close)) => {
+                return Err(io::Error::other(format!(
+                    "late resource observation failed: {primary}; observer close failed: {close}"
+                )));
+            }
+        };
+        late_set(&mut late.fields, &format!("{prefix}_state"), "+");
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_observed_volume_id"),
+            format!("{:016X}", observed_identity.0),
+        );
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_observed_file_id"),
+            late_hex(&observed_identity.1),
+        );
+        late_set(&mut late.fields, &format!("{prefix}_observed_kind"), kind);
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_observed_content_sha256"),
+            content,
+        );
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_observed_descriptor_sha256"),
+            observed_descriptor,
+        );
+        late_set(
+            &mut late.fields,
+            &format!("{prefix}_relative_probe_result"),
+            "relative_success",
+        );
+        if inventory {
+            if let Some((count, hash)) = inventory_facts {
+                late_set(
+                    &mut late.fields,
+                    &format!("{prefix}_inventory_count"),
+                    count.to_string(),
+                );
+                late_set(
+                    &mut late.fields,
+                    &format!("{prefix}_inventory_sha256"),
+                    hash,
+                );
+            } else {
+                return Err(invalid(
+                    "requested late directory inventory was not observed",
+                ));
+            }
+        } else {
+            late_set(
+                &mut late.fields,
+                &format!("{prefix}_inventory_count"),
+                "not_applicable_fixed_case",
+            );
+            late_set(
+                &mut late.fields,
+                &format!("{prefix}_inventory_sha256"),
+                "not_applicable_fixed_case",
+            );
+        }
+        Ok(())
+    }
+
+    fn fill_late_predelete_fields(
+        late: &mut LateControlState,
+        fixture: &PrivateRegistryFixture,
+        image: &HeldHelperImage,
+        anchor: &ProfileCleanupAnchor,
+        preimages: &(PrivateViewPreimage, PrivateViewPreimage),
+    ) -> io::Result<()> {
+        let software = fixture
+            .software
+            .as_ref()
+            .ok_or_else(|| invalid("Software HKEY missing before late cleanup"))?;
+        let root = fixture
+            .root
+            .as_ref()
+            .ok_or_else(|| invalid("fixture root HKEY missing before late cleanup"))?;
+        let software_name = native_registry_key_name(software.raw())?;
+        let key_name = native_registry_key_name(root.raw())?;
+        let expected_prefix = format!("{software_name}\\");
+        let measured_leaf = &key_name[expected_prefix.len().min(key_name.len())..];
+        if key_name.len() <= expected_prefix.len()
+            || !key_name[..expected_prefix.len()].eq_ignore_ascii_case(&expected_prefix)
+            || !measured_leaf.eq_ignore_ascii_case(&fixture.name)
+        {
+            return Err(invalid(
+                "native fixture key name is not the measured Software parent plus nonce leaf",
+            ));
+        }
+        let full_native_name = key_name;
+        let leaf_bytes = fixture.name.as_bytes();
+        let full_bytes = full_native_name.as_bytes();
+        let software_bytes = software_name.as_bytes();
+        let software_status = win32_open_status(software.raw(), &fixture.name, KEY_READ);
+        if software_status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(software_status as i32));
+        }
+        let fixture_id = digest(fixture.name.as_bytes())?;
+        late_set(&mut late.fields, "registry_fixture_id", fixture_id);
+        late_set(&mut late.fields, "registry_root_state", "present_predelete");
+        late_set(
+            &mut late.fields,
+            "registry_key_leaf_utf8_bytes",
+            leaf_bytes.len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_key_leaf_utf8_hex",
+            late_hex(leaf_bytes),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_native_key_name_utf8_bytes",
+            full_bytes.len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_native_key_name_utf8_hex",
+            late_hex(full_bytes),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_parent_native_name_utf8_bytes",
+            software_bytes.len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_parent_native_name_utf8_hex",
+            late_hex(software_bytes),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_parent_hkey_provenance",
+            "software_hkey_relative_probe_succeeded",
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_handle_value",
+            format!("{:X}", software.raw() as usize),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_before_native_name_utf8_bytes",
+            software_bytes.len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_before_native_name_utf8_hex",
+            late_hex(software_bytes),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_before_result",
+            "native_query_success",
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_after_native_name_utf8_bytes",
+            software_bytes.len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_after_native_name_utf8_hex",
+            late_hex(software_bytes),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_after_result",
+            "not_yet_observed",
+        );
+        late_set(
+            &mut late.fields,
+            "registry_preclose_absence_result",
+            "not_yet_observed",
+        );
+        late_set(
+            &mut late.fields,
+            "registry_predelete_machine_view_sha256",
+            preimages.0.digest()?,
+        );
+        late_set(
+            &mut late.fields,
+            "registry_predelete_user_view_sha256",
+            preimages.1.digest()?,
+        );
+        late_set(
+            &mut late.fields,
+            "registry_key_descriptor_sha256",
+            digest(&registry_key_security(root.raw())?)?,
+        );
+
+        let image_directory = image
+            .directory_handle
+            .as_ref()
+            .ok_or_else(|| invalid("helper directory keeper missing before late cleanup"))?;
+        let image_descriptor = digest(&image.expected_resource_dacl)?;
+        let directory_descriptor = digest(&image.expected_directory_dacl)?;
+        late_observe_object(
+            late,
+            "image",
+            image_directory.as_raw_handle(),
+            &image.image_leaf,
+            false,
+            image.identity,
+            &image.sha256,
+            &image_descriptor,
+            image.directory_identity,
+            false,
+        )?;
+        late_observe_object(
+            late,
+            "helper_directory",
+            anchor
+                .ac
+                .as_ref()
+                .ok_or_else(|| invalid("profile AC anchor missing before late cleanup"))?
+                .as_raw_handle(),
+            &image.directory_leaf,
+            true,
+            image.directory_identity,
+            "",
+            &directory_descriptor,
+            anchor.ac_identity,
+            true,
+        )?;
+        let packages = anchor
+            .packages
+            .as_ref()
+            .ok_or_else(|| invalid("Packages observer missing before late cleanup"))?;
+        let entry = anchor
+            .entry
+            .as_ref()
+            .ok_or_else(|| invalid("profile entry observer missing before late cleanup"))?;
+        let profile_descriptor = digest(&resource_dacl_bytes(entry.as_raw_handle())?)?;
+        late_observe_object(
+            late,
+            "profile_entry",
+            packages.as_raw_handle(),
+            &anchor.entry_leaf,
+            true,
+            anchor.entry_identity,
+            "",
+            &profile_descriptor,
+            anchor.packages_identity,
+            false,
+        )?;
+        late_set(
+            &mut late.fields,
+            "image_inventory_count",
+            "not_applicable_fixed_case",
+        );
+        late_set(
+            &mut late.fields,
+            "image_inventory_sha256",
+            "not_applicable_fixed_case",
+        );
+        late_set(
+            &mut late.fields,
+            "profile_entry_inventory_count",
+            "not_applicable_fixed_case",
+        );
+        late_set(
+            &mut late.fields,
+            "profile_entry_inventory_sha256",
+            "not_applicable_fixed_case",
+        );
+
+        let canary = late
+            .external_canary
+            .as_ref()
+            .ok_or_else(|| invalid("late external canary missing before cleanup"))?;
+        late_set(
+            &mut late.fields,
+            "control_directory_volume_id",
+            format!("{:016X}", canary.directory_identity.0),
+        );
+        late_set(
+            &mut late.fields,
+            "control_directory_file_id",
+            late_hex(&canary.directory_identity.1),
+        );
+        late_set(
+            &mut late.fields,
+            "control_directory_descriptor_sha256",
+            canary.directory_descriptor_sha256.clone(),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_name_utf8_bytes",
+            canary.facts.leaf.as_bytes().len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_name_utf8_hex",
+            late_hex(canary.facts.leaf.as_bytes()),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_expected_volume_id",
+            format!("{:016X}", canary.facts.identity.0),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_expected_file_id",
+            late_hex(&canary.facts.identity.1),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_observed_volume_id",
+            format!("{:016X}", canary.facts.identity.0),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_observed_file_id",
+            late_hex(&canary.facts.identity.1),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_expected_content_sha256",
+            canary.facts.content_sha256.clone(),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_observed_content_sha256",
+            canary.facts.content_sha256.clone(),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_expected_descriptor_sha256",
+            canary.facts.descriptor_sha256.clone(),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_observed_descriptor_sha256",
+            canary.facts.descriptor_sha256.clone(),
+        );
+        late_set(
+            &mut late.fields,
+            "foreign_canary_setup_result",
+            "created_and_verified_on_ntfs",
+        );
+        late_set(&mut late.fields, "foreign_canary_preimage_matches", "true");
+        late_set(
+            &mut late.fields,
+            "foreign_canary_postimage_matches",
+            "not_yet_observed",
+        );
+        late_set(&mut late.fields, "held_reader_blocker_state", "not_opened");
+        late_set(
+            &mut late.fields,
+            "held_reader_blocker_open_native_result",
+            "not_called",
+        );
+        late_set(
+            &mut late.fields,
+            "held_reader_blocker_close_native_result",
+            "not_opened",
+        );
+        late_set(
+            &mut late.fields,
+            "held_reader_blocker_close_reported_result",
+            "not_opened",
+        );
+        for owner in [
+            "helper_image_reader",
+            "image_delete_handle",
+            "helper_directory_keeper",
+            "profile_ac_anchor",
+            "profile_entry_anchor",
+            "packages_observer",
+            "software_registry_parent_hkey",
+            "registry_fixture_hkey",
+            "normal_job_fence",
+            "cancel_job_fence",
+        ] {
+            late_set(&mut late.fields, &format!("{owner}_state"), "opened");
+            late_set(
+                &mut late.fields,
+                &format!("{owner}_close_native_result"),
+                "not_yet_closed",
+            );
+            late_set(
+                &mut late.fields,
+                &format!("{owner}_close_reported_result"),
+                "not_yet_reported",
+            );
+        }
+        late_set(&mut late.fields, "image_delete_handle_state", "not_opened");
+        late_set(
+            &mut late.fields,
+            "image_delete_handle_close_native_result",
+            "not_opened",
+        );
+        late_set(
+            &mut late.fields,
+            "image_delete_handle_close_reported_result",
+            "not_opened",
+        );
+        Ok(())
     }
 
     fn create_control_file_canary(
@@ -8460,6 +10697,325 @@ mod registry_witness_tests {
         }
     }
 
+    fn observe_control_file_canary(
+        parent: HANDLE,
+        expected: &ControlFileFacts,
+    ) -> io::Result<ControlFileFacts> {
+        let opened = relative_open(
+            parent,
+            &expected.leaf,
+            false,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        let mut file = File::from(opened);
+        let observed = (|| -> io::Result<ControlFileFacts> {
+            check_object(file.as_raw_handle(), false)?;
+            let identity = script_identity(file.as_raw_handle())?;
+            let descriptor_sha256 = digest(&resource_dacl_bytes(file.as_raw_handle())?)?;
+            let profile_fact = profile_fact(file.as_raw_handle(), false)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(expected.length as usize);
+            (&mut file)
+                .take(expected.length.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > expected.length || bytes.len() as u64 != expected.length {
+                return Err(invalid(
+                    "late external canary length differs from its captured bound",
+                ));
+            }
+            let observed = ControlFileFacts {
+                leaf: expected.leaf.clone(),
+                identity,
+                length: bytes.len() as u64,
+                content_sha256: digest(&bytes)?,
+                descriptor_sha256,
+                profile_fact,
+            };
+            if &observed != expected {
+                return Err(invalid(
+                    "late external canary postimage differs from its captured preimage",
+                ));
+            }
+            Ok(observed)
+        })();
+        let close =
+            close_file_checked(file, "CloseHandle(late external canary postimage observer)");
+        match (observed, close) {
+            (Ok(facts), Ok(())) => Ok(facts),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(close)) => Err(close),
+            (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                "late external canary observation failed: {primary}; observer close failed: {close}"
+            ))),
+        }
+    }
+
+    fn remove_relative_owned(
+        parent: HANDLE,
+        leaf: &str,
+        directory: bool,
+        expected: (u64, [u8; 16]),
+    ) -> io::Result<()> {
+        let handle = relative_open(
+            parent,
+            leaf,
+            directory,
+            DELETE
+                | FILE_READ_ATTRIBUTES
+                | SYNCHRONIZE
+                | if directory { FILE_LIST_DIRECTORY } else { 0 },
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        let precheck = (|| -> io::Result<()> {
+            if script_identity(handle.as_raw_handle())? != expected {
+                return Err(invalid(
+                    "owned control object identity changed before deletion",
+                ));
+            }
+            if directory && !profile_children(handle.as_raw_handle())?.is_empty() {
+                return Err(invalid("owned control directory is not empty at deletion"));
+            }
+            Ok(())
+        })();
+        if let Err(primary) = precheck {
+            return match close_checked(
+                handle,
+                "CloseHandle(owned control object after precheck failure)",
+            ) {
+                Ok(()) => Err(primary),
+                Err(close) => Err(io::Error::other(format!(
+                    "owned control precheck failed: {primary}; handle close failed: {close}"
+                ))),
+            };
+        }
+        let disposition = disposition_once(handle.as_raw_handle());
+        let close = close_checked(handle, "CloseHandle(disposed owned control object)");
+        match (disposition, close) {
+            (Ok(()), Ok(())) => {}
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(()), Err(close)) => return Err(close),
+            (Err(primary), Err(close)) => {
+                return Err(io::Error::other(format!(
+                    "owned control disposition failed: {primary}; close failed: {close}"
+                )));
+            }
+        }
+        if !relative_probe_absent(parent, leaf, directory)? {
+            return Err(invalid("disposed owned control object remains present"));
+        }
+        Ok(())
+    }
+
+    fn create_late_external_canary(
+        nonce: &str,
+        user_sid: &str,
+        package_sid: &str,
+    ) -> io::Result<LateExternalCanary> {
+        let temp = std::env::temp_dir();
+        let temp_wide = wide(temp.as_os_str())?;
+        let mut volume_root = [0u16; 512];
+        if unsafe {
+            GetVolumePathNameW(
+                temp_wide.as_ptr(),
+                volume_root.as_mut_ptr(),
+                volume_root.len() as u32,
+            )
+        } == 0
+        {
+            return Err(operation_error(
+                "GetVolumePathNameW(cleanup control root)",
+                io::Error::last_os_error(),
+            ));
+        }
+        let mut filesystem = [0u16; 64];
+        if unsafe {
+            GetVolumeInformationW(
+                volume_root.as_ptr(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            )
+        } == 0
+        {
+            return Err(operation_error(
+                "GetVolumeInformationW(cleanup control root)",
+                io::Error::last_os_error(),
+            ));
+        }
+        let fs_len = filesystem
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(filesystem.len());
+        if String::from_utf16_lossy(&filesystem[..fs_len]) != "NTFS" {
+            return Err(invalid("late cleanup external canary volume is not NTFS"));
+        }
+        let raw_parent = unsafe {
+            CreateFileW(
+                temp_wide.as_ptr(),
+                FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        let parent = own("CreateFileW(held NTFS cleanup control root)", raw_parent)?;
+        let directory_leaf = format!("ORBIT-CLEANUP-CONTROL-{nonce}");
+        let mut directory = None;
+        let setup = (|| -> io::Result<_> {
+            check_object(parent.as_raw_handle(), true)?;
+            let parent_identity = script_identity(parent.as_raw_handle())?;
+            directory = Some(create_control_directory(
+                parent.as_raw_handle(),
+                &directory_leaf,
+                user_sid,
+                package_sid,
+            )?);
+            let directory_handle = directory
+                .as_ref()
+                .expect("external control directory retained");
+            let directory_identity = script_identity(directory_handle.as_raw_handle())?;
+            let directory_descriptor_sha256 =
+                digest(&resource_dacl_bytes(directory_handle.as_raw_handle())?)?;
+            let foreign_leaf = format!("ORBIT-FOREIGN-{}", &nonce[..8]);
+            let content = b"ORBIT-LATE-CLEANUP-CANARY-V1";
+            let facts = create_control_file_canary(
+                directory_handle.as_raw_handle(),
+                &foreign_leaf,
+                content,
+                user_sid,
+                package_sid,
+            )?;
+            if facts.identity.0 != directory_identity.0 || directory_identity.0 != parent_identity.0
+            {
+                return Err(invalid(
+                    "late external canary is not on the held NTFS control-root volume",
+                ));
+            }
+            verify_control_file_canary(directory_handle.as_raw_handle(), &facts)?;
+            Ok((directory_identity, directory_descriptor_sha256, facts))
+        })();
+        match setup {
+            Ok((directory_identity, directory_descriptor_sha256, facts)) => {
+                Ok(LateExternalCanary {
+                    parent: Some(parent),
+                    directory,
+                    directory_leaf,
+                    directory_identity,
+                    directory_descriptor_sha256,
+                    facts,
+                })
+            }
+            Err(primary) => {
+                let mut close_errors = Vec::new();
+                if let Some(directory) = directory {
+                    if let Err(error) = close_checked(
+                        directory,
+                        "CloseHandle(failed external canary directory setup)",
+                    ) {
+                        close_errors.push(format!("directory close: {error}"));
+                    }
+                }
+                if let Err(error) =
+                    close_checked(parent, "CloseHandle(failed external canary parent setup)")
+                {
+                    close_errors.push(format!("parent close: {error}"));
+                }
+                if close_errors.is_empty() {
+                    Err(primary)
+                } else {
+                    Err(io::Error::other(format!(
+                        "external canary setup failed: {primary}; checked close errors: {}",
+                        close_errors.join("; ")
+                    )))
+                }
+            }
+        }
+    }
+
+    fn close_late_external_canary(canary: &mut LateExternalCanary) -> io::Result<()> {
+        let mut errors = Vec::new();
+        if let (Some(directory), Some(parent)) = (canary.directory.as_ref(), canary.parent.as_ref())
+        {
+            match verify_control_file_canary(directory.as_raw_handle(), &canary.facts) {
+                Ok(()) => {
+                    if let Err(error) = remove_relative_owned(
+                        directory.as_raw_handle(),
+                        &canary.facts.leaf,
+                        false,
+                        canary.facts.identity,
+                    ) {
+                        errors.push(format!("external canary file cleanup: {error}"));
+                    }
+                    let directory_id = script_identity(directory.as_raw_handle()).ok();
+                    let directory_descriptor = resource_dacl_bytes(directory.as_raw_handle())
+                        .and_then(|bytes| digest(&bytes))
+                        .ok();
+                    if directory_id != Some(canary.directory_identity)
+                        || directory_descriptor.as_deref()
+                            != Some(canary.directory_descriptor_sha256.as_str())
+                    {
+                        errors.push(
+                            "external canary directory identity or descriptor changed".to_owned(),
+                        );
+                    }
+                    if errors.is_empty() {
+                        if let Some(directory) = canary.directory.take() {
+                            if let Err(error) =
+                                close_checked(directory, "CloseHandle(external canary directory)")
+                            {
+                                errors.push(format!("external canary directory close: {error}"));
+                            }
+                        }
+                    }
+                    if errors.is_empty() {
+                        if let Err(error) = remove_relative_owned(
+                            parent.as_raw_handle(),
+                            &canary.directory_leaf,
+                            true,
+                            canary.directory_identity,
+                        ) {
+                            errors.push(format!("external canary directory cleanup: {error}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!("external canary pre-cleanup verification: {error}"))
+                }
+            }
+        }
+        if let Some(directory) = canary.directory.take() {
+            if let Err(error) = close_checked(
+                directory,
+                "CloseHandle(remaining external canary directory)",
+            ) {
+                errors.push(format!(
+                    "remaining external canary directory close: {error}"
+                ));
+            }
+        }
+        if let Some(parent) = canary.parent.take() {
+            if let Err(error) = close_checked(parent, "CloseHandle(external canary parent)") {
+                errors.push(format!("external canary parent close: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
+    }
+
     fn verify_held_image_base(
         image: &mut HeldHelperImage,
         expected_resource_dacl: &[u8],
@@ -8494,6 +11050,46 @@ mod registry_witness_tests {
             return Err(invalid("helper image identity bridge changed"));
         }
         Ok(())
+    }
+
+    fn hold_image_reader_blocker(image: &HeldHelperImage) -> io::Result<OwnedHandle> {
+        let directory = image
+            .directory_handle
+            .as_ref()
+            .ok_or_else(|| invalid("helper directory anchor missing before blocker setup"))?;
+        let handle = relative_open(
+            directory.as_raw_handle(),
+            &image.image_leaf,
+            false,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ,
+        )?;
+        let mut file = Some(File::from(handle));
+        let verified = verify_image_file(
+            file.as_mut().expect("blocker file retained"),
+            image.identity,
+            image.expected_length,
+            &image.sha256,
+            &image.expected_resource_dacl,
+        );
+        match verified {
+            Ok(()) => Ok(unsafe {
+                OwnedHandle::from_raw_handle(
+                    file.take()
+                        .expect("verified blocker file retained")
+                        .into_raw_handle(),
+                )
+            }),
+            Err(primary) => match close_file_checked(
+                file.take().expect("failed blocker file retained"),
+                "CloseHandle(unverified held image blocker)",
+            ) {
+                Ok(()) => Err(primary),
+                Err(close) => Err(io::Error::other(format!(
+                    "held image blocker verification failed: {primary}; blocker close failed: {close}"
+                ))),
+            },
+        }
     }
 
     fn verify_held_directory_identity(image: &HeldHelperImage) -> io::Result<()> {
@@ -8773,6 +11369,912 @@ mod registry_witness_tests {
         }
     }
 
+    fn emit_late_control_partial_inner(
+        control: CleanupControl,
+        nonce: &str,
+        parent_pid: u32,
+        parent_creation: &str,
+        late: &mut LateControlState,
+        receipt: &mut CleanupReceipt,
+        job_gate: &mut CleanupJobGate,
+        parent_before: &Option<ParentMarkerCanaryFacts>,
+        host_marker_ok: bool,
+        cleanup_errors: &mut Vec<String>,
+    ) -> io::Result<()> {
+        if control != late.control || !control.is_late() {
+            return Err(invalid(
+                "late cleanup finalizer received a mismatched fixed case",
+            ));
+        }
+        let expected_parent_pid = parent_pid.to_string();
+        if late.fields.get("nonce").map(String::as_str) != Some(nonce)
+            || late.fields.get("parent_pid").map(String::as_str)
+                != Some(expected_parent_pid.as_str())
+            || late.fields.get("parent_creation").map(String::as_str) != Some(parent_creation)
+        {
+            return Err(invalid(
+                "late cleanup finalizer case context changed after initialization",
+            ));
+        }
+        if !host_marker_ok {
+            late.unexpected(
+                "host_marker_postcontrol",
+                "probe",
+                "postcheck_error",
+                "host marker controls failed after late cleanup",
+            );
+        }
+        let after_parent = parent_marker_canary_facts();
+        match (parent_before, after_parent) {
+            (Some(before), Ok(after)) if before == &after => {}
+            (Some(_), Ok(_)) => late.unexpected(
+                "parent_marker_postcontrol",
+                "probe",
+                "canary_changed",
+                "host marker canary value or descriptor changed",
+            ),
+            (Some(_), Err(error)) => late.unexpected(
+                "parent_marker_postcontrol",
+                "probe",
+                "postcheck_error",
+                &error.to_string(),
+            ),
+            (None, _) => late.unexpected(
+                "parent_marker_postcontrol",
+                "probe",
+                "baseline_missing",
+                "host marker canary baseline missing",
+            ),
+        }
+
+        let registry = receipt
+            .registry
+            .as_mut()
+            .ok_or_else(|| invalid("late control registry absence receipt missing"))?;
+        let software = registry
+            .software
+            .as_ref()
+            .ok_or_else(|| invalid("late control held Software HKEY missing before close"))?;
+        let software_name = native_registry_key_name(software.raw())?;
+        let software_bytes = software_name.as_bytes();
+        let expected_parent_hex = late
+            .fields
+            .get("registry_software_parent_native_name_utf8_hex")
+            .ok_or_else(|| invalid("late control Software-parent baseline name missing"))?;
+        if late_hex(software_bytes) != *expected_parent_hex {
+            late.unexpected(
+                "software_hkey_after_name",
+                "registry",
+                "parent_name_changed",
+                "held Software HKEY native name differs from its captured preimage",
+            );
+        }
+        let root_status = win32_open_status(software.raw(), &registry.leaf, KEY_READ);
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_after_native_name_utf8_bytes",
+            software_bytes.len().to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_after_native_name_utf8_hex",
+            late_hex(software_bytes),
+        );
+        late_set(
+            &mut late.fields,
+            "registry_software_hkey_after_result",
+            "native_query_success",
+        );
+        late_set(
+            &mut late.fields,
+            "registry_preclose_absence_result",
+            root_status.to_string(),
+        );
+        if root_status != ERROR_FILE_NOT_FOUND {
+            late.unexpected(
+                "nonce_root_absence_probe",
+                "win32",
+                &format!("0x{root_status:08X}"),
+                "nonce registry root remained present beneath held Software HKEY",
+            );
+        } else {
+            late_set(&mut late.fields, "registry_root_state", "-");
+            registry.absence_proven = true;
+        }
+        if let Err(error) = registry.verify() {
+            late.unexpected(
+                "nonce_root_absence_probe",
+                "registry",
+                "postcheck_error",
+                &error.to_string(),
+            );
+        }
+        if let Some(software) = registry.software.take() {
+            match software.close() {
+                Ok(()) => {
+                    registry.anchor_closed = true;
+                    late_set(
+                        &mut late.fields,
+                        "software_registry_parent_hkey_state",
+                        "closed",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "software_registry_parent_hkey_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "software_registry_parent_hkey_close_reported_result",
+                        "not_injected",
+                    );
+                }
+                Err(error) => {
+                    late.unexpected(
+                        "software_hkey_close",
+                        "registry",
+                        "native_close_error",
+                        &error.to_string(),
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "software_registry_parent_hkey_state",
+                        "close_failed",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "software_registry_parent_hkey_close_native_result",
+                        "error",
+                    );
+                    cleanup_errors.push(format!("held Software HKEY close failed: {error}"));
+                }
+            }
+        }
+        if let Err(error) = registry.verify() {
+            late.unexpected(
+                "nonce_root_absence_receipt",
+                "registry",
+                "postcheck_error",
+                &error.to_string(),
+            );
+        }
+
+        if let Some(packages) = receipt.profile_packages.as_ref() {
+            let expected_identity = receipt
+                .profile_packages_identity
+                .ok_or_else(|| invalid("late Packages identity receipt missing"))?;
+            let leaf = receipt
+                .profile_entry_leaf
+                .as_deref()
+                .ok_or_else(|| invalid("late profile entry leaf receipt missing"))?;
+            let descriptor = late
+                .fields
+                .get("profile_entry_observed_descriptor_sha256")
+                .cloned()
+                .ok_or_else(|| invalid("late profile entry descriptor snapshot missing"))?;
+            let expected_parent = expected_identity;
+            let expected_entry = late_profile_entry_identity(late)?;
+            let absent = matches!(
+                relative_probe_observe(packages.as_raw_handle(), leaf, true)?,
+                RelativeObjectObservation::Absent
+            );
+            late_observe_object(
+                late,
+                "profile_entry",
+                packages.as_raw_handle(),
+                leaf,
+                true,
+                expected_entry,
+                "",
+                &descriptor,
+                expected_parent,
+                false,
+            )?;
+            late_set(
+                &mut late.fields,
+                "profile_absence_probe",
+                if absent {
+                    "relative_not_found"
+                } else {
+                    "relative_success"
+                },
+            );
+            receipt.profile_absent = absent;
+        }
+        if let Some(packages) = receipt.profile_packages.take() {
+            match close_checked(
+                packages,
+                "CloseHandle(final Packages observer after late probes)",
+            ) {
+                Ok(()) => {
+                    receipt.profile_packages_close_succeeded = true;
+                    late_set(&mut late.fields, "packages_observer_state", "closed");
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_reported_result",
+                        "not_injected",
+                    );
+                }
+                Err(error) => {
+                    late.unexpected(
+                        "packages_observer_close",
+                        "close",
+                        "native_close_error",
+                        &error.to_string(),
+                    );
+                    late_set(&mut late.fields, "packages_observer_state", "close_failed");
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_native_result",
+                        "error",
+                    );
+                    cleanup_errors.push(format!("final Packages observer close failed: {error}"));
+                }
+            }
+        }
+
+        if late.external_canary.is_some() {
+            let (
+                actual_directory_id,
+                actual_directory_descriptor,
+                expected_directory_id,
+                expected_directory_descriptor,
+                parent_volume,
+                actual_canary,
+            ) = {
+                let canary = late
+                    .external_canary
+                    .as_ref()
+                    .ok_or_else(|| invalid("late external canary missing during postprobe"))?;
+                let directory = canary
+                    .directory
+                    .as_ref()
+                    .ok_or_else(|| invalid("late external canary directory owner missing"))?;
+                let parent = canary
+                    .parent
+                    .as_ref()
+                    .ok_or_else(|| invalid("late external canary parent owner missing"))?;
+                let actual_id = script_identity(directory.as_raw_handle())?;
+                let descriptor = digest(&resource_dacl_bytes(directory.as_raw_handle())?)?;
+                let observed =
+                    observe_control_file_canary(directory.as_raw_handle(), &canary.facts)?;
+                (
+                    actual_id,
+                    descriptor,
+                    canary.directory_identity,
+                    canary.directory_descriptor_sha256.clone(),
+                    script_identity(parent.as_raw_handle())?.0,
+                    observed,
+                )
+            };
+            if actual_directory_id != expected_directory_id
+                || actual_directory_descriptor != expected_directory_descriptor
+                || actual_directory_id.0 != parent_volume
+            {
+                late.unexpected(
+                    "foreign_canary_directory_postprobe",
+                    "identity",
+                    "canary_changed",
+                    "external canary directory identity, volume, or descriptor changed",
+                );
+            }
+            late_set(
+                &mut late.fields,
+                "control_directory_volume_id",
+                format!("{:016X}", actual_directory_id.0),
+            );
+            late_set(
+                &mut late.fields,
+                "control_directory_file_id",
+                late_hex(&actual_directory_id.1),
+            );
+            late_set(
+                &mut late.fields,
+                "control_directory_descriptor_sha256",
+                actual_directory_descriptor,
+            );
+            late_set(
+                &mut late.fields,
+                "foreign_canary_observed_volume_id",
+                format!("{:016X}", actual_canary.identity.0),
+            );
+            late_set(
+                &mut late.fields,
+                "foreign_canary_observed_file_id",
+                late_hex(&actual_canary.identity.1),
+            );
+            late_set(
+                &mut late.fields,
+                "foreign_canary_observed_content_sha256",
+                actual_canary.content_sha256,
+            );
+            late_set(
+                &mut late.fields,
+                "foreign_canary_observed_descriptor_sha256",
+                actual_canary.descriptor_sha256,
+            );
+            late_set(&mut late.fields, "foreign_canary_postimage_matches", "true");
+            let canary = late
+                .external_canary
+                .as_mut()
+                .ok_or_else(|| invalid("late external canary disappeared before checked close"))?;
+            if let Err(error) = close_late_external_canary(canary) {
+                late.unexpected(
+                    "foreign_canary_closeout",
+                    "cleanup",
+                    "closeout_error",
+                    &error.to_string(),
+                );
+                cleanup_errors.push(format!("external late canary closeout failed: {error}"));
+            }
+        } else {
+            late.unexpected(
+                "foreign_canary_setup",
+                "fixture",
+                "missing",
+                "late external canary owners missing",
+            );
+        }
+
+        let waited = job_gate
+            .normal
+            .as_ref()
+            .is_some_and(|fence| fence.process_waited)
+            && job_gate
+                .cancel
+                .as_ref()
+                .is_some_and(|fence| fence.process_waited);
+        if !waited || !receipt.normal_job_zero || !receipt.cancel_job_zero {
+            late.unexpected(
+                "final_job_zero",
+                "job",
+                "missing_fence_or_wait",
+                "both waited Job fences and pre-cleanup zero observations are required",
+            );
+        }
+        cleanup_errors.extend(job_gate.close_fences_with_late(Some(late)));
+
+        let image = receipt
+            .image
+            .as_ref()
+            .ok_or_else(|| invalid("late helper image partial receipt missing"))?;
+        late_set(
+            &mut late.fields,
+            "image_disposition_executed",
+            image.image_disposition_succeeded.to_string(),
+        );
+        late_set(
+            &mut late.fields,
+            "directory_disposition_executed",
+            image.directory_disposition_succeeded.to_string(),
+        );
+        if image.image_disposition_succeeded {
+            late_set(
+                &mut late.fields,
+                "image_disposition_native_result",
+                "STATUS_SUCCESS",
+            );
+            late_set(
+                &mut late.fields,
+                "image_disposition_reported_result",
+                "STATUS_SUCCESS",
+            );
+        } else if late
+            .fields
+            .get("image_disposition_reported_result")
+            .is_none_or(|value| value == "not_reached")
+        {
+            late_set(
+                &mut late.fields,
+                "image_disposition_native_result",
+                "not_called",
+            );
+            late_set(
+                &mut late.fields,
+                "image_disposition_reported_result",
+                "not_called",
+            );
+        }
+        if image.directory_disposition_succeeded {
+            late_set(
+                &mut late.fields,
+                "directory_disposition_native_result",
+                "STATUS_SUCCESS",
+            );
+            late_set(
+                &mut late.fields,
+                "directory_disposition_reported_result",
+                "STATUS_SUCCESS",
+            );
+        } else if late
+            .fields
+            .get("directory_disposition_reported_result")
+            .is_none_or(|value| value == "not_reached")
+        {
+            late_set(
+                &mut late.fields,
+                "directory_disposition_native_result",
+                "not_called",
+            );
+            late_set(
+                &mut late.fields,
+                "directory_disposition_reported_result",
+                "not_called",
+            );
+        }
+        if let Some(sdk_result) = receipt.profile_sdk_result {
+            late_set(&mut late.fields, "sdk_executed", "true");
+            late_set(
+                &mut late.fields,
+                "sdk_native_hresult",
+                format!("0x{:08X}", sdk_result as u32),
+            );
+            late_set(
+                &mut late.fields,
+                "sdk_reported_hresult",
+                format!("0x{:08X}", sdk_result as u32),
+            );
+        } else if late
+            .fields
+            .get("sdk_executed")
+            .is_none_or(|value| value == "not_reached")
+        {
+            late_set(&mut late.fields, "sdk_executed", "false");
+            late_set(&mut late.fields, "sdk_native_hresult", "not_called");
+            late_set(&mut late.fields, "sdk_reported_hresult", "not_called");
+        }
+
+        let (expected_i, expected_d, expected_p, expected_di, expected_dd, expected_sdk) =
+            match control {
+                CleanupControl::HeldReaderSharing | CleanupControl::ReaderCloseError => {
+                    (true, true, true, false, false, false)
+                }
+                CleanupControl::ProfileAnchorCloseError => (false, false, true, true, true, false),
+                CleanupControl::ObservationParentCloseError
+                | CleanupControl::JobFenceCloseError => (false, false, false, true, true, true),
+                CleanupControl::ImageDispositionNoEffect => (true, true, true, false, false, false),
+                CleanupControl::DirectoryDispositionNoEffect => {
+                    (false, true, true, true, false, false)
+                }
+                CleanupControl::SdkError | CleanupControl::SdkSOkNoEffect => {
+                    (false, false, true, true, true, false)
+                }
+                _ => return Err(invalid("non-late case reached partial receipt validator")),
+            };
+        let actual = (
+            late.fields
+                .get("registry_root_state")
+                .is_some_and(|value| value == "-"),
+            image.image_absent,
+            image.directory_absent,
+            receipt.profile_absent,
+            image.image_disposition_succeeded,
+            image.directory_disposition_succeeded,
+            receipt.profile_sdk_result.is_some(),
+        );
+        let expected = (
+            true,
+            !expected_i,
+            !expected_d,
+            !expected_p,
+            expected_di,
+            expected_dd,
+            expected_sdk,
+        );
+        if actual != expected {
+            late.unexpected(
+                "partial_residue_vector",
+                "receipt",
+                "vector_mismatch",
+                "actual resource absence/disposition vector differs from fixed late case table",
+            );
+        }
+        if late.fields.get("image_state").map(String::as_str)
+            != Some(if expected_i { "+" } else { "-" })
+            || late
+                .fields
+                .get("helper_directory_state")
+                .map(String::as_str)
+                != Some(if expected_d { "+" } else { "-" })
+            || late.fields.get("profile_entry_state").map(String::as_str)
+                != Some(if expected_p { "+" } else { "-" })
+        {
+            late.unexpected(
+                "partial_observed_states",
+                "receipt",
+                "state_mismatch",
+                "measured resource object states differ from fixed late case table",
+            );
+        }
+        if !late_expected_event_admitted(control, cleanup_errors, late) {
+            return Err(io::Error::other(format!(
+                "late control failed exact expected-error admission: cleanup_errors={} target_events={} unexpected_events={}",
+                cleanup_errors.len(),
+                late.target_events.len(),
+                late.unexpected_events.len()
+            )));
+        }
+        if !late
+            .fields
+            .get("setup_verified")
+            .is_some_and(|value| value == "true")
+        {
+            return Err(invalid(
+                "late control setup and all 69 pre-cleanup probes were not verified",
+            ));
+        }
+        if late.held_reader_blocker.is_some()
+            || late
+                .external_canary
+                .as_ref()
+                .is_some_and(|canary| canary.parent.is_some() || canary.directory.is_some())
+        {
+            return Err(invalid(
+                "late control left an owned blocker or canary parent handle open",
+            ));
+        }
+        for owner in [
+            "helper_image_reader",
+            "held_reader_blocker",
+            "image_delete_handle",
+            "helper_directory_keeper",
+            "profile_ac_anchor",
+            "profile_entry_anchor",
+            "packages_observer",
+            "software_registry_parent_hkey",
+            "registry_fixture_hkey",
+            "normal_job_fence",
+            "cancel_job_fence",
+        ] {
+            let state = late
+                .fields
+                .get(&format!("{owner}_state"))
+                .map(String::as_str)
+                .unwrap_or("");
+            let close = late
+                .fields
+                .get(&format!("{owner}_close_native_result"))
+                .map(String::as_str)
+                .unwrap_or("");
+            let reported = late
+                .fields
+                .get(&format!("{owner}_close_reported_result"))
+                .map(String::as_str)
+                .unwrap_or("");
+            let held_blocker =
+                owner == "held_reader_blocker" && control == CleanupControl::HeldReaderSharing;
+            let not_opened = owner == "held_reader_blocker" && !held_blocker
+                || owner == "image_delete_handle"
+                    && matches!(
+                        control,
+                        CleanupControl::HeldReaderSharing | CleanupControl::ReaderCloseError
+                    );
+            let expected_state = if not_opened {
+                "not_opened"
+            } else if held_blocker {
+                "opened_retained_then_closed"
+            } else {
+                "closed"
+            };
+            let expected_close = if not_opened { "not_opened" } else { "success" };
+            let expected_reported = if not_opened {
+                "not_opened"
+            } else if matches!(
+                (control, owner),
+                (CleanupControl::ReaderCloseError, "helper_image_reader")
+                    | (CleanupControl::ProfileAnchorCloseError, "profile_ac_anchor")
+                    | (
+                        CleanupControl::ObservationParentCloseError,
+                        "packages_observer"
+                    )
+                    | (CleanupControl::JobFenceCloseError, "normal_job_fence")
+            ) {
+                "injected_close_error"
+            } else {
+                "not_injected"
+            };
+            if state != expected_state || close != expected_close || reported != expected_reported {
+                return Err(invalid(
+                    "late owner state/native close/reported close differs from its fixed case",
+                ));
+            }
+        }
+        late.fields
+            .insert("target_reached".to_owned(), "true".to_owned());
+        late.sync_event_fields()?;
+        let payload = late_detail_payload(&late.fields)?;
+        if payload.len() > 8192 {
+            return Err(invalid(
+                "complete late control detail exceeds 8192-byte framing cap",
+            ));
+        }
+        late.fields
+            .insert("partial_verified".to_owned(), "true".to_owned());
+        late.sync_event_fields()?;
+        let payload = late_detail_payload(&late.fields)?;
+        let finalization = format!(
+            "registry_witness_finalization status=partial control={} registry_absent=true image_absent={} directory_absent={} profile_absent={} image_disposition_executed={} directory_disposition_executed={} sdk_executed={} normal_job_zero=true cancel_job_zero=true cleanup_errors=1",
+            control.name(),
+            image.image_absent,
+            image.directory_absent,
+            receipt.profile_absent,
+            image.image_disposition_succeeded,
+            image.directory_disposition_succeeded,
+            receipt.profile_sdk_result.is_some(),
+        );
+        let status = "registry_witness_status witness_status=INCOMPLETE run_status=control_partial";
+        let mut emission_errors = Vec::new();
+        if let Err(error) = emit_witness_record(&payload) {
+            emission_errors.push(format!("late detail frame emission: {error}"));
+        }
+        if let Err(error) = emit_witness_record(&finalization) {
+            emission_errors.push(format!("late finalization emission: {error}"));
+        }
+        if let Err(error) = emit_witness_record(status) {
+            emission_errors.push(format!("late status emission: {error}"));
+        }
+        if !emission_errors.is_empty() {
+            return Err(io::Error::other(format!(
+                "late partial receipt emission failed: {}",
+                emission_errors.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    fn emit_late_control_partial(
+        control: CleanupControl,
+        nonce: &str,
+        parent_pid: u32,
+        parent_creation: &str,
+        stage_primary_error: Option<&str>,
+        late: &mut LateControlState,
+        receipt: &mut CleanupReceipt,
+        job_gate: &mut CleanupJobGate,
+        parent_before: &Option<ParentMarkerCanaryFacts>,
+        host_marker_ok: bool,
+        cleanup_errors: &mut Vec<String>,
+    ) -> io::Result<()> {
+        if let Some(primary) = stage_primary_error {
+            late.unexpected("stage_a_prerequisite", "stage", "primary_error", primary);
+        }
+        let inner = emit_late_control_partial_inner(
+            control,
+            nonce,
+            parent_pid,
+            parent_creation,
+            late,
+            receipt,
+            job_gate,
+            parent_before,
+            host_marker_ok,
+            cleanup_errors,
+        );
+        let mut close_errors = Vec::new();
+        if let Err(error) = &inner {
+            late.unexpected(
+                "late_finalizer",
+                "receipt",
+                "finalizer_error",
+                &error.to_string(),
+            );
+        }
+        if let Some(blocker) = late.held_reader_blocker.take() {
+            match close_checked(
+                blocker,
+                "CloseHandle(late finalizer residual held-reader blocker)",
+            ) {
+                Ok(()) => {
+                    late_set(
+                        &mut late.fields,
+                        "held_reader_blocker_state",
+                        "opened_retained_then_closed",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "held_reader_blocker_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "held_reader_blocker_close_reported_result",
+                        "not_injected",
+                    );
+                }
+                Err(error) => {
+                    late.unexpected(
+                        "held_reader_blocker_close",
+                        "close",
+                        "native_close_error",
+                        &error.to_string(),
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "held_reader_blocker_state",
+                        "close_failed",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "held_reader_blocker_close_native_result",
+                        "error",
+                    );
+                    close_errors.push(format!("held-reader blocker close: {error}"));
+                }
+            }
+        }
+        if let Some(registry) = receipt.registry.as_mut() {
+            if let Some(software) = registry.software.take() {
+                match software.close() {
+                    Ok(()) => {
+                        registry.anchor_closed = true;
+                        late_set(
+                            &mut late.fields,
+                            "software_registry_parent_hkey_state",
+                            "closed",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "software_registry_parent_hkey_close_native_result",
+                            "success",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "software_registry_parent_hkey_close_reported_result",
+                            "not_injected",
+                        );
+                    }
+                    Err(error) => {
+                        late.unexpected(
+                            "software_hkey_close",
+                            "registry",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "software_registry_parent_hkey_state",
+                            "close_failed",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "software_registry_parent_hkey_close_native_result",
+                            "error",
+                        );
+                        close_errors.push(format!("Software HKEY close: {error}"));
+                    }
+                }
+            }
+        }
+        if let Some(packages) = receipt.profile_packages.take() {
+            match close_checked(
+                packages,
+                "CloseHandle(late finalizer residual Packages observer)",
+            ) {
+                Ok(()) => {
+                    receipt.profile_packages_close_succeeded = true;
+                    late_set(&mut late.fields, "packages_observer_state", "closed");
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_native_result",
+                        "success",
+                    );
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_reported_result",
+                        "not_injected",
+                    );
+                }
+                Err(error) => {
+                    late.unexpected(
+                        "packages_observer_close",
+                        "close",
+                        "native_close_error",
+                        &error.to_string(),
+                    );
+                    late_set(&mut late.fields, "packages_observer_state", "close_failed");
+                    late_set(
+                        &mut late.fields,
+                        "packages_observer_close_native_result",
+                        "error",
+                    );
+                    close_errors.push(format!("Packages observer close: {error}"));
+                }
+            }
+        }
+        if let Some(canary) = late.external_canary.as_mut() {
+            if canary.parent.is_some() || canary.directory.is_some() {
+                if let Err(error) = close_late_external_canary(canary) {
+                    late.unexpected(
+                        "foreign_canary_closeout",
+                        "cleanup",
+                        "closeout_error",
+                        &error.to_string(),
+                    );
+                    close_errors.push(format!("external canary checked closeout: {error}"));
+                }
+            }
+        }
+        for (role, owner) in [
+            ("normal_job_fence", &mut job_gate.normal),
+            ("cancel_job_fence", &mut job_gate.cancel),
+        ] {
+            if let Some(fence) = owner.take() {
+                match close_checked(
+                    fence.handle,
+                    "CloseHandle(late finalizer residual Job fence)",
+                ) {
+                    Ok(()) => {
+                        late_set(&mut late.fields, &format!("{role}_state"), "closed");
+                        late_set(
+                            &mut late.fields,
+                            &format!("{role}_close_native_result"),
+                            "success",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            &format!("{role}_close_reported_result"),
+                            "not_injected",
+                        );
+                    }
+                    Err(error) => {
+                        late.unexpected(
+                            "job_fence_close",
+                            "close",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                        late_set(&mut late.fields, &format!("{role}_state"), "close_failed");
+                        late_set(
+                            &mut late.fields,
+                            &format!("{role}_close_native_result"),
+                            "error",
+                        );
+                        close_errors.push(format!("{role} close: {error}"));
+                    }
+                }
+            }
+        }
+        cleanup_errors.extend(close_errors.iter().cloned());
+        let inner_error = inner.err().map(|error| error.to_string());
+        if stage_primary_error.is_none() && inner_error.is_none() && close_errors.is_empty() {
+            return Ok(());
+        }
+        let event_diagnostics = |events: &[LateErrorEvent]| {
+            events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "{}/{}/{}={}",
+                        event.phase, event.domain, event.code, event.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" || ")
+        };
+        let event_serialization_error = late.errors_wire().err().map(|error| error.to_string());
+        let status_emission_error = emit_witness_record(
+            "registry_witness_status witness_status=INCOMPLETE run_status=control_failed",
+        )
+        .err()
+        .map(|error| error.to_string());
+        Err(io::Error::other(format!(
+            "late cleanup control {} failed: stage_primary={}; cleanup_errors=[{}]; target_events=[{}]; unexpected_events=[{}]; finalizer_error={}; event_serialization_error={}; status_emission_error={}",
+            control.name(),
+            stage_primary_error.unwrap_or("none"),
+            cleanup_errors.join(" || "),
+            event_diagnostics(&late.target_events),
+            event_diagnostics(&late.unexpected_events),
+            inner_error.as_deref().unwrap_or("none"),
+            event_serialization_error.as_deref().unwrap_or("none"),
+            status_emission_error.as_deref().unwrap_or("none"),
+        )))
+    }
+
     fn registry_witness_stage_a_run(control: Option<CleanupControl>) -> io::Result<()> {
         verify_cancel_readiness_frame_oracle()?;
         verify_helper_pe_parser_oracle()?;
@@ -8821,6 +12323,12 @@ mod registry_witness_tests {
         let mut control_image_dacl_after: Option<Vec<u8>> = None;
         let mut control_namespace_share_refused = false;
         let mut control_check_errors = Vec::new();
+        let mut late_control_state = control
+            .filter(|selected| selected.is_late())
+            .map(LateControlState::new);
+        if let Some(late) = late_control_state.as_mut() {
+            late.initialize_fields(&nonce, parent_pid, &parent_creation)?;
+        }
         let mut control_preflight_verified = false;
         let mut control_known_preimages_verified = false;
         let mut control_private_canary_unchanged = false;
@@ -8834,6 +12342,13 @@ mod registry_witness_tests {
             session_ref.retain_profile_for_registry_witness();
             profile_anchor = Some(ProfileCleanupAnchor::capture(session_ref)?);
             let package_sid = sid_text(session_ref.sid.as_ptr().cast_mut().cast())?;
+            if let Some(late) = late_control_state.as_mut() {
+                late.external_canary = Some(create_late_external_canary(
+                    &nonce,
+                    &user_sid,
+                    &package_sid,
+                )?);
+            }
             fixture = Some(PrivateRegistryFixture::create(
                 &nonce,
                 &user_sid,
@@ -9612,6 +13127,7 @@ mod registry_witness_tests {
                         control_detail.content_sha256 = held.sha256.clone();
                         control_detail.descriptor_sha256 = digest(&held.expected_resource_dacl)?;
                     }
+                    Some(_) => {}
                     None => {}
                 }
                 if control.is_some() && control != Some(CleanupControl::JobQueryError) {
@@ -9691,7 +13207,7 @@ mod registry_witness_tests {
                     Ok(()) if control == Some(CleanupControl::LiveNonzeroJob) => Err(invalid(
                         control.expect("live Job control selected").target_error(),
                     )),
-                    Ok(()) if control.is_some() => Err(invalid(
+                    Ok(()) if control.is_some_and(|selected| !selected.is_late()) => Err(invalid(
                         "cleanup fault did not trigger its expected preflight refusal",
                     )),
                     Ok(()) => Ok(()),
@@ -9711,6 +13227,7 @@ mod registry_witness_tests {
             match preflight {
                 Err(error)
                     if control.is_some()
+                        && control.is_some_and(|selected| !selected.is_late())
                         && !preflight_checked_close_failure
                         && error
                             .to_string()
@@ -10051,14 +13568,51 @@ mod registry_witness_tests {
                 Err(error) => cleanup_errors.push(format!(
                     "cleanup preflight failed; all residue retained: {error}"
                 )),
-                Ok(()) if control.is_some() => cleanup_errors.push(format!(
+                Ok(()) if control.is_some_and(|selected| !selected.is_late()) => cleanup_errors.push(format!(
                     "cleanup control {} failed to reach its intended preflight rejection; residue retained",
                     control.expect("control present").name()
                 )),
                 Ok(()) => {
+                    if let (Some(late), Some(fixture), Some(anchor), Some(image), Some(preimages)) = (
+                        late_control_state.as_mut(),
+                        fixture.as_ref(),
+                        profile_anchor.as_ref(),
+                        image.as_ref(),
+                        control_view_preimages_before.as_ref(),
+                    ) {
+                        match fill_late_predelete_fields(late, fixture, image, anchor, preimages) {
+                            Ok(()) => { late.fields.insert("setup_verified".to_owned(), "true".to_owned()); },
+                            Err(error) => cleanup_errors.push(format!("late-control complete pre-delete snapshot failed: {error}")),
+                        }
+                    }
+                    if control == Some(CleanupControl::HeldReaderSharing) {
+                        let blocker_setup = image.as_ref()
+                            .ok_or_else(|| invalid("held image missing before blocker setup"))
+                            .and_then(hold_image_reader_blocker);
+                        match blocker_setup {
+                            Ok(blocker) => {
+                                if let Some(late) = late_control_state.as_mut() {
+                                    late.held_reader_blocker = Some(blocker);
+                                    late.fields.insert("held_reader_blocker_state".to_owned(), "opened_retained".to_owned());
+                                    late.fields.insert("held_reader_blocker_open_native_result".to_owned(), "success".to_owned());
+                                }
+                            }
+                            Err(error) => cleanup_errors.push(format!(
+                                "held-reader sharing blocker setup failed before registry deletion: {error}"
+                            )),
+                        }
+                    }
+                    if cleanup_errors.is_empty() {
                     if let Some(fixture) = fixture.as_mut() {
                         match fixture.cleanup(&job_gate) {
-                            Ok(registry) => receipt.registry = Some(registry),
+                            Ok(registry) => {
+                                receipt.registry = Some(registry);
+                                if let Some(late) = late_control_state.as_mut() {
+                                    late_set(&mut late.fields, "registry_fixture_hkey_state", "closed");
+                                    late_set(&mut late.fields, "registry_fixture_hkey_close_native_result", "success");
+                                    late_set(&mut late.fields, "registry_fixture_hkey_close_reported_result", "not_injected");
+                                }
+                            }
                             Err(error) => cleanup_errors.push(format!(
                                 "private fixture cleanup/residue: {error}; completed_steps=[{}]",
                                 fixture.completed_steps.join(",")
@@ -10070,9 +13624,15 @@ mod registry_witness_tests {
                     }
                     if cleanup_errors.is_empty() {
                         if let Some(image) = image.take() {
+                            let profile_ac = profile_anchor.as_ref().and_then(|anchor| {
+                                anchor.ac.as_ref().map(|ac| (ac.as_raw_handle(), anchor.ac_identity))
+                            });
                             let image_receipt = image.cleanup(
                                 session.as_ref().expect("profile owner retained"),
                                 &job_gate,
+                                control,
+                                profile_ac,
+                                late_control_state.as_mut(),
                             );
                             cleanup_errors.extend(image_receipt.errors.iter().cloned());
                             receipt.image = Some(image_receipt);
@@ -10090,6 +13650,8 @@ mod registry_witness_tests {
                                     anchor,
                                     &job_gate,
                                     &mut receipt,
+                                    control,
+                                    late_control_state.as_mut(),
                                 ) {
                                     cleanup_errors
                                         .push(format!("profile cleanup/residue: {error}"));
@@ -10097,6 +13659,7 @@ mod registry_witness_tests {
                             }
                             _ => cleanup_errors.push("profile cleanup anchors missing".to_owned()),
                         }
+                    }
                     }
                 }
             }
@@ -10156,6 +13719,50 @@ mod registry_witness_tests {
                 }
             }
         }
+        if let Some(late) = late_control_state.as_mut() {
+            if let Some(blocker) = late.held_reader_blocker.take() {
+                match close_checked(blocker, "CloseHandle(remaining held image reader blocker)") {
+                    Ok(()) => {
+                        late_set(
+                            &mut late.fields,
+                            "held_reader_blocker_state",
+                            "opened_retained_then_closed",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "held_reader_blocker_close_native_result",
+                            "success",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "held_reader_blocker_close_reported_result",
+                            "not_injected",
+                        );
+                    }
+                    Err(error) => {
+                        late.unexpected(
+                            "held_reader_blocker_close",
+                            "close",
+                            "native_close_error",
+                            &error.to_string(),
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "held_reader_blocker_state",
+                            "close_failed",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "held_reader_blocker_close_native_result",
+                            "error",
+                        );
+                        cleanup_errors.push(format!(
+                            "remaining held image reader blocker close failed: {error}"
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(replacement) = control_replacement_directory.take() {
             if let Err(error) = close_checked(
                 replacement,
@@ -10177,17 +13784,126 @@ mod registry_witness_tests {
             }
         }
         if let Some(anchor) = profile_anchor.as_mut() {
-            if let Err(error) = anchor.close_internal() {
-                cleanup_errors.push(format!(
-                    "retained profile entry/AC anchor close failed: {error}"
-                ));
+            if let Some(late) = late_control_state.as_mut() {
+                if late
+                    .fields
+                    .get("profile_absence_probe")
+                    .is_none_or(|value| value == "not_reached")
+                {
+                    if let Some(packages) = anchor.packages.as_ref() {
+                        let descriptor = late
+                            .fields
+                            .get("profile_entry_observed_descriptor_sha256")
+                            .cloned()
+                            .unwrap_or_else(|| "not_reached".to_owned());
+                        match late_observe_object(
+                            late,
+                            "profile_entry",
+                            packages.as_raw_handle(),
+                            &anchor.entry_leaf,
+                            true,
+                            anchor.entry_identity,
+                            "",
+                            &descriptor,
+                            anchor.packages_identity,
+                            false,
+                        ) {
+                            Ok(()) => late_set(
+                                &mut late.fields,
+                                "profile_absence_probe",
+                                "relative_success",
+                            ),
+                            Err(error) => {
+                                late.unexpected(
+                                    "profile_entry_postprobe",
+                                    "probe",
+                                    "postcheck_error",
+                                    &error.to_string(),
+                                );
+                                cleanup_errors
+                                    .push(format!("late profile entry postprobe: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+            let anchor_close = if let Some(late) = late_control_state.as_mut() {
+                anchor.close_internal_with_late(late)
+            } else {
+                anchor.close_internal()
+            };
+            match anchor_close {
+                Ok(()) => {
+                    if let Some(late) = late_control_state.as_mut() {
+                        late_set(&mut late.fields, "profile_ac_anchor_state", "closed");
+                        late_set(
+                            &mut late.fields,
+                            "profile_ac_anchor_close_native_result",
+                            "success",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "profile_ac_anchor_close_reported_result",
+                            "not_injected",
+                        );
+                        late_set(&mut late.fields, "profile_entry_anchor_state", "closed");
+                        late_set(
+                            &mut late.fields,
+                            "profile_entry_anchor_close_native_result",
+                            "success",
+                        );
+                        late_set(
+                            &mut late.fields,
+                            "profile_entry_anchor_close_reported_result",
+                            "not_injected",
+                        );
+                    }
+                }
+                Err(error) => {
+                    cleanup_errors.push(format!(
+                        "retained profile entry/AC anchor close failed: {error}"
+                    ));
+                }
             }
             if let Some(packages) = anchor.packages.take() {
-                if let Err(error) = close_checked(
+                match close_checked(
                     packages,
                     "CloseHandle(retained Packages observation anchor)",
                 ) {
-                    cleanup_errors.push(format!("retained Packages anchor close failed: {error}"));
+                    Ok(()) => {
+                        if let Some(late) = late_control_state.as_mut() {
+                            receipt.profile_packages_close_succeeded = true;
+                            late_set(&mut late.fields, "packages_observer_state", "closed");
+                            late_set(
+                                &mut late.fields,
+                                "packages_observer_close_native_result",
+                                "success",
+                            );
+                            late_set(
+                                &mut late.fields,
+                                "packages_observer_close_reported_result",
+                                "not_injected",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(late) = late_control_state.as_mut() {
+                            late.unexpected(
+                                "packages_observer_close",
+                                "close",
+                                "native_close_error",
+                                &error.to_string(),
+                            );
+                            late_set(&mut late.fields, "packages_observer_state", "close_failed");
+                            late_set(
+                                &mut late.fields,
+                                "packages_observer_close_native_result",
+                                "error",
+                            );
+                        }
+                        cleanup_errors
+                            .push(format!("retained Packages anchor close failed: {error}"));
+                    }
                 }
             }
         }
@@ -10206,6 +13922,24 @@ mod registry_witness_tests {
         }
         if let Err(error) = job_gate.require_zero("final cleanup receipt gate") {
             cleanup_errors.push(format!("final exact Job-zero check failed: {error}"));
+        }
+        if let Some(selected) = control.filter(|selected| selected.is_late()) {
+            let late = late_control_state.as_mut().ok_or_else(|| {
+                invalid("late control state missing before partial receipt finalizer")
+            })?;
+            return emit_late_control_partial(
+                selected,
+                &nonce,
+                parent_pid,
+                &parent_creation,
+                primary_error.as_deref(),
+                late,
+                &mut receipt,
+                &mut job_gate,
+                &control_canary_before,
+                host_marker_result.is_ok(),
+                &mut cleanup_errors,
+            );
         }
         if let Some(control) = control {
             let parent_after = parent_marker_canary_facts();
@@ -10629,6 +14363,43 @@ mod registry_witness_tests {
         registry_witness_cleanup_control_missing_job_fence => MissingJobFence,
         registry_witness_cleanup_control_live_nonzero_job => LiveNonzeroJob,
         registry_witness_cleanup_control_job_query_error => JobQueryError,
+        registry_witness_cleanup_control_held_reader_sharing => HeldReaderSharing,
+        registry_witness_cleanup_control_reader_close_error => ReaderCloseError,
+        registry_witness_cleanup_control_profile_anchor_close_error => ProfileAnchorCloseError,
+        registry_witness_cleanup_control_observation_parent_close_error => ObservationParentCloseError,
+        registry_witness_cleanup_control_job_fence_close_error => JobFenceCloseError,
+        registry_witness_cleanup_control_image_disposition_noeffect => ImageDispositionNoEffect,
+        registry_witness_cleanup_control_directory_disposition_noeffect => DirectoryDispositionNoEffect,
+        registry_witness_cleanup_control_sdk_error => SdkError,
+        registry_witness_cleanup_control_sdk_s_ok_noeffect => SdkSOkNoEffect,
+    }
+
+    #[test]
+    fn registry_witness_late_error_admission_rejects_coalesced_unexpected_close() {
+        let mut late = LateControlState::new(CleanupControl::ReaderCloseError);
+        late.target(
+            "image_reader_close",
+            "receipt",
+            "injected_close",
+            "image reader close succeeded; injected close error",
+        );
+        let errors = vec!["expected reader fault; separate profile-root close failed".to_owned()];
+        assert!(late_expected_event_admitted(
+            CleanupControl::ReaderCloseError,
+            &errors,
+            &late
+        ));
+        late.unexpected(
+            "profile_root_close",
+            "close",
+            "native_close_error",
+            "root close failed",
+        );
+        assert!(!late_expected_event_admitted(
+            CleanupControl::ReaderCloseError,
+            &errors,
+            &late
+        ));
     }
 
     fn cancellation_child_readiness(

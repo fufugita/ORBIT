@@ -463,10 +463,362 @@ public static class OrbitRegistryWitnessFixture {
             'image_leaf_swap','directory_swap','image_hardlink','missing_job_fence',
             'live_nonzero_job','job_query_error'
         )
-        $cleanupPending=@($cleanupCaseManifest | Where-Object {$_ -notin $cleanupImplemented})
-        if($cleanupImplemented.Count -ne 16 -or $cleanupPending.Count -ne 9){throw 'Expected exactly 16 implemented and 9 pending cleanup controls'}
+        $cleanupLate=@{
+            held_reader_sharing=@{r='-';i='+';d='+';p='+';di='0';dd='0';sdk='0';native_executed='1';injected='false';native_domain='ntstatus';native_result='0xC0000043';reported_result='native_status';fault='held_reader_open';target='image_delete_open';domain='ntstatus';code='0xC0000043';win32='32';owner='none';image_native='not_called';image_reported='not_called';directory_native='not_called';directory_reported='not_called';sdk_native='not_called';sdk_reported='not_called';profile_probe='relative_success'}
+            reader_close_error=@{r='-';i='+';d='+';p='+';di='0';dd='0';sdk='0';native_executed='1';injected='true';native_domain='close';native_result='close_succeeded';reported_result='injected_close_error';fault='image_reader_close';target='image_reader_close';domain='receipt';code='injected_close';win32='not_applicable';owner='helper_image_reader';image_native='not_called';image_reported='not_called';directory_native='not_called';directory_reported='not_called';sdk_native='not_called';sdk_reported='not_called';profile_probe='relative_success'}
+            profile_anchor_close_error=@{r='-';i='-';d='-';p='+';di='1';dd='1';sdk='0';native_executed='1';injected='true';native_domain='close';native_result='close_succeeded';reported_result='injected_close_error';fault='profile_ac_anchor_close';target='sdk_suppressed_profile_present';domain='receipt';code='injected_close';win32='not_applicable';owner='profile_ac_anchor';image_native='STATUS_SUCCESS';image_reported='STATUS_SUCCESS';directory_native='STATUS_SUCCESS';directory_reported='STATUS_SUCCESS';sdk_native='not_called';sdk_reported='not_called';profile_probe='relative_success'}
+            observation_parent_close_error=@{r='-';i='-';d='-';p='-';di='1';dd='1';sdk='1';native_executed='1';injected='true';native_domain='close';native_result='close_succeeded';reported_result='injected_close_error';fault='packages_observer_close';target='packages_observer_close';domain='receipt';code='injected_close';win32='not_applicable';owner='packages_observer';image_native='STATUS_SUCCESS';image_reported='STATUS_SUCCESS';directory_native='STATUS_SUCCESS';directory_reported='STATUS_SUCCESS';sdk_native='0x00000000';sdk_reported='0x00000000';profile_probe='relative_not_found'}
+            job_fence_close_error=@{r='-';i='-';d='-';p='-';di='1';dd='1';sdk='1';native_executed='1';injected='true';native_domain='close';native_result='close_succeeded';reported_result='injected_close_error';fault='normal_job_fence_close';target='normal_job_fence_close';domain='receipt';code='injected_close';win32='not_applicable';owner='normal_job_fence';image_native='STATUS_SUCCESS';image_reported='STATUS_SUCCESS';directory_native='STATUS_SUCCESS';directory_reported='STATUS_SUCCESS';sdk_native='0x00000000';sdk_reported='0x00000000';profile_probe='relative_not_found'}
+            image_disposition_noeffect=@{r='-';i='+';d='+';p='+';di='0';dd='0';sdk='0';native_executed='0';injected='true';native_domain='ntstatus';native_result='not_called';reported_result='success';fault='image_disposition';target='image_presence_postprobe';domain='receipt';code='image_present';win32='not_applicable';owner='none';image_native='not_called';image_reported='success';directory_native='not_called';directory_reported='not_called';sdk_native='not_called';sdk_reported='not_called';profile_probe='relative_success'}
+            directory_disposition_noeffect=@{r='-';i='-';d='+';p='+';di='1';dd='0';sdk='0';native_executed='0';injected='true';native_domain='ntstatus';native_result='not_called';reported_result='success';fault='directory_disposition';target='directory_presence_postprobe';domain='receipt';code='dir_present';win32='not_applicable';owner='none';image_native='STATUS_SUCCESS';image_reported='STATUS_SUCCESS';directory_native='not_called';directory_reported='success';sdk_native='not_called';sdk_reported='not_called';profile_probe='relative_success'}
+            sdk_error=@{r='-';i='-';d='-';p='+';di='1';dd='1';sdk='0';native_executed='0';injected='true';native_domain='hresult';native_result='not_called';reported_result='0x80004005';fault='sdk_call';target='sdk_reported_result';domain='hresult';code='fixed_non_s_ok';win32='not_applicable';owner='none';image_native='STATUS_SUCCESS';image_reported='STATUS_SUCCESS';directory_native='STATUS_SUCCESS';directory_reported='STATUS_SUCCESS';sdk_native='not_called';sdk_reported='0x80004005';profile_probe='relative_success'}
+            sdk_s_ok_noeffect=@{r='-';i='-';d='-';p='+';di='1';dd='1';sdk='0';native_executed='0';injected='true';native_domain='hresult';native_result='not_called';reported_result='0x00000000';fault='sdk_call';target='profile_presence_postprobe';domain='hresult';code='S_OK';win32='not_applicable';owner='none';image_native='STATUS_SUCCESS';image_reported='STATUS_SUCCESS';directory_native='STATUS_SUCCESS';directory_reported='STATUS_SUCCESS';sdk_native='not_called';sdk_reported='0x00000000';profile_probe='relative_success'}
+        }
+        $cleanupLateOrder=@('held_reader_sharing','reader_close_error','profile_anchor_close_error',
+            'observation_parent_close_error','job_fence_close_error','image_disposition_noeffect',
+            'directory_disposition_noeffect','sdk_error','sdk_s_ok_noeffect')
+        if($cleanupLate.Count -ne 9 -or @($cleanupLateOrder | Select-Object -Unique).Count -ne 9 -or
+            @($cleanupLateOrder | Where-Object {$_ -notin $cleanupCaseManifest}).Count -ne 0 -or
+            @($cleanupImplemented | Where-Object {$_ -in $cleanupLateOrder}).Count -ne 0){
+            throw 'Internal late cleanup-control table is not the exact disjoint nine-case set'
+        }
+        $cleanupPending=@($cleanupCaseManifest | Where-Object {$_ -notin $cleanupImplemented -and $_ -notin $cleanupLateOrder})
+        if($cleanupImplemented.Count -ne 16 -or $cleanupLate.Count -ne 9 -or $cleanupPending.Count -ne 0){throw 'Expected all 25 cleanup controls in exact early/late sets'}
+        function Get-CleanupControlMode([string]$CaseName) {
+            if($CaseName -in $cleanupImplemented){return 'retained'}
+            if($cleanupLate.ContainsKey($CaseName)){return 'partial'}
+            throw "Cleanup control is not implemented: $CaseName"
+        }
+function Get-LateDetailRequiredFields {
+    $required=@('case','nonce','source','run','selected_unit','parent_pid','parent_creation',
+        'setup_verified','target_reached','partial_verified','fault_phase','target_refusal_phase',
+        'target_count','unexpected_error_count','native_executed','native_domain','native_result',
+        'reported_result','injected','registry_fixture_id','registry_root_state',
+        'registry_key_leaf_utf8_bytes','registry_key_leaf_utf8_hex','registry_native_key_name_utf8_bytes',
+        'registry_native_key_name_utf8_hex','registry_software_parent_native_name_utf8_bytes',
+        'registry_software_parent_native_name_utf8_hex','registry_parent_hkey_provenance',
+        'registry_software_hkey_handle_value','registry_software_hkey_before_native_name_utf8_bytes',
+        'registry_software_hkey_before_native_name_utf8_hex','registry_software_hkey_before_result',
+        'registry_software_hkey_after_native_name_utf8_bytes','registry_software_hkey_after_native_name_utf8_hex',
+        'registry_software_hkey_after_result','registry_preclose_absence_result',
+        'registry_predelete_machine_view_sha256','registry_predelete_user_view_sha256',
+        'registry_key_descriptor_sha256')
+    foreach($object in @('image','helper_directory','profile_entry')){
+        foreach($suffix in @('state','expected_volume_id','expected_file_id','observed_volume_id',
+            'observed_file_id','observed_kind','observed_content_sha256','observed_descriptor_sha256',
+            'held_parent_volume_id','held_parent_file_id','relative_probe_result','inventory_count','inventory_sha256')){
+            $required+=($object+'_'+$suffix)
+        }
+    }
+    $required+=@('image_disposition_executed','image_disposition_native_result',
+        'image_disposition_reported_result','directory_disposition_executed',
+        'directory_disposition_native_result','directory_disposition_reported_result',
+        'sdk_executed','sdk_native_hresult','sdk_reported_hresult','profile_absence_probe',
+        'control_directory_volume_id','control_directory_file_id','control_directory_descriptor_sha256',
+        'foreign_canary_name_utf8_bytes','foreign_canary_name_utf8_hex',
+        'foreign_canary_expected_volume_id','foreign_canary_expected_file_id',
+        'foreign_canary_observed_volume_id','foreign_canary_observed_file_id',
+        'foreign_canary_expected_content_sha256','foreign_canary_observed_content_sha256',
+        'foreign_canary_expected_descriptor_sha256','foreign_canary_observed_descriptor_sha256',
+        'foreign_canary_setup_result','foreign_canary_preimage_matches','foreign_canary_postimage_matches')
+    foreach($owner in @('helper_image_reader','held_reader_blocker','image_delete_handle',
+        'helper_directory_keeper','profile_ac_anchor','profile_entry_anchor','packages_observer',
+        'software_registry_parent_hkey','registry_fixture_hkey','normal_job_fence','cancel_job_fence')){
+        $required+=@("${owner}_state","${owner}_close_native_result","${owner}_close_reported_result")
+    }
+    $required+='held_reader_blocker_open_native_result'
+    $required+='errors'
+    return ,$required
+}
+
+function Assert-LateErrorGrammar([string]$Value,[hashtable]$Expected) {
+    if($Value -notmatch '^v1\|([0-9]|1[0-6])\|(.*)$'){throw 'Late error list is malformed or exceeds 16 events'}
+    $count=[int]$Matches[1];$body=$Matches[2]
+    $events=if($count -eq 0){@()}else{@($body -split ';',-1)}
+    if($events.Count -ne $count -or $count -ne 1){throw 'Late control requires one exact target event and zero unexpected events'}
+    if($events[0] -cnotmatch '^([a-z_]+),([a-z_]+),([A-Za-z0-9_]{1,16}|0x[0-9A-F]{8}),([0-9A-F]*)$'){
+        throw 'Late target event does not match the closed ASCII error grammar'
+    }
+    $hex=$Matches[4]
+    if(($hex.Length % 2) -ne 0 -or $hex.Length -gt 192){throw 'Late target event message exceeds the fixed 96-byte bound'}
+    $message=[Text.Encoding]::UTF8.GetString([Convert]::FromHexString($hex))
+    $bytes=[Text.Encoding]::UTF8.GetBytes($message)
+    if([Convert]::ToHexString($bytes) -cne $hex){throw 'Late event message is not canonical lossless UTF-8'}
+    if($Matches[1] -cne $Expected.target -or $Matches[2] -cne $Expected.domain -or
+        $Matches[3] -cne $Expected.code){throw 'Late event phase/domain/code differs from the fixed case table'}
+}
+
+function Assert-LateUtf8Pair([string]$Frame,[string]$Stem) {
+    $countText=WitnessField $Frame ($Stem+'_bytes')
+    $hex=WitnessField $Frame ($Stem+'_hex')
+    if($countText -notmatch '^(0|[1-9][0-9]{0,3})$' -or
+        $hex -cnotmatch '^(?:[0-9A-F]{2})*$' -or
+        [int]$countText -ne ($hex.Length/2)){
+        throw "Measured UTF-8 length/hex mismatch: $Stem"
+    }
+}
+
+function Assert-LateControlDetail([string]$Frame,[string]$CaseName,[string]$Nonce,
+    [string]$Source,[string]$Run,[string]$Unit,[string]$ParentPid,[string]$ParentCreation,
+    [string]$FixtureId,[string]$UserSid,[string]$NormalResult,[hashtable]$Expected) {
+    $fields=Get-LateDetailRequiredFields
+    if($fields.Count -ne 139){throw 'Internal late-detail parser field set is not exactly 139 fields'}
+    WitnessExactFields $Frame $fields
+    foreach($name in @('case','nonce','source','run','selected_unit','parent_pid','parent_creation','registry_fixture_id')){
+        $want=$null
+        if($name -ceq 'case'){$want=$CaseName}
+        elseif($name -ceq 'nonce'){$want=$Nonce}
+        elseif($name -ceq 'source'){$want=$Source}
+        elseif($name -ceq 'run'){$want=$Run}
+        elseif($name -ceq 'selected_unit'){$want=$Unit}
+        elseif($name -ceq 'parent_pid'){$want=$ParentPid}
+        elseif($name -ceq 'parent_creation'){$want=$ParentCreation}
+        elseif($name -ceq 'registry_fixture_id'){$want=$FixtureId}
+        if((WitnessField $Frame $name) -cne $want){throw "Late detail binding mismatch: $name"}
+    }
+    foreach($name in @('setup_verified','target_reached','partial_verified')){
+        if((WitnessField $Frame $name) -cne 'true'){throw "Late case did not prove $name"}
+    }
+    if((WitnessField $Frame 'registry_root_state') -cne '-'){
+        throw 'Late cleanup did not prove the nonce registry root absent'
+    }
+    foreach($stem in @('registry_key_leaf_utf8','registry_native_key_name_utf8',
+        'registry_software_parent_native_name_utf8','registry_software_hkey_before_native_name_utf8',
+        'registry_software_hkey_after_native_name_utf8','foreign_canary_name_utf8')){
+        Assert-LateUtf8Pair $Frame $stem
+    }
+    foreach($field in @('registry_key_descriptor_sha256','registry_predelete_machine_view_sha256',
+        'registry_predelete_user_view_sha256','control_directory_descriptor_sha256',
+        'foreign_canary_expected_content_sha256','foreign_canary_observed_content_sha256',
+        'foreign_canary_expected_descriptor_sha256','foreign_canary_observed_descriptor_sha256')){
+        if((WitnessField $Frame $field) -cnotmatch '^[0-9A-F]{64}$'){throw "Late measured digest is malformed: $field"}
+    }
+    $leafBytes=[Convert]::FromHexString((WitnessField $Frame 'registry_key_leaf_utf8_hex'))
+    $fullNameBytes=[Convert]::FromHexString((WitnessField $Frame 'registry_native_key_name_utf8_hex'))
+    $parentNameBytes=[Convert]::FromHexString((WitnessField $Frame 'registry_software_parent_native_name_utf8_hex'))
+    $beforeNameBytes=[Convert]::FromHexString((WitnessField $Frame 'registry_software_hkey_before_native_name_utf8_hex'))
+    $afterNameBytes=[Convert]::FromHexString((WitnessField $Frame 'registry_software_hkey_after_native_name_utf8_hex'))
+    $utf8=[Text.UTF8Encoding]::new($false,$true)
+    $leafName=$utf8.GetString($leafBytes)
+    $fullName=$utf8.GetString($fullNameBytes)
+    $parentName=$utf8.GetString($parentNameBytes)
+    $expectedLeaf='ORBIT_WITNESS_'+$Nonce
+    $expectedSoftwareName='\REGISTRY\USER\'+$UserSid+'\Software'
+    $expectedFixtureId=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($expectedLeaf)))
+    $normalFixtureId=WitnessField $NormalResult 'fixture_id'
+    if($leafName -cne $expectedLeaf -or
+        [Convert]::ToHexString($leafBytes) -cne [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($expectedLeaf)) -or
+        $FixtureId -cne $normalFixtureId -or $FixtureId -cne $expectedFixtureId -or
+        (WitnessField $Frame 'registry_fixture_id') -cne $expectedFixtureId -or
+        $parentName -ine $expectedSoftwareName -or
+        $fullName -ine ($expectedSoftwareName+'\'+$expectedLeaf) -or
+        [Convert]::ToHexString($beforeNameBytes) -cne [Convert]::ToHexString($parentNameBytes) -or
+        [Convert]::ToHexString($afterNameBytes) -cne [Convert]::ToHexString($parentNameBytes) -or
+        (WitnessField $Frame 'registry_parent_hkey_provenance') -cne 'software_hkey_relative_probe_succeeded' -or
+        (WitnessField $Frame 'registry_software_hkey_before_result') -cne 'native_query_success' -or
+        (WitnessField $Frame 'registry_software_hkey_after_result') -cne 'native_query_success' -or
+        (WitnessField $Frame 'registry_preclose_absence_result') -cne '2' -or
+        (WitnessField $Frame 'registry_software_hkey_handle_value') -cnotmatch '^[1-9A-F][0-9A-F]{0,15}$'){
+        throw 'Late fixture/Software HKEY measured-name or preclose-absence binding failed'
+    }
+    if((WitnessField $Frame 'target_count') -cne '1' -or
+        (WitnessField $Frame 'unexpected_error_count') -cne '0' -or
+        (WitnessField $Frame 'fault_phase') -cne $Expected.fault -or
+        (WitnessField $Frame 'target_refusal_phase') -cne $Expected.target){
+        throw 'Late detail phase/count binding mismatch'
+    }
+    Assert-LateErrorGrammar (WitnessField $Frame 'errors') $Expected
+    foreach($fieldPair in @(
+        @('image_disposition_native_result','image_native'),
+        @('image_disposition_reported_result','image_reported'),
+        @('directory_disposition_native_result','directory_native'),
+        @('directory_disposition_reported_result','directory_reported'),
+        @('sdk_native_hresult','sdk_native'),
+        @('sdk_reported_hresult','sdk_reported'),
+        @('profile_absence_probe','profile_probe')
+    )){
+        if((WitnessField $Frame $fieldPair[0]) -cne $Expected[$fieldPair[1]]){
+            throw "Late native/reported action tuple mismatch: $($fieldPair[0])"
+        }
+    }
+    if((WitnessField $Frame 'native_executed') -cne $(if($Expected.native_executed -ceq '1'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'injected') -cne $Expected.injected -or
+        (WitnessField $Frame 'native_domain') -cne $Expected.native_domain -or
+        (WitnessField $Frame 'native_result') -cne $Expected.native_result -or
+        (WitnessField $Frame 'reported_result') -cne $Expected.reported_result){
+        throw 'Late fault execution/injection flags do not match the fixed case row'
+    }
+    if($Expected.native_executed -ceq '0' -and (WitnessField $Frame 'native_result') -cne 'not_called'){
+        throw 'Skipped native operation must report native_result=not_called'
+    }
+    $objectStateKeys=@{image='i';helper_directory='d';profile_entry='p'}
+    foreach($object in @('image','helper_directory','profile_entry')){
+        if((WitnessField $Frame ($object+'_state')) -cne $Expected[$objectStateKeys[$object]]){
+            throw "Late observed state differs from fixed table: $object"
+        }
+        $state=WitnessField $Frame ($object+'_state')
+        $expectedKind=if($object -ceq 'image'){'regular_file'}else{'directory'}
+        if((WitnessField $Frame ($object+'_expected_volume_id')) -cnotmatch '^[0-9A-F]{16}$' -or
+            (WitnessField $Frame ($object+'_expected_file_id')) -cnotmatch '^[0-9A-F]{32}$' -or
+            (WitnessField $Frame ($object+'_held_parent_volume_id')) -cnotmatch '^[0-9A-F]{16}$' -or
+            (WitnessField $Frame ($object+'_held_parent_file_id')) -cnotmatch '^[0-9A-F]{32}$'){
+            throw "Late expected/parent full identity is malformed: $object"
+        }
+        foreach($suffix in @('observed_volume_id','observed_file_id','observed_kind',
+            'observed_content_sha256','observed_descriptor_sha256')){
+            $value=WitnessField $Frame ($object+'_'+$suffix)
+            if($state -ceq '-'){
+                if($value -cne 'not_observed_absent'){throw "Absent $object contains an asserted observed fact"}
+            } elseif([string]::IsNullOrEmpty($value) -or $value -ceq 'not_observed_absent'){
+                throw "Present $object lacks an observed fact"
+            }
+        }
+        if($state -ceq '+'){
+            if((WitnessField $Frame ($object+'_observed_volume_id')) -cne (WitnessField $Frame ($object+'_expected_volume_id')) -or
+                (WitnessField $Frame ($object+'_observed_file_id')) -cne (WitnessField $Frame ($object+'_expected_file_id')) -or
+                (WitnessField $Frame ($object+'_observed_kind')) -cne $expectedKind -or
+                (WitnessField $Frame ($object+'_relative_probe_result')) -cne 'relative_success' -or
+                (WitnessField $Frame ($object+'_observed_content_sha256')) -cnotmatch '^[0-9A-F]{64}$' -or
+                (WitnessField $Frame ($object+'_observed_descriptor_sha256')) -cnotmatch '^[0-9A-F]{64}$'){
+                throw "Present $object full ID/content/DACL observation differs from its captured preimage"
+            }
+        } elseif((WitnessField $Frame ($object+'_relative_probe_result')) -cne 'relative_not_found'){
+            throw "Absent $object lacks a native relative not-found result"
+        }
+        $inventoryCountText=WitnessField $Frame ($object+'_inventory_count')
+        $inventoryHash=WitnessField $Frame ($object+'_inventory_sha256')
+        if($object -in @('image','profile_entry')){
+            if($inventoryCountText -cne 'not_applicable_fixed_case' -or
+                $inventoryHash -cne 'not_applicable_fixed_case'){
+                throw "Fixed inventory sentinels changed for $object"
+            }
+        } elseif($state -ceq '-') {
+            if($inventoryCountText -cne 'not_observed_absent' -or
+                $inventoryHash -cne 'not_observed_absent'){
+                throw 'Absent helper directory must use fixed not-observed inventory sentinels'
+            }
+        }
+        if($object -ceq 'helper_directory' -and $state -ceq '+'){
+            if($inventoryCountText -cnotmatch '^(0|[1-9][0-9]*)$' -or
+                $inventoryCountText -cne $(if($CaseName -ceq 'directory_disposition_noeffect'){'0'}else{'1'}) -or
+                $inventoryHash -cnotmatch '^[0-9A-F]{64}$' -or
+                $inventoryHash -cne (WitnessField $Frame 'helper_directory_observed_content_sha256')){
+                throw 'Helper-directory inventory differs from the exact partial residue'
+            }
+        }
+    }
+    $normalImageId=WitnessField $NormalResult 'image_id'
+    $normalImageMatch=[regex]::Match($normalImageId,'^([0-9A-F]{16}):([0-9A-F]{32})$')
+    if(-not $normalImageMatch.Success){throw 'Shared normal child image ID is not canonical uppercase full identity'}
+    $imageExpectedVolume=WitnessField $Frame 'image_expected_volume_id'
+    $imageExpectedFile=WitnessField $Frame 'image_expected_file_id'
+    $imageParentVolume=WitnessField $Frame 'image_held_parent_volume_id'
+    $imageParentFile=WitnessField $Frame 'image_held_parent_file_id'
+    $helperExpectedVolume=WitnessField $Frame 'helper_directory_expected_volume_id'
+    $helperExpectedFile=WitnessField $Frame 'helper_directory_expected_file_id'
+    $helperParentVolume=WitnessField $Frame 'helper_directory_held_parent_volume_id'
+    $helperParentFile=WitnessField $Frame 'helper_directory_held_parent_file_id'
+    $profileExpectedVolume=WitnessField $Frame 'profile_entry_expected_volume_id'
+    $profileParentVolume=WitnessField $Frame 'profile_entry_held_parent_volume_id'
+    if($imageExpectedVolume -cne $normalImageMatch.Groups[1].Value -or
+        $imageExpectedFile -cne $normalImageMatch.Groups[2].Value -or
+        $imageParentVolume -cne $helperExpectedVolume -or $imageParentFile -cne $helperExpectedFile -or
+        $profileExpectedVolume -cne $profileParentVolume){
+        throw 'Late filesystem identities do not bind to the shared normal image and held parent hierarchy'
+    }
+    if((WitnessField $Frame 'image_state') -ceq '+' -and
+        (WitnessField $Frame 'image_observed_content_sha256') -cne (WitnessField $NormalResult 'image_sha256')){
+        throw 'Present late image content hash differs from the shared normal child image hash'
+    }
+    foreach($field in @('control_directory_volume_id','foreign_canary_expected_volume_id','foreign_canary_observed_volume_id')){
+        if((WitnessField $Frame $field) -cnotmatch '^[0-9A-F]{16}$'){throw "Late canary volume ID malformed: $field"}
+    }
+    foreach($field in @('control_directory_file_id','foreign_canary_expected_file_id','foreign_canary_observed_file_id')){
+        if((WitnessField $Frame $field) -cnotmatch '^[0-9A-F]{32}$'){throw "Late canary file ID malformed: $field"}
+    }
+    $expectedForeignName='ORBIT-FOREIGN-'+$Nonce.Substring(0,8)
+    $foreignNameBytes=[Convert]::FromHexString((WitnessField $Frame 'foreign_canary_name_utf8_hex'))
+    $foreignName=$utf8.GetString($foreignNameBytes)
+    $fixedCanaryPayloadHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::ASCII.GetBytes('ORBIT-LATE-CLEANUP-CANARY-V1')))
+    if($foreignName -cne $expectedForeignName -or
+        [Convert]::ToHexString($foreignNameBytes) -cne [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($expectedForeignName)) -or
+        (WitnessField $Frame 'foreign_canary_expected_content_sha256') -cne $fixedCanaryPayloadHash -or
+        (WitnessField $Frame 'control_directory_volume_id') -cne (WitnessField $Frame 'foreign_canary_expected_volume_id') -or
+        (WitnessField $Frame 'foreign_canary_expected_volume_id') -cne (WitnessField $Frame 'foreign_canary_observed_volume_id') -or
+        (WitnessField $Frame 'foreign_canary_expected_file_id') -cne (WitnessField $Frame 'foreign_canary_observed_file_id') -or
+        (WitnessField $Frame 'foreign_canary_expected_content_sha256') -cne (WitnessField $Frame 'foreign_canary_observed_content_sha256') -or
+        (WitnessField $Frame 'foreign_canary_expected_descriptor_sha256') -cne (WitnessField $Frame 'foreign_canary_observed_descriptor_sha256') -or
+        (WitnessField $Frame 'foreign_canary_setup_result') -cne 'created_and_verified_on_ntfs' -or
+        (WitnessField $Frame 'foreign_canary_preimage_matches') -cne 'true' -or
+        (WitnessField $Frame 'foreign_canary_postimage_matches') -cne 'true'){
+        throw 'External NTFS canary full identity/content/DACL did not match its captured preimage'
+    }
+    foreach($pair in @(@('image_disposition_executed','di'),@('directory_disposition_executed','dd'),@('sdk_executed','sdk'))){
+        if((WitnessField $Frame $pair[0]) -cne $(if($Expected[$pair[1]] -ceq '1'){'true'}else{'false'})){
+            throw "Late actual-call flag mismatch: $($pair[0])"
+        }
+    }
+    foreach($owner in @('helper_image_reader','held_reader_blocker','image_delete_handle',
+        'helper_directory_keeper','profile_ac_anchor','profile_entry_anchor','packages_observer',
+        'software_registry_parent_hkey','registry_fixture_hkey','normal_job_fence','cancel_job_fence')){
+        $ownerState=WitnessField $Frame ($owner+'_state')
+        $nativeClose=WitnessField $Frame ($owner+'_close_native_result')
+        $reportedClose=WitnessField $Frame ($owner+'_close_reported_result')
+        if([string]::IsNullOrEmpty($ownerState) -or [string]::IsNullOrEmpty($nativeClose) -or
+            [string]::IsNullOrEmpty($reportedClose)) {throw "Missing physical owner outcome: $owner"}
+        $expectedState=if($owner -ceq 'held_reader_blocker'){
+            if($CaseName -ceq 'held_reader_sharing'){'opened_retained_then_closed'}else{'not_opened'}
+        } elseif($owner -ceq 'image_delete_handle' -and $CaseName -in @('held_reader_sharing','reader_close_error')){
+            'not_opened'
+        } else {'closed'}
+        $expectedNativeClose=if($expectedState -ceq 'not_opened'){'not_opened'}else{'success'}
+        $expectedReportedClose=if($expectedState -ceq 'not_opened'){'not_opened'}else{'not_injected'}
+        if($CaseName -ceq 'reader_close_error' -and $owner -ceq 'helper_image_reader'){$expectedReportedClose='injected_close_error'}
+        if($CaseName -ceq 'profile_anchor_close_error' -and $owner -ceq 'profile_ac_anchor'){$expectedReportedClose='injected_close_error'}
+        if($CaseName -ceq 'observation_parent_close_error' -and $owner -ceq 'packages_observer'){$expectedReportedClose='injected_close_error'}
+        if($CaseName -ceq 'job_fence_close_error' -and $owner -ceq 'normal_job_fence'){$expectedReportedClose='injected_close_error'}
+        if($ownerState -cne $expectedState -or $nativeClose -cne $expectedNativeClose -or
+            $reportedClose -cne $expectedReportedClose){throw "Physical owner outcome differs from fixed case table: $owner"}
+        if($nativeClose -ceq 'not_opened' -and
+            ($ownerState -cne 'not_opened' -or $reportedClose -cne 'not_opened')){
+            throw "Unopened owner has fabricated close state: $owner"
+        }
+    }
+    if($CaseName -ceq 'held_reader_sharing'){
+        if((WitnessField $Frame 'held_reader_blocker_open_native_result') -cne 'success' -or
+            (WitnessField $Frame 'held_reader_blocker_state') -cne 'opened_retained_then_closed'){
+            throw 'Held-reader setup/close was not physically accounted'
+        }
+    } elseif((WitnessField $Frame 'held_reader_blocker_open_native_result') -cne 'not_opened' -or
+        (WitnessField $Frame 'held_reader_blocker_state') -cne 'not_opened'){
+        throw 'Unexpected held-reader blocker was opened'
+    }
+    if([Text.Encoding]::ASCII.GetByteCount($Frame) -gt 8192){throw 'Late detail frame exceeds existing 8192-byte cap'}
+}
+
+function Assert-LateFinalization([string]$Frame,[string]$CaseName,[hashtable]$Expected) {
+    $fields=@('status','control','registry_absent','image_absent','directory_absent',
+        'profile_absent','image_disposition_executed','directory_disposition_executed',
+        'sdk_executed','normal_job_zero','cancel_job_zero','cleanup_errors')
+    WitnessExactFields $Frame $fields
+    if((WitnessField $Frame 'status') -cne 'partial' -or
+        (WitnessField $Frame 'control') -cne $CaseName -or
+        (WitnessField $Frame 'registry_absent') -cne 'true' -or
+        (WitnessField $Frame 'image_absent') -cne $(if($Expected.i -ceq '-'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'directory_absent') -cne $(if($Expected.d -ceq '-'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'profile_absent') -cne $(if($Expected.p -ceq '-'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'image_disposition_executed') -cne $(if($Expected.di -ceq '1'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'directory_disposition_executed') -cne $(if($Expected.dd -ceq '1'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'sdk_executed') -cne $(if($Expected.sdk -ceq '1'){'true'}else{'false'}) -or
+        (WitnessField $Frame 'normal_job_zero') -cne 'true' -or
+        (WitnessField $Frame 'cancel_job_zero') -cne 'true' -or
+        (WitnessField $Frame 'cleanup_errors') -cne '1'){
+        throw "$CaseName finalization does not match its exact partial residue and actual-action vector"
+    }
+}
+
         function InvokeCleanupControl([string]$controlName) {
-            if($controlName -notin $cleanupImplemented){throw "Cleanup control is not implemented: $controlName"}
+            $controlMode=Get-CleanupControlMode $controlName
             $caseName='process::windows::registry_witness_tests::registry_witness_cleanup_control_'+$controlName
             $controlDir=Join-Path $EvidenceDir 'registry-cleanup-controls'
             $controlLog=Join-Path $controlDir ($controlName+'.log')
@@ -478,7 +830,7 @@ public static class OrbitRegistryWitnessFixture {
                 marker_names=@();marker_hashes=@();attempted=$true
                 selected_test_executed=$false;selected_test_passed=$false
                 transcript_verified=$false;native_control_verified=$false
-                target_reached=$false;primary_probes=0;status='initializing'
+                target_reached=$false;partial_verified=$false;primary_probes=0;status='initializing'
                 log_path=(Split-Path -Leaf $controlLog)
                 records_path=(Split-Path -Leaf $controlRecordsPath)
                 metadata_path=(Split-Path -Leaf $controlMetadataPath)
@@ -563,7 +915,7 @@ public static class OrbitRegistryWitnessFixture {
                 }
                 $payload=$controlReport.Substring($payloadStart,$length)
                 if($payload -match '[^\x20-\x7e]' -or
-                    $payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup|registry_witness_control|registry_witness_control_detail)(?: |$)'){
+                    $payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup|registry_witness_control|registry_witness_control_detail|registry_witness_control_late_detail)(?: |$)'){
                     throw "$controlName unknown or malformed framed record"
                 }
                 $controlFrames.Add($payload)
@@ -621,7 +973,7 @@ public static class OrbitRegistryWitnessFixture {
                 (WitnessField $controlProbes['lifetime/cancel_job_zero'] 'active_processes') -cne '0'){
                 throw "$controlName did not prove both real helper roles reached Job zero"
             }
-            $controlProbes=ValidateWitnessTranscript -InputFrames $controlFrames -RunNonce $controlNonce -ExitCode $controlCode -Mode retained -ControlName $controlName -ExpectedIds $expected -ActualIds $controlActual -ExpectedMachineHash $controlMachineHash -ExpectedUserHash $controlUserHash
+            $controlProbes=ValidateWitnessTranscript -InputFrames $controlFrames -RunNonce $controlNonce -ExitCode $controlCode -Mode $controlMode -ControlName $controlName -ExpectedIds $expected -ActualIds $controlActual -ExpectedMachineHash $controlMachineHash -ExpectedUserHash $controlUserHash
             $controlBindings=@($controlFrames | Where-Object {$_ -match '^registry_witness_parent_binding '})
             $normalResults=@($controlFrames | Where-Object {$_ -match '^registry_witness_child_result role=normal '})
             if($controlBindings.Count -ne 1 -or $normalResults.Count -ne 1){
@@ -631,6 +983,7 @@ public static class OrbitRegistryWitnessFixture {
             $normalResult=$normalResults[0]
             $ready=$controlProbes['lifetime/cancel_ready_mapped']
             $cancelJob=$controlProbes['lifetime/cancel_job_zero']
+            if($controlMode -ceq 'retained'){
             $controlRecords=@($controlFrames | Where-Object {$_ -match '^registry_witness_control(?: |$)'})
             if($controlRecords.Count -ne 1){throw "$controlName did not emit exactly one targeted control receipt"}
             $controlRecord=$controlRecords[0]
@@ -841,9 +1194,47 @@ public static class OrbitRegistryWitnessFixture {
                 transcript_verified=$caseContext.transcript_verified
                 native_control_verified=$caseContext.native_control_verified
                 status='passed_expected_refusal';primary_probes=69
-                target_reached=$true;log_path=(Split-Path -Leaf $controlLog)
+                target_reached=$true;partial_verified=$false;log_path=(Split-Path -Leaf $controlLog)
                 records_path=(Split-Path -Leaf $controlRecordsPath)
                 metadata_path=(Split-Path -Leaf $controlMetadataPath)
+            }
+            } else {
+            $lateControlRecords=@($controlFrames | Where-Object {$_ -match '^registry_witness_control(?: |$)'})
+            $earlyDetailFrames=@($controlFrames | Where-Object {$_ -match '^registry_witness_control_detail(?: |$)'})
+            $lateDetailFrames=@($controlFrames | Where-Object {$_ -match '^registry_witness_control_late_detail(?: |$)'})
+            if($lateControlRecords.Count -ne 0 -or $earlyDetailFrames.Count -ne 0 -or $lateDetailFrames.Count -ne 1){
+                throw "$controlName late mode requires one late detail and no retained-control records"
+            }
+            $lateDetail=$lateDetailFrames[0]
+            $sourceBinding=([string]$env:GITHUB_SHA).ToLowerInvariant()
+            $fixtureId=WitnessField $normalResult 'fixture_id'
+            Assert-LateControlDetail $lateDetail $controlName $controlNonce $sourceBinding $env:GITHUB_RUN_ID `
+                $caseName (WitnessField $binding 'pid') (WitnessField $binding 'creation') $fixtureId `
+                $parentIdentity.user_sid $normalResult $cleanupLate[$controlName]
+            $controlFinal=@($controlFrames | Where-Object {$_ -match '^registry_witness_finalization(?: |$)'})
+            if($controlFinal.Count -ne 1){throw "$controlName partial finalization is not unique"}
+            Assert-LateFinalization $controlFinal[0] $controlName $cleanupLate[$controlName]
+            $caseContext.transcript_verified=$true
+            $caseContext.native_control_verified=$true
+            $caseContext.target_reached=$true
+            $caseContext.partial_verified=$true
+            $caseContext.primary_probes=69
+            $caseContext.status='passed_expected_partial'
+            $caseResult=[pscustomobject][ordered]@{
+                case=$controlName;source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID
+                selected_unit=$caseName;nonce=$controlNonce;user_sid=$parentIdentity.user_sid
+                marker_names=@($controlMachineName,$controlUserName)
+                marker_hashes=@($controlMachineHash,$controlUserHash)
+                attempted=$true;selected_test_executed=$caseContext.selected_test_executed
+                selected_test_passed=$caseContext.selected_test_passed
+                transcript_verified=$caseContext.transcript_verified
+                native_control_verified=$caseContext.native_control_verified
+                status='passed_expected_partial';primary_probes=69
+                target_reached=$true;partial_verified=$true
+                log_path=(Split-Path -Leaf $controlLog)
+                records_path=(Split-Path -Leaf $controlRecordsPath)
+                metadata_path=(Split-Path -Leaf $controlMetadataPath)
+            }
             }
         } catch {
             $caseFailure=$_.Exception.Message
@@ -890,7 +1281,7 @@ public static class OrbitRegistryWitnessFixture {
             'case','source','run','selected_unit','nonce','user_sid','marker_names',
             'marker_hashes','attempted','selected_test_executed','selected_test_passed',
             'transcript_verified','native_control_verified','status','primary_probes',
-            'target_reached','log_path','records_path','metadata_path'
+            'target_reached','partial_verified','log_path','records_path','metadata_path'
         )
         if($caseResult -isnot [System.Management.Automation.PSCustomObject] -or
             $caseProperties.Count -ne $requiredCaseProperties.Count -or
@@ -904,7 +1295,7 @@ public static class OrbitRegistryWitnessFixture {
                 [Collections.Generic.List[string]]$InputFrames,
                 [string]$RunNonce,
                 [int]$ExitCode,
-                [ValidateSet('complete','retained')][string]$Mode,
+                [ValidateSet('complete','retained','partial')][string]$Mode,
                 [string]$ControlName,
                 [Collections.Generic.HashSet[string]]$ExpectedIds,
                 [Collections.Generic.List[string]]$ActualIds,
@@ -916,6 +1307,12 @@ public static class OrbitRegistryWitnessFixture {
             $code=$ExitCode
             $expected=$ExpectedIds
             $actual=$ActualIds
+            $lateDetailCount=@($frames | Where-Object {$_.StartsWith('registry_witness_control_late_detail ')}).Count
+            if($Mode -ceq 'partial'){
+                if($lateDetailCount -ne 1){throw 'Partial cleanup mode requires exactly one late-detail frame'}
+            } elseif($lateDetailCount -ne 0){
+                throw 'Late-detail frames are forbidden in complete and retained cleanup modes'
+            }
             $probeRecords=@{}
             foreach($frame in $frames){
             if($frame.StartsWith('registry_witness_probe ')){
@@ -1323,7 +1720,7 @@ public static class OrbitRegistryWitnessFixture {
             if($missing.Count -ne 0 -or $actual.Count -ne 70){
                 throw "Registry control set incomplete (observed $($actual.Count)/70; missing $($missing -join ', '))"
             }
-        } else {
+        } elseif($Mode -ceq 'retained') {
             if((WitnessField $statusRecord 'witness_status') -cne 'INCOMPLETE' -or
                 (WitnessField $statusRecord 'run_status') -cne 'control_retained'){
                 throw 'Retained control did not report exact INCOMPLETE/control_retained status'
@@ -1352,6 +1749,31 @@ public static class OrbitRegistryWitnessFixture {
                 $missing[0] -cne 'lifetime/cleanup_absent'){
                 throw "Retained transcript is not exactly the existing 69-control subset; missing $($missing -join ', ')"
             }
+        } else {
+            if((WitnessField $statusRecord 'witness_status') -cne 'INCOMPLETE' -or
+                (WitnessField $statusRecord 'run_status') -cne 'control_partial'){
+                throw 'Late control did not report exact INCOMPLETE/control_partial status'
+            }
+            if($probeRecords.ContainsKey('lifetime/cleanup_absent')){
+                throw 'Late control reported a cleanup_absent probe'
+            }
+            $missing=@($expected | Where-Object { -not $actual.Contains($_) })
+            if($actual.Count -ne 69 -or $missing.Count -ne 1 -or
+                $missing[0] -cne 'lifetime/cleanup_absent'){
+                throw "Late transcript is not exactly the 69-probe partial subset; missing $($missing -join ', ')"
+            }
+            $partialFields=@('status','control','registry_absent','image_absent','directory_absent',
+                'profile_absent','image_disposition_executed','directory_disposition_executed',
+                'sdk_executed','normal_job_zero','cancel_job_zero','cleanup_errors')
+            WitnessExactFields $finalization $partialFields
+            if((WitnessField $finalization 'status') -cne 'partial' -or
+                (WitnessField $finalization 'control') -cne $ControlName -or
+                (WitnessField $finalization 'registry_absent') -cne 'true' -or
+                (WitnessField $finalization 'normal_job_zero') -cne 'true' -or
+                (WitnessField $finalization 'cancel_job_zero') -cne 'true' -or
+                (WitnessField $finalization 'cleanup_errors') -cne '1'){
+                throw 'Late transcript finalization did not prove the fixed partial cleanup state'
+            }
         }
             if($Mode -ceq 'complete'){
                 $parentIdentity.primary_witness_status='COMPLETE'
@@ -1361,12 +1783,25 @@ public static class OrbitRegistryWitnessFixture {
             return ,$probeRecords
         }
         $probeRecords=ValidateWitnessTranscript -InputFrames $frames -RunNonce $nonce -ExitCode $code -Mode complete -ControlName '' -ExpectedIds $expected -ActualIds $actual -ExpectedMachineHash $parentIdentity.marker_sha256[0] -ExpectedUserHash $parentIdentity.marker_sha256[1]
+        $lateAdmissionUnit='process::windows::registry_witness_tests::registry_witness_late_error_admission_rejects_coalesced_unexpected_close'
+        $lateAdmissionLog=Join-Path $EvidenceDir 'cleanup-late-error-admission.log'
+        cargo +1.99.0 test --locked -p orbit-platform --features registry-witness --lib $lateAdmissionUnit -- --exact --test-threads=1 --nocapture 2>&1 |
+            Tee-Object -FilePath $lateAdmissionLog | Out-Host
+        $lateAdmissionCode=$LASTEXITCODE
+        $lateAdmissionOutput=Get-Content $lateAdmissionLog -Raw
+        $lateAdmissionHarness=[regex]::Replace($lateAdmissionOutput,'\x1b\[[0-9;]*m','')
+        $lateAdmissionLine='(?m)^test '+[regex]::Escape($lateAdmissionUnit)+' \.\.\. ok\r?$'
+        $lateAdmissionSummary='(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\r?$'
+        if($lateAdmissionCode -ne 0 -or
+            [regex]::Matches($lateAdmissionHarness,'(?m)^running 1 test\r?$').Count -ne 1 -or
+            [regex]::Matches($lateAdmissionHarness,$lateAdmissionLine).Count -ne 1 -or
+            [regex]::Matches($lateAdmissionHarness,$lateAdmissionSummary).Count -ne 1){
+            throw 'Validator-only late error admission regression did not execute and pass exactly once'
+        }
         $controlRuns=[Collections.Generic.List[object]]::new()
-        # Run implemented cases first even though the fixed 25-name manifest begins
-        # with controls that are still pending. Every invocation gets fresh nonce
-        # marker names and a separate exact Rust unit selection.
+        # Every fixed case gets a fresh nonce, fake marker names, and an exact Rust unit selection.
         $controlFailures=[Collections.Generic.List[object]]::new()
-        foreach($controlName in $cleanupImplemented){
+        foreach($controlName in (@($cleanupImplemented)+@($cleanupLateOrder))){
             try {
                 $caseSummary=InvokeCleanupControl $controlName
                 if($caseSummary -isnot [System.Management.Automation.PSCustomObject] -or
@@ -1391,7 +1826,8 @@ public static class OrbitRegistryWitnessFixture {
                         marker_names=@();marker_hashes=@();attempted=$true
                         selected_test_executed=$false;selected_test_passed=$false
                         transcript_verified=$false;native_control_verified=$false
-                        status='metadata_missing';failure=$controlError
+                        status='metadata_missing';primary_probes=0;target_reached=$false
+                        partial_verified=$false;failure=$controlError
                         log_path=('registry-cleanup-controls/'+$controlName+'.log')
                         records_path=('registry-cleanup-controls/'+$controlName+'.records.txt')
                         metadata_path=('registry-cleanup-controls/'+$controlName+'.json')
@@ -1411,8 +1847,11 @@ public static class OrbitRegistryWitnessFixture {
         $controlPassed=@($allControlCases | Where-Object {
             $_.transcript_verified -eq $true -and $_.native_control_verified -eq $true
         }).Count
+        $suiteVerified=$controlAttempted -eq 25 -and $controlExecuted -eq 25 -and
+            $controlTestPassed -eq 25 -and $controlPassed -eq 25 -and
+            $controlFailures.Count -eq 0 -and $cleanupPending.Count -eq 0
         $cleanupControlSummary=[ordered]@{
-            status='PENDING_NATIVE_ORACLES';required=25;attempted=$controlAttempted
+            status=$(if($suiteVerified){'ALL_25_VERIFIED'}else{'INCOMPLETE_FAIL_CLOSED'});required=25;attempted=$controlAttempted
             selected_test_executed=$controlExecuted;selected_test_passed=$controlTestPassed
             native_controls_verified=$controlPassed;missing=$cleanupPending
             failed=@($controlFailures.ToArray());manifest=$cleanupCaseManifest
@@ -1421,7 +1860,7 @@ public static class OrbitRegistryWitnessFixture {
         $cleanupControlSummary | ConvertTo-Json -Depth 6 |
             Out-File (Join-Path $EvidenceDir 'registry-cleanup-controls.json')
         $parentIdentity.witness_status='INCOMPLETE'
-        $parentIdentity.cleanup_negative_controls='PENDING_NATIVE_ORACLES'
+        $parentIdentity.cleanup_negative_controls=$cleanupControlSummary.status
         $parentIdentity.cleanup_controls_attempted=$cleanupControlSummary.attempted
         $parentIdentity.cleanup_controls_executed=$cleanupControlSummary.selected_test_executed
         $parentIdentity.cleanup_controls_selected_tests_passed=$cleanupControlSummary.selected_test_passed
@@ -1430,7 +1869,9 @@ public static class OrbitRegistryWitnessFixture {
         $parentIdentity.cleanup_controls_missing=$cleanupPending
         $parentIdentity | ConvertTo-Json -Depth 8 |
             Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
-        throw "Cleanup negative-control suite remains fail-closed: $($cleanupControlSummary.native_controls_verified)/25 verified; failed $(@($controlFailures | ForEach-Object {$_.case}) -join ', '); missing $($cleanupPending -join ', ')"
+        if(-not $suiteVerified){
+            throw "Cleanup negative-control suite remains fail-closed: $($cleanupControlSummary.native_controls_verified)/25 verified; failed $(@($controlFailures | ForEach-Object {$_.case}) -join ', '); missing $($cleanupPending -join ', ')"
+        }
     } catch { $failure=$_ }
     finally {
         $cleanupComplete=$true
