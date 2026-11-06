@@ -1578,6 +1578,7 @@ mod windows {
             permissive_acl_before.facts,
             permissive_acl_after.facts
         );
+        drop(nested);
         drop(home);
 
         let home = Home::new();
