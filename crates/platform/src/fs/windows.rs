@@ -2392,6 +2392,7 @@ static INSPECTION_REPLACE_AFTER_ENUMERATION: AtomicBool = AtomicBool::new(false)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::IntoRawHandle;
 
     struct RestoreDaclOnDrop {
         handle: OwnedHandle,
@@ -2959,6 +2960,2792 @@ mod tests {
             FAILURE.with(|slot| slot.set(None));
             drop(self.directory.take());
             std::fs::remove_dir_all(&self.base).unwrap();
+        }
+    }
+
+    // Test-only native capability evidence. A ProbeHandle remains in the ledger
+    // until its single checked CloseHandle succeeds or fails; failure consumes
+    // the raw owner and is retained as evidence, never retried.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ProbeHandle(usize);
+
+    #[derive(Debug)]
+    struct ProbeCreatedName {
+        parent: FileIdentity,
+        name: OsString,
+        directory: bool,
+        identity: Option<FileIdentity>,
+    }
+
+    struct ProbeLedger {
+        handles: Vec<Option<OwnedHandle>>,
+        directories: Vec<Option<Directory>>,
+        created: Vec<ProbeCreatedName>,
+        closed: Vec<String>,
+    }
+    impl ProbeLedger {
+        fn new() -> Self {
+            Self {
+                handles: Vec::new(),
+                directories: Vec::new(),
+                created: Vec::new(),
+                closed: Vec::new(),
+            }
+        }
+        fn own_directory(&mut self, directory: Directory) -> usize {
+            let index = self.directories.len();
+            self.directories.push(Some(directory));
+            index
+        }
+        fn directory(&self, index: usize) -> &Directory {
+            self.directories[index]
+                .as_ref()
+                .expect("registered directory owner")
+        }
+        fn close_directory(&mut self, index: usize) -> io::Result<()> {
+            let directory = self.directories[index]
+                .take()
+                .ok_or_else(|| invalid("directory owner already consumed"))?;
+            let errors = probe_close_directory(directory);
+            self.closed
+                .push(format!("directory#{index} close={errors:?}"));
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "directory#{index} close errors: {errors:?}"
+                )))
+            }
+        }
+        fn own(&mut self, handle: OwnedHandle) -> ProbeHandle {
+            let id = ProbeHandle(self.handles.len());
+            self.handles.push(Some(handle));
+            id
+        }
+        fn raw(&self, id: ProbeHandle) -> HANDLE {
+            self.handles[id.0]
+                .as_ref()
+                .expect("live probe handle")
+                .as_raw_handle()
+        }
+        fn live(&self, id: ProbeHandle) -> bool {
+            self.handles.get(id.0).is_some_and(Option::is_some)
+        }
+        fn note_create(&mut self, parent: FileIdentity, name: &OsStr, directory: bool) -> usize {
+            let index = self.created.len();
+            self.created.push(ProbeCreatedName {
+                parent,
+                name: name.to_os_string(),
+                directory,
+                identity: None,
+            });
+            let record = &self.created[index];
+            println!(
+                "probe_creation_reserved parent={:?} name={:?} directory={} identity=UNKNOWN non_authorizing=true",
+                record.parent, record.name, record.directory
+            );
+            index
+        }
+        fn bind_create(&mut self, index: usize, identity: FileIdentity) -> io::Result<()> {
+            let record = self
+                .created
+                .get_mut(index)
+                .ok_or_else(|| invalid("missing probe creation record"))?;
+            if record.identity.replace(identity).is_some() {
+                return Err(invalid("probe creation identity was already bound"));
+            }
+            Ok(())
+        }
+        fn close(&mut self, id: ProbeHandle) -> io::Result<()> {
+            let Some(slot) = self.handles.get_mut(id.0) else {
+                return Err(invalid("probe handle index is invalid"));
+            };
+            let Some(handle) = slot.take() else {
+                return Err(invalid("probe handle was already consumed"));
+            };
+            match probe_close_handle(handle) {
+                Ok(()) => {
+                    self.closed.push(format!("handle#{}=closed", id.0));
+                    Ok(())
+                }
+                Err(error) => {
+                    self.closed
+                        .push(format!("handle#{}=close-error:{error}", id.0));
+                    Err(error)
+                }
+            }
+        }
+        fn close_except(&mut self, keep: &[ProbeHandle]) -> Vec<String> {
+            let mut errors = Vec::new();
+            for index in 0..self.directories.len() {
+                if self.directories[index].is_some() {
+                    if let Err(error) = self.close_directory(index) {
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+            for index in 0..self.handles.len() {
+                let id = ProbeHandle(index);
+                if keep.contains(&id) || !self.live(id) {
+                    continue;
+                }
+                if let Err(error) = self.close(id) {
+                    errors.push(format!("handle#{index}: {error}"));
+                }
+            }
+            errors
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProbeNtResult {
+        returned: i32,
+        effective: i32,
+        iosb_status: Option<i32>,
+        iosb_information: Option<usize>,
+        iosb_observation: &'static str,
+        waited: bool,
+    }
+
+    const PROBE_IOSB_SENTINEL: i32 = 0x6f65_7362;
+    const PROBE_PENDING: i32 = 0x0000_0103;
+    const PROBE_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+    const PROBE_SHARING_VIOLATION: i32 = 0xC000_0043u32 as i32;
+    const PROBE_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+
+    type ProbeNtQueryObject =
+        unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
+    type ProbeGenericProc = unsafe extern "system" fn() -> isize;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> HANDLE;
+        fn GetModuleHandleW(name: *const u16) -> HANDLE;
+        fn GetProcAddress(module: HANDLE, name: *const u8) -> Option<ProbeGenericProc>;
+    }
+
+    #[repr(C)]
+    struct ProbeObjectBasicInformation {
+        attributes: u32,
+        granted_access: u32,
+        handle_count: u32,
+        pointer_count: u32,
+        reserved: [u32; 10],
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ProbeAclEvidence {
+        owner_sid: Vec<u8>,
+        dacl: Vec<u8>,
+        protected: bool,
+        ace_type: u8,
+        ace_flags: u8,
+        ace_mask: u32,
+        ace_sid: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProbeStage {
+        name: OsString,
+        identity: FileIdentity,
+        payload: Option<(OsString, FileIdentity)>,
+        payload_acl_before: Option<ProbeAclEvidence>,
+        payload_acl_after: Option<ProbeAclEvidence>,
+    }
+
+    fn probe_ntdll_export(name: &'static [u8]) -> io::Result<ProbeGenericProc> {
+        let module_name = wide(OsStr::new("ntdll.dll"));
+        let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { GetProcAddress(module, name.as_ptr()) }.ok_or_else(io::Error::last_os_error)
+    }
+
+    fn probe_granted_access(handle: HANDLE) -> io::Result<u32> {
+        let function = probe_ntdll_export(b"NtQueryObject\0")?;
+        // SAFETY: GetProcAddress resolved NtQueryObject from the loaded ntdll.
+        let query: ProbeNtQueryObject = unsafe { std::mem::transmute(function) };
+        let mut information = ProbeObjectBasicInformation {
+            attributes: 0,
+            granted_access: 0,
+            handle_count: 0,
+            pointer_count: 0,
+            reserved: [0; 10],
+        };
+        let mut returned = 0u32;
+        let status = unsafe {
+            query(
+                handle,
+                0,
+                (&mut information as *mut ProbeObjectBasicInformation).cast(),
+                size_of::<ProbeObjectBasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        if status != 0 {
+            return Err(probe_nt_error("NtQueryObject", status));
+        }
+        if returned as usize != size_of::<ProbeObjectBasicInformation>() {
+            return Err(invalid(
+                "NtQueryObject returned an unexpected structure size",
+            ));
+        }
+        Ok(information.granted_access)
+    }
+
+    #[derive(Debug)]
+    struct ProbeNativeError {
+        operation: &'static str,
+        status: i32,
+    }
+    impl std::fmt::Display for ProbeNativeError {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                output,
+                "{} NTSTATUS=0x{:08x}",
+                self.operation, self.status as u32
+            )
+        }
+    }
+    impl std::error::Error for ProbeNativeError {}
+
+    fn probe_nt_error(operation: &'static str, status: i32) -> io::Error {
+        let code = unsafe { RtlNtStatusToDosError(status) } as i32;
+        io::Error::new(
+            io::Error::from_raw_os_error(code).kind(),
+            ProbeNativeError { operation, status },
+        )
+    }
+
+    fn probe_name_missing(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ProbeNativeError>())
+            .is_some_and(|native| native.status == PROBE_NAME_NOT_FOUND)
+    }
+
+    fn probe_security_copy(security: &Security) -> Security {
+        Security {
+            sid: security.sid.clone(),
+            descriptor: security.descriptor.clone(),
+        }
+    }
+
+    // Test-only fail-stop: no unwinding or request-storage reclamation while
+    // kernel ownership/completion is uncertain. Windows process teardown waits
+    // for outstanding I/O to complete or be cancelled. This is never a result.
+    fn probe_uncertain_native_fail_stop() -> ! {
+        static MESSAGE: &[u8] = b"ORBIT_PROBE_UNCLASSIFIED_FAIL_STOP: native completion or ownership uncertain; no classification; fixture/close facts UNKNOWN; terminating without unwinding\r\n";
+        unsafe {
+            let stderr = GetStdHandle((-12i32) as u32);
+            if !stderr.is_null() && stderr != INVALID_HANDLE_VALUE {
+                let mut written = 0;
+                let _ = WriteFile(
+                    stderr,
+                    MESSAGE.as_ptr(),
+                    MESSAGE.len() as u32,
+                    &mut written,
+                    null_mut(),
+                );
+            }
+            let _ = windows_sys::Win32::System::Threading::TerminateProcess(
+                GetCurrentProcess(),
+                0xE015_0001,
+            );
+        }
+        std::process::abort()
+    }
+
+    fn probe_close_handle(handle: OwnedHandle) -> io::Result<()> {
+        let raw = handle.into_raw_handle();
+        // Ownership is consumed exactly once even when CloseHandle fails.
+        if unsafe { CloseHandle(raw) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn probe_finish_nt_call(
+        handle: HANDLE,
+        returned: i32,
+        status: *mut IO_STATUS_BLOCK,
+    ) -> ProbeNtResult {
+        let waited = returned == PROBE_PENDING;
+        if waited {
+            // No IOSB reference or load exists while kernel writes may continue.
+            // This synchronous, nonalertable handle has no overlapping request.
+            let wait = unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(handle, u32::MAX)
+            };
+            if wait != WAIT_OBJECT_0 {
+                probe_uncertain_native_fail_stop();
+            }
+        }
+        // SAFETY: a nonpending return is final, or the same-handle wait above
+        // observed completion. Only then may the kernel output be inspected.
+        let iosb_status = unsafe { std::ptr::addr_of!((*status).Anonymous.Status).read() };
+        if waited && (iosb_status == PROBE_PENDING || iosb_status == PROBE_IOSB_SENTINEL) {
+            probe_uncertain_native_fail_stop();
+        }
+        let information = unsafe { std::ptr::addr_of!((*status).Information).read() };
+        let touched = iosb_status != PROBE_IOSB_SENTINEL || information != usize::MAX;
+        ProbeNtResult {
+            returned,
+            effective: if waited { iosb_status } else { returned },
+            iosb_status: touched.then_some(iosb_status),
+            iosb_information: touched.then_some(information),
+            iosb_observation: if touched {
+                "changed-output"
+            } else {
+                "initialized-by-caller-unchanged-or-ambiguous"
+            },
+            waited,
+        }
+    }
+
+    fn probe_log_nt(label: &str, result: &ProbeNtResult) {
+        println!(
+            "{label} returned=0x{:08x} effective=0x{:08x} pending_wait={} iosb_observation={} iosb_status={:?} iosb_information={:?}",
+            result.returned as u32,
+            result.effective as u32,
+            result.waited,
+            result.iosb_observation,
+            result
+                .iosb_status
+                .map(|value| format!("0x{:08x}", value as u32)),
+            result.iosb_information,
+        );
+    }
+
+    fn probe_open(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        directory: bool,
+        disposition: u32,
+        desired_access: u32,
+        share_access: u32,
+        descriptor: *const SECURITY_DESCRIPTOR,
+    ) -> io::Result<ProbeHandle> {
+        validate_data_component(name)?;
+        probe_open_validated(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            directory,
+            disposition,
+            desired_access,
+            share_access,
+            descriptor,
+        )
+    }
+
+    fn probe_open_validated(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        directory: bool,
+        disposition: u32,
+        desired_access: u32,
+        share_access: u32,
+        descriptor: *const SECURITY_DESCRIPTOR,
+    ) -> io::Result<ProbeHandle> {
+        validate_component(name)?;
+        let created = disposition == FILE_CREATE;
+        let created_index = created.then(|| ledger.note_create(parent_id, name, directory));
+        let mut name_wide: Vec<u16> = name.encode_wide().collect();
+        if name_wide.len() > u16::MAX as usize / 2 {
+            return Err(invalid("probe name exceeds UNICODE_STRING bound"));
+        }
+        let byte_length = (name_wide.len() * 2) as u16;
+        let unicode_name = UNICODE_STRING {
+            Length: byte_length,
+            MaximumLength: byte_length,
+            Buffer: name_wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent,
+            ObjectName: &unicode_name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: descriptor,
+            SecurityQualityOfService: null(),
+        };
+        let mut raw = null_mut();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        status_block.Anonymous.Status = PROBE_IOSB_SENTINEL;
+        status_block.Information = usize::MAX;
+        let returned = unsafe {
+            NtCreateFile(
+                &mut raw,
+                desired_access,
+                &attributes,
+                &mut status_block,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share_access,
+                disposition,
+                FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_DIRECTORY_FILE
+                    } else {
+                        FILE_NON_DIRECTORY_FILE
+                    },
+                null(),
+                0,
+            )
+        };
+        if returned == PROBE_PENDING {
+            // NtCreateFile offers no supplied event and an anomalous pending
+            // return does not prove that its output handle is usable for a wait.
+            // Keep name/OA/IOSB/output/descriptor and fixture owners in scope.
+            probe_uncertain_native_fail_stop();
+        }
+        let result = probe_finish_nt_call(parent, returned, &raw mut status_block);
+        probe_log_nt("probe_open", &result);
+        if returned != 0 {
+            if !raw.is_null() {
+                probe_uncertain_native_fail_stop();
+            }
+            return Err(probe_nt_error("NtCreateFile", returned));
+        }
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            probe_uncertain_native_fail_stop();
+        }
+        let handle = ledger.own(unsafe { OwnedHandle::from_raw_handle(raw) });
+        if let Some(index) = created_index {
+            let id = identity(ledger.raw(handle))?;
+            ledger.bind_create(index, id)?;
+        }
+        Ok(handle)
+    }
+
+    fn probe_rename_directory(
+        source: HANDLE,
+        target_parent: HANDLE,
+        target_name: &OsStr,
+    ) -> ProbeNtResult {
+        assert!(
+            validate_data_component(target_name).is_ok(),
+            "rename target is one validated component"
+        );
+        let name: Vec<u16> = target_name.encode_wide().collect();
+        let bytes = offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * 2;
+        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        status_block.Anonymous.Status = PROBE_IOSB_SENTINEL;
+        status_block.Information = usize::MAX;
+        // SAFETY: aligned variable-tail buffer remains alive through pending
+        // completion; relative RootDirectory, one component, ReplaceIfExists=false,
+        // and zeroed remaining bytes implement FileRenameInformation flags=0.
+        let returned = unsafe {
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).RootDirectory = target_parent;
+            (*info).FileNameLength = (name.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            NtSetInformationFile(
+                source,
+                &mut status_block,
+                info.cast(),
+                bytes as u32,
+                FileRenameInformation,
+            )
+        };
+        probe_finish_nt_call(source, returned, &raw mut status_block)
+    }
+
+    fn probe_disposition(handle: HANDLE) -> io::Result<ProbeNtResult> {
+        let information = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+        let mut status_block = IO_STATUS_BLOCK::default();
+        status_block.Anonymous.Status = PROBE_IOSB_SENTINEL;
+        status_block.Information = usize::MAX;
+        // SAFETY: input information and IOSB remain live if the synchronous call
+        // reports pending; probe_finish_nt_call waits before either can be dropped.
+        let returned = unsafe {
+            NtSetInformationFile(
+                handle,
+                &mut status_block,
+                (&information as *const FILE_DISPOSITION_INFORMATION).cast(),
+                size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                FileDispositionInformation,
+            )
+        };
+        let result = probe_finish_nt_call(handle, returned, &raw mut status_block);
+        probe_log_nt("probe_disposition", &result);
+        if result.effective == 0 {
+            Ok(result)
+        } else {
+            Err(probe_nt_error(
+                "FileDispositionInformation",
+                result.effective,
+            ))
+        }
+    }
+
+    fn probe_close_directory(directory: Directory) -> Vec<String> {
+        let Directory { chain, .. } = directory;
+        let mut errors = Vec::new();
+        for (index, anchor) in chain.into_iter().enumerate().rev() {
+            match Arc::try_unwrap(anchor) {
+                Ok(handle) => {
+                    if let Err(error) = probe_close_handle(handle) {
+                        errors.push(format!("directory-anchor#{index}: {error}"));
+                    }
+                }
+                Err(anchor) => {
+                    let count = Arc::strong_count(&anchor);
+                    errors.push(format!(
+                        "directory-anchor#{index} retained by {count} owner(s)"
+                    ));
+                    drop(anchor);
+                }
+            }
+        }
+        errors
+    }
+
+    fn probe_close_lock(lock: StateLock) -> Vec<String> {
+        let lock = std::mem::ManuallyDrop::new(lock);
+        // SAFETY: StateLock has Drop, so read its PrivateFile once and suppress
+        // the automatic unlock; this function performs and checks unlock itself.
+        let private = unsafe { std::ptr::read(&lock.file) };
+        let mut errors = Vec::new();
+        let mut overlap = OVERLAPPED::default();
+        if unsafe { UnlockFileEx(private.file.as_raw_handle(), 0, 1, 0, &mut overlap) } == 0 {
+            errors.push(format!(
+                "exclusive lock unlock: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let PrivateFile { file, _anchors, .. } = private;
+        let raw = file.into_raw_handle();
+        let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
+        if let Err(error) = probe_close_handle(owned) {
+            errors.push(format!("exclusive lock handle close: {error}"));
+        }
+        drop(_anchors);
+        errors
+    }
+
+    fn probe_read_payload(handle: HANDLE, expected: FileIdentity) -> io::Result<Vec<u8>> {
+        if identity(handle)? != expected {
+            return Err(denied("probe payload full identity changed"));
+        }
+        let snapshot = file_snapshot(handle, expected)?;
+        if snapshot.length > 4096 {
+            return Err(invalid("probe payload exceeds bounded fixture size"));
+        }
+        let mut bytes = vec![0u8; snapshot.length as usize];
+        let mut read = 0;
+        if unsafe {
+            ReadFile(
+                handle,
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                &mut read,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        bytes.truncate(read as usize);
+        if bytes.len() as u64 != snapshot.length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short probe payload read",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn probe_acl_evidence(handle: HANDLE, security: &Security) -> io::Result<ProbeAclEvidence> {
+        let mut owner = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        let _allocation = LocalAllocation(descriptor);
+        if owner.is_null() || dacl.is_null() {
+            return Err(denied("probe owner or DACL is absent"));
+        }
+        let owner_len = unsafe { GetLengthSid(owner) } as usize;
+        if owner_len == 0 || owner_len > 68 {
+            return Err(invalid("probe owner SID length is invalid"));
+        }
+        let owner_sid =
+            unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), owner_len) }.to_vec();
+        if unsafe { EqualSid(owner, security.sid.as_ptr().cast_mut().cast()) } == 0 {
+            return Err(denied("probe object owner is not captured TokenUser"));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        unsafe {
+            ok(GetSecurityDescriptorControl(
+                descriptor,
+                &mut control,
+                &mut revision,
+            ))?;
+        }
+        let acl_length = unsafe { (*dacl).AclSize as usize };
+        if acl_length < size_of::<ACL>() {
+            return Err(invalid("probe DACL size is invalid"));
+        }
+        let acl_bytes =
+            unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_length) }.to_vec();
+        if unsafe { (*dacl).AceCount } != 1 {
+            return Err(denied("probe DACL must contain exactly one ACE"));
+        }
+        let mut ace = null_mut();
+        unsafe {
+            ok(GetAce(dacl, 0, &mut ace))?;
+        }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if (header.AceSize as usize) < offset_of!(ACCESS_ALLOWED_ACE, SidStart) + 8 {
+            return Err(invalid("probe ACE is shorter than its SID prefix"));
+        }
+        if header.AceType != 0 {
+            return Err(denied("probe DACL ACE is not ordinary allow"));
+        }
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let ace_sid_ptr = (&allowed.SidStart as *const u32).cast_mut().cast();
+        let ace_sid_len = unsafe { GetLengthSid(ace_sid_ptr) } as usize;
+        if ace_sid_len == 0
+            || ace_sid_len > header.AceSize as usize - offset_of!(ACCESS_ALLOWED_ACE, SidStart)
+        {
+            return Err(invalid("probe ACE SID length is invalid"));
+        }
+        let ace_sid =
+            unsafe { std::slice::from_raw_parts(ace_sid_ptr.cast::<u8>(), ace_sid_len) }.to_vec();
+        Ok(ProbeAclEvidence {
+            owner_sid,
+            dacl: acl_bytes,
+            protected: control & SE_DACL_PROTECTED != 0,
+            ace_type: header.AceType,
+            ace_flags: header.AceFlags,
+            ace_mask: allowed.Mask,
+            ace_sid,
+        })
+    }
+
+    fn probe_check_r(handle: HANDLE, security: &Security) -> io::Result<ProbeAclEvidence> {
+        if security.check_owner_access(handle, true)? != PrivateFileAccess::ReadOnly {
+            return Err(denied("probe DACL is not canonical R"));
+        }
+        let evidence = probe_acl_evidence(handle, security)?;
+        if !evidence.protected
+            || evidence.ace_flags != 0
+            || evidence.ace_mask != FILE_GENERIC_READ
+            || evidence.ace_sid
+                != security
+                    .sid
+                    .iter()
+                    .flat_map(|word| word.to_ne_bytes())
+                    .collect::<Vec<_>>()
+        {
+            return Err(denied(
+                "probe R DACL is not protected owner-only with exact mask and zero ACE flags",
+            ));
+        }
+        Ok(evidence)
+    }
+
+    fn probe_check_full(handle: HANDLE, security: &Security) -> io::Result<ProbeAclEvidence> {
+        if security.check_owner_access(handle, false)? != PrivateFileAccess::FullControl {
+            return Err(denied("probe fixture DACL is not full-control"));
+        }
+        probe_acl_evidence(handle, security)
+    }
+
+    fn probe_open_bound(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        directory: bool,
+        desired: u32,
+        sharing: u32,
+        descriptor: *const SECURITY_DESCRIPTOR,
+        expected: Option<FileIdentity>,
+        metadata: bool,
+    ) -> io::Result<ProbeHandle> {
+        if metadata && desired & FILE_READ_ATTRIBUTES == 0 {
+            return Err(invalid(
+                "FILE_READ_ATTRIBUTES is required for the requested metadata oracle",
+            ));
+        }
+        let handle = probe_open(
+            ledger, parent, parent_id, name, directory, FILE_OPEN, desired, sharing, descriptor,
+        )?;
+        let actual = identity(ledger.raw(handle))?;
+        if expected.is_some_and(|wanted| wanted != actual) {
+            return Err(denied(
+                "probe handle full identity does not match its recorded object",
+            ));
+        }
+        if metadata {
+            ensure_kind(ledger.raw(handle), directory)?;
+        }
+        Ok(handle)
+    }
+
+    fn probe_open_lock_bound(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        expected: Option<FileIdentity>,
+    ) -> io::Result<ProbeHandle> {
+        let name = OsStr::new("transaction.lock");
+        validate_lock_component(name)?;
+        let handle = probe_open_validated(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            false,
+            FILE_OPEN,
+            DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+        )?;
+        let actual = identity(ledger.raw(handle))?;
+        if expected.is_some_and(|wanted| actual != wanted) {
+            return Err(denied("lock teardown full identity changed"));
+        }
+        ensure_kind(ledger.raw(handle), false)?;
+        Ok(handle)
+    }
+
+    fn probe_check_lock_absent(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+    ) -> io::Result<()> {
+        match probe_open_lock_bound(ledger, parent, parent_id, None) {
+            Ok(handle) => {
+                ledger.close(handle)?;
+                Err(denied("lock file remains after teardown"))
+            }
+            Err(error) if probe_name_missing(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn probe_check_absent(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        match probe_open_bound(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            true,
+            FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            None,
+            true,
+        ) {
+            Ok(handle) => {
+                ledger.close(handle)?;
+                Err(denied(
+                    "probe name expected absent but it resolved to a directory",
+                ))
+            }
+            Err(error) if probe_name_missing(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn probe_check_named_directory(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        expected: FileIdentity,
+        security: &Security,
+    ) -> io::Result<ProbeHandle> {
+        let root = probe_open_bound(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            true,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            Some(expected),
+            true,
+        )?;
+        security.check(ledger.raw(root))?;
+        let _ = probe_check_full(ledger.raw(root), security)?;
+        Ok(root)
+    }
+
+    fn probe_create_payload(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        bytes: &[u8],
+        security: &Security,
+    ) -> io::Result<(FileIdentity, ProbeAclEvidence)> {
+        let writer = probe_open(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            false,
+            FILE_CREATE,
+            FILE_ALL_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            security.descriptor.as_ptr().cast(),
+        )?;
+        let file_id = identity(ledger.raw(writer))?;
+        let creation_acl = probe_check_full(ledger.raw(writer), security)?;
+        let granted = probe_granted_access(ledger.raw(writer))?;
+        println!(
+            "probe_payload_create file_id={file_id:?} desired=0x{:08x} share=0x{:08x} granted=0x{granted:08x} owner_dacl={creation_acl:?}",
+            FILE_ALL_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        );
+        if granted != FILE_ALL_ACCESS {
+            return Err(denied(
+                "probe file writer grant differs from FILE_ALL_ACCESS creation request",
+            ));
+        }
+        let mut written = 0u32;
+        let write_result = if unsafe {
+            WriteFile(
+                ledger.raw(writer),
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                null_mut(),
+            )
+        } == 0
+        {
+            Err(io::Error::last_os_error())
+        } else if written as usize != bytes.len() {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short probe fixture write",
+            ))
+        } else if unsafe { FlushFileBuffers(ledger.raw(writer)) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        let close_result = ledger.close(writer);
+        match (write_result, close_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Err(error), Err(close)) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; probe writer close also failed: {close}"),
+                ));
+            }
+        }
+        let view = probe_open_bound(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            false,
+            FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            null(),
+            Some(file_id),
+            true,
+        )?;
+        let observed_acl = probe_check_full(ledger.raw(view), security)?;
+        if observed_acl != creation_acl {
+            return Err(denied(
+                "full-control fixture DACL changed between creation and readback",
+            ));
+        }
+        if probe_read_payload(ledger.raw(view), file_id)? != bytes {
+            return Err(denied(
+                "flushed probe fixture bytes differ on independent readback",
+            ));
+        }
+        ledger.close(view)?;
+        Ok((file_id, observed_acl))
+    }
+
+    fn probe_set_dacl(handle: HANDLE, security: &Security) -> io::Result<()> {
+        let mut present = 0;
+        let mut dacl = null_mut();
+        let mut defaulted = 0;
+        unsafe {
+            ok(GetSecurityDescriptorDacl(
+                security.descriptor.as_ptr().cast_mut().cast(),
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            ))?;
+        }
+        if present == 0 || dacl.is_null() {
+            return Err(invalid("probe descriptor has no DACL"));
+        }
+        let result = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        if result == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(result as i32))
+        }
+    }
+
+    fn probe_readonly_security(security: &Security) -> io::Result<Security> {
+        let mut sid_text = null_mut();
+        unsafe {
+            ok(ConvertSidToStringSidW(
+                security.sid.as_ptr().cast_mut().cast(),
+                &mut sid_text,
+            ))?;
+        }
+        let sid_allocation = LocalAllocation(sid_text.cast());
+        let mut sid_length = 0usize;
+        while unsafe { *sid_text.add(sid_length) } != 0 {
+            sid_length += 1;
+        }
+        let owner = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, sid_length) })
+            .map_err(|_| invalid("probe owner SID string encoding"))?;
+        drop(sid_allocation);
+        let text = wide(OsStr::new(&format!(
+            "O:{owner}D:P(A;;0x00120089;;;{owner})"
+        )));
+        let mut raw = null_mut();
+        let mut length = 0u32;
+        unsafe {
+            ok(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut raw,
+                &mut length,
+            ))?;
+        }
+        let allocation = LocalAllocation(raw);
+        let actual_length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+        if actual_length == 0 || length < actual_length as u32 {
+            return Err(invalid("probe R descriptor length is invalid"));
+        }
+        let mut descriptor = vec![0usize; actual_length.div_ceil(size_of::<usize>())];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw.cast::<u8>(),
+                descriptor.as_mut_ptr().cast(),
+                actual_length,
+            );
+        }
+        drop(allocation);
+        Ok(Security {
+            sid: security.sid.clone(),
+            descriptor,
+        })
+    }
+
+    fn probe_open_fixture_directory(
+        ledger: &mut ProbeLedger,
+        path: &Path,
+        security: &Security,
+        expected: FileIdentity,
+    ) -> io::Result<Directory> {
+        let mut components = path.components();
+        let drive = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                _ => return Err(unsupported("probe requires a local drive")),
+            },
+            _ => return Err(invalid("probe root must be absolute")),
+        };
+        if components.next() != Some(Component::RootDir) {
+            return Err(invalid("probe drive-relative path"));
+        }
+        let names = components
+            .map(|component| match component {
+                Component::Normal(name) => {
+                    validate_component(name)?;
+                    Ok(name.to_os_string())
+                }
+                _ => Err(invalid("ambiguous probe fixture path")),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if names.is_empty() {
+            return Err(invalid("probe fixture cannot be drive root"));
+        }
+        let drive_path = wide(OsStr::new(&format!("{}:\\", char::from(drive))));
+        if unsafe { GetDriveTypeW(drive_path.as_ptr()) } != DRIVE_FIXED {
+            return Err(unsupported("probe requires fixed local NTFS"));
+        }
+        let root_path = wide(OsStr::new(&format!("\\\\?\\{}:\\", char::from(drive))));
+        let raw = unsafe {
+            CreateFileW(
+                root_path.as_ptr(),
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let first = ledger.own(unsafe { OwnedHandle::from_raw_handle(raw) });
+        ensure_kind(ledger.raw(first), true)?;
+        let mut filesystem = [0u16; 32];
+        unsafe {
+            ok(GetVolumeInformationByHandleW(
+                ledger.raw(first),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            ))?;
+        }
+        let length = filesystem
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(filesystem.len());
+        if String::from_utf16_lossy(&filesystem[..length]) != "NTFS" {
+            return Err(unsupported("probe requires NTFS semantics"));
+        }
+        let mut anchors = vec![first];
+        let mut parent_id = identity(ledger.raw(first))?;
+        for (index, name) in names.iter().enumerate() {
+            let desired = if index + 1 == names.len() {
+                FILE_ALL_ACCESS & !DELETE
+            } else {
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+            };
+            let parent = ledger.raw(*anchors.last().unwrap());
+            let handle = probe_open_validated(
+                ledger,
+                parent,
+                parent_id,
+                name,
+                true,
+                FILE_OPEN,
+                desired,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+            )?;
+            ensure_kind(ledger.raw(handle), true)?;
+            parent_id = identity(ledger.raw(handle))?;
+            anchors.push(handle);
+        }
+        let final_raw = ledger.raw(*anchors.last().unwrap());
+        security.check(final_raw)?;
+        if parent_id != expected {
+            return Err(denied(
+                "fixture path differs from recorded creation full identity",
+            ));
+        }
+        // No fallible operation follows transfer: all these owners are already
+        // registered, validated and known live. The returned Directory is stored
+        // in its fixture/ledger slot before the caller's next fallible operation.
+        if anchors.iter().any(|handle| !ledger.live(*handle)) {
+            return Err(invalid("missing checked fixture anchor"));
+        }
+        let chain = anchors
+            .into_iter()
+            .map(|handle| Arc::new(ledger.handles[handle.0].take().unwrap()))
+            .collect();
+        Ok(Directory {
+            chain,
+            identity: parent_id,
+            security: probe_security_copy(security),
+            enumeration: Mutex::new(()),
+        })
+    }
+
+    fn probe_create_fixture_lock(
+        ledger: &mut ProbeLedger,
+        parent: &Directory,
+        security: &Security,
+    ) -> io::Result<StateLock> {
+        let name = OsStr::new("transaction.lock");
+        validate_lock_component(name)?;
+        let handle = probe_open_validated(
+            ledger,
+            parent.handle(),
+            parent.identity(),
+            name,
+            false,
+            FILE_CREATE,
+            FILE_ALL_ACCESS & !DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            security.descriptor.as_ptr().cast(),
+        )?;
+        let raw = ledger.raw(handle);
+        ensure_kind(raw, false)?;
+        security.check(raw)?;
+        let file_id = identity(raw)?;
+        if file_snapshot(raw, file_id)?.length != 0 {
+            return Err(denied("new probe lock is not empty"));
+        }
+        let mut overlap = OVERLAPPED::default();
+        if unsafe {
+            LockFileEx(
+                raw,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlap,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
+                probe_uncertain_native_fail_stop();
+            }
+            return Err(error);
+        }
+        let owned = ledger.handles[handle.0].take().unwrap();
+        Ok(StateLock {
+            file: PrivateFile {
+                file: File::from(owned),
+                identity: file_id,
+                parent: parent.identity(),
+                _anchors: parent.chain.clone(),
+                security: probe_security_copy(security),
+                writable_candidate: AtomicBool::new(false),
+                publication: Mutex::new(()),
+            },
+            mode: LockMode::Exclusive,
+        })
+    }
+
+    fn probe_create_directory(
+        ledger: &mut ProbeLedger,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        path: &std::path::Path,
+        security: &Security,
+        stage_log: Option<&mut Vec<ProbeStage>>,
+    ) -> io::Result<(ProbeHandle, FileIdentity)> {
+        let creator = probe_open(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            true,
+            FILE_CREATE,
+            FILE_ALL_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            security.descriptor.as_ptr().cast(),
+        )?;
+        let created_id = identity(ledger.raw(creator))?;
+        let acl = probe_check_full(ledger.raw(creator), security)?;
+        if acl.ace_flags != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8 {
+            return Err(denied(
+                "new private directory creation ACE flags differ from captured descriptor",
+            ));
+        }
+        if let Some(log) = stage_log {
+            log.push(ProbeStage {
+                name: name.to_os_string(),
+                identity: created_id,
+                payload: None,
+                payload_acl_before: None,
+                payload_acl_after: None,
+            });
+        }
+        ledger.close(creator)?;
+        let checked_owner = probe_open_fixture_directory(ledger, path, security, created_id)?;
+        let checked_index = ledger.own_directory(checked_owner);
+        let checked = ledger.directory(checked_index);
+        let checked_id = checked.identity();
+        checked.check()?;
+        if checked_id != created_id {
+            return Err(denied(
+                "opened probe directory identity differs from creation identity",
+            ));
+        }
+        let _checked_acl = checked.security.check(checked.handle())?;
+        ledger.close_directory(checked_index)?;
+        let root = probe_open_bound(
+            ledger,
+            parent,
+            parent_id,
+            name,
+            true,
+            DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            Some(created_id),
+            true,
+        )?;
+        let granted = probe_granted_access(ledger.raw(root))?;
+        if granted != DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE {
+            return Err(denied(
+                "probe stage root grant differs from DELETE rename authority",
+            ));
+        }
+        println!(
+            "probe_root name={name:?} path={path:?} full_id={created_id:?} creation_acl={acl:?} requested=0x{:08x} share=0x{:08x} granted=0x{granted:08x}",
+            DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        );
+        Ok((root, created_id))
+    }
+
+    fn probe_directory_chain(directory: &Directory) -> io::Result<Vec<FileIdentity>> {
+        directory
+            .chain
+            .iter()
+            .map(|handle| identity(handle.as_raw_handle()))
+            .collect()
+    }
+
+    fn probe_recheck_chain(directory: &Directory, expected: &[FileIdentity]) -> io::Result<()> {
+        let observed = probe_directory_chain(directory)?;
+        if observed != expected {
+            return Err(denied("held parent/ancestor full identity chain changed"));
+        }
+        directory.check()
+    }
+
+    fn probe_close_lock_owned(lock: StateLock) -> Vec<String> {
+        probe_close_lock(lock)
+    }
+
+    struct ProbeFixture {
+        ledger: ProbeLedger,
+        security: Option<Security>,
+        read_only: Option<Security>,
+        temp_parent: Option<ProbeHandle>,
+        temp_parent_id: Option<FileIdentity>,
+        base_name: Option<OsString>,
+        base_path: Option<std::path::PathBuf>,
+        base_id: Option<FileIdentity>,
+        base_dir: Option<Directory>,
+        base_chain: Vec<FileIdentity>,
+        state_name: OsString,
+        state_path: Option<std::path::PathBuf>,
+        state_id: Option<FileIdentity>,
+        state_dir: Option<Directory>,
+        state_chain: Vec<FileIdentity>,
+        foreign_name: OsString,
+        foreign_path: Option<std::path::PathBuf>,
+        foreign_id: Option<FileIdentity>,
+        foreign_dir: Option<Directory>,
+        foreign_chain: Vec<FileIdentity>,
+        lock: Option<StateLock>,
+        lock_id: Option<FileIdentity>,
+        stages: Vec<ProbeStage>,
+        foreign_canary: Option<(FileIdentity, ProbeAclEvidence)>,
+        removed: Vec<String>,
+        preserve_receipt: String,
+    }
+
+    impl ProbeFixture {
+        fn empty() -> Self {
+            Self {
+                ledger: ProbeLedger::new(),
+                security: None,
+                read_only: None,
+                temp_parent: None,
+                temp_parent_id: None,
+                base_name: None,
+                base_path: None,
+                base_id: None,
+                base_dir: None,
+                base_chain: Vec::new(),
+                state_name: OsString::from("state"),
+                state_path: None,
+                state_id: None,
+                state_dir: None,
+                state_chain: Vec::new(),
+                foreign_name: OsString::from("foreign-parent"),
+                foreign_path: None,
+                foreign_id: None,
+                foreign_dir: None,
+                foreign_chain: Vec::new(),
+                lock: None,
+                lock_id: None,
+                stages: Vec::new(),
+                foreign_canary: None,
+                removed: Vec::new(),
+                preserve_receipt: String::new(),
+            }
+        }
+
+        fn initialize(&mut self) -> io::Result<()> {
+            static SERIAL: AtomicU64 = AtomicU64::new(0);
+            self.security = Some(Security::current()?);
+            let temp_path = std::env::temp_dir();
+            let wide_path = wide(temp_path.as_os_str());
+            let raw = unsafe {
+                CreateFileW(
+                    wide_path.as_ptr(),
+                    FILE_LIST_DIRECTORY
+                        | FILE_ADD_SUBDIRECTORY
+                        | FILE_DELETE_CHILD
+                        | FILE_READ_ATTRIBUTES
+                        | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let temp_parent = self
+                .ledger
+                .own(unsafe { OwnedHandle::from_raw_handle(raw) });
+            ensure_kind(self.ledger.raw(temp_parent), true)?;
+            let temp_id = identity(self.ledger.raw(temp_parent))?;
+            let desired = FILE_LIST_DIRECTORY
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_DELETE_CHILD
+                | FILE_READ_ATTRIBUTES
+                | SYNCHRONIZE;
+            let granted = probe_granted_access(self.ledger.raw(temp_parent))?;
+            if granted & desired != desired {
+                return Err(denied(
+                    "temporary parent lacks measured relative-create/delete rights",
+                ));
+            }
+            self.temp_parent = Some(temp_parent);
+            self.temp_parent_id = Some(temp_id);
+
+            let base = OsString::from(format!(
+                "orbit-leaf15-probe-{}-{}",
+                std::process::id(),
+                SERIAL.fetch_add(1, Ordering::Relaxed),
+            ));
+            validate_data_component(&base)?;
+            let base_path = temp_path.join(&base);
+            self.base_name = Some(base.clone());
+            self.base_path = Some(base_path.clone());
+            let temp_raw = self.ledger.raw(temp_parent);
+            let (base_handle, base_id) = probe_create_directory(
+                &mut self.ledger,
+                temp_raw,
+                temp_id,
+                &base,
+                &base_path,
+                self.security.as_ref().unwrap(),
+                None,
+            )?;
+            self.base_id = Some(base_id);
+            self.ledger.close(base_handle)?;
+            self.base_dir = Some(probe_open_fixture_directory(
+                &mut self.ledger,
+                &base_path,
+                self.security.as_ref().unwrap(),
+                base_id,
+            )?);
+            let base_dir = self.base_dir.as_ref().unwrap();
+            self.base_chain = probe_directory_chain(base_dir)?;
+            if base_dir.identity() != base_id {
+                return Err(denied(
+                    "private probe base identity differs from created object",
+                ));
+            }
+
+            let base_dir = self.base_dir.as_ref().unwrap();
+            let state_path = base_path.join(&self.state_name);
+            self.state_path = Some(state_path.clone());
+            let (state_creator, state_id) = probe_create_directory(
+                &mut self.ledger,
+                base_dir.handle(),
+                base_id,
+                &self.state_name,
+                &state_path,
+                self.security.as_ref().unwrap(),
+                None,
+            )?;
+            self.state_id = Some(state_id);
+            self.ledger.close(state_creator)?;
+            self.state_dir = Some(probe_open_fixture_directory(
+                &mut self.ledger,
+                &state_path,
+                self.security.as_ref().unwrap(),
+                state_id,
+            )?);
+            let state = self.state_dir.as_ref().unwrap();
+            self.state_chain = probe_directory_chain(state)?;
+            if state.identity() != state_id {
+                return Err(denied(
+                    "private probe state identity differs from created object",
+                ));
+            }
+            self.lock = Some(probe_create_fixture_lock(
+                &mut self.ledger,
+                self.state_dir.as_ref().unwrap(),
+                self.security.as_ref().unwrap(),
+            )?);
+            let lock = self.lock.as_ref().unwrap();
+            self.lock_id = Some(lock.identity());
+            self.state_dir.as_ref().unwrap().require_lock(lock, true)?;
+
+            let foreign_path = base_path.join(&self.foreign_name);
+            self.foreign_path = Some(foreign_path.clone());
+            let (foreign_creator, foreign_id) = probe_create_directory(
+                &mut self.ledger,
+                base_dir.handle(),
+                base_id,
+                &self.foreign_name,
+                &foreign_path,
+                self.security.as_ref().unwrap(),
+                None,
+            )?;
+            self.foreign_id = Some(foreign_id);
+            self.ledger.close(foreign_creator)?;
+            self.foreign_dir = Some(probe_open_fixture_directory(
+                &mut self.ledger,
+                &foreign_path,
+                self.security.as_ref().unwrap(),
+                foreign_id,
+            )?);
+            let foreign = self.foreign_dir.as_ref().unwrap();
+            self.foreign_chain = probe_directory_chain(foreign)?;
+            if foreign.identity() != foreign_id {
+                return Err(denied(
+                    "foreign parent identity differs from created object",
+                ));
+            }
+            self.read_only = Some(probe_readonly_security(self.security.as_ref().unwrap())?);
+            println!(
+                "probe_fixture temp_parent={temp_id:?} base={base_id:?} state={state_id:?} foreign={foreign_id:?} lock={:?} lock_mode=Exclusive temp_parent_desired=0x{:08x} temp_parent_granted=0x{granted:08x}",
+                self.lock_id, desired,
+            );
+            Ok(())
+        }
+
+        fn base(&self) -> &Directory {
+            self.base_dir.as_ref().expect("initialized fixture base")
+        }
+        fn state(&self) -> &Directory {
+            self.state_dir.as_ref().expect("initialized fixture state")
+        }
+        fn foreign(&self) -> &Directory {
+            self.foreign_dir
+                .as_ref()
+                .expect("initialized fixture foreign")
+        }
+        fn sec(&self) -> &Security {
+            self.security.as_ref().expect("captured probe owner")
+        }
+        fn rsec(&self) -> &Security {
+            self.read_only
+                .as_ref()
+                .expect("constructed R fixture policy")
+        }
+
+        fn bind_stage_payload(
+            &mut self,
+            root: FileIdentity,
+            name: &OsStr,
+            file: FileIdentity,
+            acl: ProbeAclEvidence,
+        ) -> io::Result<()> {
+            let stage = self
+                .stages
+                .iter_mut()
+                .find(|stage| stage.identity == root)
+                .ok_or_else(|| invalid("created stage is absent from fixture ledger"))?;
+            stage.payload = Some((name.to_os_string(), file));
+            stage.payload_acl_before = Some(acl.clone());
+            stage.payload_acl_after = Some(acl);
+            Ok(())
+        }
+
+        fn rename_stage(&mut self, root: FileIdentity, new_name: &OsStr) -> io::Result<()> {
+            let stage = self
+                .stages
+                .iter_mut()
+                .find(|stage| stage.identity == root)
+                .ok_or_else(|| invalid("renamed stage is absent from fixture ledger"))?;
+            stage.name = new_name.to_os_string();
+            Ok(())
+        }
+
+        fn close_parent_owners(&mut self) -> Vec<String> {
+            let mut errors = Vec::new();
+            if let Some(lock) = self.lock.take() {
+                errors.extend(probe_close_lock_owned(lock));
+            }
+            if let Some(foreign) = self.foreign_dir.take() {
+                errors.extend(probe_close_directory(foreign));
+            }
+            if let Some(state) = self.state_dir.take() {
+                errors.extend(probe_close_directory(state));
+            }
+            if let Some(base) = self.base_dir.take() {
+                errors.extend(probe_close_directory(base));
+            }
+            if let Some(temp) = self.temp_parent.take() {
+                if let Err(error) = self.ledger.close(temp) {
+                    errors.push(format!("temporary parent close: {error}"));
+                }
+            }
+            errors
+        }
+
+        fn preserve_failure(&mut self) -> Vec<String> {
+            let keep = self.temp_parent.into_iter().collect::<Vec<_>>();
+            let mut errors = self.ledger.close_except(&keep);
+            errors.extend(self.close_parent_owners());
+            self.preserve_receipt = format!(
+                "preserved non-authorizing fixture at {:?}; created={:?}; removed={:?}; consumed_close_facts={:?}; close_errors={errors:?}",
+                self.base_path, self.ledger.created, self.removed, self.ledger.closed,
+            );
+            println!("probe_teardown=preserved receipt={}", self.preserve_receipt);
+            errors
+        }
+
+        fn cleanup_success(&mut self) -> io::Result<()> {
+            self.cleanup_known_entries()?;
+            let close_errors = self.close_parent_owners();
+            if !close_errors.is_empty() {
+                return Err(io::Error::other(format!(
+                    "checked fixture owner close errors: {close_errors:?}"
+                )));
+            }
+            if let Some(temp) = self.temp_parent {
+                if self.ledger.live(temp) {
+                    return Err(invalid("temporary parent still live after fixture cleanup"));
+                }
+            }
+            println!(
+                "probe_teardown=all-known-identities-removed removed={:?}",
+                self.removed
+            );
+            Ok(())
+        }
+
+        fn finish_success(&mut self) -> io::Result<()> {
+            let keep = self.temp_parent.into_iter().collect::<Vec<_>>();
+            let close_errors = self.ledger.close_except(&keep);
+            if !close_errors.is_empty() {
+                return Err(io::Error::other(format!(
+                    "pre-cleanup owner close errors: {close_errors:?}"
+                )));
+            }
+            self.cleanup_success()
+        }
+
+        fn cleanup_known_entries(&mut self) -> io::Result<()> {
+            let state_id = self
+                .state_id
+                .ok_or_else(|| invalid("state identity missing at teardown"))?;
+            let state_handle = self.state().handle();
+            let lock_id = self
+                .lock_id
+                .ok_or_else(|| invalid("lock identity missing at teardown"))?;
+            let lock = self
+                .lock
+                .as_ref()
+                .ok_or_else(|| invalid("exclusive lock missing at teardown"))?;
+            self.state().require_lock(lock, true)?;
+            if identity(state_handle)? != state_id || lock.identity() != lock_id {
+                return Err(denied("state/lock full identity changed before teardown"));
+            }
+            let entries = directory_entries(
+                state_handle,
+                EnumerationLimits {
+                    max_entries: 16,
+                    max_name_bytes: 65536,
+                },
+            )?;
+            let expected_names: Vec<OsString> = self
+                .stages
+                .iter()
+                .map(|stage| stage.name.clone())
+                .chain([OsString::from("transaction.lock")])
+                .collect();
+            if entries.len() != expected_names.len()
+                || expected_names
+                    .iter()
+                    .any(|name| !entries.iter().any(|entry| &entry.name == name))
+            {
+                return Err(denied(
+                    "state directory inventory differs from recorded fixture ledger",
+                ));
+            }
+            for stage in self.stages.clone() {
+                self.cleanup_stage(&stage)?;
+            }
+            // Keep the actual exclusive guard through all stage removals; only
+            // its own final file removal requires releasing its no-delete hold.
+            let lock = self
+                .lock
+                .take()
+                .ok_or_else(|| invalid("exclusive lock missing before teardown"))?;
+            let lock_close = probe_close_lock_owned(lock);
+            if !lock_close.is_empty() {
+                return Err(io::Error::other(format!(
+                    "checked exclusive-lock close failed: {lock_close:?}"
+                )));
+            }
+            self.cleanup_lock_file(lock_id)?;
+            if !directory_entries(
+                state_handle,
+                EnumerationLimits {
+                    max_entries: 16,
+                    max_name_bytes: 65536,
+                },
+            )?
+            .is_empty()
+            {
+                return Err(denied(
+                    "state directory is not empty after known stage/lock cleanup",
+                ));
+            }
+            self.close_state_before_remove(state_id)?;
+            let base_id = self
+                .base_id
+                .ok_or_else(|| invalid("base identity missing at teardown"))?;
+            self.remove_named_directory_from_base(&self.state_name.clone(), state_id)?;
+
+            let foreign_id = self
+                .foreign_id
+                .ok_or_else(|| invalid("foreign parent identity missing at teardown"))?;
+            let foreign = self.foreign().handle();
+            let canary = self
+                .foreign_canary
+                .clone()
+                .ok_or_else(|| invalid("foreign canary ledger is missing"))?;
+            let listed = directory_entries(
+                foreign,
+                EnumerationLimits {
+                    max_entries: 4,
+                    max_name_bytes: 4096,
+                },
+            )?;
+            if listed.len() != 1
+                || listed[0].name != OsStr::new("canary")
+                || listed[0].identity != canary.0.file
+            {
+                return Err(denied(
+                    "foreign parent inventory differs from recorded canary",
+                ));
+            }
+            self.cleanup_foreign_canary(canary.0, &canary.1)?;
+            if !directory_entries(
+                foreign,
+                EnumerationLimits {
+                    max_entries: 4,
+                    max_name_bytes: 4096,
+                },
+            )?
+            .is_empty()
+            {
+                return Err(denied("foreign parent not empty after canary cleanup"));
+            }
+            self.close_foreign_before_remove(foreign_id)?;
+            self.remove_named_directory_from_base(&self.foreign_name.clone(), foreign_id)?;
+
+            let base_handle = self.base().handle();
+            if identity(base_handle)? != base_id
+                || !directory_entries(
+                    base_handle,
+                    EnumerationLimits {
+                        max_entries: 8,
+                        max_name_bytes: 8192,
+                    },
+                )?
+                .is_empty()
+            {
+                return Err(denied(
+                    "base inventory is not empty after state and foreign cleanup",
+                ));
+            }
+            self.close_base_before_remove(base_id)?;
+            self.remove_base_from_temp(base_id)?;
+            Ok(())
+        }
+
+        fn cleanup_stage(&mut self, stage: &ProbeStage) -> io::Result<()> {
+            let security = probe_security_copy(self.sec());
+            let read_only = probe_security_copy(self.rsec());
+            self.state().require_lock(
+                self.lock
+                    .as_ref()
+                    .ok_or_else(|| invalid("cleanup requires live guard"))?,
+                true,
+            )?;
+            let state = self.state();
+            let state_id = state.identity();
+            let parent = state.handle();
+            let root = probe_check_named_directory(
+                &mut self.ledger,
+                parent,
+                state_id,
+                &stage.name,
+                stage.identity,
+                &security,
+            )?;
+            let root_handle = self.ledger.raw(root);
+            let entries = directory_entries(
+                root_handle,
+                EnumerationLimits {
+                    max_entries: 4,
+                    max_name_bytes: 4096,
+                },
+            )?;
+            match &stage.payload {
+                Some((name, file_id)) => {
+                    if entries.len() != 1
+                        || entries[0].name != *name
+                        || entries[0].identity != file_id.file
+                    {
+                        return Err(denied(
+                            "stage cleanup inventory differs from recorded payload full identity",
+                        ));
+                    }
+                    let writer = probe_open_bound(
+                        &mut self.ledger,
+                        root_handle,
+                        stage.identity,
+                        name,
+                        false,
+                        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        null(),
+                        Some(*file_id),
+                        true,
+                    )?;
+                    let writer_raw = self.ledger.raw(writer);
+                    let acl_now = match probe_acl_evidence(writer_raw, &security) {
+                        Ok(evidence)
+                            if evidence.ace_flags == 0
+                                && evidence.ace_mask == FILE_GENERIC_READ =>
+                        {
+                            probe_check_r(writer_raw, &read_only)?
+                        }
+                        Ok(_) => probe_check_full(writer_raw, &security)?,
+                        Err(error) => return Err(error),
+                    };
+                    if stage
+                        .payload_acl_after
+                        .as_ref()
+                        .is_some_and(|expected| expected != &acl_now)
+                    {
+                        return Err(denied(
+                            "payload ACL differs from the measured final DACL snapshot",
+                        ));
+                    }
+                    probe_set_dacl(writer_raw, &security)?;
+                    let restored = probe_check_full(writer_raw, &security)?;
+                    println!(
+                        "probe_teardown_acl_restore file_id={file_id:?} restored_acl={restored:?} after_measurement=true"
+                    );
+                    self.ledger.close(writer)?;
+
+                    let delete_file = probe_open_bound(
+                        &mut self.ledger,
+                        root_handle,
+                        stage.identity,
+                        name,
+                        false,
+                        FILE_ALL_ACCESS,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        null(),
+                        Some(*file_id),
+                        true,
+                    )?;
+                    let delete_raw = self.ledger.raw(delete_file);
+                    let _ = probe_check_full(delete_raw, &security)?;
+                    probe_disposition(delete_raw)?;
+                    self.ledger.close(delete_file)?;
+                    self.removed.push(format!("payload:{:?}:{file_id:?}", name));
+                    if !directory_entries(
+                        root_handle,
+                        EnumerationLimits {
+                            max_entries: 4,
+                            max_name_bytes: 4096,
+                        },
+                    )?
+                    .is_empty()
+                    {
+                        return Err(denied(
+                            "stage directory has an unrecorded entry after payload disposition",
+                        ));
+                    }
+                }
+                None if !entries.is_empty() => {
+                    return Err(denied(
+                        "empty control stage contains an unrecorded entry at teardown",
+                    ));
+                }
+                None => {}
+            }
+            self.ledger.close(root)?;
+            let remove_root = probe_open_bound(
+                &mut self.ledger,
+                parent,
+                state_id,
+                &stage.name,
+                true,
+                DELETE
+                    | FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                Some(stage.identity),
+                true,
+            )?;
+            let remove_raw = self.ledger.raw(remove_root);
+            let _ = probe_check_full(remove_raw, &security)?;
+            if !directory_entries(
+                remove_raw,
+                EnumerationLimits {
+                    max_entries: 4,
+                    max_name_bytes: 4096,
+                },
+            )?
+            .is_empty()
+            {
+                return Err(denied(
+                    "stage directory is not empty before identity-bound teardown",
+                ));
+            }
+            probe_disposition(remove_raw)?;
+            self.ledger.close(remove_root)?;
+            probe_check_absent(&mut self.ledger, parent, state_id, &stage.name)?;
+            self.removed
+                .push(format!("stage:{:?}:{:?}", stage.name, stage.identity));
+            Ok(())
+        }
+
+        fn cleanup_lock_file(&mut self, expected: FileIdentity) -> io::Result<()> {
+            let parent = self.state().handle();
+            let state_id = self.state().identity();
+            let opened = probe_open_lock_bound(&mut self.ledger, parent, state_id, Some(expected))?;
+            let raw = self.ledger.raw(opened);
+            let _ = probe_check_full(raw, self.sec())?;
+            probe_disposition(raw)?;
+            self.ledger.close(opened)?;
+            probe_check_lock_absent(&mut self.ledger, parent, state_id)?;
+            self.removed.push(format!("lock:{expected:?}"));
+            Ok(())
+        }
+
+        fn cleanup_foreign_canary(
+            &mut self,
+            expected: FileIdentity,
+            expected_acl: &ProbeAclEvidence,
+        ) -> io::Result<()> {
+            let security = probe_security_copy(self.sec());
+            let parent = self.foreign().handle();
+            let foreign_id = self.foreign().identity();
+            let opened = probe_open_bound(
+                &mut self.ledger,
+                parent,
+                foreign_id,
+                OsStr::new("canary"),
+                false,
+                FILE_ALL_ACCESS,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                Some(expected),
+                true,
+            )?;
+            let raw = self.ledger.raw(opened);
+            let actual_acl = probe_check_full(raw, &security)?;
+            if &actual_acl != expected_acl
+                || probe_read_payload(raw, expected)? != b"untouched foreign canary"
+            {
+                return Err(denied(
+                    "foreign canary ACL, bytes, or full identity changed before teardown",
+                ));
+            }
+            probe_disposition(raw)?;
+            self.ledger.close(opened)?;
+            probe_check_absent(&mut self.ledger, parent, foreign_id, OsStr::new("canary"))?;
+            self.removed.push(format!("foreign-canary:{expected:?}"));
+            Ok(())
+        }
+
+        fn close_state_before_remove(&mut self, expected: FileIdentity) -> io::Result<()> {
+            let state = self
+                .state_dir
+                .take()
+                .ok_or_else(|| invalid("state Directory owner missing"))?;
+            let actual = state.identity();
+            if actual != expected {
+                return Err(denied(
+                    "state Directory owner identity changed before close",
+                ));
+            }
+            let errors = probe_close_directory(state);
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "state Directory close errors: {errors:?}"
+                )))
+            }
+        }
+
+        fn close_foreign_before_remove(&mut self, expected: FileIdentity) -> io::Result<()> {
+            let foreign = self
+                .foreign_dir
+                .take()
+                .ok_or_else(|| invalid("foreign Directory owner missing"))?;
+            let actual = foreign.identity();
+            if actual != expected {
+                return Err(denied(
+                    "foreign Directory owner identity changed before close",
+                ));
+            }
+            let errors = probe_close_directory(foreign);
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "foreign Directory close errors: {errors:?}"
+                )))
+            }
+        }
+
+        fn close_base_before_remove(&mut self, expected: FileIdentity) -> io::Result<()> {
+            let base = self
+                .base_dir
+                .take()
+                .ok_or_else(|| invalid("base Directory owner missing"))?;
+            let actual = base.identity();
+            if actual != expected {
+                return Err(denied("base Directory owner identity changed before close"));
+            }
+            let errors = probe_close_directory(base);
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "base Directory close errors: {errors:?}"
+                )))
+            }
+        }
+
+        fn remove_named_directory_from_base(
+            &mut self,
+            name: &OsStr,
+            expected: FileIdentity,
+        ) -> io::Result<()> {
+            let security = probe_security_copy(self.sec());
+            let parent = self.base().handle();
+            let base_id = self.base().identity();
+            let remove = probe_open_bound(
+                &mut self.ledger,
+                parent,
+                base_id,
+                name,
+                true,
+                DELETE
+                    | FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                Some(expected),
+                true,
+            )?;
+            let raw = self.ledger.raw(remove);
+            let _ = probe_check_full(raw, &security)?;
+            if !directory_entries(
+                raw,
+                EnumerationLimits {
+                    max_entries: 4,
+                    max_name_bytes: 4096,
+                },
+            )?
+            .is_empty()
+            {
+                return Err(denied("known child directory is not empty at teardown"));
+            }
+            probe_disposition(raw)?;
+            self.ledger.close(remove)?;
+            probe_check_absent(&mut self.ledger, parent, base_id, name)?;
+            self.removed
+                .push(format!("directory:{name:?}:{expected:?}"));
+            Ok(())
+        }
+
+        fn remove_base_from_temp(&mut self, expected: FileIdentity) -> io::Result<()> {
+            let security = probe_security_copy(self.sec());
+            let temp = self
+                .temp_parent
+                .ok_or_else(|| invalid("temporary parent handle missing"))?;
+            let parent = self.ledger.raw(temp);
+            let parent_id = self
+                .temp_parent_id
+                .ok_or_else(|| invalid("temporary parent full ID missing"))?;
+            if identity(parent)? != parent_id {
+                return Err(denied("temporary parent full identity changed"));
+            }
+            let name = self
+                .base_name
+                .as_ref()
+                .ok_or_else(|| invalid("base name missing"))?
+                .clone();
+            let remove = probe_open_bound(
+                &mut self.ledger,
+                parent,
+                parent_id,
+                &name,
+                true,
+                DELETE
+                    | FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                Some(expected),
+                true,
+            )?;
+            let raw = self.ledger.raw(remove);
+            let _ = probe_check_full(raw, &security)?;
+            if !directory_entries(
+                raw,
+                EnumerationLimits {
+                    max_entries: 4,
+                    max_name_bytes: 4096,
+                },
+            )?
+            .is_empty()
+            {
+                return Err(denied("fixture base directory is not empty at teardown"));
+            }
+            probe_disposition(raw)?;
+            self.ledger.close(remove)?;
+            probe_check_absent(&mut self.ledger, parent, parent_id, &name)?;
+            self.removed.push(format!("fixture-base:{expected:?}"));
+            Ok(())
+        }
+    }
+
+    fn probe_verify_payload(
+        ledger: &mut ProbeLedger,
+        root: HANDLE,
+        root_id: FileIdentity,
+        file_name: &OsStr,
+        expected_id: FileIdentity,
+        expected_bytes: &[u8],
+        security: &Security,
+        expect_r: bool,
+        expected_acl: Option<&ProbeAclEvidence>,
+    ) -> io::Result<ProbeAclEvidence> {
+        let view = probe_open_bound(
+            ledger,
+            root,
+            root_id,
+            file_name,
+            false,
+            FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            null(),
+            Some(expected_id),
+            true,
+        )?;
+        let raw = ledger.raw(view);
+        let granted = probe_granted_access(raw)?;
+        let desired = FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE;
+        println!(
+            "probe_read_view file_id={expected_id:?} desired=0x{desired:08x} share=0x{:08x} granted=0x{granted:08x}",
+            FILE_SHARE_READ | FILE_SHARE_DELETE
+        );
+        if granted != desired {
+            return Err(denied(
+                "probe read-view grant differs from requested R view",
+            ));
+        }
+        let acl = if expect_r {
+            probe_check_r(raw, security)?
+        } else {
+            probe_check_full(raw, security)?
+        };
+        if expected_acl.is_some_and(|expected| expected != &acl) {
+            return Err(denied(
+                "payload policy changed across namespace observation",
+            ));
+        }
+        if probe_read_payload(raw, expected_id)? != expected_bytes {
+            return Err(denied("payload bytes changed across namespace observation"));
+        }
+        let standard: FILE_STANDARD_INFO = information(raw, FileStandardInfo)?;
+        if standard.NumberOfLinks != 1 || standard.DeletePending {
+            return Err(denied("payload link count or delete-pending fact changed"));
+        }
+        ledger.close(view)?;
+        Ok(acl)
+    }
+
+    fn probe_positive_control(
+        fixture: &mut ProbeFixture,
+        old_name: &OsStr,
+        target_name: &OsStr,
+        payload: Option<&[u8]>,
+    ) -> io::Result<(FileIdentity, Option<FileIdentity>)> {
+        let security = probe_security_copy(fixture.sec());
+        let parent = fixture.state().handle();
+        let parent_id = fixture.state().identity();
+        probe_check_absent(&mut fixture.ledger, parent, parent_id, target_name)?;
+        let stage_path = fixture
+            .state_path
+            .as_ref()
+            .ok_or_else(|| invalid("state path missing"))?
+            .join(old_name);
+        let (root, root_id) = probe_create_directory(
+            &mut fixture.ledger,
+            parent,
+            parent_id,
+            old_name,
+            &stage_path,
+            &security,
+            Some(&mut fixture.stages),
+        )?;
+        let file_id = if let Some(bytes) = payload {
+            let root_raw = fixture.ledger.raw(root);
+            let (file_id, acl) = probe_create_payload(
+                &mut fixture.ledger,
+                root_raw,
+                root_id,
+                OsStr::new("payload"),
+                bytes,
+                &security,
+            )?;
+            fixture.bind_stage_payload(root_id, OsStr::new("payload"), file_id, acl)?;
+            Some(file_id)
+        } else {
+            None
+        };
+
+        probe_recheck_chain(fixture.state(), &fixture.state_chain)?;
+        fixture.state().require_lock(
+            fixture
+                .lock
+                .as_ref()
+                .ok_or_else(|| invalid("exclusive parent lock missing"))?,
+            true,
+        )?;
+        if identity(parent)? != parent_id {
+            return Err(denied("positive-control parent identity changed"));
+        }
+        let result = probe_rename_directory(fixture.ledger.raw(root), parent, target_name);
+        probe_log_nt("probe_control_rename", &result);
+        if result.effective != 0 {
+            return Err(probe_nt_error(
+                "positive-control directory rename",
+                result.effective,
+            ));
+        }
+        probe_check_absent(&mut fixture.ledger, parent, parent_id, old_name)?;
+        let moved_root = probe_check_named_directory(
+            &mut fixture.ledger,
+            parent,
+            parent_id,
+            target_name,
+            root_id,
+            &security,
+        )?;
+        if let Some(expected_file) = file_id {
+            let expected_acl = fixture
+                .stages
+                .iter()
+                .find(|stage| stage.identity == root_id)
+                .and_then(|stage| stage.payload_acl_after.as_ref())
+                .ok_or_else(|| invalid("positive-control payload ACL receipt missing"))?;
+            let moved_raw = fixture.ledger.raw(moved_root);
+            probe_verify_payload(
+                &mut fixture.ledger,
+                moved_raw,
+                root_id,
+                OsStr::new("payload"),
+                expected_file,
+                payload.unwrap(),
+                &security,
+                false,
+                Some(expected_acl),
+            )?;
+        }
+        fixture.ledger.close(moved_root)?;
+        fixture.rename_stage(root_id, target_name)?;
+        fixture.ledger.close(root)?;
+        Ok((root_id, file_id))
+    }
+
+    fn probe_verify_foreign(
+        fixture: &mut ProbeFixture,
+        expected_id: FileIdentity,
+        expected_acl: &ProbeAclEvidence,
+    ) -> io::Result<()> {
+        let security = probe_security_copy(fixture.sec());
+        let foreign = fixture.foreign();
+        foreign.check()?;
+        let foreign_raw = foreign.handle();
+        let actual_parent = identity(foreign_raw)?;
+        if actual_parent
+            != fixture
+                .foreign_id
+                .ok_or_else(|| invalid("foreign parent ID missing"))?
+        {
+            return Err(denied("foreign parent native full identity changed"));
+        }
+        let view = probe_open_bound(
+            &mut fixture.ledger,
+            foreign_raw,
+            actual_parent,
+            OsStr::new("canary"),
+            false,
+            FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            null(),
+            Some(expected_id),
+            true,
+        )?;
+        let actual_acl = probe_check_full(fixture.ledger.raw(view), &security)?;
+        if &actual_acl != expected_acl
+            || probe_read_payload(fixture.ledger.raw(view), expected_id)?
+                != b"untouched foreign canary"
+        {
+            return Err(denied(
+                "foreign canary identity, owner/DACL, or bytes changed",
+            ));
+        }
+        fixture.ledger.close(view)?;
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProbeClassification {
+        SupportedMeasuredCohort,
+        IncompatibleMeasuredCohort,
+    }
+
+    fn probe_execute(fixture: &mut ProbeFixture) -> io::Result<ProbeClassification> {
+        let security = probe_security_copy(fixture.sec());
+        let read_only = probe_security_copy(fixture.rsec());
+        let state_id = fixture
+            .state_id
+            .ok_or_else(|| invalid("state full ID missing"))?;
+        fixture.state().check()?;
+        let state_raw = fixture.state().handle();
+        let parent_id = identity(state_raw)?;
+        if parent_id != state_id {
+            return Err(denied("measured parent native full identity changed"));
+        }
+        let parent_granted = probe_granted_access(state_raw)?;
+        let parent_desired = FILE_ALL_ACCESS & !DELETE;
+        if parent_granted != parent_desired || parent_granted & FILE_DELETE_CHILD == 0 {
+            return Err(denied(
+                "parent handle does not have the measured full private-parent/DELETE_CHILD grant",
+            ));
+        }
+        let lock = fixture
+            .lock
+            .as_ref()
+            .ok_or_else(|| invalid("exclusive transaction lock missing"))?;
+        fixture.state().require_lock(lock, true)?;
+        let lock_id = lock.identity();
+        if lock.file.parent != state_id || identity(lock.file.file.as_raw_handle())? != lock_id {
+            return Err(denied(
+                "exclusive lock does not belong to the actual measured parent",
+            ));
+        }
+        let lock_granted = probe_granted_access(lock.file.file.as_raw_handle())?;
+        if lock_granted != FILE_ALL_ACCESS & !DELETE {
+            return Err(denied(
+                "exclusive lock actual grant differs from requested private lock mask",
+            ));
+        }
+        let ancestor_ids = fixture.state_chain.clone();
+        if ancestor_ids.last() != Some(&state_id)
+            || ancestor_ids.iter().any(|id| id.volume != state_id.volume)
+        {
+            return Err(denied("state parent/ancestor full-ID chain is invalid"));
+        }
+        probe_recheck_chain(fixture.state(), &ancestor_ids)?;
+        println!(
+            "probe_parent parent={state_id:?} ancestors={ancestor_ids:?} desired=0x{parent_desired:08x} share=0x{:08x} granted=0x{parent_granted:08x} lock={lock_id:?} lock_granted=0x{lock_granted:08x} lock_mode=Exclusive",
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        );
+
+        let foreign_id = fixture
+            .foreign_id
+            .ok_or_else(|| invalid("foreign parent identity missing"))?;
+        fixture.foreign().check()?;
+        let foreign_raw = fixture.foreign().handle();
+        if identity(foreign_raw)? != foreign_id {
+            return Err(denied(
+                "foreign guard negative-control parent identity changed",
+            ));
+        }
+        let (canary_id, canary_acl) = probe_create_payload(
+            &mut fixture.ledger,
+            foreign_raw,
+            foreign_id,
+            OsStr::new("canary"),
+            b"untouched foreign canary",
+            &security,
+        )?;
+        fixture.foreign_canary = Some((canary_id, canary_acl.clone()));
+        let wrong_guard = fixture.foreign().require_lock(lock, true);
+        if !matches!(wrong_guard, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            return Err(denied(
+                "foreign parent accepted the measured parent's exclusive lock",
+            ));
+        }
+        if identity(foreign_raw)? != foreign_id {
+            return Err(denied("foreign parent changed during wrong-guard refusal"));
+        }
+        probe_verify_foreign(fixture, canary_id, &canary_acl)?;
+
+        // Independent positive controls use distinct fresh directories and
+        // complete before the retained-child measurement begins.
+        let (empty_id, _) = probe_positive_control(
+            fixture,
+            OsStr::new("empty-old"),
+            OsStr::new("empty-new"),
+            None,
+        )?;
+        let (closed_id, closed_file) = probe_positive_control(
+            fixture,
+            OsStr::new("closed-old"),
+            OsStr::new("closed-new"),
+            Some(b"probe-v1"),
+        )?;
+        if empty_id == closed_id || closed_file.is_none() {
+            return Err(denied(
+                "positive controls did not use fresh empty/populated roots",
+            ));
+        }
+
+        let retained_name = OsStr::new("retained-old");
+        let target_name = OsStr::new("retained-new");
+        probe_check_absent(&mut fixture.ledger, state_raw, state_id, retained_name)?;
+        probe_check_absent(&mut fixture.ledger, state_raw, state_id, target_name)?;
+        let stage_path = fixture.state_path.as_ref().unwrap().join(retained_name);
+        let (root, root_id) = probe_create_directory(
+            &mut fixture.ledger,
+            state_raw,
+            state_id,
+            retained_name,
+            &stage_path,
+            &security,
+            Some(&mut fixture.stages),
+        )?;
+        let root_raw = fixture.ledger.raw(root);
+        let root_granted = probe_granted_access(root_raw)?;
+        let root_desired = DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+        let root_share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        println!(
+            "probe_measured_root parent={state_id:?} root={root_id:?} desired=0x{root_desired:08x} share=0x{root_share:08x} granted=0x{root_granted:08x}"
+        );
+        if root_granted != root_desired
+            || identity(root_raw)? != root_id
+            || probe_check_full(root_raw, &security)?.protected == false
+        {
+            return Err(denied(
+                "measured source root identity, exact grant, or secured DACL check failed",
+            ));
+        }
+
+        // Explicit captured TokenUser owner on creation; read back owner,
+        // full identity, initial full-control DACL, and data before sealing.
+        let writer = probe_open(
+            &mut fixture.ledger,
+            root_raw,
+            root_id,
+            OsStr::new("payload"),
+            false,
+            FILE_CREATE,
+            FILE_ALL_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            security.descriptor.as_ptr().cast(),
+        )?;
+        let payload_id = identity(fixture.ledger.raw(writer))?;
+        if security.check(fixture.ledger.raw(writer)).is_err() {
+            return Err(denied(
+                "new payload owner/DACL did not read back as captured-user full control",
+            ));
+        }
+        let creation_acl = probe_check_full(fixture.ledger.raw(writer), &security)?;
+        if probe_granted_access(fixture.ledger.raw(writer))? != FILE_ALL_ACCESS {
+            return Err(denied(
+                "temporary writer actual grant differs from requested FILE_ALL_ACCESS",
+            ));
+        }
+        let created_data = fixture
+            .stages
+            .iter_mut()
+            .find(|stage| stage.identity == root_id)
+            .ok_or_else(|| invalid("measured stage missing from fixture ledger"))?;
+        created_data.payload = Some((OsString::from("payload"), payload_id));
+        created_data.payload_acl_before = Some(creation_acl);
+
+        // The mutator explicitly requests FILE_READ_ATTRIBUTES because its
+        // real type/reparse oracle uses that right; the minimum keeper does not.
+        let mutator_desired = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        let mutator = probe_open_bound(
+            &mut fixture.ledger,
+            root_raw,
+            root_id,
+            OsStr::new("payload"),
+            false,
+            mutator_desired,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            Some(payload_id),
+            true,
+        )?;
+        let mutator_granted = probe_granted_access(fixture.ledger.raw(mutator))?;
+        println!(
+            "probe_dacl_mutator file_id={payload_id:?} desired=0x{mutator_desired:08x} share=0x{:08x} granted=0x{mutator_granted:08x} metadata_oracle=FILE_READ_ATTRIBUTES",
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        );
+        if mutator_granted != mutator_desired {
+            return Err(denied(
+                "DACL mutator actual grant differs from explicit metadata-capable request",
+            ));
+        }
+        let keeper_desired = DELETE | SYNCHRONIZE;
+        let keeper = probe_open_bound(
+            &mut fixture.ledger,
+            root_raw,
+            root_id,
+            OsStr::new("payload"),
+            false,
+            keeper_desired,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            Some(payload_id),
+            false,
+        )?;
+        let keeper_granted = probe_granted_access(fixture.ledger.raw(keeper))?;
+        println!(
+            "probe_minimum_keeper file_id={payload_id:?} desired=0x{keeper_desired:08x} share=0x{:08x} granted=0x{keeper_granted:08x} identity_query=GetFileInformationByHandleEx(FileIdInfo)-on-same-handle",
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        );
+        if keeper_granted != keeper_desired {
+            return Err(denied(
+                "minimum keeper grant differs from DELETE|SYNCHRONIZE",
+            ));
+        }
+
+        let mut written = 0u32;
+        if unsafe {
+            WriteFile(
+                fixture.ledger.raw(writer),
+                b"probe-v1".as_ptr(),
+                8,
+                &mut written,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if written != 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short measured probe payload write",
+            ));
+        }
+        if unsafe { FlushFileBuffers(fixture.ledger.raw(writer)) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        probe_set_dacl(fixture.ledger.raw(mutator), &read_only)?;
+        let sealed_acl = probe_check_r(fixture.ledger.raw(mutator), &read_only)?;
+        fixture
+            .stages
+            .iter_mut()
+            .find(|stage| stage.identity == root_id)
+            .unwrap()
+            .payload_acl_after = Some(sealed_acl.clone());
+        fixture.ledger.close(writer)?;
+        fixture.ledger.close(mutator)?;
+        if fixture.ledger.live(writer) || fixture.ledger.live(mutator) {
+            return Err(invalid(
+                "writer or DACL mutator remains live after checked close",
+            ));
+        }
+
+        // An independent R view validates kind, full ID, link count, bytes and
+        // exact zero-flag ACL, then closes before rename. Its share admits DELETE.
+        let view = probe_open_bound(
+            &mut fixture.ledger,
+            root_raw,
+            root_id,
+            OsStr::new("payload"),
+            false,
+            FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            null(),
+            Some(payload_id),
+            true,
+        )?;
+        let view_granted = probe_granted_access(fixture.ledger.raw(view))?;
+        let view_desired = FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE;
+        if view_granted != view_desired {
+            return Err(denied("sealed R-view grant differs from requested access"));
+        }
+        let view_acl = probe_check_r(fixture.ledger.raw(view), &read_only)?;
+        if view_acl != sealed_acl
+            || probe_read_payload(fixture.ledger.raw(view), payload_id)? != b"probe-v1"
+        {
+            return Err(denied(
+                "independent sealed payload readback differs from written data or DACL",
+            ));
+        }
+        let standard: FILE_STANDARD_INFO = information(fixture.ledger.raw(view), FileStandardInfo)?;
+        if standard.NumberOfLinks != 1 || standard.DeletePending {
+            return Err(denied("sealed payload is linked or delete-pending"));
+        }
+        fixture.ledger.close(view)?;
+        if fixture.ledger.live(view) {
+            return Err(invalid(
+                "sealed read view remained live after checked close",
+            ));
+        }
+
+        let parent = fixture.state().handle();
+        probe_recheck_chain(fixture.state(), &ancestor_ids)?;
+        fixture
+            .state()
+            .require_lock(fixture.lock.as_ref().unwrap(), true)?;
+        if identity(parent)? != state_id || identity(root_raw)? != root_id {
+            return Err(denied(
+                "source or target parent identity changed before native rename",
+            ));
+        }
+        probe_check_absent(&mut fixture.ledger, parent, state_id, target_name)?;
+        let retained = probe_rename_directory(root_raw, parent, target_name);
+        probe_log_nt("probe_retained_child_rename", &retained);
+        let completed_success = retained.effective == 0;
+        let compatible_status = retained.effective == PROBE_ACCESS_DENIED
+            || retained.effective == PROBE_SHARING_VIOLATION;
+
+        let classification = if completed_success {
+            probe_check_absent(&mut fixture.ledger, parent, state_id, retained_name)?;
+            let observed_root = probe_check_named_directory(
+                &mut fixture.ledger,
+                parent,
+                state_id,
+                target_name,
+                root_id,
+                &security,
+            )?;
+            let observed_raw = fixture.ledger.raw(observed_root);
+            probe_verify_payload(
+                &mut fixture.ledger,
+                observed_raw,
+                root_id,
+                OsStr::new("payload"),
+                payload_id,
+                b"probe-v1",
+                &read_only,
+                true,
+                Some(&sealed_acl),
+            )?;
+            fixture.ledger.close(observed_root)?;
+            probe_verify_payload(
+                &mut fixture.ledger,
+                root_raw,
+                root_id,
+                OsStr::new("payload"),
+                payload_id,
+                b"probe-v1",
+                &read_only,
+                true,
+                Some(&sealed_acl),
+            )?;
+            fixture.rename_stage(root_id, target_name)?;
+            ProbeClassification::SupportedMeasuredCohort
+        } else {
+            // The same original and exact target must remain unchanged/absent;
+            // after closing the keeper, retry the same target on this root.
+            let old_root = probe_check_named_directory(
+                &mut fixture.ledger,
+                parent,
+                state_id,
+                retained_name,
+                root_id,
+                &security,
+            )?;
+            let old_raw = fixture.ledger.raw(old_root);
+            probe_check_absent(&mut fixture.ledger, parent, state_id, target_name)?;
+            probe_verify_payload(
+                &mut fixture.ledger,
+                old_raw,
+                root_id,
+                OsStr::new("payload"),
+                payload_id,
+                b"probe-v1",
+                &read_only,
+                true,
+                Some(&sealed_acl),
+            )?;
+            fixture.ledger.close(old_root)?;
+            probe_verify_payload(
+                &mut fixture.ledger,
+                root_raw,
+                root_id,
+                OsStr::new("payload"),
+                payload_id,
+                b"probe-v1",
+                &read_only,
+                true,
+                Some(&sealed_acl),
+            )?;
+            if fixture.ledger.live(writer)
+                || fixture.ledger.live(mutator)
+                || fixture.ledger.live(view)
+            {
+                return Err(invalid(
+                    "writer, DACL mutator, or read view remained live at retained-child failure",
+                ));
+            }
+            fixture.ledger.close(keeper)?;
+            if fixture.ledger.live(keeper) {
+                return Err(invalid("minimum keeper remained live after checked close"));
+            }
+            probe_check_absent(&mut fixture.ledger, parent, state_id, target_name)?;
+            let retry = probe_rename_directory(root_raw, parent, target_name);
+            probe_log_nt("probe_same_target_closed_child_retry", &retry);
+            if retry.effective != 0 {
+                return Err(probe_nt_error(
+                    "same-target closed-child retry",
+                    retry.effective,
+                ));
+            }
+            probe_check_absent(&mut fixture.ledger, parent, state_id, retained_name)?;
+            let moved_root = probe_check_named_directory(
+                &mut fixture.ledger,
+                parent,
+                state_id,
+                target_name,
+                root_id,
+                &security,
+            )?;
+            let moved_raw = fixture.ledger.raw(moved_root);
+            probe_verify_payload(
+                &mut fixture.ledger,
+                moved_raw,
+                root_id,
+                OsStr::new("payload"),
+                payload_id,
+                b"probe-v1",
+                &read_only,
+                true,
+                Some(&sealed_acl),
+            )?;
+            fixture.ledger.close(moved_root)?;
+            probe_verify_payload(
+                &mut fixture.ledger,
+                root_raw,
+                root_id,
+                OsStr::new("payload"),
+                payload_id,
+                b"probe-v1",
+                &read_only,
+                true,
+                Some(&sealed_acl),
+            )?;
+            fixture.rename_stage(root_id, target_name)?;
+            if compatible_status {
+                ProbeClassification::IncompatibleMeasuredCohort
+            } else {
+                return Err(probe_nt_error(
+                    "retained-child rename unclassified despite successful same-target closed-child retry",
+                    retained.effective,
+                ));
+            }
+        };
+
+        if fixture.ledger.live(keeper) {
+            fixture.ledger.close(keeper)?;
+        }
+        if fixture.ledger.live(root) {
+            fixture.ledger.close(root)?;
+        }
+        probe_verify_foreign(fixture, canary_id, &canary_acl)?;
+        println!(
+            "probe_classification={classification:?} measured_parent={state_id:?} ancestors={ancestor_ids:?} root={root_id:?} payload={payload_id:?} target={target_name:?} retained_effective=0x{:08x} same_target_retry={}",
+            retained.effective as u32, !completed_success
+        );
+        Ok(classification)
+    }
+
+    #[test]
+    fn staged_directory_child_keeper_rename_prerequisite() {
+        let mut fixture = ProbeFixture::empty();
+        let result = (|| -> io::Result<ProbeClassification> {
+            fixture.initialize()?;
+            let classification = probe_execute(&mut fixture)?;
+            fixture.finish_success()?;
+            Ok(classification)
+        })();
+        match result {
+            Ok(classification) => println!("probe_test_result={classification:?}"),
+            Err(primary) => {
+                let cleanup_errors = fixture.preserve_failure();
+                if cleanup_errors.is_empty() {
+                    panic!(
+                        "native capability measurement/setup failed: {primary}; fixture was preserved"
+                    );
+                }
+                panic!(
+                    "native capability measurement/setup failed: {primary}; explicit owner-close errors={cleanup_errors:?}; fixture was preserved"
+                );
+            }
         }
     }
 

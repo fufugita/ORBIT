@@ -176,7 +176,7 @@ $env:CARGO_TERM_COLOR = 'never'
 $env:NO_COLOR = '1'
 if ($Group -eq 'Foundation') {
     $log = Join-Path $EvidenceDir 'foundation.log'
-    cargo +1.99.0 test --locked --no-fail-fast -p orbit-platform --lib --test windows_foundation -- --test-threads=1 2>&1 |
+    cargo +1.99.0 test --locked --no-fail-fast -p orbit-platform --lib --test windows_foundation -- --test-threads=1 --show-output 2>&1 |
         Tee-Object -FilePath $log
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $required = @(
@@ -239,10 +239,11 @@ if ($Group -eq 'Foundation') {
         'windows::source_directory_enumeration_enforces_entry_and_name_bounds_without_changes',
         'fs::windows::tests::container_ace_layout_parser_only_rejects_malformed_unknown_and_callback_forms',
         'fs::windows::tests::source_component_policy_is_separate_from_private_names',
-        'fs::windows::tests::source_snapshot_rejects_link_added_after_initial_kind_check'
+        'fs::windows::tests::source_snapshot_rejects_link_added_after_initial_kind_check',
+        'fs::windows::tests::staged_directory_child_keeper_rename_prerequisite'
     )
-    if ($required.Count -ne 60 -or @($required | Select-Object -Unique).Count -ne 60) {
-        throw "Foundation's exact required-name manifest must contain 60 unique cases; found $($required.Count)"
+    if ($required.Count -ne 61 -or @($required | Select-Object -Unique).Count -ne 61) {
+        throw "Foundation's exact required-name manifest must contain 61 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {
