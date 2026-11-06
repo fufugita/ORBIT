@@ -16,11 +16,15 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+#[cfg(all(test, feature = "registry-witness"))]
+use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
     FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
 use windows_sys::Win32::Foundation::*;
+#[cfg(all(test, feature = "registry-witness"))]
+use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
@@ -2648,6 +2652,267 @@ mod registry_witness_tests {
         Ok(format!("{ticks:016X}"))
     }
 
+    struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl LocalSecurityDescriptor {
+        fn free(&mut self) -> io::Result<()> {
+            if self.0.is_null() {
+                return Ok(());
+            }
+            let result = unsafe { LocalFree(self.0.cast()) };
+            if result.is_null() {
+                self.0 = null_mut();
+                Ok(())
+            } else {
+                let error = io::Error::last_os_error();
+                Err(io::Error::other(format!(
+                    "LocalFree(helper directory security descriptor) failed: {error}"
+                )))
+            }
+        }
+    }
+
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0.cast()) };
+            }
+        }
+    }
+
+    struct DirectoryDescriptorObservation {
+        owner_matches_user: Option<bool>,
+        dacl_present: Option<bool>,
+        dacl_null: Option<bool>,
+        dacl_protected: Option<bool>,
+        errors: Vec<String>,
+    }
+
+    #[derive(Debug)]
+    struct DirectoryDiagnosticContext {
+        primary: Option<io::Error>,
+        diagnostics: Vec<String>,
+    }
+
+    impl std::fmt::Display for DirectoryDiagnosticContext {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if let Some(primary) = &self.primary {
+                write!(formatter, "{primary}")?;
+            } else {
+                formatter.write_str("helper directory diagnostic incomplete")?;
+            }
+            write!(
+                formatter,
+                "; diagnostic outcomes: {}",
+                self.diagnostics.join("; ")
+            )
+        }
+    }
+
+    impl std::error::Error for DirectoryDiagnosticContext {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.primary
+                .as_ref()
+                .map(|primary| primary as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn with_directory_diagnostics(
+        primary: Option<io::Error>,
+        diagnostics: Vec<String>,
+    ) -> io::Error {
+        if diagnostics.is_empty() {
+            return primary.unwrap_or_else(|| invalid("missing directory diagnostic outcome"));
+        }
+        let kind = primary
+            .as_ref()
+            .map_or(io::ErrorKind::Other, io::Error::kind);
+        io::Error::new(
+            kind,
+            DirectoryDiagnosticContext {
+                primary,
+                diagnostics,
+            },
+        )
+    }
+
+    fn observed_bool(value: Option<bool>) -> &'static str {
+        match value {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+    }
+
+    fn record_helper_diagnostic(payload: &str, errors: &mut Vec<String>) {
+        if let Err(error) = emit_witness_record(payload) {
+            errors.push(format!("diagnostic record emission failed: {error}"));
+        }
+    }
+
+    fn query_directory_handle_access(handle: HANDLE) -> (i32, u32, Option<u32>) {
+        // PUBLIC_OBJECT_BASIC_INFORMATION contains 14 ULONG/ACCESS_MASK fields.
+        // A u32 array provides its required alignment without creating a typed
+        // reference into raw bytes. The granted-access field is slot 1.
+        let mut information = [0u32; 14];
+        let expected_length = (information.len() * size_of::<u32>()) as u32;
+        let mut returned_length = 0u32;
+        let status = unsafe {
+            NtQueryObject(
+                handle,
+                ObjectBasicInformation,
+                information.as_mut_ptr().cast(),
+                expected_length,
+                &mut returned_length,
+            )
+        };
+        let granted_access = if status >= 0 && returned_length == expected_length {
+            Some(information[1])
+        } else {
+            None
+        };
+        (status, returned_length, granted_access)
+    }
+
+    fn observe_directory_descriptor(
+        path: &Path,
+        original_identity: (u64, [u8; 16]),
+        user_sid: &str,
+    ) -> DirectoryDescriptorObservation {
+        let mut observation = DirectoryDescriptorObservation {
+            owner_matches_user: None,
+            dacl_present: None,
+            dacl_null: None,
+            dacl_protected: None,
+            errors: Vec::new(),
+        };
+        let path_wide = match wide(path.as_os_str()) {
+            Ok(value) => value,
+            Err(error) => {
+                observation.errors.push(format!(
+                    "directory descriptor path encoding failed: {error}"
+                ));
+                return observation;
+            }
+        };
+        let read_handle = match own(
+            "CreateFileW(helper directory READ_CONTROL observation)",
+            unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                observation
+                    .errors
+                    .push(format!("directory READ_CONTROL open failed: {error}"));
+                return observation;
+            }
+        };
+        if let Err(error) = check_object(read_handle.as_raw_handle(), true) {
+            observation.errors.push(format!(
+                "directory READ_CONTROL object check failed: {error}"
+            ));
+            return observation;
+        }
+        let read_identity = match script_identity(read_handle.as_raw_handle()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                observation
+                    .errors
+                    .push(format!("directory READ_CONTROL identity failed: {error}"));
+                return observation;
+            }
+        };
+        if read_identity != original_identity {
+            observation
+                .errors
+                .push("directory READ_CONTROL handle identity mismatch".to_owned());
+            return observation;
+        }
+
+        let (mut owner, mut descriptor) = (null_mut(), null_mut());
+        let status = unsafe {
+            GetSecurityInfo(
+                read_handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        let mut descriptor = LocalSecurityDescriptor(descriptor);
+        let observation_result = (|| {
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            if descriptor.0.is_null() {
+                return Err(invalid("GetSecurityInfo returned a null descriptor"));
+            }
+            observation.owner_matches_user = match sid_text(owner) {
+                Ok(text) => Some(text == user_sid),
+                Err(error) => {
+                    observation
+                        .errors
+                        .push(format!("directory owner SID comparison failed: {error}"));
+                    None
+                }
+            };
+
+            let (mut dacl_present, mut dacl_pointer, mut defaulted) = (0, null_mut(), 0);
+            let dacl_ok = unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.0,
+                    &mut dacl_present,
+                    &mut dacl_pointer,
+                    &mut defaulted,
+                )
+            };
+            if dacl_ok == 0 {
+                let error = io::Error::last_os_error();
+                observation
+                    .errors
+                    .push(format!("GetSecurityDescriptorDacl failed: {error}"));
+            } else {
+                observation.dacl_present = Some(dacl_present != 0);
+                observation.dacl_null = Some(dacl_pointer.is_null());
+            }
+
+            let (mut control, mut revision) = (0, 0);
+            let control_ok =
+                unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) };
+            if control_ok == 0 {
+                let error = io::Error::last_os_error();
+                observation
+                    .errors
+                    .push(format!("GetSecurityDescriptorControl failed: {error}"));
+            } else {
+                observation.dacl_protected = Some(control & SE_DACL_PROTECTED != 0);
+            }
+            Ok(())
+        })();
+        if let Err(error) = observation_result {
+            observation.errors.push(format!(
+                "GetSecurityInfo(helper directory READ_CONTROL) failed: {error}"
+            ));
+        }
+        if let Err(error) = descriptor.free() {
+            observation.errors.push(error.to_string());
+        }
+        observation
+    }
+
     fn set_owned_resource_dacl(
         handle: HANDLE,
         user_sid: &str,
@@ -2714,12 +2979,14 @@ mod registry_witness_tests {
             .map_err(|error| operation_error("CreateDirectory(helper image)", error))?;
         let path = directory.join("orbit-registry-helper.exe");
         let mut image_file_created = false;
+        let mut diagnostic_errors = Vec::new();
         let result = (|| {
             let directory_wide = wide(directory.as_os_str())?;
+            let directory_requested_access = FILE_READ_ATTRIBUTES | WRITE_DAC | FILE_TRAVERSE;
             let directory_handle = own("CreateFileW(owned helper directory)", unsafe {
                 CreateFileW(
                     directory_wide.as_ptr(),
-                    FILE_READ_ATTRIBUTES | WRITE_DAC | FILE_TRAVERSE,
+                    directory_requested_access,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     null(),
                     OPEN_EXISTING,
@@ -2728,13 +2995,76 @@ mod registry_witness_tests {
                 )
             })?;
             check_object(directory_handle.as_raw_handle(), true)?;
-            set_owned_resource_dacl(
+            let (query_status, returned_length, granted_access) =
+                query_directory_handle_access(directory_handle.as_raw_handle());
+            let write_dac = granted_access.map(|mask| mask & WRITE_DAC != 0);
+            let access_record = format!(
+                "registry_witness_helper_directory_access requested={directory_requested_access:#010x} query_ntstatus={:#010x} returned_length={} expected_length={} actual={} write_dac={}",
+                query_status as u32,
+                returned_length,
+                size_of::<[u32; 14]>(),
+                granted_access.map_or_else(|| "unknown".to_owned(), |mask| format!("{mask:#010x}")),
+                observed_bool(write_dac)
+            );
+            record_helper_diagnostic(&access_record, &mut diagnostic_errors);
+
+            let original_identity = match script_identity(directory_handle.as_raw_handle()) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    diagnostic_errors
+                        .push(format!("directory handle identity query failed: {error}"));
+                    None
+                }
+            };
+            if granted_access.is_none() {
+                diagnostic_errors.push(format!(
+                    "NtQueryObject directory access unknown: status={:#010x} returned_length={} expected_length={}",
+                    query_status as u32,
+                    returned_length,
+                    size_of::<[u32; 14]>()
+                ));
+            }
+            if write_dac == Some(true) {
+                match original_identity {
+                    Some(identity) => {
+                        let observation =
+                            observe_directory_descriptor(&directory, identity, user_sid);
+                        let descriptor_record = format!(
+                            "registry_witness_helper_directory_descriptor owner_matches_user={} dacl_present={} dacl_null={} dacl_protected={}",
+                            observed_bool(observation.owner_matches_user),
+                            observed_bool(observation.dacl_present),
+                            observed_bool(observation.dacl_null),
+                            observed_bool(observation.dacl_protected)
+                        );
+                        record_helper_diagnostic(&descriptor_record, &mut diagnostic_errors);
+                        diagnostic_errors.extend(observation.errors);
+                    }
+                    None => diagnostic_errors.push(
+                        "directory descriptor observation skipped: exact original identity unknown"
+                            .to_owned(),
+                    ),
+                }
+            }
+
+            let dacl_result = set_owned_resource_dacl(
                 directory_handle.as_raw_handle(),
                 user_sid,
                 package_sid,
                 "FX",
                 "SetSecurityInfo(helper image directory)",
-            )?;
+            );
+            if let Err(primary) = dacl_result {
+                return Err(with_directory_diagnostics(
+                    Some(primary),
+                    std::mem::take(&mut diagnostic_errors),
+                ));
+            }
+            if !diagnostic_errors.is_empty() {
+                return Err(with_directory_diagnostics(
+                    None,
+                    std::mem::take(&mut diagnostic_errors),
+                ));
+            }
             drop(directory_handle);
 
             let source = std::env::current_exe()?;
