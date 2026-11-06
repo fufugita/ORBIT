@@ -228,9 +228,14 @@ mod windows {
         unsafe { OwnedHandle::from_raw_handle(handle) }
     }
 
-    fn set_fixture_file_mask(path: &Path, sid: &str, mask: u32) {
+    fn set_fixture_file_mask(path: &Path, sid: &str, mask: u32, ace_flags: u8) {
+        let inheritance_flags = match ace_flags {
+            0 => "",
+            flags if flags == (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8 => "OICI",
+            _ => panic!("unsupported fixture ACE inheritance flags: {ace_flags}"),
+        };
         let sddl = wide(OsStr::new(&format!(
-            "O:{sid}D:P(A;OICI;0x{mask:08X};;;{sid})"
+            "O:{sid}D:P(A;{inheritance_flags};0x{mask:08X};;;{sid})"
         )));
         let mut descriptor = null_mut();
         let mut descriptor_length = 0;
@@ -387,10 +392,13 @@ mod windows {
                     first_ace_sid_matches_current = Some(sid_matches_current);
                     first_ace_mask = Some(allowed.Mask);
                 }
+                let effective = header.AceFlags & INHERIT_ONLY_ACE as u8 == 0;
                 has_current_owner_full_control_ace |=
-                    sid_matches_current && allowed.Mask == FILE_ALL_ACCESS;
+                    effective && sid_matches_current && allowed.Mask == FILE_ALL_ACCESS;
                 has_everyone_full_control_ace |= unsafe {
-                    EqualSid(ace_sid, everyone_sid.0.cast()) != 0 && allowed.Mask == FILE_ALL_ACCESS
+                    effective
+                        && EqualSid(ace_sid, everyone_sid.0.cast()) != 0
+                        && allowed.Mask == FILE_ALL_ACCESS
                 };
             }
         }
@@ -444,10 +452,10 @@ mod windows {
         sid: &str,
         directory: bool,
         expected_mask: u32,
+        expected_ace_flags: u8,
     ) -> FixtureAclSnapshot {
         let snapshot = fixture_acl_snapshot(path, sid, directory);
         let facts = &snapshot.facts;
-        let inherited_flags = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
         assert!(
             facts.owner_matches_current,
             "fixture owner mismatch: {facts:?}"
@@ -465,7 +473,7 @@ mod windows {
         );
         assert_eq!(
             facts.first_ace_flags,
-            Some(inherited_flags),
+            Some(expected_ace_flags),
             "fixture ACE flags mismatch: {facts:?}"
         );
         assert_eq!(
@@ -1345,7 +1353,7 @@ mod windows {
         let read_only_identity = read_only.identity();
         drop(read_only);
         let read_only_path = root_path.join("read-only.dat");
-        set_fixture_file_mask(&read_only_path, &sid, FILE_GENERIC_READ);
+        set_fixture_file_mask(&read_only_path, &sid, FILE_GENERIC_READ, 0);
 
         let mut read_execute = home
             .dir()
@@ -1359,6 +1367,7 @@ mod windows {
             &read_execute_path,
             &sid,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            0,
         );
 
         let seed = home
@@ -1380,22 +1389,40 @@ mod windows {
             (
                 root_path.as_path(),
                 true,
-                assert_fixture_acl(&root_path, &sid, true, FILE_ALL_ACCESS),
+                assert_fixture_acl(
+                    &root_path,
+                    &sid,
+                    true,
+                    FILE_ALL_ACCESS,
+                    (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+                ),
             ),
             (
                 nested_path.as_path(),
                 true,
-                assert_fixture_acl(&nested_path, &sid, true, FILE_ALL_ACCESS),
+                assert_fixture_acl(
+                    &nested_path,
+                    &sid,
+                    true,
+                    FILE_ALL_ACCESS,
+                    (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+                ),
             ),
             (
                 full_path.as_path(),
                 false,
-                assert_fixture_acl(&full_path, &sid, false, FILE_ALL_ACCESS),
+                assert_fixture_acl(
+                    &full_path,
+                    &sid,
+                    false,
+                    FILE_ALL_ACCESS,
+                    (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+                ),
             ),
             (
                 read_only_path.as_path(),
                 false,
-                assert_fixture_acl(&read_only_path, &sid, false, FILE_GENERIC_READ),
+                assert_fixture_acl(&read_only_path, &sid, false, FILE_GENERIC_READ, 0),
             ),
             (
                 read_execute_path.as_path(),
@@ -1405,12 +1432,19 @@ mod windows {
                     &sid,
                     false,
                     FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                    0,
                 ),
             ),
             (
                 lock_path.as_path(),
                 false,
-                assert_fixture_acl(&lock_path, &sid, false, FILE_ALL_ACCESS),
+                assert_fixture_acl(
+                    &lock_path,
+                    &sid,
+                    false,
+                    FILE_ALL_ACCESS,
+                    (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+                ),
             ),
         ];
         let before = tree_snapshot(&root_path);
@@ -1481,7 +1515,13 @@ mod windows {
         let nested = home.dir().child(OsStr::new("nested"), true).unwrap();
         drop(nested.create_file(OsStr::new("private.dat")).unwrap());
         let nested_path = home.path().join("nested");
-        let private_acl = assert_fixture_acl(&nested_path, &sid, true, FILE_ALL_ACCESS);
+        let private_acl = assert_fixture_acl(
+            &nested_path,
+            &sid,
+            true,
+            FILE_ALL_ACCESS,
+            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+        );
         home.dir()
             .inspect_private_tree(InspectionLimits {
                 max_entries: 8,
@@ -1509,21 +1549,13 @@ mod windows {
             permissive_facts.ace_count, 2,
             "mutator changed more than the intended ACE: {permissive_facts:?}"
         );
-        assert_eq!(
-            permissive_facts.first_ace_type,
-            Some(ACCESS_ALLOWED_ACE_TYPE)
-        );
-        assert_eq!(
-            permissive_facts.first_ace_flags,
-            Some((OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8)
-        );
         assert!(
             permissive_facts.has_current_owner_full_control_ace,
-            "owner ACE changed: {permissive_facts:?}"
+            "effective current-owner full-control ACE is missing: {permissive_facts:?}"
         );
         assert!(
             permissive_facts.has_everyone_full_control_ace,
-            "Everyone full-control ACE was not installed: {permissive_facts:?}"
+            "effective Everyone full-control ACE was not installed: {permissive_facts:?}"
         );
         assert!(private_acl.normalized_descriptor != permissive_acl_before.normalized_descriptor);
 
@@ -1557,7 +1589,13 @@ mod windows {
         record.write_all(b"owner fixture").unwrap();
         drop(record);
         let record_path = home.path().join("wrong-owner.dat");
-        let private_acl = assert_fixture_acl(&record_path, &sid, false, FILE_ALL_ACCESS);
+        let private_acl = assert_fixture_acl(
+            &record_path,
+            &sid,
+            false,
+            FILE_ALL_ACCESS,
+            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+        );
         home.dir()
             .inspect_private_tree(InspectionLimits {
                 max_entries: 8,
