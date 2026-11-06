@@ -333,13 +333,16 @@ mod windows {
         );
         assert_ne!(present, 0);
         assert!(!dacl.is_null());
-        let handle = fixture_handle(path, READ_CONTROL | WRITE_DAC, directory);
+        let owner_sid = sid_from_text(sid);
+        let handle = fixture_handle(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER, directory);
         let result = unsafe {
             SetSecurityInfo(
                 handle.as_raw_handle(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner_sid.0.cast(),
                 null_mut(),
                 dacl,
                 null_mut(),
@@ -347,7 +350,7 @@ mod windows {
         };
         assert_eq!(
             result, ERROR_SUCCESS,
-            "installing public-source fixture ACL failed: {result}"
+            "installing public-source fixture owner and ACL failed: {result}"
         );
     }
 
