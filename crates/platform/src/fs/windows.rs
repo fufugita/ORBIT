@@ -2260,97 +2260,818 @@ fn relative_validated(
     ensure_kind(handle.as_raw_handle(), directory)?;
     Ok(handle)
 }
-// This declaration surface deliberately has no successful construction path.
-// The first native tracer fails before stage creation; later implementation
-// must establish the owned facts represented by these private fields.
-#[allow(dead_code)]
 mod staged_package {
     use super::*;
+    use std::os::windows::io::IntoRawHandle;
 
-    struct StageNode {
-        checked_components: Vec<OsString>,
+    const META: u32 = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    const ROOT_READ: u32 = META | FILE_LIST_DIRECTORY | FILE_TRAVERSE;
+    const READ_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_DELETE;
+    const OBSERVER_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_NAMES: usize = 1048576;
+    const MAX_SD: usize = 65536;
+
+    struct UncertainClose {
+        raw: usize,
+        error: u32,
         identity: Option<FileIdentity>,
-        handle: Option<OwnedHandle>,
-        snapshot: Option<SourceSnapshot>,
-        expected_executable: bool,
-        sealed: bool,
-        removed: bool,
+        phase: &'static str,
+    }
+    impl std::fmt::Debug for UncertainClose {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("UncertainClose")
+                .field("raw", &self.raw)
+                .field("error", &self.error)
+                .field("identity", &self.identity)
+                .field("phase", &self.phase)
+                .finish()
+        }
     }
 
-    struct StageLeases {
+    #[derive(Debug, Default)]
+    pub(super) struct CloseState {
         active: AtomicU64,
-        close_uncertain: AtomicBool,
+        poisoned: AtomicBool,
+        uncertain: Mutex<Vec<UncertainClose>>,
+    }
+    #[derive(Debug)]
+    struct CloseFault {
+        message: &'static str,
+        state: Arc<CloseState>,
+        primary: Option<io::Error>,
+    }
+    impl std::fmt::Display for CloseFault {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)?;
+            let count = self
+                .state
+                .uncertain
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            write!(f, " ({count} retained uncertain native owners)")?;
+            if let Some(error) = &self.primary {
+                write!(f, ": {error}")?;
+            }
+            Ok(())
+        }
+    }
+    impl std::error::Error for CloseFault {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.primary.as_ref().map(|e| e as _)
+        }
+    }
+    impl CloseState {
+        pub(super) fn record(
+            &self,
+            raw: HANDLE,
+            error: u32,
+            identity: Option<FileIdentity>,
+            phase: &'static str,
+        ) {
+            self.poisoned.store(true, Ordering::Release);
+            // A failed close may have consumed/reused the value. This owning
+            // uncertainty slot is never blindly re-closed, including in Drop.
+            self.uncertain
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(UncertainClose {
+                    raw: raw as usize,
+                    error,
+                    identity,
+                    phase,
+                });
+        }
+        pub(super) fn fault(
+            self: &Arc<Self>,
+            message: &'static str,
+            primary: Option<io::Error>,
+        ) -> io::Error {
+            let kind = primary
+                .as_ref()
+                .map_or(io::ErrorKind::Other, io::Error::kind);
+            io::Error::new(
+                kind,
+                CloseFault {
+                    message,
+                    state: Arc::clone(self),
+                    primary,
+                },
+            )
+        }
+        pub(super) fn check(self: &Arc<Self>) -> io::Result<()> {
+            if self.poisoned.load(Ordering::Acquire) {
+                Err(self.fault("package native ownership/close uncertainty", None))
+            } else {
+                Ok(())
+            }
+        }
+        fn acquire(self: &Arc<Self>) -> io::Result<()> {
+            self.check()?;
+            self.active
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_ENTRIES as u64).then(|| n + 1)
+                })
+                .map_err(|_| invalid("package view lease limit exceeded"))?;
+            Ok(())
+        }
+        fn zero(self: &Arc<Self>) -> io::Result<()> {
+            self.check()?;
+            if self.active.load(Ordering::Acquire) != 0 {
+                return Err(denied("package has live read leases"));
+            }
+            // Observing the releasing Drop's zero count orders its completed
+            // close/uncertainty publication before this final poison check.
+            self.check()
+        }
+    }
+    fn close_owned(
+        handle: OwnedHandle,
+        state: &Arc<CloseState>,
+        id: Option<FileIdentity>,
+        phase: &'static str,
+    ) -> io::Result<()> {
+        let raw = handle.into_raw_handle();
+        if unsafe { CloseHandle(raw) } == 0 {
+            let code = unsafe { GetLastError() };
+            state.record(raw, code, id, phase);
+            Err(state.fault(
+                "package CloseHandle failed",
+                Some(io::Error::from_raw_os_error(code as i32)),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    fn finish_owned<T>(
+        handle: OwnedHandle,
+        state: &Arc<CloseState>,
+        id: Option<FileIdentity>,
+        phase: &'static str,
+        result: io::Result<T>,
+    ) -> io::Result<T> {
+        match close_owned(handle, state, id, phase) {
+            Ok(()) => result,
+            Err(_) => Err(state.fault("package checked temporary close failed", result.err())),
+        }
     }
 
-    struct StageCore {
+    struct PreparedName {
+        wide: Vec<u16>,
+    }
+    impl PreparedName {
+        fn new(name: &OsStr) -> io::Result<Self> {
+            let wide = name.encode_wide().collect::<Vec<_>>();
+            if wide
+                .len()
+                .checked_mul(2)
+                .is_none_or(|n| n == 0 || n > u16::MAX as usize)
+            {
+                return Err(invalid("package native component length invalid"));
+            }
+            Ok(Self { wide })
+        }
+    }
+    #[derive(Debug)]
+    pub(super) struct NativeError {
+        pub(super) phase: &'static str,
+        pub(super) status: i32,
+    }
+    impl std::fmt::Display for NativeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} NTSTATUS=0x{:08x}", self.phase, self.status as u32)
+        }
+    }
+    impl std::error::Error for NativeError {}
+    fn native_error(phase: &'static str, status: i32) -> io::Error {
+        let kind =
+            io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32).kind();
+        io::Error::new(kind, NativeError { phase, status })
+    }
+    fn native_open(
+        parent: HANDLE,
+        name: &PreparedName,
+        directory: bool,
+        disposition: u32,
+        access: u32,
+        share: u32,
+        descriptor: *const SECURITY_DESCRIPTOR,
+        state: &Arc<CloseState>,
+        phase: &'static str,
+    ) -> io::Result<OwnedHandle> {
+        let unicode = UNICODE_STRING {
+            Length: (name.wide.len() * 2) as u16,
+            MaximumLength: (name.wide.len() * 2) as u16,
+            Buffer: name.wide.as_ptr().cast_mut(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent,
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: descriptor,
+            SecurityQualityOfService: null(),
+        };
+        let mut raw = null_mut();
+        let mut iosb = IO_STATUS_BLOCK::default();
+        // IRP_MJ_CREATE is synchronous; NONALERT+SYNCHRONIZE also binds all
+        // subsequent operations to synchronous nonalertable file-object I/O.
+        // No COMPLETE_IF_OPLOCKED, async mode, backup intent or flag fallback.
+        let returned = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access,
+                &attributes,
+                &mut iosb,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_DIRECTORY_FILE
+                    } else {
+                        FILE_NON_DIRECTORY_FILE
+                    },
+                null(),
+                0,
+            )
+        };
+        if returned != 0 {
+            let error = native_error(phase, returned);
+            if !raw.is_null() {
+                state.record(raw, 0, None, "unclassified failed native-open output");
+                return Err(state.fault(
+                    "failed package open returned unclassified output",
+                    Some(error),
+                ));
+            }
+            return Err(error);
+        }
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(invalid("successful package open returned no valid owner"));
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+    pub(super) fn observation_open(
+        parent: HANDLE,
+        name: &OsStr,
+        execute: bool,
+        state: &Arc<CloseState>,
+    ) -> io::Result<OwnedHandle> {
+        validate_source_component(name)?;
+        let prepared = PreparedName::new(name)?;
+        native_open(
+            parent,
+            &prepared,
+            false,
+            FILE_OPEN,
+            META | if execute { FILE_EXECUTE } else { 0 },
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            state,
+            if execute {
+                "package-execute"
+            } else {
+                "package-metadata"
+            },
+        )
+    }
+    fn sid_copy(sid: PSID, base: *const u8, length: usize) -> io::Result<Vec<u8>> {
+        let offset = (sid as usize)
+            .checked_sub(base as usize)
+            .ok_or_else(|| invalid("package SID outside descriptor"))?;
+        if sid.is_null()
+            || sid as usize % 4 != 0
+            || offset.checked_add(8).is_none_or(|n| n > length)
+        {
+            return Err(invalid("package SID prefix bounds/alignment invalid"));
+        }
+        let count = unsafe { *sid.cast::<u8>().add(1) } as usize;
+        let size = 8 + count * 4;
+        if count > 15 || offset.checked_add(size).is_none_or(|n| n > length) {
+            return Err(invalid("package SID tail outside descriptor"));
+        }
+        ok(unsafe { IsValidSid(sid) })?;
+        if unsafe { GetLengthSid(sid) } as usize != size {
+            return Err(invalid("package SID length mismatch"));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), size) }.to_vec())
+    }
+    fn sid_text(bytes: &[u8]) -> io::Result<String> {
+        let mut words = vec![0u32; bytes.len().div_ceil(4)];
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast(), bytes.len());
+        }
+        let mut text = null_mut();
+        ok(unsafe { ConvertSidToStringSidW(words.as_mut_ptr().cast(), &mut text) })?;
+        let allocation = LocalAllocation(text.cast());
+        let mut length = 0;
+        while length < 256 && unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        if length == 256 {
+            return Err(invalid("package SID text bound exceeded"));
+        }
+        let value = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+            .map_err(|_| invalid("package SID text invalid"))?;
+        drop(allocation);
+        Ok(value)
+    }
+    fn descriptor(user: &[u8], group: &[u8], mask: u32) -> io::Result<Vec<usize>> {
+        let user = sid_text(user)?;
+        let group = sid_text(group)?;
+        let text = wide(OsStr::new(&format!(
+            "O:{user}G:{group}D:P(A;;0x{mask:08x};;;{user})"
+        )));
+        let mut raw = null_mut();
+        let mut length = 0;
+        ok(unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut raw,
+                &mut length,
+            )
+        })?;
+        let allocation = LocalAllocation(raw);
+        if length as usize > MAX_SD || (length as usize) < size_of::<SECURITY_DESCRIPTOR_RELATIVE>()
+        {
+            return Err(invalid("package descriptor size invalid"));
+        }
+        let mut words = vec![0usize; (length as usize).div_ceil(size_of::<usize>())];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw.cast::<u8>(),
+                words.as_mut_ptr().cast(),
+                length as usize,
+            );
+        }
+        drop(allocation);
+        Ok(words)
+    }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct PolicyFacts {
+        owner: Vec<u8>,
+        group: Vec<u8>,
+        dacl: Vec<u8>,
+        control: u16,
+    }
+    fn policy(
+        handle: HANDLE,
+        user: &[u8],
+        group_expected: &[u8],
+        mask: u32,
+    ) -> io::Result<PolicyFacts> {
+        let mut owner = null_mut();
+        let mut group = null_mut();
+        let mut dacl = null_mut();
+        let mut raw = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                null_mut(),
+                &mut raw,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let allocation = LocalAllocation(raw.cast());
+        ok(unsafe { IsValidSecurityDescriptor(raw) })?;
+        let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+        if length > MAX_SD || length < size_of::<SECURITY_DESCRIPTOR_RELATIVE>() {
+            return Err(invalid("package policy descriptor bound invalid"));
+        }
+        let owner = sid_copy(owner, raw.cast(), length)?;
+        let group = sid_copy(group, raw.cast(), length)?;
+        let mut control = 0;
+        let mut revision = 0;
+        ok(unsafe { GetSecurityDescriptorControl(raw, &mut control, &mut revision) })?;
+        let offset = (dacl as usize)
+            .checked_sub(raw as usize)
+            .ok_or_else(|| invalid("package DACL outside descriptor"))?;
+        if dacl.is_null()
+            || dacl as usize % 4 != 0
+            || offset
+                .checked_add(size_of::<ACL>())
+                .is_none_or(|n| n > length)
+        {
+            return Err(invalid("package ACL header invalid"));
+        }
+        let size = unsafe { (*dacl).AclSize } as usize;
+        if size < size_of::<ACL>() || offset.checked_add(size).is_none_or(|n| n > length) {
+            return Err(invalid("package ACL tail invalid"));
+        }
+        ok(unsafe { IsValidAcl(dacl) })?;
+        if control & (SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE)
+            != SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE
+            || owner != user
+            || group != group_expected
+            || unsafe { (*dacl).AceCount } != 1
+        {
+            return Err(denied("package owner/group/private DACL changed"));
+        }
+        let mut ace = null_mut();
+        ok(unsafe { GetAce(dacl, 0, &mut ace) })?;
+        let ace_offset = (ace as usize)
+            .checked_sub(dacl as usize)
+            .ok_or_else(|| invalid("package ACE outside ACL"))?;
+        if ace as usize % 4 != 0
+            || ace_offset
+                .checked_add(size_of::<ACE_HEADER>())
+                .is_none_or(|n| n > size)
+        {
+            return Err(invalid("package ACE header invalid"));
+        }
+        let header = unsafe { ace.cast::<ACE_HEADER>().read() };
+        let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        if header.AceType != 0
+            || header.AceFlags != 0
+            || (header.AceSize as usize) < sid_offset + 8
+            || ace_offset
+                .checked_add(header.AceSize as usize)
+                .is_none_or(|n| n > size)
+        {
+            return Err(denied(
+                "package ACE is not canonical ordinary zero-flag allow",
+            ));
+        }
+        let actual_mask = unsafe { ace.cast::<u8>().add(4).cast::<u32>().read() };
+        let sid = sid_copy(
+            unsafe { ace.cast::<u8>().add(sid_offset).cast() },
+            ace.cast(),
+            header.AceSize as usize,
+        )?;
+        if actual_mask != mask || sid != user {
+            return Err(denied("package canonical rights/SID changed"));
+        }
+        let dacl = unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), size) }.to_vec();
+        drop(allocation);
+        Ok(PolicyFacts {
+            owner,
+            group,
+            dacl,
+            control,
+        })
+    }
+
+    struct Domain {
         guard: Arc<StateLock>,
         parent_identity: FileIdentity,
         lock_identity: FileIdentity,
-        outer_anchors: Vec<(Arc<OwnedHandle>, FileIdentity)>,
+        anchors: Vec<Arc<OwnedHandle>>,
+        identities: Vec<FileIdentity>,
         security: Security,
+        user: Vec<u8>,
+        group: Vec<u8>,
+        full_sd: Vec<usize>,
+        read_sd: Vec<usize>,
+        rx_sd: Vec<usize>,
+        closes: Arc<CloseState>,
+    }
+    impl Domain {
+        fn capture(directory: &Directory, guard: Arc<StateLock>) -> io::Result<Arc<Self>> {
+            directory.require_lock(&guard, true)?;
+            let closes = Arc::new(CloseState::default());
+            let (user, group) = execution_observation::package_principal(&closes)?;
+            let expected = unsafe {
+                std::slice::from_raw_parts(
+                    directory.security.sid.as_ptr().cast::<u8>(),
+                    directory.security.sid.len() * 4,
+                )
+            };
+            if user != expected {
+                return Err(denied(
+                    "package creation context differs from private parent owner",
+                ));
+            }
+            let identities = directory
+                .chain
+                .iter()
+                .map(|h| identity(h.as_raw_handle()))
+                .collect::<io::Result<Vec<_>>>()?;
+            let full_sd = descriptor(&user, &group, FILE_ALL_ACCESS)?;
+            let read_sd = descriptor(&user, &group, FILE_GENERIC_READ)?;
+            let rx_sd = descriptor(&user, &group, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+            let domain = Arc::new(Self {
+                lock_identity: guard.identity(),
+                guard,
+                parent_identity: directory.identity,
+                anchors: directory.chain.clone(),
+                identities,
+                security: directory.security.clone(),
+                user,
+                group,
+                full_sd,
+                read_sd,
+                rx_sd,
+                closes,
+            });
+            domain.check()?;
+            Ok(domain)
+        }
+        fn parent(&self) -> HANDLE {
+            self.anchors.last().unwrap().as_raw_handle()
+        }
+        fn check(&self) -> io::Result<()> {
+            self.closes.check()?;
+            check_source_anchors(&self.anchors, &self.identities)?;
+            self.security.check(self.parent())?;
+            self.guard.check()?;
+            if self.identities.last().copied() != Some(self.parent_identity)
+                || self.guard.file.parent != self.parent_identity
+                || self.guard.identity() != self.lock_identity
+                || self.guard.mode != LockMode::Exclusive
+            {
+                return Err(denied("package parent/lock domain changed"));
+            }
+            Ok(())
+        }
+        fn facts(&self, raw: HANDLE, mask: u32) -> io::Result<PolicyFacts> {
+            policy(raw, &self.user, &self.group, mask)
+        }
+    }
+    struct StageNode {
+        name: OsString,
+        identity: Option<FileIdentity>,
+        creator: Option<OwnedHandle>,
+        snapshot: Option<SourceSnapshot>,
+        policy: Option<PolicyFacts>,
+        executable: bool,
+        attempted: bool,
+        flushed: bool,
+        sealed: bool,
+        poisoned: bool,
+    }
+    struct StageCore {
+        domain: Arc<Domain>,
         original_name: OsString,
         final_name: Option<OsString>,
         root: Option<OwnedHandle>,
+        bridge: Option<OwnedHandle>,
+        reader: Option<OwnedHandle>,
+        bridge_identity: Option<FileIdentity>,
+        reader_identity: Option<FileIdentity>,
         root_identity: Option<FileIdentity>,
+        root_policy: Option<PolicyFacts>,
         ledger: Vec<StageNode>,
         remaining_entries: usize,
         remaining_name_bytes: usize,
         remaining_depth: usize,
-        leases: StageLeases,
-        close_errors: Vec<io::Error>,
+        create_attempted: bool,
         phase: PublicationState,
+    }
+    impl StageCore {
+        fn raw(&self) -> io::Result<HANDLE> {
+            self.root
+                .as_ref()
+                .or(self.bridge.as_ref())
+                .or(self.reader.as_ref())
+                .map(AsRawHandle::as_raw_handle)
+                .ok_or_else(|| invalid("package root owner unavailable"))
+        }
+        fn check_root(&self) -> io::Result<()> {
+            self.domain.check()?;
+            let raw = self.raw()?;
+            ensure_kind(raw, true)?;
+            if Some(identity(raw)?) != self.root_identity
+                || self
+                    .root_identity
+                    .is_none_or(|id| id.volume != self.domain.parent_identity.volume)
+            {
+                return Err(denied("package stage root identity changed"));
+            }
+            let actual = self.domain.facts(raw, FILE_ALL_ACCESS)?;
+            if self
+                .root_policy
+                .as_ref()
+                .is_some_and(|before| *before != actual)
+            {
+                return Err(denied("package root private policy changed"));
+            }
+            Ok(())
+        }
+        fn inventory(&self, root: HANDLE) -> io::Result<()> {
+            self.domain.check()?;
+            let listed = source_directory_entries(
+                root,
+                EnumerationLimits {
+                    max_entries: MAX_ENTRIES,
+                    max_name_bytes: MAX_NAMES,
+                },
+            )?;
+            if listed.len() != self.ledger.len() {
+                return Err(denied("package inventory differs from owned ledger"));
+            }
+            for node in &self.ledger {
+                if node.poisoned
+                    || !node.attempted
+                    || !node.flushed
+                    || !node.sealed
+                    || node.creator.is_some()
+                    || node.identity.is_none()
+                    || node.snapshot.is_none()
+                    || node.policy.is_none()
+                {
+                    return Err(denied("package ledger has incomplete/poisoned entry"));
+                }
+                let id = node.identity.unwrap();
+                if !listed.iter().any(|entry| {
+                    entry.name == node.name && entry.identity == id.file && !entry.directory
+                }) {
+                    return Err(denied("package inventory name/identity/kind changed"));
+                }
+                let prepared = PreparedName::new(&node.name)?;
+                let handle = native_open(
+                    root,
+                    &prepared,
+                    false,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ,
+                    READ_SHARE,
+                    null(),
+                    &self.domain.closes,
+                    "package-inventory",
+                )?;
+                let result = (|| {
+                    if source_snapshot(handle.as_raw_handle(), id, false)? != node.snapshot.unwrap()
+                        || self
+                            .domain
+                            .facts(handle.as_raw_handle(), mode(node.executable))?
+                            != *node.policy.as_ref().unwrap()
+                    {
+                        return Err(denied("package sealed entry changed"));
+                    }
+                    let observed = execution_observation::observe_package(
+                        handle.as_raw_handle(),
+                        id,
+                        root,
+                        self.root_identity.unwrap(),
+                        &node.name,
+                        || {
+                            self.domain.check()?;
+                            let sampled = source_snapshot(handle.as_raw_handle(), id, false)?;
+                            if Some(sampled) != node.snapshot
+                                || self
+                                    .domain
+                                    .facts(handle.as_raw_handle(), mode(node.executable))?
+                                    != *node.policy.as_ref().unwrap()
+                            {
+                                return Err(denied(
+                                    "package inventory changed during execution observation",
+                                ));
+                            }
+                            Ok(sampled)
+                        },
+                        &self.domain.closes,
+                    )?;
+                    if observed.executable() != node.executable {
+                        return Err(denied("package inventory execution mode disagrees"));
+                    }
+                    Ok(())
+                })();
+                finish_owned(
+                    handle,
+                    &self.domain.closes,
+                    Some(id),
+                    "package inventory reader",
+                    result,
+                )?;
+            }
+            Ok(())
+        }
+        fn make_view<'a>(&'a self, name: &OsStr, executable: bool) -> io::Result<PackageFile<'a>> {
+            self.check_root()?;
+            let prepared = PreparedName::new(name)?;
+            let owner = native_open(
+                self.raw()?,
+                &prepared,
+                false,
+                FILE_OPEN,
+                FILE_GENERIC_READ,
+                READ_SHARE,
+                null(),
+                &self.domain.closes,
+                "package-stage-reader",
+            )?;
+            let result = (|| {
+                let id = identity(owner.as_raw_handle())?;
+                let node = self
+                    .ledger
+                    .iter()
+                    .find(|node| node.identity == Some(id))
+                    .ok_or_else(|| denied("package reader is not a registered entry"))?;
+                if node.poisoned
+                    || !node.sealed
+                    || !node.flushed
+                    || node.creator.is_some()
+                    || node.executable != executable
+                {
+                    return Err(denied("package entry not sealed in requested mode"));
+                }
+                let sampled = source_snapshot(owner.as_raw_handle(), id, false)?;
+                let facts = self.domain.facts(owner.as_raw_handle(), mode(executable))?;
+                if Some(sampled) != node.snapshot || Some(&facts) != node.policy.as_ref() {
+                    return Err(denied("package reader metadata/policy changed"));
+                }
+                Ok((id, sampled, facts, node.name.clone()))
+            })();
+            let (id, snapshot, facts, name) = match result {
+                Ok(values) => values,
+                Err(error) => {
+                    return finish_owned(
+                        owner,
+                        &self.domain.closes,
+                        None,
+                        "failed stage reader",
+                        Err(error),
+                    );
+                }
+            };
+            if let Err(error) = self.domain.closes.acquire() {
+                return finish_owned(
+                    owner,
+                    &self.domain.closes,
+                    Some(id),
+                    "unleased stage reader",
+                    Err(error),
+                );
+            }
+            let view = PackageFile {
+                file: Some(File::from(owner)),
+                identity: id,
+                expected_executable: executable,
+                snapshot,
+                policy: facts,
+                name,
+                lease: PackageLease::Stage(self),
+                closes: Arc::clone(&self.domain.closes),
+            };
+            view.execution_permission()?;
+            Ok(view)
+        }
+    }
+    fn mode(executable: bool) -> u32 {
+        FILE_GENERIC_READ | if executable { FILE_GENERIC_EXECUTE } else { 0 }
     }
 
     pub struct StagedDirectory {
         core: StageCore,
         identity: FileIdentity,
     }
-
-    struct PackageReadDomain {
-        guard: Arc<StateLock>,
-        parent_identity: FileIdentity,
-        lock_identity: FileIdentity,
-        outer_anchors: Vec<(Arc<OwnedHandle>, FileIdentity)>,
-    }
-
     pub struct PackageDirectory {
-        domain: Arc<PackageReadDomain>,
+        domain: Arc<Domain>,
         chain: Vec<(OwnedHandle, FileIdentity)>,
         identity: FileIdentity,
+        ledger: Vec<ReadNode>,
         remaining_depth: usize,
         enumeration: Mutex<()>,
     }
-
+    struct ReadNode {
+        name: OsString,
+        identity: FileIdentity,
+        executable: bool,
+        snapshot: SourceSnapshot,
+        policy: PolicyFacts,
+    }
     enum PackageLease<'a> {
-        Stage(&'a StageLeases),
+        Stage(&'a StageCore),
         Published(&'a PackageDirectory),
     }
-
     pub struct PackageFile<'a> {
-        file: File,
+        file: Option<File>,
         identity: FileIdentity,
         expected_executable: bool,
-        anchors: Vec<Arc<OwnedHandle>>,
+        snapshot: SourceSnapshot,
+        policy: PolicyFacts,
+        name: OsString,
         lease: PackageLease<'a>,
+        closes: Arc<CloseState>,
     }
-
     pub struct PackagePublication {
         core: StageCore,
         identity: FileIdentity,
         durability: Durability,
     }
-
     pub struct PackageAcceptance {
         directory: PackageDirectory,
+        #[allow(dead_code)]
         identity: FileIdentity,
+        #[allow(dead_code)]
         durability: Durability,
     }
-
     pub struct StageRecovery {
         core: StageCore,
         publication: Option<(FileIdentity, Durability)>,
     }
-
     pub enum StageCreateError {
         Unchanged(io::Error),
         Uncertain {
@@ -2358,7 +3079,6 @@ mod staged_package {
             recovery: StageRecovery,
         },
     }
-
     pub enum StagePublishError {
         Unchanged {
             source: io::Error,
@@ -2370,7 +3090,6 @@ mod staged_package {
             recovery: StageRecovery,
         },
     }
-
     pub struct StageAcceptError {
         pub source: io::Error,
         pub recovery: StageRecovery,
@@ -2379,69 +3098,484 @@ mod staged_package {
     impl Directory {
         pub fn stage_directory(
             &self,
-            _guard: Arc<StateLock>,
-            _name: &OsStr,
+            guard: Arc<StateLock>,
+            name: &OsStr,
         ) -> Result<StagedDirectory, StageCreateError> {
-            Err(StageCreateError::Unchanged(unsupported(
-                "staged package creation is not implemented",
-            )))
+            validate_data_component(name).map_err(StageCreateError::Unchanged)?;
+            let prepared = PreparedName::new(name).map_err(StageCreateError::Unchanged)?;
+            let domain = Domain::capture(self, guard).map_err(StageCreateError::Unchanged)?;
+            let mut core = StageCore {
+                domain,
+                original_name: name.to_os_string(),
+                final_name: None,
+                root: None,
+                bridge: None,
+                reader: None,
+                bridge_identity: None,
+                reader_identity: None,
+                root_identity: None,
+                root_policy: None,
+                ledger: Vec::new(),
+                remaining_entries: MAX_ENTRIES,
+                remaining_name_bytes: MAX_NAMES - prepared.wide.len() * 2,
+                remaining_depth: 64,
+                create_attempted: false,
+                phase: PublicationState::NamespaceUnknown,
+            };
+            core.ledger.reserve(1);
+            core.create_attempted = true;
+            let result = (|| {
+                let owner = native_open(
+                    core.domain.parent(),
+                    &prepared,
+                    true,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    core.domain.full_sd.as_ptr().cast(),
+                    &core.domain.closes,
+                    "package-stage-create",
+                )?;
+                core.root = Some(owner);
+                core.root_identity = Some(identity(core.raw()?)?);
+                ensure_kind(core.raw()?, true)?;
+                core.root_policy = Some(core.domain.facts(core.raw()?, FILE_ALL_ACCESS)?);
+                if held_leaf(core.raw()?)? != name {
+                    return Err(denied("created package stage leaf differs"));
+                }
+                core.check_root()?;
+                Ok(core.root_identity.unwrap())
+            })();
+            match result {
+                Ok(identity) => Ok(StagedDirectory { core, identity }),
+                Err(source) => Err(StageCreateError::Uncertain {
+                    source,
+                    recovery: StageRecovery {
+                        core,
+                        publication: None,
+                    },
+                }),
+            }
         }
     }
-
     impl StagedDirectory {
         pub fn identity(&self) -> FileIdentity {
             self.identity
         }
-
         pub fn write_new<'s>(
             &'s mut self,
-            _name: &OsStr,
-            _bytes: &[u8],
-            _executable: bool,
+            name: &OsStr,
+            bytes: &[u8],
+            executable: bool,
         ) -> io::Result<PackageFile<'s>> {
-            Err(unsupported("staged package writing is not implemented"))
+            validate_source_component(name)?;
+            self.core.check_root()?;
+            self.core.domain.closes.zero()?;
+            let prepared = PreparedName::new(name)?;
+            let name_bytes = prepared.wide.len() * 2;
+            if self.core.remaining_entries == 0 || name_bytes > self.core.remaining_name_bytes {
+                return Err(invalid("package construction bounds exceeded"));
+            }
+            self.core.ledger.reserve(1);
+            let index = self.core.ledger.len();
+            self.core.ledger.push(StageNode {
+                name: name.to_os_string(),
+                identity: None,
+                creator: None,
+                snapshot: None,
+                policy: None,
+                executable,
+                attempted: true,
+                flushed: false,
+                sealed: false,
+                poisoned: true,
+            });
+            self.core.remaining_entries -= 1;
+            self.core.remaining_name_bytes -= name_bytes;
+            let result = (|| {
+                let owner = native_open(
+                    self.core.raw()?,
+                    &prepared,
+                    false,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    self.core.domain.full_sd.as_ptr().cast(),
+                    &self.core.domain.closes,
+                    "package-file-create",
+                )?;
+                self.core.ledger[index].creator = Some(owner);
+                let raw = self.core.ledger[index]
+                    .creator
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_handle();
+                let id = identity(raw)?;
+                self.core.ledger[index].identity = Some(id);
+                ensure_kind(raw, false)?;
+                if id.volume != self.identity.volume {
+                    return Err(denied("package entry volume differs"));
+                }
+                let actual_name = held_leaf(raw)?;
+                validate_source_component(&actual_name)?;
+                if actual_name != name {
+                    return Err(denied("created package file leaf differs"));
+                }
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let size = (bytes.len() - offset).min(u32::MAX as usize);
+                    let mut written = 0;
+                    ok(unsafe {
+                        WriteFile(
+                            raw,
+                            bytes[offset..].as_ptr(),
+                            size as u32,
+                            &mut written,
+                            null_mut(),
+                        )
+                    })?;
+                    if written == 0 || written as usize > size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "package native write made invalid progress",
+                        ));
+                    }
+                    offset += written as usize;
+                }
+                ok(unsafe { FlushFileBuffers(raw) })?;
+                self.core.ledger[index].flushed = true;
+                let descriptor = if executable {
+                    &self.core.domain.rx_sd
+                } else {
+                    &self.core.domain.read_sd
+                };
+                let mut present = 0;
+                let mut dacl = null_mut();
+                let mut defaulted = 0;
+                ok(unsafe {
+                    GetSecurityDescriptorDacl(
+                        descriptor.as_ptr().cast_mut().cast(),
+                        &mut present,
+                        &mut dacl,
+                        &mut defaulted,
+                    )
+                })?;
+                if present == 0 || dacl.is_null() {
+                    return Err(invalid("package sealing DACL absent"));
+                }
+                let status = unsafe {
+                    SetSecurityInfo(
+                        raw,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        dacl,
+                        null_mut(),
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(status as i32));
+                }
+                self.core.ledger[index].policy =
+                    Some(self.core.domain.facts(raw, mode(executable))?);
+                let creator = self.core.ledger[index].creator.take().unwrap();
+                close_owned(
+                    creator,
+                    &self.core.domain.closes,
+                    Some(id),
+                    "package last writer",
+                )?;
+                let reader = native_open(
+                    self.core.raw()?,
+                    &prepared,
+                    false,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ,
+                    READ_SHARE,
+                    null(),
+                    &self.core.domain.closes,
+                    "package-postseal-reader",
+                )?;
+                let mut file = File::from(reader);
+                let checked = (|| {
+                    let sampled = source_snapshot(file.as_raw_handle(), id, false)?;
+                    if sampled.length != bytes.len() as u64
+                        || self
+                            .core
+                            .domain
+                            .facts(file.as_raw_handle(), mode(executable))?
+                            != *self.core.ledger[index].policy.as_ref().unwrap()
+                    {
+                        return Err(denied("package post-writer baseline changed"));
+                    }
+                    let mut offset = 0;
+                    let mut buffer = [0u8; 8192];
+                    while offset < bytes.len() {
+                        let size = buffer.len().min(bytes.len() - offset);
+                        let count = file.read(&mut buffer[..size])?;
+                        if count == 0 || buffer[..count] != bytes[offset..offset + count] {
+                            return Err(denied("package postseal bytes differ"));
+                        }
+                        offset += count;
+                    }
+                    if source_snapshot(file.as_raw_handle(), id, false)? != sampled {
+                        return Err(denied("package changed across postseal read"));
+                    }
+                    Ok(sampled)
+                })();
+                let reader = unsafe { OwnedHandle::from_raw_handle(file.into_raw_handle()) };
+                let sampled = finish_owned(
+                    reader,
+                    &self.core.domain.closes,
+                    Some(id),
+                    "package postseal verification",
+                    checked,
+                )?;
+                self.core.ledger[index].snapshot = Some(sampled);
+                self.core.ledger[index].sealed = true;
+                self.core.ledger[index].poisoned = false;
+                Ok(())
+            })();
+            result?;
+            self.core.make_view(name, executable)
         }
-
         pub fn verify_package_mode<'s>(
             &'s self,
-            _name: &OsStr,
-            _executable: bool,
+            name: &OsStr,
+            executable: bool,
         ) -> io::Result<PackageFile<'s>> {
-            Err(unsupported(
-                "staged package verification is not implemented",
-            ))
+            validate_source_component(name)?;
+            self.core.make_view(name, executable)
         }
-
         pub fn publish_directory(
-            self,
-            _final_name: &OsStr,
+            mut self,
+            final_name: &OsStr,
         ) -> Result<PackagePublication, StagePublishError> {
-            Err(StagePublishError::Unchanged {
-                source: unsupported("staged package publication is not implemented"),
-                stage: self,
+            let preflight = (|| {
+                validate_data_component(final_name)?;
+                self.core.check_root()?;
+                self.core.domain.closes.zero()?;
+                self.core.inventory(self.core.raw()?)?;
+                PreparedName::new(final_name)
+            })();
+            let prepared = match preflight {
+                Ok(name) => name,
+                Err(source) => {
+                    return Err(StagePublishError::Uncertain {
+                        source,
+                        state: PublicationState::NamespaceUnknown,
+                        recovery: StageRecovery {
+                            core: self.core,
+                            publication: None,
+                        },
+                    });
+                }
+            };
+            self.core.final_name = Some(final_name.to_os_string());
+            let length = offset_of!(FILE_RENAME_INFORMATION, FileName) + prepared.wide.len() * 2;
+            let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+            let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+            let mut iosb = IO_STATUS_BLOCK::default();
+            let returned = unsafe {
+                (*information).Anonymous.ReplaceIfExists = false;
+                (*information).RootDirectory = self.core.domain.parent();
+                (*information).FileNameLength = (prepared.wide.len() * 2) as u32;
+                std::ptr::copy_nonoverlapping(
+                    prepared.wide.as_ptr(),
+                    (*information).FileName.as_mut_ptr(),
+                    prepared.wide.len(),
+                );
+                // Same synchronous NONALERT+SYNCHRONIZE root file object.
+                // File object, request and IOSB stay live through final return.
+                NtSetInformationFile(
+                    self.core.root.as_ref().unwrap().as_raw_handle(),
+                    &mut iosb,
+                    information.cast(),
+                    length as u32,
+                    FileRenameInformation,
+                )
+            };
+            if returned != 0 {
+                let source = native_error("package-directory-rename", returned);
+                let state = self.core.phase;
+                return Err(StagePublishError::Uncertain {
+                    source,
+                    state,
+                    recovery: StageRecovery {
+                        core: self.core,
+                        publication: None,
+                    },
+                });
+            }
+            let postcheck = (|| {
+                self.core.check_root()?;
+                let current = PreparedName::new(final_name)?;
+                let owner = native_open(
+                    self.core.domain.parent(),
+                    &current,
+                    true,
+                    FILE_OPEN,
+                    ROOT_READ,
+                    OBSERVER_SHARE,
+                    null(),
+                    &self.core.domain.closes,
+                    "package-publication-postcheck",
+                )?;
+                let result = (|| {
+                    if identity(owner.as_raw_handle())? != self.identity {
+                        return Err(denied("published package root identity differs"));
+                    }
+                    self.core
+                        .domain
+                        .facts(owner.as_raw_handle(), FILE_ALL_ACCESS)?;
+                    self.core.inventory(owner.as_raw_handle())
+                })();
+                finish_owned(
+                    owner,
+                    &self.core.domain.closes,
+                    Some(self.identity),
+                    "package published-root observer",
+                    result,
+                )?;
+                let old = PreparedName::new(&self.core.original_name)?;
+                match native_open(
+                    self.core.domain.parent(),
+                    &old,
+                    true,
+                    FILE_OPEN,
+                    META,
+                    OBSERVER_SHARE,
+                    null(),
+                    &self.core.domain.closes,
+                    "package-old-name",
+                ) {
+                    Err(error)
+                        if error
+                            .get_ref()
+                            .and_then(|e| e.downcast_ref::<NativeError>())
+                            .is_some_and(|e| e.status == 0xc0000034u32 as i32) =>
+                    {
+                        Ok(())
+                    }
+                    Ok(owner) => finish_owned(
+                        owner,
+                        &self.core.domain.closes,
+                        None,
+                        "unexpected old package name",
+                        Err(denied("old package name remains after publication")),
+                    ),
+                    Err(error) => Err(error),
+                }
+            })();
+            if let Err(source) = postcheck {
+                return Err(StagePublishError::Uncertain {
+                    source,
+                    state: PublicationState::NamespaceUnknown,
+                    recovery: StageRecovery {
+                        core: self.core,
+                        publication: None,
+                    },
+                });
+            }
+            self.core.phase = PublicationState::NamePublished;
+            Ok(PackagePublication {
+                core: self.core,
+                identity: self.identity,
+                durability: Durability::FileBuffersFlushed,
             })
         }
     }
 
     impl PackageFile<'_> {
+        fn raw(&self) -> io::Result<HANDLE> {
+            self.file
+                .as_ref()
+                .map(AsRawHandle::as_raw_handle)
+                .ok_or_else(|| invalid("package view is closed"))
+        }
+        fn domain_root(&self) -> io::Result<(&Arc<Domain>, HANDLE, FileIdentity)> {
+            match &self.lease {
+                PackageLease::Stage(core) => {
+                    core.check_root()?;
+                    Ok((&core.domain, core.raw()?, core.root_identity.unwrap()))
+                }
+                PackageLease::Published(directory) => {
+                    directory.check()?;
+                    Ok((&directory.domain, directory.root(), directory.identity))
+                }
+            }
+        }
+        fn check(&self) -> io::Result<()> {
+            let (domain, _, parent) = self.domain_root()?;
+            if self.identity.volume != parent.volume
+                || domain.facts(self.raw()?, mode(self.expected_executable))? != self.policy
+                || source_snapshot(self.raw()?, self.identity, false)? != self.snapshot
+            {
+                return Err(denied("package read view identity/policy/snapshot changed"));
+            }
+            Ok(())
+        }
         pub fn identity(&self) -> FileIdentity {
             self.identity
         }
         pub fn snapshot(&self) -> io::Result<SourceSnapshot> {
-            Err(unsupported(
-                "package snapshot observation is not implemented",
-            ))
+            self.check()?;
+            source_snapshot(self.raw()?, self.identity, false)
         }
-        pub fn read_limited(&mut self, _maximum: usize) -> io::Result<Vec<u8>> {
-            Err(unsupported("package reading is not implemented"))
+        pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
+            let before = self.snapshot()?;
+            let file = self
+                .file
+                .as_mut()
+                .ok_or_else(|| invalid("closed package view"))?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            (&mut *file)
+                .take(maximum.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > maximum {
+                return Err(invalid("package file exceeds read limit"));
+            }
+            if self.snapshot()? != before {
+                return Err(denied("package changed during checked read"));
+            }
+            Ok(bytes)
         }
         pub fn execution_permission(&self) -> io::Result<ExecutionPermission> {
-            Err(unsupported(
-                "package execution observation is not implemented",
-            ))
+            self.check()?;
+            let (_, parent, parent_id) = self.domain_root()?;
+            let value = execution_observation::observe_package(
+                self.raw()?,
+                self.identity,
+                parent,
+                parent_id,
+                &self.name,
+                || self.snapshot(),
+                &self.closes,
+            )?;
+            if value.executable() != self.expected_executable {
+                return Err(denied(
+                    "package execution observation disagrees with declared mode",
+                ));
+            }
+            Ok(value)
         }
     }
-
+    impl Drop for PackageFile<'_> {
+        fn drop(&mut self) {
+            if let Some(file) = self.file.take() {
+                let owner = unsafe { OwnedHandle::from_raw_handle(file.into_raw_handle()) };
+                let _ = close_owned(
+                    owner,
+                    &self.closes,
+                    Some(self.identity),
+                    "package read lease",
+                );
+                self.closes.active.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
     impl PackagePublication {
         pub fn identity(&self) -> FileIdentity {
             self.identity
@@ -2449,33 +3583,216 @@ mod staged_package {
         pub fn durability(&self) -> Durability {
             self.durability
         }
-        pub fn accept(self) -> Result<PackageAcceptance, StageAcceptError> {
-            Err(StageAcceptError {
-                source: unsupported("package acceptance is not implemented"),
-                recovery: StageRecovery {
-                    core: self.core,
-                    publication: Some((self.identity, self.durability)),
-                },
+        pub fn accept(mut self) -> Result<PackageAcceptance, StageAcceptError> {
+            let result = (|| {
+                self.core.check_root()?;
+                self.core.domain.closes.zero()?;
+                if self.core.phase != PublicationState::NamePublished {
+                    return Err(denied("package publication not proven"));
+                }
+                self.core.inventory(self.core.raw()?)?;
+                let name = PreparedName::new(
+                    self.core
+                        .final_name
+                        .as_ref()
+                        .ok_or_else(|| invalid("published package name missing"))?,
+                )?;
+                self.core.bridge = Some(native_open(
+                    self.core.domain.parent(),
+                    &name,
+                    true,
+                    FILE_OPEN,
+                    ROOT_READ,
+                    OBSERVER_SHARE,
+                    null(),
+                    &self.core.domain.closes,
+                    "package-accept-bridge",
+                )?);
+                self.core.check_root()?;
+                let bridge = self.core.bridge.as_ref().unwrap().as_raw_handle();
+                self.core.bridge_identity = Some(identity(bridge)?);
+                if self.core.bridge_identity != Some(self.identity) {
+                    return Err(denied("package acceptance bridge identity differs"));
+                }
+                self.core.domain.facts(bridge, FILE_ALL_ACCESS)?;
+                self.core.inventory(bridge)?;
+                let creator = self
+                    .core
+                    .root
+                    .take()
+                    .ok_or_else(|| invalid("package DELETE root owner missing"))?;
+                close_owned(
+                    creator,
+                    &self.core.domain.closes,
+                    Some(self.identity),
+                    "package DELETE root at accept",
+                )?;
+                self.core.domain.closes.zero()?;
+                self.core.reader = Some(native_open(
+                    self.core.domain.parent(),
+                    &name,
+                    true,
+                    FILE_OPEN,
+                    ROOT_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null(),
+                    &self.core.domain.closes,
+                    "package-final-read-root",
+                )?);
+                let reader = self.core.reader.as_ref().unwrap().as_raw_handle();
+                ensure_kind(reader, true)?;
+                self.core.reader_identity = Some(identity(reader)?);
+                if self.core.reader_identity != Some(self.identity) {
+                    return Err(denied(
+                        "fresh no-DELETE-sharing package root identity differs",
+                    ));
+                }
+                self.core.domain.facts(reader, FILE_ALL_ACCESS)?;
+                self.core.inventory(reader)?;
+                self.core.domain.check()?;
+                let bridge = self.core.bridge.take().unwrap();
+                close_owned(
+                    bridge,
+                    &self.core.domain.closes,
+                    Some(self.identity),
+                    "package acceptance bridge",
+                )?;
+                self.core.domain.closes.zero()?;
+                Ok(())
+            })();
+            if let Err(source) = result {
+                return Err(StageAcceptError {
+                    source,
+                    recovery: StageRecovery {
+                        core: self.core,
+                        publication: Some((self.identity, self.durability)),
+                    },
+                });
+            }
+            let ledger = self
+                .core
+                .ledger
+                .iter()
+                .map(|node| ReadNode {
+                    name: node.name.clone(),
+                    identity: node.identity.unwrap(),
+                    executable: node.executable,
+                    snapshot: node.snapshot.unwrap(),
+                    policy: node.policy.as_ref().unwrap().clone(),
+                })
+                .collect();
+            let reader = self.core.reader.take().unwrap();
+            let directory = PackageDirectory {
+                domain: self.core.domain,
+                chain: vec![(reader, self.identity)],
+                identity: self.identity,
+                ledger,
+                remaining_depth: self.core.remaining_depth,
+                enumeration: Mutex::new(()),
+            };
+            Ok(PackageAcceptance {
+                directory,
+                identity: self.identity,
+                durability: self.durability,
             })
         }
     }
-
     impl PackageDirectory {
+        fn root(&self) -> HANDLE {
+            self.chain.last().unwrap().0.as_raw_handle()
+        }
+        fn check(&self) -> io::Result<()> {
+            self.domain.check()?;
+            for (owner, expected) in &self.chain {
+                ensure_kind(owner.as_raw_handle(), true)?;
+                if identity(owner.as_raw_handle())? != *expected {
+                    return Err(denied("accepted package chain identity changed"));
+                }
+                self.domain.facts(owner.as_raw_handle(), FILE_ALL_ACCESS)?;
+            }
+            if self.chain.last().map(|(_, id)| *id) != Some(self.identity)
+                || self.remaining_depth == 0
+            {
+                return Err(denied("accepted package read domain invalid"));
+            }
+            Ok(())
+        }
         pub fn identity(&self) -> FileIdentity {
             self.identity
         }
         pub fn verify_package_mode<'p>(
             &'p self,
-            _name: &OsStr,
-            _expected: FileIdentity,
-            _executable: bool,
+            name: &OsStr,
+            expected: FileIdentity,
+            executable: bool,
         ) -> io::Result<PackageFile<'p>> {
-            Err(unsupported(
-                "accepted package verification is not implemented",
-            ))
+            let _serial = self
+                .enumeration
+                .lock()
+                .map_err(|_| denied("accepted package read serialization poisoned"))?;
+            validate_source_component(name)?;
+            self.check()?;
+            let node = self
+                .ledger
+                .iter()
+                .find(|node| node.identity == expected)
+                .ok_or_else(|| denied("accepted package ID not in ledger"))?;
+            if node.executable != executable {
+                return Err(denied("accepted package declared mode differs"));
+            }
+            let prepared = PreparedName::new(name)?;
+            let owner = native_open(
+                self.root(),
+                &prepared,
+                false,
+                FILE_OPEN,
+                FILE_GENERIC_READ,
+                READ_SHARE,
+                null(),
+                &self.domain.closes,
+                "accepted-package-reader",
+            )?;
+            let result = (|| {
+                if source_snapshot(owner.as_raw_handle(), expected, false)? != node.snapshot
+                    || self.domain.facts(owner.as_raw_handle(), mode(executable))? != node.policy
+                {
+                    return Err(denied("accepted package entry changed"));
+                }
+                self.check()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                return finish_owned(
+                    owner,
+                    &self.domain.closes,
+                    Some(expected),
+                    "failed accepted package view",
+                    Err(error),
+                );
+            }
+            if let Err(error) = self.domain.closes.acquire() {
+                return finish_owned(
+                    owner,
+                    &self.domain.closes,
+                    Some(expected),
+                    "unleased accepted view",
+                    Err(error),
+                );
+            }
+            let view = PackageFile {
+                file: Some(File::from(owner)),
+                identity: expected,
+                expected_executable: executable,
+                snapshot: node.snapshot,
+                policy: node.policy.clone(),
+                name: node.name.clone(),
+                lease: PackageLease::Published(self),
+                closes: Arc::clone(&self.domain.closes),
+            };
+            view.execution_permission()?;
+            Ok(view)
         }
     }
-
     impl PackageAcceptance {
         pub fn directory(&self) -> &PackageDirectory {
             &self.directory
@@ -2487,6 +3804,7 @@ mod staged_package {
             f.debug_struct("StageRecovery")
                 .field("root_identity", &self.core.root_identity)
                 .field("phase", &self.core.phase)
+                .field("publication", &self.publication)
                 .finish_non_exhaustive()
         }
     }
@@ -3376,6 +4694,164 @@ mod execution_observation {
         Err(unsupported(
             "source AccessCheck privilege buffer unavailable",
         ))
+    }
+
+    impl Handles {
+        fn finish_package<T>(
+            mut self,
+            result: io::Result<T>,
+            state: &Arc<staged_package::CloseState>,
+        ) -> io::Result<T> {
+            for slot in self.slots.iter_mut().rev() {
+                if let Some(owner) = slot.take() {
+                    let raw = owner.into_raw_handle();
+                    if unsafe { CloseHandle(raw) } == 0 {
+                        let code = unsafe { GetLastError() };
+                        state.record(raw, code, None, "package observation temporary owner");
+                    }
+                }
+            }
+            if state.check().is_err() {
+                Err(state.fault("package observation ownership uncertainty", result.err()))
+            } else {
+                result
+            }
+        }
+    }
+
+    pub(super) fn package_principal(
+        state: &Arc<staged_package::CloseState>,
+    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut handles = Handles::default();
+        let result = (|| {
+            let (_, key) = effective(&mut handles)?;
+            Ok((key.user, key.primary_group))
+        })();
+        handles.finish_package(result, state)
+    }
+
+    fn package_open(
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        leaf: &OsStr,
+        expected: FileIdentity,
+        phase: OpenPhase,
+        handles: &mut Handles,
+        state: &Arc<staged_package::CloseState>,
+    ) -> io::Result<usize> {
+        ensure_kind(parent, true)?;
+        if identity(parent)? != parent_id || parent_id.volume != expected.volume {
+            return Err(denied("package observation parent identity changed"));
+        }
+        let owner =
+            staged_package::observation_open(parent, leaf, phase == OpenPhase::Execute, state)?;
+        let slot = handles.own(owner);
+        ensure_kind(handles.raw(slot), false)?;
+        if identity(handles.raw(slot))? != expected {
+            return Err(denied(
+                "package observation reopened a different full identity",
+            ));
+        }
+        Ok(slot)
+    }
+
+    // Borrow the actual stage/accepted parent rather than acquiring a public
+    // SourceDirectory whose no-DELETE root sharing conflicts with publication.
+    // The existing SourceFile wrapper and its open/share/read behavior stay intact.
+    pub(super) fn observe_package<F>(
+        file: HANDLE,
+        expected: FileIdentity,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        leaf: &OsStr,
+        snapshot: F,
+        state: &Arc<staged_package::CloseState>,
+    ) -> io::Result<ExecutionPermission>
+    where
+        F: Fn() -> io::Result<SourceSnapshot>,
+    {
+        let mut handles = Handles::default();
+        let result = (|| {
+            state.check()?;
+            let before = snapshot()?;
+            if source_snapshot(file, expected, false)? != before {
+                return Err(denied("package held metadata baseline differs"));
+            }
+            let (original, key) = effective(&mut handles)?;
+            let metadata = package_open(
+                parent,
+                parent_id,
+                leaf,
+                expected,
+                OpenPhase::Metadata,
+                &mut handles,
+                state,
+            )?;
+            if source_snapshot(handles.raw(metadata), expected, false)? != before {
+                return Err(denied("package observation metadata changed"));
+            }
+            let descriptor = security(handles.raw(metadata))?;
+            let duplicate = duplicate(&mut handles, original, &key)?;
+            let checked = access_check(&descriptor, handles.raw(duplicate))?;
+            let native = match package_open(
+                parent,
+                parent_id,
+                leaf,
+                expected,
+                OpenPhase::Execute,
+                &mut handles,
+                state,
+            ) {
+                Ok(probe) => {
+                    if source_snapshot(handles.raw(probe), expected, false)? != before
+                        || security(handles.raw(probe))?.fingerprint != descriptor.fingerprint
+                    {
+                        return Err(denied("package execution probe metadata/security changed"));
+                    }
+                    true
+                }
+                Err(error)
+                    if error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<staged_package::NativeError>())
+                        .is_some_and(|e| {
+                            e.phase == "package-execute" && e.status == STATUS_ACCESS_DENIED
+                        }) =>
+                {
+                    state.check()?;
+                    false
+                }
+                Err(error) => return Err(error),
+            };
+            if checked != native {
+                return Err(denied(
+                    "package AccessCheck/native execution decisions disagree",
+                ));
+            }
+            if security(handles.raw(metadata))?.fingerprint != descriptor.fingerprint
+                || source_snapshot(handles.raw(metadata), expected, false)? != before
+                || source_snapshot(file, expected, false)? != before
+                || snapshot()? != before
+            {
+                return Err(denied(
+                    "package observation identity/policy/snapshot changed",
+                ));
+            }
+            if context(handles.raw(original), key.thread_token)? != key {
+                return Err(denied("original package observation context changed"));
+            }
+            let (_, current) = effective(&mut handles)?;
+            if current != key {
+                return Err(denied("current package observation context changed"));
+            }
+            Ok(ExecutionPermission {
+                executable: checked,
+                identity: expected,
+                security: descriptor.fingerprint,
+                context: key,
+            })
+        })();
+        handles.finish_package(result, state)
     }
 
     pub(super) fn observe(file: &SourceFile) -> io::Result<ExecutionPermission> {
