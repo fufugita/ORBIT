@@ -1960,6 +1960,10 @@ mod tests {
             .args(arguments)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if program.file_name() == Some(std::ffi::OsStr::new("powershell.exe")) {
+            // Let the legacy PowerShell child use its own module search defaults.
+            command.env_remove("PSModulePath");
+        }
         if let Some(path) = path {
             command.env("ORBIT_TEST_ACL_PATH", path);
         }
