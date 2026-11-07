@@ -185,6 +185,29 @@ jobs:
           name: windows-foundation
           path: platform-results/
 
+  windows-private-stores:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install the pinned compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run every native credential library contract
+        shell: pwsh
+        run: ./scripts/windows_native_test.ps1 -Group PrivateStores
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-private-stores
+          path: platform-results/
+
   windows-powershell:
     runs-on: windows-2025
     timeout-minutes: 15

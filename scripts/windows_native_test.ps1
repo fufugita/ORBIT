@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Foundation', 'Confinement', 'RegistryDiagnostic', 'RegistryWitness', 'HostCapabilities')]
+    [ValidateSet('Foundation', 'PrivateStores', 'Confinement', 'RegistryDiagnostic', 'RegistryWitness', 'HostCapabilities')]
     [string] $Group = 'Confinement',
     [string] $EvidenceDir = 'platform-results'
 )
@@ -174,6 +174,96 @@ if ($Group -eq 'HostCapabilities') {
 $env:CARGO_BUILD_JOBS = '1'
 $env:CARGO_TERM_COLOR = 'never'
 $env:NO_COLOR = '1'
+if ($Group -eq 'PrivateStores') {
+    $log = Join-Path $EvidenceDir 'private-stores-lib.log'
+    cargo +1.99.0 test --locked --no-fail-fast -p orbit-adapter --lib -- --test-threads=1 --show-output 2>&1 |
+        Tee-Object -FilePath $log
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $required = @(
+        'provider_credentials::tests::provider_storage_foreign_ownership_is_rejected_without_privileged_fixture',
+        'provider_credentials::tests::provider_storage_held_directory_rejects_inode_substitution',
+        'provider_credentials::tests::provider_storage_held_home_rejects_root_substitution',
+        'provider_credentials::tests::provider_storage_lock_child',
+        'provider_credentials::tests::provider_storage_lock_rejects_named_inode_substitution',
+        'provider_credentials::tests::provider_storage_lock_wait_is_bounded_and_leaves_record_unchanged',
+        'provider_credentials::tests::provider_storage_post_rename_failure_reports_uncertainty_and_retains_publication',
+        'provider_credentials::tests::provider_storage_read_only_status_preserves_missing_lock_and_records',
+        'provider_credentials::tests::provider_storage_record_recheck_rejects_inode_substitution',
+        'provider_credentials::tests::provider_storage_roundtrip_binding_revision_and_precedence',
+        'stream::observation_encoding_tests::billing_counters_require_a_valid_provider_reported_terminal_snapshot',
+        'stream::observation_encoding_tests::observation_external_fault_revokes_terminal_capture_without_changing_observed_state',
+        'stream::observation_encoding_tests::observation_internal_counter_overflow_latches_without_a_fake_short_stream',
+        'stream::observation_encoding_tests::observation_raw_and_row_preimages_match_independent_fixed_bytes',
+        'tests::adapter_error_retry_classification_is_closed',
+        'tests::checked_integer_cost_rounds_categories_independently',
+        'tests::deterministic_adapter_route_and_invoke',
+        'tests::effort_setting_preserves_explicit_default_and_value',
+        'tests::effort_values_preserve_typed_wire_values_and_validate_shape',
+        'tests::endpoint_query_absent_serialization_keeps_existing_route_bytes',
+        'tests::endpoint_query_is_part_of_full_route_equality',
+        'tests::endpoint_query_serde_roundtrip_retains_exact_raw_query',
+        'tests::mock_adapter_partial_stream_retains_usage',
+        'tests::output_hashes_preserve_bytes_exactly',
+        'tests::redaction_catalog_and_secret_scrubber_never_leak',
+        'tests::sampling_wire_format_is_integer_only',
+        'tests::scrub_secret_bytes_is_output_bounded_not_oom',
+        'tests::stream_final_cache_read_usage_regression_is_refused',
+        'tests::stream_final_cache_write_usage_regression_is_refused',
+        'tests::stream_final_input_usage_regression_is_refused',
+        'tests::stream_final_output_usage_regression_is_refused',
+        'tests::stream_final_reasoning_usage_regression_is_refused',
+        'tests::stream_sequence_and_usage_violations_refused',
+        'tests::usage_observation_absence_retains_exact_legacy_json',
+        'tests::usage_observation_independent_stream_goldens',
+        'tests::usage_observation_legacy_mock_and_fresh_accumulator_stay_qualified',
+        'tests::usage_observation_metadata_faults_latch_and_cannot_yield_evidence',
+        'tests::usage_observation_present_metadata_requires_a_strict_complete_object',
+        'tests::usage_observation_sequence_faults_and_post_terminal_capture_remain_invalid',
+        'tests::usage_observation_total_reason_mapping_has_fixed_hashes',
+        'types::billing_kernel_tests::billing_ceil_boundaries_and_flat',
+        'types::billing_kernel_tests::billing_combined_product_overflow',
+        'types::billing_kernel_tests::billing_contract_canonical_golden',
+        'types::billing_kernel_tests::billing_counter_contract_mismatches',
+        'types::billing_kernel_tests::billing_declaration_presence_and_explicit_free',
+        'types::billing_kernel_tests::billing_identity_and_presence_distinct',
+        'types::billing_kernel_tests::billing_inherited_vs_dedicated_ceil',
+        'types::billing_kernel_tests::billing_legacy_shapes_and_calculator_unchanged',
+        'types::billing_kernel_tests::billing_money_and_subtotal_overflow',
+        'types::billing_kernel_tests::billing_normalized_count_exceeds_u64',
+        'types::billing_kernel_tests::billing_quote_four_reasoning_contracts',
+        'types::billing_kernel_tests::billing_quote_raw_counters_unchanged',
+        'types::billing_kernel_tests::billing_rate_presence_used_vs_unused',
+        'types::billing_kernel_tests::billing_reported_zero_requires_declared_reasoning_contract',
+        'types::billing_kernel_tests::billing_unknown_overlap_subtotal',
+        'types::billing_kernel_tests::billing_unknown_reason_order',
+        'types::billing_kernel_tests::partial_v2_contracts_remain_incomplete_and_bind_spend_ceiling',
+        'types::tool_round_quote_probe::tool_round_reasoning_exceeding_output_quotes_complete_zero'
+    )
+    if ($required.Count -ne 58 -or @($required | Select-Object -Unique).Count -ne 58) {
+        throw 'PrivateStores requires all 58 unique adapter library cases'
+    }
+    $report = Get-Content $log -Raw
+    $rows = [regex]::Matches($report, '(?m)^test (?<case>[^\r\n]+) \.\.\. (?<status>ok|FAILED|ignored)\r?$')
+    if ($rows.Count -ne $required.Count) { throw 'Adapter library case count differs from the exact manifest' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($row in $rows) {
+        $case = $row.Groups['case'].Value
+        if (-not $seen.Add($case) -or $case -cnotin $required -or $row.Groups['status'].Value -cne 'ok') {
+            throw "Unexpected, duplicate or unsuccessful adapter library case: $case"
+        }
+    }
+    foreach ($case in $required) {
+        if (-not $seen.Contains($case)) { throw "Required native adapter library case did not pass: $case" }
+    }
+    if ($report -match '\b[1-9][0-9]* (ignored|filtered out)\b') { throw 'Adapter library cases were skipped' }
+    if ($report -notmatch '(?m)^test result: ok\. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;') {
+        throw 'Expected the exact nonzero adapter library test summary'
+    }
+    @{ required_cases = $required.Count; logical_cases = 57; credential_logical_cases = 9;
+       child_helper_cases = 1; status = 'passed'; source = $env:GITHUB_SHA } |
+        ConvertTo-Json | Out-File (Join-Path $EvidenceDir 'private-stores.json')
+    return
+}
 if ($Group -eq 'Foundation') {
     $log = Join-Path $EvidenceDir 'foundation.log'
     cargo +1.99.0 test --locked --no-fail-fast -p orbit-platform --lib --test windows_foundation -- --test-threads=1 --show-output 2>&1 |

@@ -1,19 +1,29 @@
 //! Exact provider credential bindings and private local persistence.
 
 use crate::SecretBytes;
+#[cfg(windows)]
+use orbit_platform::fs::FileSnapshot as Stat;
+#[cfg(unix)]
 use rustix::fd::OwnedFd;
+#[cfg(unix)]
 use rustix::fs::{
     AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, Stat, flock, fstat, fsync, mkdirat, open,
     openat, renameat, statat, unlinkat,
 };
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use windows::{Directory, StoreLock};
 use zeroize::Zeroizing;
 
 pub const MAX_PROVIDER_KEY_BYTES: usize = 16 * 1024;
@@ -209,7 +219,14 @@ impl ProviderCredentialStore {
             || home == Path::new("/")
             || home
                 .components()
-                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+                .any(|part| {
+                    #[cfg(windows)]
+                    if matches!(part, Component::Prefix(prefix) if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))) {
+                        return false;
+                    }
+                    !matches!(part, Component::RootDir | Component::Normal(_))
+                })
+            || (cfg!(windows) && home.file_name().is_none())
         {
             return Err(ProviderCredentialError::UnsafeDirectory);
         }
@@ -398,9 +415,13 @@ impl ProviderCredentialStore {
         };
         lock.check()?;
         directory.check_record(identity, Some(&current))?;
+        #[cfg(windows)]
+        directory.remove_record(identity, &current, &lock)?;
+        #[cfg(unix)]
         unlinkat(&*directory.fd, identity.file_name(), AtFlags::empty())
             .map_err(|_| ProviderCredentialError::Io)?;
         // Unlink is a publication point too; never report definite failure after it.
+        #[cfg(unix)]
         directory
             .sync()
             .and_then(|()| lock.check())
@@ -640,6 +661,7 @@ fn take_field<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8], ProviderCredentialErr
     Ok(field)
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum DirectoryPolicy {
     Ancestor,
@@ -647,6 +669,7 @@ enum DirectoryPolicy {
     Private,
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 struct Binding {
     parent: Arc<OwnedFd>,
@@ -655,11 +678,13 @@ struct Binding {
     policy: DirectoryPolicy,
 }
 
+#[cfg(unix)]
 struct Directory {
     fd: Arc<OwnedFd>,
     bindings: Vec<Binding>,
 }
 
+#[cfg(unix)]
 impl Directory {
     fn open(home: &Path, create: bool) -> Result<Option<Self>, ProviderCredentialError> {
         let root = open(
@@ -961,11 +986,13 @@ impl Directory {
 }
 
 /// A single per-store lock precedes every record access; there are no nested locks.
+#[cfg(unix)]
 struct StoreLock<'a> {
     directory: &'a Directory,
     file: File,
 }
 
+#[cfg(unix)]
 impl<'a> StoreLock<'a> {
     fn acquire(directory: &'a Directory) -> Result<Self, ProviderCredentialError> {
         Self::open(directory, true)
@@ -1017,6 +1044,7 @@ impl<'a> StoreLock<'a> {
     }
 }
 
+#[cfg(unix)]
 fn check_directory(stat: &Stat, policy: DirectoryPolicy) -> Result<(), ProviderCredentialError> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         return Err(ProviderCredentialError::UnsafeDirectory);
@@ -1033,6 +1061,7 @@ fn check_directory(stat: &Stat, policy: DirectoryPolicy) -> Result<(), ProviderC
     Ok(())
 }
 
+#[cfg(unix)]
 fn check_file(stat: &Stat) -> Result<(), ProviderCredentialError> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != rustix::process::geteuid().as_raw()
@@ -1044,6 +1073,7 @@ fn check_file(stat: &Stat) -> Result<(), ProviderCredentialError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn same_inode(a: &Stat, b: &Stat) -> bool {
     a.st_dev == b.st_dev
         && a.st_ino == b.st_ino
@@ -1051,6 +1081,7 @@ fn same_inode(a: &Stat, b: &Stat) -> bool {
         && FileType::from_raw_mode(a.st_mode) == FileType::from_raw_mode(b.st_mode)
 }
 
+#[cfg(unix)]
 fn same_file(a: &Stat, b: &Stat) -> bool {
     same_inode(a, b)
         && a.st_mode == b.st_mode
@@ -1062,10 +1093,415 @@ fn same_file(a: &Stat, b: &Stat) -> bool {
         && a.st_ctime_nsec == b.st_ctime_nsec
 }
 
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use orbit_platform::fs::{
+        Directory as PrivateDirectory, FileIdentity, InspectionLimits, LockMode, OwnedContainer,
+        PrivateFileAccess, PublishError, RemovalError, StateLock,
+    };
+    use std::ffi::OsStr;
+    use std::io;
+
+    pub(super) struct Directory {
+        home: OwnedContainer,
+        auth: PrivateDirectory,
+        records: PrivateDirectory,
+    }
+
+    impl Directory {
+        pub(super) fn open(
+            home: &Path,
+            create: bool,
+        ) -> Result<Option<Self>, ProviderCredentialError> {
+            let container = match OwnedContainer::open(home) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(ProviderCredentialError::UnsafeDirectory),
+            };
+            let auth_path = home.join("auth");
+            let auth = match PrivateDirectory::open(&auth_path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && !create => {
+                    return Ok(None);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match PrivateDirectory::create(&auth_path) {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            PrivateDirectory::open(&auth_path)
+                                .map_err(|_| ProviderCredentialError::UnsafeDirectory)?
+                        }
+                        Err(_) => return Err(ProviderCredentialError::UnsafeDirectory),
+                    }
+                }
+                Err(_) => return Err(ProviderCredentialError::UnsafeDirectory),
+            };
+            container
+                .check()
+                .map_err(|_| ProviderCredentialError::PathChanged)?;
+            let records = match auth.child(OsStr::new("providers"), false) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && !create => {
+                    return Ok(None);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match auth.child(OsStr::new("providers"), true) {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => auth
+                            .child(OsStr::new("providers"), false)
+                            .map_err(|_| ProviderCredentialError::UnsafeDirectory)?,
+                        Err(_) => return Err(ProviderCredentialError::UnsafeDirectory),
+                    }
+                }
+                Err(_) => return Err(ProviderCredentialError::UnsafeDirectory),
+            };
+            let value = Self {
+                home: container,
+                auth,
+                records,
+            };
+            value.check()?;
+            Ok(Some(value))
+        }
+
+        pub(super) fn check(&self) -> Result<(), ProviderCredentialError> {
+            self.home
+                .check()
+                .and_then(|()| self.auth.check())
+                .and_then(|()| self.records.check())
+                .map_err(|_| ProviderCredentialError::PathChanged)
+        }
+
+        pub(super) fn read(
+            &self,
+            identity: &ProviderAuthIdentity,
+        ) -> Result<Option<Stored>, ProviderCredentialError> {
+            self.check()?;
+            let name = identity.file_name();
+            let mut file = match self.records.open_file(OsStr::new(&name)) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(ProviderCredentialError::UnsafeFile),
+            };
+            let before = file
+                .snapshot()
+                .map_err(|_| ProviderCredentialError::UnsafeFile)?;
+            if before.length > MAX_PROVIDER_RECORD_BYTES as u64 {
+                return Err(ProviderCredentialError::LimitExceeded);
+            }
+            // One fixed caller-owned allocation, zeroized on every return path.
+            let mut bytes = Zeroizing::new(vec![0; MAX_PROVIDER_RECORD_BYTES + 1]);
+            let mut length = 0;
+            loop {
+                let count = file
+                    .read_into(&mut bytes[length..])
+                    .map_err(|_| ProviderCredentialError::Io)?;
+                if count == 0 {
+                    break;
+                }
+                length += count;
+                if length == bytes.len() {
+                    return Err(ProviderCredentialError::LimitExceeded);
+                }
+            }
+            let after = file
+                .snapshot()
+                .map_err(|_| ProviderCredentialError::PathChanged)?;
+            drop(file);
+            let named = self
+                .records
+                .open_file(OsStr::new(&name))
+                .and_then(|file| file.snapshot())
+                .map_err(|_| ProviderCredentialError::PathChanged)?;
+            if length as u64 != before.length || before != after || after != named {
+                return Err(ProviderCredentialError::PathChanged);
+            }
+            self.check()?;
+            decode(&bytes[..length], identity, after).map(Some)
+        }
+
+        pub(super) fn check_record(
+            &self,
+            identity: &ProviderAuthIdentity,
+            expected: Option<&Stored>,
+        ) -> Result<(), ProviderCredentialError> {
+            self.check()?;
+            match (
+                self.records.open_file(OsStr::new(&identity.file_name())),
+                expected,
+            ) {
+                (Err(error), None) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                (Ok(file), Some(record)) => {
+                    let snapshot = file
+                        .snapshot()
+                        .map_err(|_| ProviderCredentialError::UnsafeFile)?;
+                    if snapshot == record.stat {
+                        Ok(())
+                    } else {
+                        Err(ProviderCredentialError::PathChanged)
+                    }
+                }
+                _ => Err(ProviderCredentialError::PathChanged),
+            }
+        }
+
+        pub(super) fn count_records(&self) -> Result<usize, ProviderCredentialError> {
+            self.check()?;
+            let inspection = self
+                .records
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: MAX_PROVIDER_RECORDS * 2 + 1,
+                    max_name_bytes: 128 * 1024,
+                    max_depth: 1,
+                })
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::InvalidInput {
+                        ProviderCredentialError::LimitExceeded
+                    } else {
+                        ProviderCredentialError::UnsafeFile
+                    }
+                })?;
+            let mut count = 0;
+            for entry in inspection.entries {
+                let name = entry
+                    .relative_path
+                    .to_str()
+                    .ok_or(ProviderCredentialError::UnsafeFile)?;
+                if entry.directory || entry.file_access != Some(PrivateFileAccess::FullControl) {
+                    return Err(ProviderCredentialError::UnsafeFile);
+                }
+                let bytes = name.as_bytes();
+                let record = bytes.len() == 75
+                    && bytes.ends_with(b".credential")
+                    && bytes[..64].iter().all(u8::is_ascii_hexdigit);
+                // Uncertain replacement retains the foundation's checked backup.
+                if !record
+                    && name != LOCK_NAME
+                    && !name.starts_with(".pending-")
+                    && !name.starts_with(".previous-")
+                {
+                    return Err(ProviderCredentialError::UnsafeFile);
+                }
+                if entry
+                    .snapshot
+                    .ok_or(ProviderCredentialError::UnsafeFile)?
+                    .length
+                    > MAX_PROVIDER_RECORD_BYTES as u64
+                {
+                    return Err(ProviderCredentialError::LimitExceeded);
+                }
+                count += usize::from(record);
+                if count > MAX_PROVIDER_RECORDS {
+                    return Err(ProviderCredentialError::LimitExceeded);
+                }
+            }
+            self.check()?;
+            Ok(count)
+        }
+
+        pub(super) fn publish(
+            &self,
+            identity: &ProviderAuthIdentity,
+            bytes: &[u8],
+            current: Option<&Stored>,
+            lock: &StoreLock<'_>,
+        ) -> Result<(), ProviderCredentialError> {
+            self.publish_with(identity, bytes, current, lock, || {})
+        }
+
+        pub(super) fn publish_with<F: FnOnce()>(
+            &self,
+            identity: &ProviderAuthIdentity,
+            bytes: &[u8],
+            current: Option<&Stored>,
+            lock: &StoreLock<'_>,
+            after_rename: F,
+        ) -> Result<(), ProviderCredentialError> {
+            lock.check()?;
+            if !lock.exclusive {
+                return Err(ProviderCredentialError::UnsafeFile);
+            }
+            let pending = format!(
+                ".pending-{}-{}",
+                std::process::id(),
+                NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
+            );
+            let mut file = self
+                .records
+                .create_file(OsStr::new(&pending))
+                .map_err(|_| ProviderCredentialError::Io)?;
+            let candidate = file.identity();
+            let prepared = file
+                .write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| ProviderCredentialError::Io)
+                .and_then(|()| lock.check())
+                .and_then(|()| self.check_record(identity, current));
+            if let Err(error) = prepared {
+                drop(file);
+                self.discard_candidate(&pending, candidate, lock);
+                return Err(error);
+            }
+            let name = identity.file_name();
+            let result = match current {
+                Some(record) => self.records.replace(
+                    &file,
+                    OsStr::new(&name),
+                    record.stat.identity,
+                    &lock.guard,
+                ),
+                None => self.records.publish_new(&file, OsStr::new(&name)),
+            };
+            let publication = match result {
+                Ok(value) => value,
+                Err(PublishError::Unchanged(_)) => {
+                    drop(file);
+                    self.discard_candidate(&pending, candidate, lock);
+                    return Err(ProviderCredentialError::Io);
+                }
+                Err(PublishError::Uncertain { .. }) => {
+                    return Err(ProviderCredentialError::PublicationUncertain);
+                }
+            };
+            // Close the DELETE-capable candidate before opening a no-delete-sharing reader.
+            let published = file
+                .snapshot()
+                .map_err(|_| ProviderCredentialError::PublicationUncertain)?;
+            drop(file);
+            after_rename();
+            lock.check()
+                .map_err(|_| ProviderCredentialError::PublicationUncertain)?;
+            let named = self
+                .records
+                .open_file(OsStr::new(&name))
+                .and_then(|file| file.snapshot())
+                .map_err(|_| ProviderCredentialError::PublicationUncertain)?;
+            if named != published || named.identity != publication.identity {
+                return Err(ProviderCredentialError::PublicationUncertain);
+            }
+            // Domain acceptance precedes removal of the identity-bound old record.
+            if let (Some(backup), Some(old)) = (publication.original_backup, current) {
+                let file = self
+                    .records
+                    .open_for_rename(&backup, old.stat.identity, &lock.guard)
+                    .map_err(|_| ProviderCredentialError::PublicationUncertain)?;
+                self.records
+                    .remove_file(file)
+                    .map_err(|_| ProviderCredentialError::PublicationUncertain)?;
+            }
+            lock.check()
+                .map_err(|_| ProviderCredentialError::PublicationUncertain)
+        }
+
+        fn discard_candidate(&self, name: &str, expected: FileIdentity, lock: &StoreLock<'_>) {
+            if lock.check().is_ok()
+                && let Ok(file) =
+                    self.records
+                        .open_for_rename(OsStr::new(name), expected, &lock.guard)
+            {
+                let _ = self.records.remove_file(file);
+            }
+        }
+
+        pub(super) fn remove_record(
+            &self,
+            identity: &ProviderAuthIdentity,
+            current: &Stored,
+            lock: &StoreLock<'_>,
+        ) -> Result<(), ProviderCredentialError> {
+            lock.check()?;
+            let file = self
+                .records
+                .open_for_rename(
+                    OsStr::new(&identity.file_name()),
+                    current.stat.identity,
+                    &lock.guard,
+                )
+                .map_err(|_| ProviderCredentialError::PathChanged)?;
+            self.records
+                .remove_file(file)
+                .map_err(|error| match error {
+                    RemovalError::Unchanged(_) => ProviderCredentialError::Io,
+                    RemovalError::Uncertain { .. } => ProviderCredentialError::PublicationUncertain,
+                })?;
+            lock.check()
+                .map_err(|_| ProviderCredentialError::PublicationUncertain)
+        }
+    }
+
+    pub(super) struct StoreLock<'a> {
+        directory: &'a Directory,
+        guard: StateLock,
+        exclusive: bool,
+    }
+
+    impl<'a> StoreLock<'a> {
+        pub(super) fn acquire(directory: &'a Directory) -> Result<Self, ProviderCredentialError> {
+            Self::open(directory, true)
+        }
+        pub(super) fn acquire_existing(
+            directory: &'a Directory,
+        ) -> Result<Self, ProviderCredentialError> {
+            Self::open(directory, false)
+        }
+        fn open(directory: &'a Directory, create: bool) -> Result<Self, ProviderCredentialError> {
+            directory.check()?;
+            let started = Instant::now();
+            let mode = if create {
+                LockMode::Exclusive
+            } else {
+                LockMode::Shared
+            };
+            loop {
+                let result = if create {
+                    directory.records.try_lock(OsStr::new(LOCK_NAME), mode)
+                } else {
+                    directory
+                        .records
+                        .open_lock_existing(OsStr::new(LOCK_NAME), mode)
+                };
+                match result {
+                    Ok(guard) => {
+                        let result = Self {
+                            directory,
+                            guard,
+                            exclusive: create,
+                        };
+                        result.check()?;
+                        return Ok(result);
+                    }
+                    Err(error)
+                        if error.raw_os_error() == Some(33)
+                            || error.kind() == io::ErrorKind::WouldBlock
+                            || error.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        if started.elapsed() >= LOCK_WAIT {
+                            return Err(ProviderCredentialError::Busy);
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return Err(ProviderCredentialError::UnsafeFile),
+                }
+            }
+        }
+        pub(super) fn check(&self) -> Result<(), ProviderCredentialError> {
+            self.directory.check()?;
+            // The held guard denies delete sharing, pins the name, and validates zero length.
+            self.guard
+                .check()
+                .map_err(|_| ProviderCredentialError::PathChanged)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, DirBuilder, OpenOptions};
+    use std::fs;
+    #[cfg(unix)]
+    use std::fs::{DirBuilder, OpenOptions};
+    #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     struct Home(PathBuf);
@@ -1078,7 +1514,7 @@ mod tests {
                     std::process::id(),
                     NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
                 ));
-                match DirBuilder::new().mode(0o700).create(&path) {
+                match create_directory(&path) {
                     Ok(()) => return Self(path),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(_) => panic!("could not create disposable storage home"),
@@ -1113,143 +1549,742 @@ mod tests {
     }
 
     fn private_file(path: &Path, bytes: &[u8]) {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap();
-        file.write_all(bytes).unwrap();
+        #[cfg(unix)]
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let parent = orbit_platform::fs::Directory::open(path.parent().unwrap()).unwrap();
+            let mut file = parent.create_file(path.file_name().unwrap()).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        }
     }
 
     #[test]
     fn provider_storage_held_directory_rejects_inode_substitution() {
-        let home = Home::new();
-        let directory = Directory::open(&home.0, true).unwrap().unwrap();
-        let providers = home.0.join("auth/providers");
-        fs::rename(&providers, home.0.join("auth/retained")).unwrap();
-        DirBuilder::new().mode(0o700).create(&providers).unwrap();
-        assert_eq!(directory.check(), Err(ProviderCredentialError::PathChanged));
-        assert!(home.0.join("auth/retained").exists());
+        #[cfg(unix)]
+        {
+            let home = Home::new();
+            let directory = Directory::open(&home.0, true).unwrap().unwrap();
+            let providers = home.0.join("auth/providers");
+            fs::rename(&providers, home.0.join("auth/retained")).unwrap();
+            DirBuilder::new().mode(0o700).create(&providers).unwrap();
+            assert_eq!(directory.check(), Err(ProviderCredentialError::PathChanged));
+            assert!(home.0.join("auth/retained").exists());
+        }
+        #[cfg(windows)]
+        {
+            let home = Home::new();
+            let directory = Directory::open(&home.0, true).unwrap().unwrap();
+            let providers = home.0.join("auth/providers");
+            let target = home.0.join("auth/retained");
+            let before = object_identity(&providers);
+            let security = acl_snapshot(&providers);
+            blocked_rename(&providers, &target);
+            assert!(create_directory(&providers).is_err());
+            assert_eq!(directory.check(), Ok(()));
+            assert_eq!(object_identity(&providers), before);
+            assert_eq!(acl_snapshot(&providers), security);
+            drop(directory);
+            rename_roundtrip(&providers, &target, before, &security);
+        }
     }
 
     #[test]
     fn provider_storage_held_home_rejects_root_substitution() {
-        let base = Home::new();
-        let home = base.0.join("home");
-        DirBuilder::new().mode(0o700).create(&home).unwrap();
-        let directory = Directory::open(&home, true).unwrap().unwrap();
-        fs::rename(&home, base.0.join("retained")).unwrap();
-        DirBuilder::new().mode(0o700).create(&home).unwrap();
-        assert_eq!(directory.check(), Err(ProviderCredentialError::PathChanged));
+        #[cfg(unix)]
+        {
+            let base = Home::new();
+            let home = base.0.join("home");
+            DirBuilder::new().mode(0o700).create(&home).unwrap();
+            let directory = Directory::open(&home, true).unwrap().unwrap();
+            fs::rename(&home, base.0.join("retained")).unwrap();
+            DirBuilder::new().mode(0o700).create(&home).unwrap();
+            assert_eq!(directory.check(), Err(ProviderCredentialError::PathChanged));
+        }
+        #[cfg(windows)]
+        {
+            let base = Home::new();
+            let home = base.0.join("home");
+            create_directory(&home).unwrap();
+            let directory = Directory::open(&home, true).unwrap().unwrap();
+            let target = base.0.join("retained");
+            let before = object_identity(&home);
+            let security = acl_snapshot(&home);
+            blocked_rename(&home, &target);
+            assert!(create_directory(&home).is_err());
+            assert_eq!(directory.check(), Ok(()));
+            assert_eq!(object_identity(&home), before);
+            assert_eq!(acl_snapshot(&home), security);
+            drop(directory);
+            rename_roundtrip(&home, &target, before, &security);
+        }
     }
 
     #[test]
     fn provider_storage_lock_rejects_named_inode_substitution() {
-        let home = Home::new();
-        let directory = Directory::open(&home.0, true).unwrap().unwrap();
-        let lock = StoreLock::acquire(&directory).unwrap();
-        fs::rename(
-            home.0.join("auth/providers/store.lock"),
-            home.0.join("auth/providers/retained.lock"),
-        )
-        .unwrap();
-        private_file(&home.0.join("auth/providers/store.lock"), b"");
-        assert_eq!(lock.check(), Err(ProviderCredentialError::PathChanged));
+        #[cfg(unix)]
+        {
+            let home = Home::new();
+            let directory = Directory::open(&home.0, true).unwrap().unwrap();
+            let lock = StoreLock::acquire(&directory).unwrap();
+            fs::rename(
+                home.0.join("auth/providers/store.lock"),
+                home.0.join("auth/providers/retained.lock"),
+            )
+            .unwrap();
+            private_file(&home.0.join("auth/providers/store.lock"), b"");
+            assert_eq!(lock.check(), Err(ProviderCredentialError::PathChanged));
+        }
+        #[cfg(windows)]
+        {
+            let home = Home::new();
+            let directory = Directory::open(&home.0, true).unwrap().unwrap();
+            let lock = StoreLock::acquire(&directory).unwrap();
+            let path = home.0.join("auth/providers/store.lock");
+            let target = home.0.join("auth/providers/retained.lock");
+            let before = object_identity(&path);
+            let security = acl_snapshot(&path);
+            blocked_rename(&path, &target);
+            assert_eq!(lock.check(), Ok(()));
+            assert_eq!(object_identity(&path), before);
+            assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            assert_eq!(acl_snapshot(&path), security);
+            drop(lock);
+            rename_roundtrip(&path, &target, before, &security);
+        }
     }
 
     #[test]
     fn provider_storage_record_recheck_rejects_inode_substitution() {
-        let home = Home::new();
-        let identity = identity();
-        home.store()
-            .save(&identity, secret(), ExpectedRevision::Absent)
-            .unwrap();
-        let directory = Directory::open(&home.0, false).unwrap().unwrap();
-        let _lock = StoreLock::acquire(&directory).unwrap();
-        let held = directory.read(&identity).unwrap().unwrap();
-        let path = home.0.join("auth/providers").join(identity.file_name());
-        let bytes = Zeroizing::new(fs::read(&path).unwrap());
-        fs::rename(&path, home.0.join("auth/providers/retained.credential")).unwrap();
-        private_file(&path, &bytes);
-        assert_eq!(
-            directory.check_record(&identity, Some(&held)),
-            Err(ProviderCredentialError::PathChanged)
-        );
+        #[cfg(unix)]
+        {
+            let home = Home::new();
+            let identity = identity();
+            home.store()
+                .save(&identity, secret(), ExpectedRevision::Absent)
+                .unwrap();
+            let directory = Directory::open(&home.0, false).unwrap().unwrap();
+            let _lock = StoreLock::acquire(&directory).unwrap();
+            let held = directory.read(&identity).unwrap().unwrap();
+            let path = home.0.join("auth/providers").join(identity.file_name());
+            let bytes = Zeroizing::new(fs::read(&path).unwrap());
+            fs::rename(&path, home.0.join("auth/providers/retained.credential")).unwrap();
+            private_file(&path, &bytes);
+            assert_eq!(
+                directory.check_record(&identity, Some(&held)),
+                Err(ProviderCredentialError::PathChanged)
+            );
+        }
+        #[cfg(windows)]
+        {
+            let home = Home::new();
+            let identity = identity();
+            home.store()
+                .save(&identity, secret(), ExpectedRevision::Absent)
+                .unwrap();
+            let directory = Directory::open(&home.0, false).unwrap().unwrap();
+            let _lock = StoreLock::acquire(&directory).unwrap();
+            let held = directory.read(&identity).unwrap().unwrap();
+            let path = home.0.join("auth/providers").join(identity.file_name());
+            let bytes = Zeroizing::new(fs::read(&path).unwrap());
+            let retained = home.0.join("auth/providers/retained.credential");
+            fs::rename(&path, &retained).unwrap();
+            private_file(&path, &bytes);
+            assert_eq!(
+                directory.check_record(&identity, Some(&held)),
+                Err(ProviderCredentialError::PathChanged)
+            );
+            assert_eq!(*Zeroizing::new(fs::read(&retained).unwrap()), *bytes);
+        }
     }
 
     #[test]
     fn provider_storage_foreign_ownership_is_rejected_without_privileged_fixture() {
-        let home = Home::new();
-        let directory = Directory::open(&home.0, true).unwrap().unwrap();
-        let mut stat = fstat(&*directory.fd).unwrap();
-        stat.st_uid = stat.st_uid.wrapping_add(1);
-        assert_eq!(
-            check_directory(&stat, DirectoryPolicy::Private),
-            Err(ProviderCredentialError::UnsafeDirectory)
-        );
-        let lock = StoreLock::acquire(&directory).unwrap();
-        let mut stat = fstat(&lock.file).unwrap();
-        stat.st_uid = stat.st_uid.wrapping_add(1);
-        assert_eq!(check_file(&stat), Err(ProviderCredentialError::UnsafeFile));
+        #[cfg(unix)]
+        {
+            let home = Home::new();
+            let directory = Directory::open(&home.0, true).unwrap().unwrap();
+            let mut stat = fstat(&*directory.fd).unwrap();
+            stat.st_uid = stat.st_uid.wrapping_add(1);
+            assert_eq!(
+                check_directory(&stat, DirectoryPolicy::Private),
+                Err(ProviderCredentialError::UnsafeDirectory)
+            );
+            let lock = StoreLock::acquire(&directory).unwrap();
+            let mut stat = fstat(&lock.file).unwrap();
+            stat.st_uid = stat.st_uid.wrapping_add(1);
+            assert_eq!(check_file(&stat), Err(ProviderCredentialError::UnsafeFile));
+        }
+        #[cfg(windows)]
+        {
+            let home = Home::new();
+            let directory = Directory::open(&home.0, true).unwrap().unwrap();
+            let lock = StoreLock::acquire(&directory).unwrap();
+            let owner = current_sid();
+            let foreign_owner = "S-1-5-32-544";
+            assert_ne!(owner, foreign_owner);
+            let restore = format!("*{owner}");
+            let providers = home.0.join("auth/providers");
+            let original = acl_snapshot(&providers);
+            assert_eq!(owner_sid(&providers), owner);
+            icacls(&providers, &["/setowner", "*S-1-5-32-544"]);
+            let foreign = acl_snapshot(&providers);
+            assert_eq!(owner_sid(&providers), foreign_owner);
+            assert_ne!(foreign, original);
+            assert!(directory.check().is_err());
+            assert_eq!(owner_sid(&providers), foreign_owner);
+            assert_eq!(acl_snapshot(&providers), foreign);
+            icacls(&providers, &["/setowner", &restore]);
+            assert_eq!(owner_sid(&providers), owner);
+            assert_eq!(acl_snapshot(&providers), original);
+            let path = providers.join("store.lock");
+            let original = acl_snapshot(&path);
+            assert_eq!(owner_sid(&path), owner);
+            icacls(&path, &["/setowner", "*S-1-5-32-544"]);
+            let foreign = acl_snapshot(&path);
+            assert_eq!(owner_sid(&path), foreign_owner);
+            assert_ne!(foreign, original);
+            assert_eq!(lock.check(), Err(ProviderCredentialError::PathChanged));
+            assert_eq!(owner_sid(&path), foreign_owner);
+            assert_eq!(acl_snapshot(&path), foreign);
+            assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            icacls(&path, &["/setowner", &restore]);
+            assert_eq!(owner_sid(&path), owner);
+            assert_eq!(acl_snapshot(&path), original);
+        }
     }
 
     #[test]
     fn provider_storage_lock_wait_is_bounded_and_leaves_record_unchanged() {
-        let home = Home::new();
-        let identity = identity();
-        home.store()
-            .save(&identity, secret(), ExpectedRevision::Absent)
-            .unwrap();
-        let before = Zeroizing::new(
-            fs::read(home.0.join("auth/providers").join(identity.file_name())).unwrap(),
-        );
-        let directory = Directory::open(&home.0, false).unwrap().unwrap();
-        let _lock = StoreLock::acquire(&directory).unwrap();
-        assert_eq!(
+        #[cfg(unix)]
+        {
+            let home = Home::new();
+            let identity = identity();
             home.store()
-                .resolve_with(&identity, |_| Ok(None))
-                .unwrap_err(),
-            ProviderCredentialError::Busy
-        );
-        let after = Zeroizing::new(
-            fs::read(home.0.join("auth/providers").join(identity.file_name())).unwrap(),
-        );
-        assert_eq!(*before, *after);
+                .save(&identity, secret(), ExpectedRevision::Absent)
+                .unwrap();
+            let before = Zeroizing::new(
+                fs::read(home.0.join("auth/providers").join(identity.file_name())).unwrap(),
+            );
+            let directory = Directory::open(&home.0, false).unwrap().unwrap();
+            let _lock = StoreLock::acquire(&directory).unwrap();
+            assert_eq!(
+                home.store()
+                    .resolve_with(&identity, |_| Ok(None))
+                    .unwrap_err(),
+                ProviderCredentialError::Busy
+            );
+            let after = Zeroizing::new(
+                fs::read(home.0.join("auth/providers").join(identity.file_name())).unwrap(),
+            );
+            assert_eq!(*before, *after);
+        }
+        #[cfg(windows)]
+        {
+            use std::process::{Command, Stdio};
+            let home = Home::new();
+            let identity = identity();
+            home.store()
+                .save(&identity, secret(), ExpectedRevision::Absent)
+                .unwrap();
+            let path = home.0.join("auth/providers").join(identity.file_name());
+            let before = Zeroizing::new(fs::read(&path).unwrap());
+            let security = acl_snapshot(&path);
+            let mut child = ChildGuard(Some(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "provider_credentials::tests::provider_storage_lock_child",
+                        "--test-threads=1",
+                    ])
+                    .env("ORBIT_PROVIDER_STORAGE_CHILD", &home.0)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            ));
+            let started = Instant::now();
+            while !home.0.join("child-ready").exists() {
+                assert!(child.child().try_wait().unwrap().is_none());
+                assert!(started.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let started = Instant::now();
+            assert_eq!(
+                home.store()
+                    .resolve_with(&identity, |_| Ok(None))
+                    .unwrap_err(),
+                ProviderCredentialError::Busy
+            );
+            assert!(started.elapsed() >= LOCK_WAIT && started.elapsed() < Duration::from_secs(2));
+            assert_eq!(*Zeroizing::new(fs::read(&path).unwrap()), *before);
+            assert_eq!(acl_snapshot(&path), security);
+            fs::write(home.0.join("child-release"), b"release").unwrap();
+            let started = Instant::now();
+            loop {
+                if let Some(status) = child.child().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                home.store()
+                    .resolve_with(&identity, |_| Ok(None))
+                    .unwrap()
+                    .source(),
+                ProviderCredentialSource::Saved
+            );
+        }
     }
 
     #[test]
     fn provider_storage_post_rename_failure_reports_uncertainty_and_retains_publication() {
+        #[cfg(unix)]
+        {
+            let home = Home::new();
+            let identity = identity();
+            let first = home
+                .store()
+                .save(&identity, secret(), ExpectedRevision::Absent)
+                .unwrap();
+            let directory = Directory::open(&home.0, false).unwrap().unwrap();
+            let lock = StoreLock::acquire(&directory).unwrap();
+            let current = directory.read(&identity).unwrap().unwrap();
+            assert_eq!(current.revision, first.revision);
+            let replacement = SecretBytes::new(b"synthetic-replacement-secret".to_vec());
+            let revision = fresh_revision(&identity);
+            let bytes = encode(&identity, revision, replacement.expose()).unwrap();
+            let result = directory.publish_with(&identity, &bytes, Some(&current), &lock, || {
+                fs::rename(home.0.join("auth/providers"), home.0.join("auth/retained")).unwrap();
+                DirBuilder::new()
+                    .mode(0o700)
+                    .create(home.0.join("auth/providers"))
+                    .unwrap();
+            });
+            assert_eq!(result, Err(ProviderCredentialError::PublicationUncertain));
+            let retained = home.0.join("auth/retained").join(identity.file_name());
+            let retained_bytes = Zeroizing::new(fs::read(retained).unwrap());
+            assert_eq!(*retained_bytes, *bytes);
+            assert!(
+                !home
+                    .0
+                    .join("auth/providers")
+                    .join(identity.file_name())
+                    .exists()
+            );
+        }
+        #[cfg(windows)]
+        {
+            let home = Home::new();
+            let identity = identity();
+            let first = home
+                .store()
+                .save(&identity, secret(), ExpectedRevision::Absent)
+                .unwrap();
+            let directory = Directory::open(&home.0, false).unwrap().unwrap();
+            let lock = StoreLock::acquire(&directory).unwrap();
+            let current = directory.read(&identity).unwrap().unwrap();
+            assert_eq!(current.revision, first.revision);
+            let replacement = SecretBytes::new(b"synthetic-replacement-secret".to_vec());
+            let bytes = encode(&identity, fresh_revision(&identity), replacement.expose()).unwrap();
+            let providers = home.0.join("auth/providers");
+            let original_policy = acl_snapshot(&providers);
+            let mut callback_ran = false;
+            let mut unsafe_policy = String::new();
+            let result = directory.publish_with(&identity, &bytes, Some(&current), &lock, || {
+                icacls(&providers, &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+                unsafe_policy = unsafe_directory_policy(&providers);
+                assert_ne!(unsafe_policy, original_policy);
+                callback_ran = true;
+            });
+            assert!(
+                callback_ran,
+                "must reach the intended post-publication hook"
+            );
+            assert!(!unsafe_policy.is_empty());
+            assert_eq!(result, Err(ProviderCredentialError::PublicationUncertain));
+            assert_eq!(unsafe_directory_policy(&providers), unsafe_policy);
+            let retained = Zeroizing::new(fs::read(providers.join(identity.file_name())).unwrap());
+            assert_eq!(*retained, *bytes);
+            let backups: Vec<_> = fs::read_dir(&providers)
+                .unwrap()
+                .map(|v| v.unwrap().path())
+                .filter(|v| {
+                    v.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".previous-")
+                })
+                .collect();
+            assert_eq!(backups.len(), 1);
+            let original = Zeroizing::new(fs::read(&backups[0]).unwrap());
+            assert_eq!(
+                *original,
+                *encode(&identity, first.revision, secret().expose()).unwrap()
+            );
+            icacls(&providers, &["/remove:g", "*S-1-1-0"]);
+            assert_eq!(acl_snapshot(&providers), original_policy);
+        }
+    }
+    #[cfg(unix)]
+    fn create_directory(path: &Path) -> std::io::Result<()> {
+        DirBuilder::new().mode(0o700).create(path)
+    }
+
+    #[cfg(windows)]
+    fn create_directory(path: &Path) -> std::io::Result<()> {
+        orbit_platform::fs::Directory::create(path).map(drop)
+    }
+
+    #[cfg(windows)]
+    fn fixture_command(
+        program: &Path,
+        arguments: &[&std::ffi::OsStr],
+        path: Option<&Path>,
+    ) -> std::process::Output {
+        use std::process::{Command, Stdio};
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = path {
+            command.env("ORBIT_TEST_ACL_PATH", path);
+        }
+        let mut child = ChildGuard(Some(command.spawn().unwrap()));
+        let started = Instant::now();
+        loop {
+            match child.child().try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = child.stop();
+                    panic!("fixture polling failed: {error}; cleanup: {cleanup:?}");
+                }
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                let cleanup = child.stop();
+                panic!("fixture command timed out; cleanup: {cleanup:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The terminal state was observed before moving out of the ownership guard.
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        assert!(output.status.success(), "native fixture command failed");
+        assert!(output.stdout.len() <= 16384 && output.stderr.len() <= 16384);
+        output
+    }
+
+    #[cfg(windows)]
+    fn system_program(name: &str) -> PathBuf {
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join(name)
+    }
+
+    #[cfg(windows)]
+    fn acl_snapshot(path: &Path) -> String {
+        use std::ffi::OsStr;
+        let output = fixture_command(
+            &system_program("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-Command"),
+                OsStr::new(
+                    "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath $env:ORBIT_TEST_ACL_PATH).Sddl",
+                ),
+            ],
+            Some(path),
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(windows)]
+    fn owner_sid(path: &Path) -> String {
+        use std::ffi::OsStr;
+        let output = fixture_command(
+            &system_program("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-Command"),
+                OsStr::new(
+                    "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath $env:ORBIT_TEST_ACL_PATH).GetOwner([Security.Principal.SecurityIdentifier]).Value",
+                ),
+            ],
+            Some(path),
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(windows)]
+    fn unsafe_directory_policy(path: &Path) -> String {
+        use std::ffi::OsStr;
+        let output = fixture_command(
+            &system_program("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-Command"),
+                OsStr::new(
+                    "$ErrorActionPreference='Stop'; $acl=Get-Acl -LiteralPath $env:ORBIT_TEST_ACL_PATH; $allow=@($acl.Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0' -and $_.AccessControlType -eq 'Allow' -and (([int]$_.PropagationFlags -band 2) -eq 0) -and (([int64]$_.FileSystemRights.value__ -band 2) -ne 0) }); if($allow.Count -lt 1){throw 'Missing effective Everyone write grant'}; $acl.Sddl",
+                ),
+            ],
+            Some(path),
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(windows)]
+    fn object_identity(path: &Path) -> orbit_platform::fs::FileIdentity {
+        use orbit_platform::fs::SourceDirectory;
+        if fs::symlink_metadata(path).unwrap().is_dir() {
+            SourceDirectory::open(path).unwrap().identity()
+        } else {
+            SourceDirectory::open(path.parent().unwrap())
+                .unwrap()
+                .open_file(path.file_name().unwrap())
+                .unwrap()
+                .identity()
+        }
+    }
+
+    #[cfg(windows)]
+    fn blocked_rename(path: &Path, target: &Path) {
+        assert!(!target.exists());
+        let error = fs::rename(path, target).unwrap_err();
+        eprintln!(
+            "blocked rename native_error={:?} kind={:?}",
+            error.raw_os_error(),
+            error.kind()
+        );
+        assert!(error.raw_os_error().is_some());
+        assert!(path.exists() && !target.exists());
+    }
+
+    #[cfg(windows)]
+    fn rename_roundtrip(
+        path: &Path,
+        target: &Path,
+        identity: orbit_platform::fs::FileIdentity,
+        security: &str,
+    ) {
+        fs::rename(path, target).unwrap();
+        assert!(!path.exists());
+        assert_eq!(object_identity(target), identity);
+        assert_eq!(acl_snapshot(target), security);
+        fs::rename(target, path).unwrap();
+        assert!(!target.exists());
+        assert_eq!(object_identity(path), identity);
+        assert_eq!(acl_snapshot(path), security);
+    }
+
+    #[cfg(windows)]
+    fn icacls(path: &Path, arguments: &[&str]) {
+        use std::ffi::OsStr;
+        let mut args = vec![path.as_os_str()];
+        args.extend(arguments.iter().map(OsStr::new));
+        fixture_command(&system_program("icacls.exe"), &args, None);
+    }
+
+    #[cfg(windows)]
+    fn current_sid() -> String {
+        use std::ffi::OsStr;
+        let output = fixture_command(
+            &system_program("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-Command"),
+                OsStr::new("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value"),
+            ],
+            None,
+        );
+        let sid = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        assert!(
+            sid.starts_with("S-1-5-")
+                && sid
+                    .bytes()
+                    .all(|v| v.is_ascii_digit() || v == b'S' || v == b'-')
+        );
+        sid
+    }
+
+    #[cfg(windows)]
+    struct ChildGuard(Option<std::process::Child>);
+
+    #[cfg(windows)]
+    impl ChildGuard {
+        fn child(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().expect("owned fixture child")
+        }
+        fn stop(&mut self) -> Result<(), String> {
+            let Some(child) = self.0.as_mut() else {
+                return Ok(());
+            };
+            let mut failures = Vec::new();
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.0.take();
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(format!("poll: {error}")),
+            }
+            if let Err(error) = child.kill() {
+                failures.push(format!("kill: {error}"));
+            }
+            match child.wait() {
+                Ok(_) => {
+                    self.0.take();
+                }
+                Err(error) => failures.push(format!("wait: {error}")),
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            use std::io::Write as _;
+            if let Err(error) = self.stop() {
+                let _ = writeln!(std::io::stderr(), "fixture child cleanup failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_storage_lock_child() {
+        let Some(path) = std::env::var_os("ORBIT_PROVIDER_STORAGE_CHILD") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let directory = Directory::open(&path, false).unwrap().unwrap();
+        let _lock = StoreLock::acquire(&directory).unwrap();
+        fs::write(path.join("child-ready"), b"ready").unwrap();
+        let started = Instant::now();
+        while !path.join("child-release").exists() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn provider_storage_roundtrip_binding_revision_and_precedence() {
         let home = Home::new();
+        let store = home.store();
         let identity = identity();
-        let first = home
-            .store()
+        let saved = store
             .save(&identity, secret(), ExpectedRevision::Absent)
             .unwrap();
-        let directory = Directory::open(&home.0, false).unwrap().unwrap();
-        let lock = StoreLock::acquire(&directory).unwrap();
-        let current = directory.read(&identity).unwrap().unwrap();
-        assert_eq!(current.revision, first.revision);
-        let replacement = SecretBytes::new(b"synthetic-replacement-secret".to_vec());
-        let revision = fresh_revision(&identity);
-        let bytes = encode(&identity, revision, replacement.expose()).unwrap();
-        let result = directory.publish_with(&identity, &bytes, Some(&current), &lock, || {
-            fs::rename(home.0.join("auth/providers"), home.0.join("auth/retained")).unwrap();
-            DirBuilder::new()
-                .mode(0o700)
-                .create(home.0.join("auth/providers"))
-                .unwrap();
-        });
-        assert_eq!(result, Err(ProviderCredentialError::PublicationUncertain));
-        let retained = home.0.join("auth/retained").join(identity.file_name());
-        let retained_bytes = Zeroizing::new(fs::read(retained).unwrap());
-        assert_eq!(*retained_bytes, *bytes);
+        let reopened = store.resolve_with(&identity, |_| Ok(None)).unwrap();
+        assert_eq!(reopened.source(), ProviderCredentialSource::Saved);
+        assert_eq!(reopened.revision(), Some(saved.revision));
+        assert!(!format!("{reopened:?}").contains("synthetic-held-secret"));
+        assert_eq!(reopened.into_secret().unwrap().expose(), secret().expose());
         assert!(
-            !home
-                .0
-                .join("auth/providers")
-                .join(identity.file_name())
-                .exists()
+            !store
+                .save(&identity, secret(), ExpectedRevision::Exact(saved.revision))
+                .unwrap()
+                .changed
+        );
+        let draft = SecretBytes::new(b"draft-test-secret".to_vec());
+        assert_eq!(
+            store
+                .resolve_with_draft(&identity, Some((&identity, &draft)), |_| Ok(None))
+                .unwrap()
+                .source(),
+            ProviderCredentialSource::Draft
+        );
+        assert_eq!(
+            store
+                .resolve_with_draft(&identity, Some((&identity, &draft)), |_| Ok(Some(
+                    SecretBytes::new(b"env-test-secret".to_vec())
+                )))
+                .unwrap()
+                .source(),
+            ProviderCredentialSource::Environment
+        );
+        let other = ProviderAuthIdentity::new(
+            "other-provider",
+            "openai-compatible",
+            "https://provider.invalid/v1/",
+            Some("TEST_TOKEN"),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .resolve_with_draft(&identity, Some((&other, &draft)), |_| Ok(None))
+                .unwrap()
+                .source(),
+            ProviderCredentialSource::Saved
+        );
+        assert_eq!(
+            store.resolve_with(&other, |_| Ok(None)).unwrap_err(),
+            ProviderCredentialError::Missing
+        );
+        let updated = store
+            .save(&identity, draft, ExpectedRevision::Exact(saved.revision))
+            .unwrap();
+        assert_ne!(updated.revision, saved.revision);
+        assert_eq!(
+            store.remove(&identity, ExpectedRevision::Exact(saved.revision)),
+            Err(ProviderCredentialError::StaleRevision)
+        );
+        assert_eq!(
+            store
+                .remove(&identity, ExpectedRevision::Exact(updated.revision))
+                .unwrap(),
+            ProviderCredentialRemoveResult::Removed
+        );
+    }
+
+    #[test]
+    fn provider_storage_read_only_status_preserves_missing_lock_and_records() {
+        let home = Home::new();
+        let store = home.store();
+        let identity = identity();
+        let saved = store
+            .save(&identity, secret(), ExpectedRevision::Absent)
+            .unwrap();
+        let record = home.0.join("auth/providers").join(identity.file_name());
+        let before = Zeroizing::new(fs::read(&record).unwrap());
+        let lock = home.0.join("auth/providers/store.lock");
+        fs::remove_file(&lock).unwrap();
+        #[cfg(windows)]
+        let security = acl_snapshot(&record);
+        assert_eq!(
+            store.status_read_only_with(&identity, |_| Ok(None)),
+            ProviderCredentialStatus::Invalid(ProviderCredentialError::UnsafeFile)
+        );
+        assert!(!lock.exists());
+        assert_eq!(*Zeroizing::new(fs::read(&record).unwrap()), *before);
+        #[cfg(windows)]
+        assert_eq!(acl_snapshot(&record), security);
+        assert_eq!(
+            store
+                .resolve_with(&identity, |_| Ok(None))
+                .unwrap()
+                .revision(),
+            Some(saved.revision)
         );
     }
 }

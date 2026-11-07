@@ -20,4 +20,7 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+orbit-platform = { path = "../platform" }
+
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
