@@ -8,8 +8,8 @@
 //!
 //! Violation → E0705 restricted_acl_invalid, refuse start or replay.
 //!
-//! NOTE: this module uses `#[cfg(unix)]` since mode/ownership are POSIX concepts.
-//! On non-unix targets the checks are compiled out (v0.1 is Linux-only per DR-13 §1).
+//! Unix checks use UID and mode. Windows uses held owner/DACL validation and
+//! bounded read-only private-tree inspection.
 
 use crate::error::TrustError;
 use std::path::Path;
@@ -49,6 +49,26 @@ pub fn verify_restricted_acl(root: &Path) -> Result<(), TrustError> {
         }
         walk_files(root, uid)?;
     }
+    #[cfg(windows)]
+    {
+        use orbit_platform::fs::{Directory, InspectionLimits};
+        let directory = Directory::open(root).map_err(|error| {
+            TrustError::RegistryBootstrapIncomplete(format!(
+                "restricted ACL root validation failed: {error}"
+            ))
+        })?;
+        directory
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 4096,
+                max_name_bytes: 1_048_576,
+                max_depth: 128,
+            })
+            .map_err(|error| {
+                TrustError::RegistryBootstrapIncomplete(format!(
+                    "restricted ACL private-tree inspection failed: {error}"
+                ))
+            })?;
+    }
     Ok(())
 }
 
@@ -82,7 +102,7 @@ fn walk_files(dir: &Path, uid: u32) -> Result<(), TrustError> {
     Ok(())
 }
 
-/// Non-unix: no-op (v0.1 is Linux-only; DR-13 §1).
+/// Reserved helper for non-Unix builds.
 #[cfg(not(unix))]
 fn _unused(_: &Path) {}
 
