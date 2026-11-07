@@ -1593,6 +1593,67 @@ mod windows_fixture {
         eprintln!("{prefix}{}", &escaped[..end]);
     }
 
+    fn set_exact_owner_rule(path: &Path, operation: &'static str) -> std::process::Output {
+        use std::ffi::OsStr;
+        let script = match operation {
+            "owner-R" => {
+                "$ErrorActionPreference='Stop'; $file=[IO.FileInfo]::new($env:ORBIT_TEST_ACL_PATH); $acl=$file.GetAccessControl(); $sid=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value; if($sid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value){throw 'Owned fixture owner mismatch'}; $sddl='D:P(A;;0x00120089;;;' + $sid + ')'; $acl.SetSecurityDescriptorSddlForm($sddl,[Security.AccessControl.AccessControlSections]::Access); $file.SetAccessControl($acl)"
+            }
+            "owner-RX" => {
+                "$ErrorActionPreference='Stop'; $file=[IO.FileInfo]::new($env:ORBIT_TEST_ACL_PATH); $acl=$file.GetAccessControl(); $sid=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value; if($sid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value){throw 'Owned fixture owner mismatch'}; $sddl='D:P(A;;0x001200a9;;;' + $sid + ')'; $acl.SetSecurityDescriptorSddlForm($sddl,[Security.AccessControl.AccessControlSections]::Access); $file.SetAccessControl($acl)"
+            }
+            _ => panic!("Unknown exact owner fixture operation"),
+        };
+        fixture_command(
+            operation,
+            &system_program("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-Command"),
+                OsStr::new(script),
+            ],
+            Some(path),
+        )
+    }
+
+    fn exact_owner_mask(operation: &'static str) -> u64 {
+        match operation {
+            "owner-R" => 0x00120089,
+            "owner-RX" => 0x001200a9,
+            _ => panic!("Unknown exact owner fixture operation"),
+        }
+    }
+
+    fn require_exact_owner_rule(observed: &Security, before: &Security, operation: &'static str) {
+        assert!(
+            observed.owner == before.owner && observed.owner == owner(),
+            "Fixture owner changed"
+        );
+        assert!(observed.group == before.group, "Fixture group changed");
+        assert!(
+            before.protected && observed.protected,
+            "Fixture lost protected DACL"
+        );
+        assert!(
+            observed.aces.len() == 1,
+            "Fixture requires one explicit owner rule"
+        );
+        let ace = &observed.aces[0];
+        assert!(
+            ace.sid == before.owner && ace.kind == "Allow",
+            "Fixture requires owner Allow rule"
+        );
+        assert!(
+            ace.inheritance == 0 && ace.propagation == 0 && !ace.inherited,
+            "Fixture rule must be explicit and effective"
+        );
+        assert!(
+            ace.mask == exact_owner_mask(operation),
+            "Exact fixture mask did not persist"
+        );
+    }
+
     pub(super) fn edit_acl(path: &Path, arguments: &[&str]) -> Observation {
         let operation = match arguments {
             ["/grant:r", grant] if grant.ends_with(":R") => Some("owner-R"),
@@ -1600,9 +1661,41 @@ mod windows_fixture {
             _ => None,
         };
         let before = observe(path);
-        let editor = icacls(path, arguments);
+        let before_bytes = operation.map(|_| {
+            use std::os::windows::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(path).expect("Owned fixture metadata unavailable");
+            assert!(
+                metadata.is_file() && metadata.file_attributes() & 0x400 == 0,
+                "Owned fixture must be a regular nonreparse file"
+            );
+            assert_private(path, false);
+            assert!(
+                before.security.owner == owner() && before.security.protected,
+                "Owned fixture baseline policy invalid"
+            );
+            assert!(
+                before.security.aces.len() == 1
+                    && before.security.aces[0].kind == "Allow"
+                    && before.security.aces[0].sid == before.security.owner
+                    && before.security.aces[0].mask == 0x1f01ff
+                    && before.security.aces[0].propagation & 2 == 0
+                    && !before.security.aces[0].inherited,
+                "Owned fixture baseline must have one explicit Allow rule"
+            );
+            fs::read(path).expect("Owned fixture bytes unavailable")
+        });
+        let editor = match operation {
+            Some(operation) => set_exact_owner_rule(path, operation),
+            None => icacls(path, arguments),
+        };
         if let Some(operation) = operation {
             let immediate = security(path);
+            emit_acl_diagnostic(
+                operation,
+                "editor_kind",
+                b"dotnet-framework-access-section-replacement",
+                path,
+            );
             emit_acl_diagnostic(
                 operation,
                 "before_security",
@@ -1623,6 +1716,7 @@ mod windows_fixture {
                 format!("{immediate:?}").as_bytes(),
                 path,
             );
+            require_exact_owner_rule(&immediate, &before.security, operation);
         }
         let after = observe(path);
         if let Some(operation) = operation {
@@ -1631,6 +1725,13 @@ mod windows_fixture {
                 "after_observation_security",
                 format!("{:?}", after.security).as_bytes(),
                 path,
+            );
+            require_exact_owner_rule(&after.security, &before.security, operation);
+            let expected_bytes = before_bytes.expect("Owned fixture baseline bytes missing");
+            let actual_bytes = fs::read(path).expect("Owned fixture bytes unavailable after edit");
+            assert!(
+                actual_bytes == expected_bytes,
+                "Owned fixture bytes changed during access edit"
             );
         }
         assert_eq!(after.identity, before.identity);
