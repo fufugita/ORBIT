@@ -179,7 +179,15 @@ if ($Group -eq 'PrivateStores') {
     $log = Join-Path $EvidenceDir 'private-stores.log'
     cargo +1.99.0 test --locked --no-fail-fast -p orbit-adapter --lib --test provider_credentials -- --test-threads=1 --show-output 2>&1 |
         Tee-Object -FilePath $log
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $adapterExit = $LASTEXITCODE
+    $trustLog = Join-Path $EvidenceDir 'private-stores-trust.log'
+    cargo +1.99.0 test --locked --no-fail-fast -p orbit-trust --lib -- --test-threads=1 --show-output 2>&1 |
+        Tee-Object -FilePath $trustLog
+    $trustExit = $LASTEXITCODE
+    @("source=$env:GITHUB_SHA", "adapter_exit=$adapterExit", "trust_exit=$trustExit") |
+        Out-File (Join-Path $EvidenceDir 'private-stores-exits.txt')
+    if ($adapterExit -ne 0) { exit $adapterExit }
+    if ($trustExit -ne 0) { exit $trustExit }
     $libraryRequired = @(
         'provider_credentials::tests::provider_storage_foreign_ownership_is_rejected_without_privileged_fixture',
         'provider_credentials::tests::provider_storage_held_directory_rejects_inode_substitution',
@@ -289,6 +297,18 @@ if ($Group -eq 'PrivateStores') {
         'read_only_status_does_not_recreate_missing_lock_or_change_records',
         'read_only_status_uses_validated_environment_and_saved_source_without_writes'
     )
+    $trustRequired = @(
+        'acl::tests::empty_dir_passes_when_0700',
+        'acl::tests::world_readable_dir_fails',
+        'canonical::tests::sorts_keys_recursively',
+        'canonical::tests::no_trailing_whitespace_or_bom',
+        'canonical::tests::deterministic_across_runs',
+        'manifest::tests::verify_accepts_valid_root_signature',
+        'manifest::tests::verify_rejects_wrong_root',
+        'manifest::tests::reject_attested_trust_level_in_v0_1',
+        'root::tests::add_root_persists_and_reloads',
+        'root::tests::verify_manifest_no_roots_fails_e0706'
+    )
     if ($libraryRequired.Count -ne 58 -or @($libraryRequired | Select-Object -Unique).Count -ne 58) {
         throw 'PrivateStores requires all 58 unique adapter library cases'
     }
@@ -299,26 +319,58 @@ if ($Group -eq 'PrivateStores') {
     if ($required.Count -ne 105 -or @($required | Select-Object -Unique).Count -ne 105) {
         throw 'PrivateStores requires 105 disjoint library and integration cases'
     }
-    $report = Get-Content $log -Raw
-    $requiredByTarget = @{ lib = $libraryRequired; provider_credentials = $integrationRequired }
+    if ($trustRequired.Count -ne 10 -or @($trustRequired | Select-Object -Unique).Count -ne 10) {
+        throw 'PrivateStores requires all 10 unique original trust cases'
+    }
+    $report = (Get-Content $log -Raw) + [Environment]::NewLine + (Get-Content $trustLog -Raw)
+    $requiredByTarget = @{ adapter_lib = $libraryRequired; adapter_provider_credentials = $integrationRequired; trust_lib = $trustRequired }
+    $packageByTarget = @{ adapter_lib = 'orbit-adapter'; adapter_provider_credentials = 'orbit-adapter'; trust_lib = 'orbit-trust' }
+    $cargoTargetByTarget = @{ adapter_lib = 'orbit_adapter'; adapter_provider_credentials = 'provider_credentials'; trust_lib = 'orbit_trust' }
     $seenTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $completedTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $globalSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $caseEvidence = [Collections.Generic.List[object]]::new()
     $activeTarget = $null
     $activeRequired = $null
+    $activeSourceKind = $null
+    $activeExecutable = $null
     $blockSeen = $null
-    $headerPattern = '^[ \t]*Running (?:(?<lib>unittests src[\\/]lib\.rs)|(?<integration>tests[\\/]provider_credentials\.rs)) \('
+    $headerPattern = '^[ \t]*Running (?<source>unittests src[\\/]lib\.rs|tests[\\/]provider_credentials\.rs) \((?<executable>[^\r\n]+)\)\r?$'
+    $executablePattern = '^(?<family>orbit_adapter|provider_credentials|orbit_trust)-(?<fingerprint>[0-9a-fA-F]+)(?:\.exe)?$'
     $rowPattern = '^test (?<case>[^\r\n]+) \.\.\. (?<status>ok|FAILED|ignored)\r?$'
     $summaryPattern = '^test result: (?<status>ok|FAILED)\. (?<passed>[0-9]+) passed; (?<failed>[0-9]+) failed; (?<ignored>[0-9]+) ignored; (?<measured>[0-9]+) measured; (?<filtered>[0-9]+) filtered out;[^\r\n]*\r?$'
     foreach ($line in ($report -split '\r?\n')) {
         $header = [regex]::Match($line, $headerPattern)
         if ($header.Success) {
-            $target = if ($header.Groups['lib'].Success) { 'lib' } else { 'provider_credentials' }
+            $sourceKind = if ($header.Groups['source'].Value -cmatch '^unittests ') { 'lib' } else { 'integration' }
+            $executablePath = $header.Groups['executable'].Value
+            if ($executablePath.StartsWith('"') -and $executablePath.EndsWith('"')) {
+                $executablePath = $executablePath.Substring(1, $executablePath.Length - 2)
+            }
+            $executable = @($executablePath -split '[\\/]')[-1]
+            $binary = [regex]::Match($executable, $executablePattern)
+            if (-not $binary.Success) { throw 'Unknown Cargo test executable basename' }
+            $target = switch ($binary.Groups['family'].Value) {
+                'orbit_adapter' {
+                    if ($sourceKind -cne 'lib') { throw 'Adapter library executable has the wrong source kind' }
+                    'adapter_lib'
+                }
+                'provider_credentials' {
+                    if ($sourceKind -cne 'integration') { throw 'Credential executable has the wrong source kind' }
+                    'adapter_provider_credentials'
+                }
+                'orbit_trust' {
+                    if ($sourceKind -cne 'lib') { throw 'Trust library executable has the wrong source kind' }
+                    'trust_lib'
+                }
+                default { throw 'Unsupported Cargo test executable' }
+            }
             if ($null -ne $activeTarget -or -not $seenTargets.Add($target)) {
                 throw 'Duplicate adapter binary or preceding binary without its completed summary'
             }
             $activeTarget = $target
+            $activeSourceKind = $sourceKind
+            $activeExecutable = $executable
             $activeRequired = @($requiredByTarget[$target])
             $blockSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             continue
@@ -341,6 +393,8 @@ if ($Group -eq 'PrivateStores') {
             if (-not $completedTargets.Add($activeTarget)) { throw 'Duplicate adapter binary summary' }
             $activeTarget = $null
             $activeRequired = $null
+            $activeSourceKind = $null
+            $activeExecutable = $null
             $blockSeen = $null
             continue
         }
@@ -349,22 +403,25 @@ if ($Group -eq 'PrivateStores') {
             if ($null -eq $activeTarget) { throw 'Adapter case outside an active binary block' }
             $case = $row.Groups['case'].Value
             if ($case -cnotin $activeRequired -or $row.Groups['status'].Value -cne 'ok' -or
-                -not $blockSeen.Add($case) -or -not $globalSeen.Add($case)) {
+                -not $blockSeen.Add($case) -or -not $globalSeen.Add($activeTarget + '::' + $case)) {
                 throw "Unexpected, duplicate or unsuccessful case in observed binary $activeTarget : $case"
             }
-            $caseEvidence.Add(@{ name = $case; status = $row.Groups['status'].Value; target = $activeTarget })
+            $caseEvidence.Add(@{ name = $case; status = $row.Groups['status'].Value; block = $activeTarget;
+                package = $packageByTarget[$activeTarget]; target = $cargoTargetByTarget[$activeTarget];
+                source_kind = $activeSourceKind; executable = $activeExecutable })
             continue
         }
         if ($line -match '^test ') { throw 'Unparsed adapter case or summary line' }
     }
-    if ($null -ne $activeTarget -or $seenTargets.Count -ne 2 -or $completedTargets.Count -ne 2 -or
-        -not $completedTargets.Contains('lib') -or -not $completedTargets.Contains('provider_credentials')) {
-        throw 'Both exact adapter binary blocks must complete once'
+    if ($null -ne $activeTarget -or $seenTargets.Count -ne 3 -or $completedTargets.Count -ne 3 -or
+        -not $completedTargets.Contains('adapter_lib') -or -not $completedTargets.Contains('adapter_provider_credentials') -or
+        -not $completedTargets.Contains('trust_lib')) {
+        throw 'All three exact native test executable blocks must complete once'
     }
-    if ($globalSeen.Count -ne 105 -or $caseEvidence.Count -ne 105) { throw 'Expected exactly 105 observed adapter cases' }
+    if ($globalSeen.Count -ne 115 -or $caseEvidence.Count -ne 115) { throw 'Expected exactly 115 observed package/target cases' }
     if ($report -match '\b[1-9][0-9]* (ignored|filtered out)\b') { throw 'Adapter cases were skipped' }
-    @{ required_cases = 105; library_required_cases = 58; integration_required_cases = 47;
-       raw_cases = 105; logical_cases = 104; credential_logical_cases = 56; child_helper_cases = 1;
+    @{ required_cases = 115; library_required_cases = 58; integration_required_cases = 47; trust_library_required_cases = 10;
+       raw_cases = 115; logical_cases = 114; credential_logical_cases = 56; trust_logical_cases = 10; child_helper_cases = 1;
        status = 'passed'; source = $env:GITHUB_SHA; cases = @($caseEvidence.ToArray()) } |
         ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'private-stores.json')
     return
