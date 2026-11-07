@@ -300,6 +300,15 @@ if ($Group -eq 'PrivateStores') {
     $trustRequired = @(
         'acl::tests::empty_dir_passes_when_0700',
         'acl::tests::world_readable_dir_fails',
+        'acl::tests::windows_nested_private_fa_r_rx_pass',
+        'acl::tests::windows_unsafe_nested_acl_fails',
+        'acl::tests::windows_foreign_owner_fails',
+        'acl::tests::windows_symlink_roots_and_children_fail',
+        'acl::tests::windows_hardlinked_file_fails',
+        'acl::tests::windows_missing_root_fails_without_creation',
+        'acl::tests::windows_entry_limit_boundary',
+        'acl::tests::windows_depth_limit_boundary',
+        'acl::tests::windows_name_bytes_limit_boundary',
         'canonical::tests::sorts_keys_recursively',
         'canonical::tests::no_trailing_whitespace_or_bom',
         'canonical::tests::deterministic_across_runs',
@@ -319,9 +328,34 @@ if ($Group -eq 'PrivateStores') {
     if ($required.Count -ne 105 -or @($required | Select-Object -Unique).Count -ne 105) {
         throw 'PrivateStores requires 105 disjoint library and integration cases'
     }
-    if ($trustRequired.Count -ne 10 -or @($trustRequired | Select-Object -Unique).Count -ne 10) {
-        throw 'PrivateStores requires all 10 unique original trust cases'
+    if ($trustRequired.Count -ne 19 -or @($trustRequired | Select-Object -Unique).Count -ne 19) {
+        throw 'PrivateStores requires all 19 unique trust cases'
     }
+    $trustSubcases = @(
+        'case=acl::tests::windows_nested_private_fa_r_rx_pass subcase=fa-r-rx outcome=Pass',
+        'case=acl::tests::windows_unsafe_nested_acl_fails subcase=directory outcome=Refused',
+        'case=acl::tests::windows_unsafe_nested_acl_fails subcase=file outcome=Refused',
+        'case=acl::tests::windows_foreign_owner_fails subcase=root outcome=Refused',
+        'case=acl::tests::windows_foreign_owner_fails subcase=directory outcome=Refused',
+        'case=acl::tests::windows_foreign_owner_fails subcase=file outcome=Refused',
+        'case=acl::tests::windows_symlink_roots_and_children_fail subcase=root outcome=Refused',
+        'case=acl::tests::windows_symlink_roots_and_children_fail subcase=directory outcome=Refused',
+        'case=acl::tests::windows_symlink_roots_and_children_fail subcase=file outcome=Refused',
+        'case=acl::tests::windows_hardlinked_file_fails subcase=alias outcome=Refused',
+        'case=acl::tests::windows_missing_root_fails_without_creation subcase=absent outcome=Refused',
+        'case=acl::tests::windows_entry_limit_boundary subcase=at-limit outcome=Pass entries=4096 name_bytes=40960 depth=1',
+        'case=acl::tests::windows_entry_limit_boundary subcase=above-limit outcome=Refused entries=4097 name_bytes=40970 depth=1',
+        'case=acl::tests::windows_depth_limit_boundary subcase=at-limit outcome=Pass entries=128 name_bytes=32768 depth=128',
+        'case=acl::tests::windows_depth_limit_boundary subcase=above-limit outcome=Refused entries=129 name_bytes=33282 depth=129',
+        'case=acl::tests::windows_name_bytes_limit_boundary subcase=at-limit outcome=Pass entries=4095 name_bytes=1048576 depth=2',
+        'case=acl::tests::windows_name_bytes_limit_boundary subcase=above-limit outcome=Refused entries=4096 name_bytes=1048644 depth=2'
+    )
+    if ($trustSubcases.Count -ne 17 -or @($trustSubcases | Select-Object -Unique).Count -ne 17) {
+        throw 'PrivateStores requires 17 unique completed trust subcases'
+    }
+    $trustSubcaseSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $trustSubcaseEvidence = [Collections.Generic.List[object]]::new()
+    $trustOutputCase = $null
     $report = (Get-Content $log -Raw) + [Environment]::NewLine + (Get-Content $trustLog -Raw)
     $requiredByTarget = @{ adapter_lib = $libraryRequired; adapter_provider_credentials = $integrationRequired; trust_lib = $trustRequired }
     $packageByTarget = @{ adapter_lib = 'orbit-adapter'; adapter_provider_credentials = 'orbit-adapter'; trust_lib = 'orbit-trust' }
@@ -371,11 +405,33 @@ if ($Group -eq 'PrivateStores') {
             $activeTarget = $target
             $activeSourceKind = $sourceKind
             $activeExecutable = $executable
+            $trustOutputCase = $null
             $activeRequired = @($requiredByTarget[$target])
             $blockSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             continue
         }
         if ($line -cmatch '^[ \t]*Running ') { throw 'Unexpected adapter test binary' }
+        $outputSection = [regex]::Match($line, '^---- (?<case>[^\r\n]+) stdout ----\r?$')
+        if ($outputSection.Success -and $activeTarget -ceq 'trust_lib') {
+            $trustOutputCase = $outputSection.Groups['case'].Value
+            if ($trustOutputCase -cnotin $trustRequired -or -not $blockSeen.Contains($trustOutputCase)) {
+                throw 'Trust captured output has no successful observed case'
+            }
+        }
+        if ($line.StartsWith('trust_acl_adversarial_complete')) {
+            $completion = [regex]::Match($line, '^trust_acl_adversarial_complete (?<record>case=(?<case>[^ ]+) [^\r\n]+)\r?$')
+            if (-not $completion.Success -or $activeTarget -cne 'trust_lib' -or
+                $completion.Groups['case'].Value -cne $trustOutputCase -or
+                $completion.Groups['record'].Value -cnotin $trustSubcases -or
+                -not $trustSubcaseSeen.Add($completion.Groups['record'].Value)) {
+                throw 'Unexpected, duplicate or wrongly attributed trust subcase completion'
+            }
+            $trustSubcaseEvidence.Add(@{ case = $trustOutputCase; record = $completion.Groups['record'].Value;
+                block = $activeTarget; package = $packageByTarget[$activeTarget];
+                target = $cargoTargetByTarget[$activeTarget]; source_kind = $activeSourceKind;
+                executable = $activeExecutable })
+            continue
+        }
         $summary = [regex]::Match($line, $summaryPattern)
         if ($summary.Success) {
             if ($null -eq $activeTarget) { throw 'Adapter summary outside an active binary block' }
@@ -390,11 +446,18 @@ if ($Group -eq 'PrivateStores') {
             foreach ($case in $activeRequired) {
                 if (-not $blockSeen.Contains($case)) { throw "Missing case in observed binary $activeTarget : $case" }
             }
+            if ($activeTarget -ceq 'trust_lib') {
+                if ($trustSubcaseSeen.Count -ne 17) { throw 'Missing actual trust subcase completions' }
+                foreach ($subcase in $trustSubcases) {
+                    if (-not $trustSubcaseSeen.Contains($subcase)) { throw 'Required trust subcase did not complete' }
+                }
+            }
             if (-not $completedTargets.Add($activeTarget)) { throw 'Duplicate adapter binary summary' }
             $activeTarget = $null
             $activeRequired = $null
             $activeSourceKind = $null
             $activeExecutable = $null
+            $trustOutputCase = $null
             $blockSeen = $null
             continue
         }
@@ -418,10 +481,11 @@ if ($Group -eq 'PrivateStores') {
         -not $completedTargets.Contains('trust_lib')) {
         throw 'All three exact native test executable blocks must complete once'
     }
-    if ($globalSeen.Count -ne 115 -or $caseEvidence.Count -ne 115) { throw 'Expected exactly 115 observed package/target cases' }
+    if ($globalSeen.Count -ne 124 -or $caseEvidence.Count -ne 124) { throw 'Expected exactly 124 observed package/target cases' }
     if ($report -match '\b[1-9][0-9]* (ignored|filtered out)\b') { throw 'Adapter cases were skipped' }
-    @{ required_cases = 115; library_required_cases = 58; integration_required_cases = 47; trust_library_required_cases = 10;
-       raw_cases = 115; logical_cases = 114; credential_logical_cases = 56; trust_logical_cases = 10; child_helper_cases = 1;
+    @{ required_cases = 124; library_required_cases = 58; integration_required_cases = 47; trust_library_required_cases = 19;
+       raw_cases = 124; logical_cases = 123; credential_logical_cases = 56; trust_logical_cases = 19; child_helper_cases = 1;
+       trust_completed_subcases = 17; trust_subcases = @($trustSubcaseEvidence.ToArray());
        status = 'passed'; source = $env:GITHUB_SHA; cases = @($caseEvidence.ToArray()) } |
         ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'private-stores.json')
     return
