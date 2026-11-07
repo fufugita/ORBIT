@@ -10041,6 +10041,1174 @@ mod windows {
                                 }
                             }
                         }
+
+                        pub(in crate::windows) mod policy_case {
+                            use super::*;
+
+                            const NATIVE: &str = "policy-native-fa";
+                            const MANAGED_CAUSE: &str =
+                                "published managed rights are not canonical";
+                            const PRIVATE_CAUSE: &str = "unsupported owner-private access mask";
+                            const A: [Spec; 2] = [
+                                Spec {
+                                    name: "policy-r",
+                                    bytes: b"managed-R-policy-v1",
+                                    executable: false,
+                                    mask: FILE_GENERIC_READ,
+                                },
+                                Spec {
+                                    name: "policy-rx",
+                                    bytes: b"managed-RX-policy-v1",
+                                    executable: true,
+                                    mask: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                                },
+                            ];
+                            const B: [Spec; 1] = [Spec {
+                                name: "private-full",
+                                bytes: b"private-FA-policy-v1",
+                                executable: true,
+                                mask: FILE_ALL_ACCESS,
+                            }];
+
+                            #[derive(Clone, Copy)]
+                            struct Spec {
+                                name: &'static str,
+                                bytes: &'static [u8],
+                                executable: bool,
+                                mask: u32,
+                            }
+                            #[derive(Clone, Debug, Eq, PartialEq)]
+                            struct FileImage {
+                                id: FileIdentity,
+                                snapshot: SourceSnapshot,
+                                policy: SecurityFacts,
+                                sd: Vec<u8>,
+                            }
+                            #[derive(Clone, Debug, Eq, PartialEq)]
+                            struct TreeImage {
+                                id: FileIdentity,
+                                policy: SecurityFacts,
+                                sd: Vec<u8>,
+                                files: Vec<FileImage>,
+                            }
+                            #[derive(Debug, Default)]
+                            struct Removal {
+                                child_attempted: [bool; 2],
+                                child_mark: [Option<(i32, u32)>; 2],
+                                child_absent: [bool; 2],
+                                root_attempted: bool,
+                                root_mark: Option<(i32, u32)>,
+                                root_absent: bool,
+                            }
+                            #[derive(Debug)]
+                            enum Cause {
+                                Io(io::Error),
+                                Product(ProductFailure),
+                            }
+                            impl From<io::Error> for Cause {
+                                fn from(value: io::Error) -> Self {
+                                    Self::Io(value)
+                                }
+                            }
+                            struct Control {
+                                base: Fixture,
+                                flight: Option<Flight>,
+                                reader: Option<PackageDirectory>,
+                                private_child: Option<Directory>,
+                                unexpected_private: Vec<orbit_platform::fs::PrivateFile>,
+                                refusal: Option<io::Error>,
+                                a: Option<TreeImage>,
+                                b: Option<TreeImage>,
+                                root_a: Option<FileIdentity>,
+                                root_b: Option<FileIdentity>,
+                                file_b: Option<FileIdentity>,
+                                written: [Option<(FileIdentity, SourceSnapshot)>; 2],
+                                accepted: bool,
+                                native_root_attempted: bool,
+                                native_file_attempted: bool,
+                                native_owned: bool,
+                                removed: [Removal; 2],
+                                phase: &'static str,
+                            }
+                            impl Control {
+                                fn new() -> Self {
+                                    Self {
+                                        base: Fixture::new(),
+                                        flight: None,
+                                        reader: None,
+                                        private_child: None,
+                                        unexpected_private: Vec::new(),
+                                        refusal: None,
+                                        a: None,
+                                        b: None,
+                                        root_a: None,
+                                        root_b: None,
+                                        file_b: None,
+                                        written: [None; 2],
+                                        accepted: false,
+                                        native_root_attempted: false,
+                                        native_file_attempted: false,
+                                        native_owned: false,
+                                        removed: [Removal::default(), Removal::default()],
+                                        phase: "native preparation",
+                                    }
+                                }
+                                fn raw(&self, owner: usize) -> HANDLE {
+                                    self.base.h.oracle.handles.raw(owner)
+                                }
+                                fn note_id(&mut self, owner: usize) -> io::Result<FileIdentity> {
+                                    let slot = self.base.note(owner);
+                                    let id = identity(self.raw(owner))?;
+                                    self.base.progress.opened[slot].1 = Some(id);
+                                    Ok(id)
+                                }
+                                fn close(
+                                    &mut self,
+                                    owner: usize,
+                                    id: Option<FileIdentity>,
+                                    phase: &'static str,
+                                ) -> io::Result<()> {
+                                    self.base.close(owner, id, phase)
+                                }
+                                fn observed_descriptor(
+                                    &self,
+                                    raw: HANDLE,
+                                    mask: u32,
+                                ) -> io::Result<(ReadDescriptor, Vec<u8>)>
+                                {
+                                    // GROUP is measured independently, not required to equal TokenPrimaryGroup.
+                                    let bytes = security_blob(raw)?;
+                                    let mut words =
+                                        vec![0usize; bytes.len().div_ceil(size_of::<usize>())];
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            bytes.as_ptr(),
+                                            words.as_mut_ptr().cast(),
+                                            bytes.len(),
+                                        );
+                                    }
+                                    let mut group = null_mut();
+                                    let mut defaulted = 0;
+                                    yes(unsafe {
+                                        IsValidSecurityDescriptor(words.as_mut_ptr().cast())
+                                    })?;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorGroup(
+                                            words.as_mut_ptr().cast(),
+                                            &mut group,
+                                            &mut defaulted,
+                                        )
+                                    })?;
+                                    let actual_group =
+                                        sid_bytes(group, words.as_ptr().cast(), bytes.len())?;
+                                    let mut expected =
+                                        self.base.h.oracle.key.as_ref().unwrap().clone();
+                                    expected.group = actual_group;
+                                    let descriptor = read_descriptor(raw, &expected, mask)?;
+                                    require(
+                                        security_blob(raw)? == bytes,
+                                        "policy descriptor changed across actual GROUP sampling",
+                                    )?;
+                                    Ok((descriptor, bytes))
+                                }
+                                fn inventory(&self, raw: HANDLE, specs: &[Spec]) -> io::Result<()> {
+                                    let mut words = vec![0usize; LIMIT / size_of::<usize>()];
+                                    let mut class = FileIdBothDirectoryRestartInfo;
+                                    let mut seen = vec![false; specs.len()];
+                                    for _ in 0..4 {
+                                        words.fill(0);
+                                        let ok = unsafe {
+                                            GetFileInformationByHandleEx(
+                                                raw,
+                                                class,
+                                                words.as_mut_ptr().cast(),
+                                                LIMIT as u32,
+                                            )
+                                        };
+                                        let error = if ok == 0 {
+                                            unsafe { GetLastError() }
+                                        } else {
+                                            0
+                                        };
+                                        if ok == 0 {
+                                            if error != ERROR_NO_MORE_FILES {
+                                                return Err(io::Error::from_raw_os_error(
+                                                    error as i32,
+                                                ));
+                                            }
+                                            return require(
+                                                seen.iter().all(|v| *v),
+                                                "policy exact inventory incomplete",
+                                            );
+                                        }
+                                        let mut offset = 0usize;
+                                        let mut records = 0;
+                                        loop {
+                                            require(
+                                                offset
+                                                    % std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>()
+                                                    == 0
+                                                    && offset
+                                                        .checked_add(
+                                                            size_of::<FILE_ID_BOTH_DIR_INFO>(),
+                                                        )
+                                                        .is_some_and(|end| end <= LIMIT),
+                                                "policy inventory header invalid",
+                                            )?;
+                                            let entry = unsafe {
+                                                words
+                                                    .as_ptr()
+                                                    .cast::<u8>()
+                                                    .add(offset)
+                                                    .cast::<FILE_ID_BOTH_DIR_INFO>()
+                                                    .read()
+                                            };
+                                            let start = offset
+                                                + offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                                            let length = entry.FileNameLength as usize;
+                                            require(
+                                                length != 0
+                                                    && length % 2 == 0
+                                                    && start
+                                                        .checked_add(length)
+                                                        .is_some_and(|end| end <= LIMIT),
+                                                "policy inventory name invalid",
+                                            )?;
+                                            let name = unsafe {
+                                                std::slice::from_raw_parts(
+                                                    words
+                                                        .as_ptr()
+                                                        .cast::<u8>()
+                                                        .add(start)
+                                                        .cast::<u16>(),
+                                                    length / 2,
+                                                )
+                                            };
+                                            if name != [46] && name != [46, 46] {
+                                                let index = specs
+                                                    .iter()
+                                                    .position(|s| {
+                                                        s.name
+                                                            .encode_utf16()
+                                                            .eq(name.iter().copied())
+                                                    })
+                                                    .ok_or_else(|| {
+                                                        bad("policy unexpected child")
+                                                    })?;
+                                                require(!seen[index], "policy duplicate child")?;
+                                                seen[index] = true;
+                                            }
+                                            records += 1;
+                                            require(
+                                                records <= specs.len() + 2,
+                                                "policy inventory record bound exceeded",
+                                            )?;
+                                            if entry.NextEntryOffset == 0 {
+                                                break;
+                                            }
+                                            require(
+                                                entry.NextEntryOffset as usize
+                                                    >= offset_of!(FILE_ID_BOTH_DIR_INFO, FileName)
+                                                        + length,
+                                                "policy overlapping inventory",
+                                            )?;
+                                            offset = offset
+                                                .checked_add(entry.NextEntryOffset as usize)
+                                                .ok_or_else(|| bad("policy inventory overflow"))?;
+                                        }
+                                        class = FileIdBothDirectoryInfo;
+                                    }
+                                    Err(bad("policy inventory batch bound exceeded"))
+                                }
+                                fn image(
+                                    &mut self,
+                                    name: &'static str,
+                                    expected: FileIdentity,
+                                    specs: &[Spec],
+                                    phase: &'static str,
+                                ) -> io::Result<TreeImage> {
+                                    let parent = self.raw(self.base.h.oracle.root.unwrap());
+                                    let root_owner = shared(
+                                        &mut self.base.h.oracle.handles,
+                                        parent,
+                                        OsStr::new(name),
+                                        true,
+                                        ROOT_READ,
+                                    )?;
+                                    let id = self.note_id(root_owner)?;
+                                    let root = self.raw(root_owner);
+                                    require(id == expected, "policy named root full ID differs")?;
+                                    kind(root, true)?;
+                                    granted(root, ROOT_READ)?;
+                                    let (root_policy, root_sd) =
+                                        self.observed_descriptor(root, FILE_ALL_ACCESS)?;
+                                    self.inventory(root, specs)?;
+                                    let key = self.base.h.oracle.key.as_ref().unwrap().clone();
+                                    let (original, current) =
+                                        effective(&mut self.base.h.oracle.handles)?;
+                                    self.base.note(original);
+                                    require(
+                                        current == key,
+                                        "policy original/current effective context differs",
+                                    )?;
+                                    let level = key.impersonation.unwrap_or(SecurityImpersonation);
+                                    let mut duplicate_raw = null_mut();
+                                    yes(unsafe {
+                                        DuplicateTokenEx(
+                                            self.raw(original),
+                                            TOKEN_QUERY,
+                                            null(),
+                                            level,
+                                            TokenImpersonation,
+                                            &mut duplicate_raw,
+                                        )
+                                    })?;
+                                    let duplicate = self.base.h.oracle.handles.own(duplicate_raw);
+                                    self.base.note(duplicate);
+                                    let stats: TOKEN_STATISTICS =
+                                        token_value(duplicate_raw, TokenStatistics)?;
+                                    require(
+                                        stats.TokenType == TokenImpersonation
+                                            && stats.ImpersonationLevel == level,
+                                        "policy AccessCheck-only duplicate type/level differs",
+                                    )?;
+                                    let mut files = Vec::with_capacity(specs.len());
+                                    for spec in specs {
+                                        let owner = shared(
+                                            &mut self.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(spec.name),
+                                            false,
+                                            FILE_GENERIC_READ,
+                                        )?;
+                                        let file_id = self.note_id(owner)?;
+                                        let raw = self.raw(owner);
+                                        kind(raw, false)?;
+                                        granted(raw, FILE_GENERIC_READ)?;
+                                        let sampled = snapshot(raw)?;
+                                        require(
+                                            sampled.identity == file_id
+                                                && sampled.kind == SourceKind::File
+                                                && sampled.link_count == 1
+                                                && sampled.length == spec.bytes.len() as u64,
+                                            "policy native file kind/full snapshot differs",
+                                        )?;
+                                        let (policy, sd) =
+                                            self.observed_descriptor(raw, spec.mask)?;
+                                        raw_bytes(raw, spec.bytes)?;
+                                        let allowed = access_check(&policy, duplicate_raw)?;
+                                        let native = match shared(
+                                            &mut self.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(spec.name),
+                                            false,
+                                            META | FILE_EXECUTE,
+                                        ) {
+                                            Err(e) if native_is(&e, DENIED) => false,
+                                            Err(e) => return Err(e),
+                                            Ok(execute) => {
+                                                let execute_id = self.note_id(execute)?;
+                                                require(
+                                                    execute_id == file_id
+                                                        && snapshot(self.raw(execute))? == sampled
+                                                        && self
+                                                            .observed_descriptor(
+                                                                self.raw(execute),
+                                                                spec.mask,
+                                                            )?
+                                                            .1
+                                                            == sd,
+                                                    "policy execute-open object differs",
+                                                )?;
+                                                granted(self.raw(execute), META | FILE_EXECUTE)?;
+                                                self.close(
+                                                    execute,
+                                                    Some(execute_id),
+                                                    "policy native EXEC oracle",
+                                                )?;
+                                                true
+                                            }
+                                        };
+                                        require(
+                                            allowed == native
+                                                && native == spec.executable
+                                                && snapshot(raw)? == sampled
+                                                && self.observed_descriptor(raw, spec.mask)?.1
+                                                    == sd,
+                                            "policy native metadata/AccessCheck/EXEC disagreement",
+                                        )?;
+                                        println!(
+                                            "package_policy_native_file phase={phase} name={} id={file_id:?} snapshot={sampled:?} actual_OWNER={:?} actual_GROUP={:?} policy={:?} sd={sd:?} AccessCheck={allowed} native_EXEC={native} bytes_verified=true",
+                                            spec.name,
+                                            policy.facts.owner,
+                                            policy.facts.group,
+                                            policy.facts
+                                        );
+                                        files.push(FileImage {
+                                            id: file_id,
+                                            snapshot: sampled,
+                                            policy: policy.facts,
+                                            sd,
+                                        });
+                                        self.close(
+                                            owner,
+                                            Some(file_id),
+                                            "policy native read oracle",
+                                        )?;
+                                    }
+                                    let (last, current) =
+                                        effective(&mut self.base.h.oracle.handles)?;
+                                    self.base.note(last);
+                                    require(
+                                        current == key
+                                            && token_key(self.raw(original), key.thread_token)?
+                                                == key,
+                                        "policy original context changed during native oracles",
+                                    )?;
+                                    self.close(last, None, "policy current context token")?;
+                                    self.close(
+                                        duplicate,
+                                        None,
+                                        "policy AccessCheck-only duplicate",
+                                    )?;
+                                    self.close(original, None, "policy original context token")?;
+                                    require(
+                                        self.observed_descriptor(root, FILE_ALL_ACCESS)?.1
+                                            == root_sd,
+                                        "policy root security changed",
+                                    )?;
+                                    self.close(root_owner, Some(id), "policy named root observer")?;
+                                    Ok(TreeImage {
+                                        id,
+                                        policy: root_policy.facts,
+                                        sd: root_sd,
+                                        files,
+                                    })
+                                }
+                                fn read(
+                                    directory: &PackageDirectory,
+                                    history: &TreeImage,
+                                    specs: &[Spec],
+                                    phase: &'static str,
+                                ) -> io::Result<()> {
+                                    require(
+                                        directory.identity() == history.id,
+                                        "policy public root ID differs",
+                                    )?;
+                                    for (spec, expected) in specs.iter().zip(&history.files) {
+                                        let mut file = directory.verify_package_mode(
+                                            OsStr::new(spec.name),
+                                            expected.id,
+                                            spec.executable,
+                                        )?;
+                                        let mode = file.execution_permission()?;
+                                        require(
+                                            file.identity() == expected.id
+                                                && file.snapshot()? == expected.snapshot
+                                                && mode.executable() == spec.executable
+                                                && file.read_limited(4096)? == spec.bytes
+                                                && file.snapshot()? == expected.snapshot
+                                                && file.execution_permission()? == mode,
+                                            "policy public file whole snapshot/bytes/mode differs",
+                                        )?;
+                                    }
+                                    println!(
+                                        "package_policy_public_read phase={phase} root={:?} files={} whole_ID_snapshot_bytes_execution=true",
+                                        history.id,
+                                        specs.len()
+                                    );
+                                    Ok(())
+                                }
+                                fn trial(
+                                    &mut self,
+                                    phase: &'static str,
+                                    exclusive: bool,
+                                    expected: bool,
+                                ) -> io::Result<()> {
+                                    lock_trial(
+                                        &mut self.base.h,
+                                        &mut self.base.unknown,
+                                        &mut self.base.trials,
+                                        phase,
+                                        exclusive,
+                                        expected,
+                                    )
+                                }
+                                fn genuine(&mut self) -> Result<(), Cause> {
+                                    self.phase = "genuine two-entry managed publication";
+                                    let stage = self
+                                        .base
+                                        .h
+                                        .parent
+                                        .as_ref()
+                                        .unwrap()
+                                        .stage_directory(
+                                            Arc::clone(self.base.h.guard.as_ref().unwrap()),
+                                            OsStr::new(STAGE),
+                                        )
+                                        .map_err(|e| Cause::Product(ProductFailure::Create(e)))?;
+                                    self.root_a = Some(stage.identity());
+                                    self.flight = Some(Flight::Stage(stage));
+                                    for (i, spec) in A.iter().enumerate() {
+                                        let Some(Flight::Stage(stage)) = &mut self.flight else {
+                                            return Err(bad("policy owned stage missing").into());
+                                        };
+                                        let file = stage.write_new(
+                                            OsStr::new(spec.name),
+                                            spec.bytes,
+                                            spec.executable,
+                                        )?;
+                                        self.written[i] = Some((file.identity(), file.snapshot()?));
+                                        drop(file);
+                                    }
+                                    let before = self.image(
+                                        STAGE,
+                                        self.root_a.unwrap(),
+                                        &A,
+                                        "sealed_before_publish",
+                                    )?;
+                                    require(
+                                        before.files[0].id != before.files[1].id
+                                            && A.iter().enumerate().all(|(i, _)| {
+                                                self.written[i]
+                                                    == Some((
+                                                        before.files[i].id,
+                                                        before.files[i].snapshot,
+                                                    ))
+                                            }),
+                                        "policy actual two sealed entries differ from write history",
+                                    )?;
+                                    self.a = Some(before.clone());
+                                    let stage = match self.flight.take() {
+                                        Some(Flight::Stage(stage)) => stage,
+                                        other => {
+                                            self.flight = other;
+                                            return Err(
+                                                bad("policy stage transition missing").into()
+                                            );
+                                        }
+                                    };
+                                    let publication = stage
+                                        .publish_directory(OsStr::new(FINAL))
+                                        .map_err(|e| Cause::Product(ProductFailure::Publish(e)))?;
+                                    let id = publication.identity();
+                                    let durability = publication.durability();
+                                    self.flight = Some(Flight::Publication(publication));
+                                    require(
+                                        id == before.id
+                                            && durability == Durability::FileBuffersFlushed,
+                                        "policy real publication receipt differs",
+                                    )?;
+                                    require(
+                                        self.image(FINAL, id, &A, "published_before_accept")?
+                                            == before,
+                                        "policy publication changed complete two-entry preimage",
+                                    )?;
+                                    let publication = match self.flight.take() {
+                                        Some(Flight::Publication(publication)) => publication,
+                                        other => {
+                                            self.flight = other;
+                                            return Err(bad(
+                                                "policy publication transition missing",
+                                            )
+                                            .into());
+                                        }
+                                    };
+                                    let acceptance = publication
+                                        .accept()
+                                        .map_err(|e| Cause::Product(ProductFailure::Accept(e)))?;
+                                    self.accepted = true;
+                                    self.flight = Some(Flight::Acceptance(acceptance));
+                                    let Some(Flight::Acceptance(acceptance)) = &self.flight else {
+                                        return Err(bad("policy genuine acceptance missing").into());
+                                    };
+                                    Self::read(
+                                        acceptance.directory(),
+                                        &before,
+                                        &A,
+                                        "genuine_acceptance",
+                                    )?;
+                                    self.private_child = Some(
+                                        self.base
+                                            .h
+                                            .parent
+                                            .as_ref()
+                                            .unwrap()
+                                            .child(OsStr::new(FINAL), false)?,
+                                    );
+                                    require(
+                                        self.private_child.as_ref().unwrap().identity() == id,
+                                        "policy private FA-root admission full ID differs",
+                                    )?;
+                                    for spec in A {
+                                        match self
+                                            .private_child
+                                            .as_ref()
+                                            .unwrap()
+                                            .open_file(OsStr::new(spec.name))
+                                        {
+                                            Err(e)
+                                                if e.kind() == io::ErrorKind::PermissionDenied
+                                                    && has_cause(&e, PRIVATE_CAUSE) =>
+                                            {
+                                                println!(
+                                                    "package_policy_private_FA_refused name={} primary={PRIVATE_CAUSE:?} native_read_precondition=true public_temporary_RAII_release_not_checked_telemetry=true",
+                                                    spec.name
+                                                )
+                                            }
+                                            Err(e) => return Err(e.into()),
+                                            Ok(file) => {
+                                                self.unexpected_private.push(file);
+                                                return Err(bad("policy private R/RX admission unexpectedly succeeded; owner retained").into());
+                                            }
+                                        }
+                                    }
+                                    self.private_child.take();
+                                    self.base.world("policy_accepted_private_refusals")?;
+                                    self.trial(
+                                        "policy_accepted_Exclusive_native_Shared",
+                                        false,
+                                        false,
+                                    )?;
+                                    drop(self.flight.take());
+                                    self.base.drop_inputs(false)?;
+                                    for mode in [LockMode::Shared, LockMode::Exclusive] {
+                                        self.phase = "actual Shared/Exclusive positive reopen";
+                                        self.base.acquire(mode)?;
+                                        let shared_mode = matches!(mode, LockMode::Shared);
+                                        self.trial(
+                                            "policy_input_native_Shared",
+                                            false,
+                                            shared_mode,
+                                        )?;
+                                        if shared_mode {
+                                            self.trial(
+                                                "policy_input_native_Exclusive",
+                                                true,
+                                                false,
+                                            )?;
+                                        }
+                                        require(
+                                            self.image(FINAL, id, &A, "before_positive_reopen")?
+                                                == before,
+                                            "policy positive preimage changed",
+                                        )?;
+                                        self.reader = Some(
+                                            self.base.h.parent.as_ref().unwrap().open_package(
+                                                Arc::clone(self.base.h.guard.as_ref().unwrap()),
+                                                OsStr::new(FINAL),
+                                                id,
+                                            )?,
+                                        );
+                                        self.base.drop_inputs(false)?;
+                                        Self::read(
+                                            self.reader.as_ref().unwrap(),
+                                            &before,
+                                            &A,
+                                            "positive_after_inputs_drop",
+                                        )?;
+                                        self.base
+                                            .world("policy_positive_reader_retains_context")?;
+                                        require(
+                                            self.image(
+                                                FINAL,
+                                                id,
+                                                &A,
+                                                "positive_after_inputs_drop",
+                                            )? == before,
+                                            "policy positive read changed native preimages",
+                                        )?;
+                                        self.trial(
+                                            "policy_retained_native_Shared",
+                                            false,
+                                            shared_mode,
+                                        )?;
+                                        if shared_mode {
+                                            self.trial(
+                                                "policy_retained_native_Exclusive",
+                                                true,
+                                                false,
+                                            )?;
+                                        }
+                                        drop(self.reader.take());
+                                    }
+                                    self.base.acquire(LockMode::Exclusive)?;
+                                    Ok(())
+                                }
+                                fn native_fixture(&mut self) -> io::Result<()> {
+                                    self.phase = "separate explicitly native-owned FA tree";
+                                    let parent = self.raw(self.base.h.oracle.root.unwrap());
+                                    absent(
+                                        &mut self.base.h.oracle.handles,
+                                        parent,
+                                        OsStr::new(NATIVE),
+                                        true,
+                                    )?;
+                                    let key = self.base.h.oracle.key.as_ref().unwrap().clone();
+                                    let sd = descriptor(&key, FILE_ALL_ACCESS)?;
+                                    self.native_root_attempted = true;
+                                    let owner = relative(
+                                        &mut self.base.h.oracle.handles,
+                                        parent,
+                                        OsStr::new(NATIVE),
+                                        true,
+                                        FILE_CREATE,
+                                        FILE_ALL_ACCESS,
+                                        sd.as_ptr().cast(),
+                                    )?;
+                                    let root_id = self.note_id(owner)?;
+                                    self.root_b = Some(root_id);
+                                    let root = self.raw(owner);
+                                    kind(root, true)?;
+                                    granted(root, FILE_ALL_ACCESS)?;
+                                    self.observed_descriptor(root, FILE_ALL_ACCESS)?;
+                                    self.native_file_attempted = true;
+                                    let file = relative(
+                                        &mut self.base.h.oracle.handles,
+                                        root,
+                                        OsStr::new(B[0].name),
+                                        false,
+                                        FILE_CREATE,
+                                        FILE_ALL_ACCESS,
+                                        sd.as_ptr().cast(),
+                                    )?;
+                                    let file_id = self.note_id(file)?;
+                                    self.file_b = Some(file_id);
+                                    kind(self.raw(file), false)?;
+                                    granted(self.raw(file), FILE_ALL_ACCESS)?;
+                                    let mut written = 0;
+                                    yes(unsafe {
+                                        WriteFile(
+                                            self.raw(file),
+                                            B[0].bytes.as_ptr(),
+                                            B[0].bytes.len() as u32,
+                                            &mut written,
+                                            null_mut(),
+                                        )
+                                    })?;
+                                    require(
+                                        written as usize == B[0].bytes.len(),
+                                        "policy native FA fixture short write",
+                                    )?;
+                                    yes(unsafe { FlushFileBuffers(self.raw(file)) })?;
+                                    self.close(
+                                        file,
+                                        Some(file_id),
+                                        "policy native FA payload creator",
+                                    )?;
+                                    let before = self.image(
+                                        NATIVE,
+                                        root_id,
+                                        &B,
+                                        "native_owned_FA_prerequisites",
+                                    )?;
+                                    require(
+                                        before.files[0].id == file_id,
+                                        "policy native-owned file full ID differs",
+                                    )?;
+                                    self.b = Some(before);
+                                    self.close(
+                                        owner,
+                                        Some(root_id),
+                                        "policy close native root DELETE creator before reader",
+                                    )?;
+                                    self.native_owned = true;
+                                    Ok(())
+                                }
+                                fn refusal(&mut self) -> Result<(), Cause> {
+                                    self.base.drop_inputs(true)?;
+                                    self.base.acquire(LockMode::Shared)?;
+                                    self.trial(
+                                        "policy_FA_input_Shared_native_Shared",
+                                        false,
+                                        true,
+                                    )?;
+                                    self.trial(
+                                        "policy_FA_input_Shared_native_Exclusive",
+                                        true,
+                                        false,
+                                    )?;
+                                    let before = self.b.as_ref().unwrap().clone();
+                                    require(
+                                        self.image(
+                                            NATIVE,
+                                            before.id,
+                                            &B,
+                                            "FA_before_initial_open",
+                                        )? == before,
+                                        "policy FA constructor prerequisites changed",
+                                    )?;
+                                    self.base.world("policy_FA_before_initial_open")?;
+                                    self.phase = "initial healthy managed-FA refusal with actual retained origin";
+                                    match self.base.h.parent.as_ref().unwrap().open_package(
+                                        Arc::clone(self.base.h.guard.as_ref().unwrap()),
+                                        OsStr::new(NATIVE),
+                                        before.id,
+                                    ) {
+                                        Ok(reader) => {
+                                            self.reader = Some(reader);
+                                            return Err(bad("policy managed FA admission unexpectedly succeeded; reader retained").into());
+                                        }
+                                        Err(e) => {
+                                            self.refusal = Some(e);
+                                        }
+                                    }
+                                    let error = self.refusal.as_ref().unwrap();
+                                    require(
+                                        error.kind() == io::ErrorKind::PermissionDenied
+                                            && has_cause(error, MANAGED_CAUSE),
+                                        "policy initial FA refusal is not healthy exact policy cause; actual error retained INVALID",
+                                    )?;
+                                    self.base.drop_inputs(false)?;
+                                    require(
+                                        self.image(
+                                            NATIVE,
+                                            before.id,
+                                            &B,
+                                            "FA_error_after_inputs_drop",
+                                        )? == before,
+                                        "policy FA retained-error native preimage changed",
+                                    )?;
+                                    self.base.world("policy_FA_error_after_inputs_drop")?;
+                                    self.trial(
+                                        "policy_FA_error_Shared_native_Shared",
+                                        false,
+                                        true,
+                                    )?;
+                                    self.trial(
+                                        "policy_FA_error_Shared_native_Exclusive",
+                                        true,
+                                        false,
+                                    )?;
+                                    require(
+                                        self.reader.is_none()
+                                            && self.flight.is_none()
+                                            && self.private_child.is_none()
+                                            && self.unexpected_private.is_empty()
+                                            && self.base.unknown.is_empty()
+                                            && self.base.progress.opened.iter().all(
+                                                |(owner, _)| {
+                                                    self.base.h.oracle.handles.slots[*owner]
+                                                        .is_none()
+                                                },
+                                            ),
+                                        "policy initial refusal has exported/uncertain fixture owners; error retained",
+                                    )?;
+                                    // Initial failed construction exported no reader/file/lease/state.
+                                    // ReadInit::fail takes every known slot before its Acquire sample;
+                                    // this private failed initializer has no concurrent exported writer.
+                                    // Healthy kind is source-guarded evidence, not native close telemetry.
+                                    println!(
+                                        "package_policy_initial_FA_refusal_complete outer=PermissionDenied primary={MANAGED_CAUSE:?} retained_actual_Shared_origin=true native_preimages_unchanged=true initial_no_export_boundary_source_reviewed=true release_is_not_recovery_disposal=true"
+                                    );
+                                    drop(self.refusal.take());
+                                    self.base.acquire(LockMode::Exclusive)?;
+                                    self.trial(
+                                        "policy_FA_release_Exclusive_native_Shared",
+                                        false,
+                                        false,
+                                    )?;
+                                    require(
+                                        self.image(
+                                            NATIVE,
+                                            before.id,
+                                            &B,
+                                            "FA_after_healthy_release",
+                                        )? == before,
+                                        "policy FA release changed native fixture",
+                                    )?;
+                                    Ok(())
+                                }
+                                fn remove_tree(
+                                    &mut self,
+                                    row: usize,
+                                    name: &'static str,
+                                    history: TreeImage,
+                                    specs: &[Spec],
+                                ) -> io::Result<()> {
+                                    require(
+                                        self.reader.is_none()
+                                            && self.flight.is_none()
+                                            && self.refusal.is_none()
+                                            && self.private_child.is_none()
+                                            && self.unexpected_private.is_empty()
+                                            && self
+                                                .base
+                                                .h
+                                                .guard
+                                                .as_ref()
+                                                .is_some_and(|g| Arc::strong_count(g) == 1)
+                                            && if row == 0 {
+                                                self.accepted
+                                            } else {
+                                                self.native_owned
+                                            },
+                                        "policy cleanup authority incomplete",
+                                    )?;
+                                    require(
+                                        self.image(
+                                            name,
+                                            history.id,
+                                            specs,
+                                            "complete_preflight_before_any_mark",
+                                        )? == history,
+                                        "policy whole-tree cleanup preflight differs",
+                                    )?;
+                                    let parent = self.raw(self.base.h.oracle.root.unwrap());
+                                    let owner = relative(
+                                        &mut self.base.h.oracle.handles,
+                                        parent,
+                                        OsStr::new(name),
+                                        true,
+                                        FILE_OPEN,
+                                        ROOT_READ | FILE_DELETE_CHILD,
+                                        null(),
+                                    )?;
+                                    let root_id = self.note_id(owner)?;
+                                    let root = self.raw(owner);
+                                    kind(root, true)?;
+                                    granted(root, ROOT_READ | FILE_DELETE_CHILD)?;
+                                    require(
+                                        root_id == history.id
+                                            && self.observed_descriptor(root, FILE_ALL_ACCESS)?.1
+                                                == history.sd,
+                                        "policy held cleanup root differs",
+                                    )?;
+                                    self.inventory(root, specs)?;
+                                    require(
+                                        self.image(
+                                            name,
+                                            history.id,
+                                            specs,
+                                            "held_root_all_entries_before_first_mark",
+                                        )? == history,
+                                        "policy held-root two-entry preflight differs",
+                                    )?;
+                                    for (i, spec) in specs.iter().enumerate() {
+                                        let expected = &history.files[i];
+                                        let child = relative(
+                                            &mut self.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(spec.name),
+                                            false,
+                                            FILE_OPEN,
+                                            DELETE | META,
+                                            null(),
+                                        )?;
+                                        let id = self.note_id(child)?;
+                                        let raw = self.raw(child);
+                                        kind(raw, false)?;
+                                        granted(raw, DELETE | META)?;
+                                        require(
+                                            id == expected.id
+                                                && snapshot(raw)? == expected.snapshot
+                                                && self.observed_descriptor(raw, spec.mask)?.1
+                                                    == expected.sd,
+                                            "policy DELETE child preimage differs",
+                                        )?;
+                                        let read = shared(
+                                            &mut self.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(spec.name),
+                                            false,
+                                            FILE_GENERIC_READ,
+                                        )?;
+                                        let read_id = self.note_id(read)?;
+                                        require(
+                                            read_id == id
+                                                && snapshot(self.raw(read))? == expected.snapshot
+                                                && self
+                                                    .observed_descriptor(self.raw(read), spec.mask)?
+                                                    .1
+                                                    == expected.sd,
+                                            "policy separate byte-oracle preimage differs",
+                                        )?;
+                                        raw_bytes(self.raw(read), spec.bytes)?;
+                                        self.close(
+                                            read,
+                                            Some(read_id),
+                                            "policy close byte oracle BEFORE disposition",
+                                        )?;
+                                        mark(
+                                            raw,
+                                            &mut self.removed[row].child_attempted[i],
+                                            &mut self.removed[row].child_mark[i],
+                                        )?;
+                                        self.close(
+                                            child,
+                                            Some(id),
+                                            "policy marked child cached-ID close ONLY",
+                                        )?;
+                                        scope_absent(
+                                            &mut self.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(spec.name),
+                                            false,
+                                        )?;
+                                        self.removed[row].child_absent[i] = true;
+                                    }
+                                    scope_empty(root)?;
+                                    require(
+                                        identity(root)? == history.id
+                                            && self.observed_descriptor(root, FILE_ALL_ACCESS)?.1
+                                                == history.sd,
+                                        "policy empty cleanup root differs",
+                                    )?;
+                                    self.close(
+                                        owner,
+                                        Some(root_id),
+                                        "policy close ALL noDELETE artifact root holds",
+                                    )?;
+                                    let remove = relative(
+                                        &mut self.base.h.oracle.handles,
+                                        parent,
+                                        OsStr::new(name),
+                                        true,
+                                        FILE_OPEN,
+                                        DELETE | META,
+                                        null(),
+                                    )?;
+                                    let id = self.note_id(remove)?;
+                                    let raw = self.raw(remove);
+                                    kind(raw, true)?;
+                                    granted(raw, DELETE | META)?;
+                                    require(
+                                        id == history.id
+                                            && self.observed_descriptor(raw, FILE_ALL_ACCESS)?.1
+                                                == history.sd,
+                                        "policy fresh root DELETE owner differs",
+                                    )?;
+                                    mark(
+                                        raw,
+                                        &mut self.removed[row].root_attempted,
+                                        &mut self.removed[row].root_mark,
+                                    )?;
+                                    self.close(
+                                        remove,
+                                        Some(id),
+                                        "policy marked root cached-ID close ONLY",
+                                    )?;
+                                    scope_absent(
+                                        &mut self.base.h.oracle.handles,
+                                        parent,
+                                        OsStr::new(name),
+                                        true,
+                                    )?;
+                                    self.removed[row].root_absent = true;
+                                    println!(
+                                        "package_policy_known_ID_teardown row={row} name={name} root={id:?} entries={} all_dispositions_checked_closed=true exact_parent_names_absent=true authority_genuine_acceptance_or_native_creation=true acl_repair=false global_volume_ID_absence_claim=false",
+                                        specs.len()
+                                    );
+                                    Ok(())
+                                }
+                                fn execute(&mut self) -> Result<(), Cause> {
+                                    self.base.h.prepare()?;
+                                    self.genuine()?;
+                                    self.native_fixture()?;
+                                    self.refusal()?;
+                                    self.phase = "two independent known-ID tree cleanups";
+                                    self.base.world("policy_before_both_tree_cleanups")?;
+                                    self.remove_tree(
+                                        0,
+                                        FINAL,
+                                        self.a.as_ref().unwrap().clone(),
+                                        &A,
+                                    )?;
+                                    self.remove_tree(
+                                        1,
+                                        NATIVE,
+                                        self.b.as_ref().unwrap().clone(),
+                                        &B,
+                                    )?;
+                                    require(
+                                        self.removed.iter().all(|r| r.root_absent),
+                                        "policy both roots must be absent before legacy teardown",
+                                    )?;
+                                    self.base.h.observe("policy_both_artifacts_absent", false)?;
+                                    self.phase = "full original parent lock canary teardown";
+                                    self.base.h.cleanup()?;
+                                    require(
+                                        self.base.unknown.is_empty()
+                                            && self
+                                                .base
+                                                .h
+                                                .oracle
+                                                .handles
+                                                .slots
+                                                .iter()
+                                                .all(Option::is_none)
+                                            && self.base.trials.len() == 12
+                                            && self.base.trials.iter().all(|t| {
+                                                t.closed
+                                                    && (t.lock_bool == 0
+                                                        || t.unlock.is_some_and(|(ok, e)| {
+                                                            ok != 0 && e == 0
+                                                        }))
+                                            }),
+                                        "policy final owners/lock trials incomplete",
+                                    )?;
+                                    println!(
+                                        "package_policy_complete genuine_two_R_RX=true private_FA_refusals=2 actual_Shared_and_Exclusive_readers=true native_FA_initial_healthy_refusal=true retained_error_origin=true both_known_ID_trees_and_original_fixture_removed=true source_review_only_uncertainty_branches=true native_failed_close_coverage=false"
+                                    );
+                                    Ok(())
+                                }
+                            }
+                            fn has_cause(error: &io::Error, expected: &str) -> bool {
+                                let mut cause: Option<&(dyn std::error::Error + 'static)> =
+                                    Some(error);
+                                while let Some(current) = cause {
+                                    if current.to_string() == expected {
+                                        return true;
+                                    }
+                                    cause = current.source();
+                                }
+                                false
+                            }
+                            pub(in crate::windows) struct Failure {
+                                cause: Cause,
+                                retained: Box<Control>,
+                            }
+                            impl std::fmt::Debug for Failure {
+                                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                    let cause = match &self.cause {
+                                        Cause::Io(e) => format!("Io({e:?})"),
+                                        Cause::Product(e) => format!("Product({e:?})"),
+                                    };
+                                    f.debug_struct("PACKAGE_POLICY_INVALID_OWNING_FAILURE")
+                                        .field("phase", &self.retained.phase)
+                                        .field("cause_diagnostic_only", &cause)
+                                        .field("accepted_history", &self.retained.accepted)
+                                        .field(
+                                            "native_create_attempts",
+                                            &(
+                                                self.retained.native_root_attempted,
+                                                self.retained.native_file_attempted,
+                                            ),
+                                        )
+                                        .field(
+                                            "actual_native_ids",
+                                            &(self.retained.root_b, self.retained.file_b),
+                                        )
+                                        .field("remaining_flight", &self.retained.flight.is_some())
+                                        .field("remaining_reader", &self.retained.reader.is_some())
+                                        .field("retained_refusal", &self.retained.refusal)
+                                        .field("native_progress", &self.retained.removed)
+                                        .field("uncertain_closes", &self.retained.base.unknown)
+                                        .field("retained_authority", &true)
+                                        .finish()
+                                }
+                            }
+                            pub(in crate::windows) fn run() -> Result<(), Failure> {
+                                let mut control = Control::new();
+                                match control.execute() {
+                                    Ok(()) => Ok(()),
+                                    Err(cause) => Err(Failure {
+                                        cause,
+                                        retained: Box::new(control),
+                                    }),
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -10207,6 +11375,12 @@ mod windows {
     -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::Failure>
     {
         execution_oracle::first_stage::discard_case::guard_case::read_seam_case::run()
+    }
+
+    #[test]
+    fn staged_package_policy_stays_distinct_from_private_mutation()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::Failure>{
+        execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::run()
     }
 
     #[test]

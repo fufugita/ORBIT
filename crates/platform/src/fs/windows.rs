@@ -2886,7 +2886,6 @@ mod staged_package {
         Existing(Arc<ReadDomain>),
     }
     impl ReadOrigin {
-        #[cfg(test)]
         fn closes(&self) -> &Arc<CloseState> {
             match self {
                 Self::Accepted(domain) => &domain.closes,
@@ -2901,8 +2900,14 @@ mod staged_package {
             }
         }
         fn error(&self, primary: io::Error, close: Option<io::Error>) -> io::Error {
+            let poisoned = self.closes().poisoned.load(Ordering::Acquire);
+            let kind = if poisoned || close.is_some() {
+                io::ErrorKind::Other
+            } else {
+                primary.kind()
+            };
             io::Error::new(
-                primary.kind(),
+                kind,
                 ReadFailure {
                     primary,
                     close: close.into_iter().collect(),
@@ -3067,8 +3072,14 @@ mod staged_package {
                     close.push(error);
                 }
             }
+            let poisoned = self.closes.poisoned.load(Ordering::Acquire);
+            let kind = if poisoned || !close.is_empty() {
+                io::ErrorKind::Other
+            } else {
+                primary.kind()
+            };
             io::Error::new(
-                primary.kind(),
+                kind,
                 ReadFailure {
                     primary,
                     close,
