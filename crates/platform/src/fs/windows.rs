@@ -2879,6 +2879,564 @@ mod staged_package {
             policy(raw, &self.user, &self.group, mask)
         }
     }
+    // Read-only origins deliberately carry no mutation Domain authority.
+    #[derive(Clone)]
+    enum ReadOrigin {
+        Accepted(Arc<Domain>),
+        Existing(Arc<ReadDomain>),
+    }
+    impl ReadOrigin {
+        #[cfg(test)]
+        fn closes(&self) -> &Arc<CloseState> {
+            match self {
+                Self::Accepted(domain) => &domain.closes,
+                Self::Existing(domain) => &domain.closes,
+            }
+        }
+        #[cfg(test)]
+        fn identities(&self) -> (FileIdentity, FileIdentity) {
+            match self {
+                Self::Accepted(d) => (d.parent_identity, d.lock_identity),
+                Self::Existing(d) => (d.parent_identity, d.lock_identity),
+            }
+        }
+        fn error(&self, primary: io::Error, close: Option<io::Error>) -> io::Error {
+            io::Error::new(
+                primary.kind(),
+                ReadFailure {
+                    primary,
+                    close: close.into_iter().collect(),
+                    origin: ReadErrorOrigin::Ready(self.clone()),
+                },
+            )
+        }
+    }
+    struct ReadDomain {
+        guard: Arc<StateLock>,
+        parent_identity: FileIdentity,
+        lock_identity: FileIdentity,
+        anchors: Vec<Arc<OwnedHandle>>,
+        identities: Vec<FileIdentity>,
+        security: Security,
+        parent_policy: PolicyFacts,
+        lock_policy: PolicyFacts,
+        context: execution_observation::ContextKey,
+        user: Vec<u8>,
+        closes: Arc<CloseState>,
+    }
+    impl ReadDomain {
+        fn check(&self) -> io::Result<()> {
+            self.closes.check()?;
+            check_source_anchors(&self.anchors, &self.identities)?;
+            let parent = self
+                .anchors
+                .last()
+                .ok_or_else(|| invalid("empty package read anchors"))?
+                .as_raw_handle();
+            self.security.check(parent)?;
+            self.guard.check()?;
+            if self.identities.last().copied() != Some(self.parent_identity)
+                || self.guard.file.parent != self.parent_identity
+                || self.guard.identity() != self.lock_identity
+                || read_security(parent)? != self.parent_policy
+                || read_security(self.guard.file.file.as_raw_handle())? != self.lock_policy
+            {
+                return Err(denied("published read parent/lock facts changed"));
+            }
+            if execution_observation::package_read_context(&self.closes)?.0 != self.context {
+                return Err(denied("published read effective context changed"));
+            }
+            self.closes.check()
+        }
+        fn facts(&self, raw: HANDLE, expected: &PolicyFacts, mask: u32) -> io::Result<PolicyFacts> {
+            // GROUP belongs to this object, independently of parent/token/siblings.
+            policy(raw, &self.user, &expected.group, mask)
+        }
+    }
+    enum ReadErrorOrigin {
+        Partial(Box<ReadInit>),
+        Ready(ReadOrigin),
+    }
+    struct ReadFailure {
+        primary: io::Error,
+        close: Vec<io::Error>,
+        origin: ReadErrorOrigin,
+    }
+    impl std::fmt::Debug for ReadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let (state, parent, lock) = match &self.origin {
+                ReadErrorOrigin::Partial(init) => {
+                    (&init.closes, init.parent_identity, init.lock_identity)
+                }
+                ReadErrorOrigin::Ready(ReadOrigin::Accepted(d)) => {
+                    (&d.closes, d.parent_identity, d.lock_identity)
+                }
+                ReadErrorOrigin::Ready(ReadOrigin::Existing(d)) => {
+                    (&d.closes, d.parent_identity, d.lock_identity)
+                }
+            };
+            f.debug_struct("PublishedReadError")
+                .field("primary", &self.primary)
+                .field("close", &self.close)
+                .field("parent", &parent)
+                .field("lock", &lock)
+                .field("ownership", state)
+                .finish()
+        }
+    }
+    impl std::fmt::Display for ReadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "published read failed: {}; {} checked-close errors",
+                self.primary,
+                self.close.len()
+            )
+        }
+    }
+    impl std::error::Error for ReadFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.primary)
+        }
+    }
+    struct ReadSlot {
+        owner: Option<OwnedHandle>,
+        actual: Option<FileIdentity>,
+        phase: &'static str,
+    }
+    // Created before any fallible guard/context/descriptor/native query.
+    struct ReadInit {
+        guard: Arc<StateLock>,
+        anchors: Vec<Arc<OwnedHandle>>,
+        identities: Vec<Option<FileIdentity>>,
+        security: Security,
+        parent_identity: FileIdentity,
+        lock_identity: FileIdentity,
+        closes: Arc<CloseState>,
+        ready: Option<Arc<ReadDomain>>,
+        slots: Vec<ReadSlot>,
+        ledger: Vec<ReadNode>,
+        context: Option<execution_observation::ContextKey>,
+        user: Option<Vec<u8>>,
+    }
+    impl ReadInit {
+        fn new(directory: &Directory, guard: Arc<StateLock>) -> Self {
+            Self {
+                lock_identity: guard.identity(),
+                guard,
+                anchors: directory.chain.clone(),
+                identities: vec![None; directory.chain.len()],
+                security: directory.security.clone(),
+                parent_identity: directory.identity,
+                closes: Arc::new(CloseState::default()),
+                ready: None,
+                slots: Vec::new(),
+                ledger: Vec::new(),
+                context: None,
+                user: None,
+            }
+        }
+        fn own(&mut self, owner: OwnedHandle, phase: &'static str) -> usize {
+            let slot = self.slots.len();
+            self.slots.push(ReadSlot {
+                owner: Some(owner),
+                actual: None,
+                phase,
+            });
+            slot
+        }
+        fn raw(&self, slot: usize) -> HANDLE {
+            self.slots[slot].owner.as_ref().unwrap().as_raw_handle()
+        }
+        fn measure(&mut self, slot: usize) -> io::Result<FileIdentity> {
+            let actual = identity(self.raw(slot))?;
+            self.slots[slot].actual = Some(actual);
+            Ok(actual)
+        }
+        fn close(&mut self, slot: usize) -> io::Result<()> {
+            let value = &mut self.slots[slot];
+            if let Some(owner) = value.owner.take() {
+                close_owned(owner, &self.closes, value.actual, value.phase)?;
+            }
+            Ok(())
+        }
+        fn fail(mut self, primary: io::Error) -> io::Error {
+            let mut close = Vec::new();
+            for slot in (0..self.slots.len()).rev() {
+                if let Err(error) = self.close(slot) {
+                    close.push(error);
+                }
+            }
+            io::Error::new(
+                primary.kind(),
+                ReadFailure {
+                    primary,
+                    close,
+                    origin: ReadErrorOrigin::Partial(Box::new(self)),
+                },
+            )
+        }
+        fn prepare(&mut self, directory: &Directory) -> io::Result<()> {
+            directory.require_lock(&self.guard, false)?;
+            for (index, owner) in self.anchors.iter().enumerate() {
+                self.identities[index] = Some(identity(owner.as_raw_handle())?);
+                ensure_kind(owner.as_raw_handle(), true)?;
+            }
+            let (context, user) = execution_observation::package_read_context(&self.closes)?;
+            self.context = Some(context.clone());
+            self.user = Some(user.clone());
+            let parent = self
+                .anchors
+                .last()
+                .ok_or_else(|| invalid("empty read parent chain"))?
+                .as_raw_handle();
+            let parent_policy = read_security(parent)?;
+            let lock_policy = read_security(self.guard.file.file.as_raw_handle())?;
+            let domain = Arc::new(ReadDomain {
+                guard: Arc::clone(&self.guard),
+                parent_identity: self.parent_identity,
+                lock_identity: self.lock_identity,
+                anchors: self.anchors.clone(),
+                identities: self
+                    .identities
+                    .iter()
+                    .map(|id| id.ok_or_else(|| invalid("incomplete read anchors")))
+                    .collect::<io::Result<Vec<_>>>()?,
+                security: self.security.clone(),
+                parent_policy,
+                lock_policy,
+                context,
+                user,
+                closes: Arc::clone(&self.closes),
+            });
+            self.ready = Some(domain);
+            self.ready.as_ref().unwrap().check()
+        }
+        fn node(
+            &mut self,
+            root: usize,
+            name: &OsStr,
+            expected: FileIdentity,
+        ) -> io::Result<ReadNode> {
+            let prepared = PreparedName::new(name)?;
+            let owner = native_open(
+                self.raw(root),
+                &prepared,
+                false,
+                FILE_OPEN,
+                FILE_GENERIC_READ,
+                READ_SHARE,
+                null(),
+                &self.closes,
+                "published-ledger-file",
+            )?;
+            let slot = self.own(owner, "published-ledger-file");
+            // Every later error goes through fail(), which closes this registered owner.
+            if self.measure(slot)? != expected {
+                return Err(denied("published ledger full ID differs"));
+            }
+            let raw = self.raw(slot);
+            ensure_kind(raw, false)?;
+            let before = source_snapshot(raw, expected, false)?;
+            if before.link_count != 1 || read_leaf(raw)? != name {
+                return Err(denied("published file link/name differs"));
+            }
+            let domain = Arc::clone(self.ready.as_ref().unwrap());
+            domain.check()?;
+            let (facts, executable) = read_policy(raw, &domain.user, false)?;
+            let observed = execution_observation::observe_package(
+                raw,
+                expected,
+                self.raw(root),
+                self.slots[root].actual.unwrap(),
+                name,
+                || source_snapshot(raw, expected, false),
+                &self.closes,
+            )?;
+            if observed.executable() != executable
+                || domain.facts(raw, &facts, mode(executable))? != facts
+                || source_snapshot(raw, expected, false)? != before
+            {
+                return Err(denied("published ledger policy/snapshot/execution changed"));
+            }
+            domain.check()?;
+            self.close(slot)?;
+            Ok(ReadNode {
+                name: name.to_os_string(),
+                identity: expected,
+                executable,
+                snapshot: before,
+                policy: facts,
+            })
+        }
+        fn construct(
+            &mut self,
+            directory: &Directory,
+            name: &OsStr,
+            expected: FileIdentity,
+        ) -> io::Result<(usize, ReadRoot)> {
+            self.prepare(directory)?;
+            let prepared = PreparedName::new(name)?;
+            let owner = native_open(
+                self.anchors.last().unwrap().as_raw_handle(),
+                &prepared,
+                true,
+                FILE_OPEN,
+                ROOT_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                &self.closes,
+                "published-read-root",
+            )?;
+            let root = self.own(owner, "published-read-root");
+            if self.measure(root)? != expected {
+                return Err(denied("published root actual full ID differs"));
+            }
+            ensure_kind(self.raw(root), true)?;
+            if self.identities.contains(&Some(expected)) || read_leaf(self.raw(root))? != name {
+                return Err(denied("published root repeats anchor or leaf differs"));
+            }
+            let snapshot = source_snapshot(self.raw(root), expected, true)?;
+            let (facts, _) = read_policy(self.raw(root), self.user.as_ref().unwrap(), true)?;
+            let limit = MAX_NAMES
+                .checked_sub(prepared.wide.len() * 2)
+                .filter(|n| *n > 0)
+                .ok_or_else(|| invalid("published read name budget exhausted"))?;
+            let entries = read_entries(self.raw(root), expected, limit)?;
+            for entry in entries {
+                let id = FileIdentity {
+                    volume: expected.volume,
+                    file: entry.identity,
+                };
+                if id == expected
+                    || self.identities.contains(&Some(id))
+                    || self.ledger.iter().any(|node| node.identity == id)
+                {
+                    return Err(denied("published ledger repeated full ID"));
+                }
+                let node = self.node(root, &entry.name, id)?;
+                self.ledger.push(node);
+            }
+            check_read_entries(self.raw(root), expected, limit, &self.ledger)?;
+            // Second full reopen pass; no node is committed from an unclosed temporary.
+            for index in 0..self.ledger.len() {
+                let name = self.ledger[index].name.clone();
+                let id = self.ledger[index].identity;
+                let node = self.node(root, &name, id)?;
+                if node != self.ledger[index] {
+                    return Err(denied("published ledger changed between complete passes"));
+                }
+            }
+            check_read_entries(self.raw(root), expected, limit, &self.ledger)?;
+            let domain = self.ready.as_ref().unwrap();
+            if domain.facts(self.raw(root), &facts, FILE_ALL_ACCESS)? != facts
+                || source_snapshot(self.raw(root), expected, true)? != snapshot
+                || read_leaf(self.raw(root))? != name
+            {
+                return Err(denied("published root changed during ledger capture"));
+            }
+            domain.check()?;
+            self.closes.zero()?;
+            Ok((
+                root,
+                ReadRoot {
+                    policy: facts,
+                    snapshot,
+                    name: name.to_os_string(),
+                    name_budget: limit,
+                },
+            ))
+        }
+    }
+    struct ReadRoot {
+        policy: PolicyFacts,
+        snapshot: SourceSnapshot,
+        name: OsString,
+        name_budget: usize,
+    }
+    fn read_entries(raw: HANDLE, root: FileIdentity, names: usize) -> io::Result<Vec<RawEntry>> {
+        let entries = source_directory_entries(
+            raw,
+            EnumerationLimits {
+                max_entries: MAX_ENTRIES,
+                max_name_bytes: names,
+            },
+        )?;
+        if entries
+            .iter()
+            .any(|entry| entry.directory || entry.identity == root.file)
+        {
+            return Err(unsupported(
+                "published read supports only flat ordinary files",
+            ));
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            if entries[..index]
+                .iter()
+                .any(|other| other.name == entry.name || other.identity == entry.identity)
+            {
+                return Err(denied("published read duplicate name/ID"));
+            }
+        }
+        Ok(entries)
+    }
+    fn check_read_entries(
+        raw: HANDLE,
+        root: FileIdentity,
+        names: usize,
+        ledger: &[ReadNode],
+    ) -> io::Result<()> {
+        let entries = read_entries(raw, root, names)?;
+        if entries.len() != ledger.len()
+            || entries.iter().any(|entry| {
+                !ledger.iter().any(|node| {
+                    node.name == entry.name
+                        && node.identity.volume == root.volume
+                        && node.identity.file == entry.identity
+                })
+            })
+        {
+            return Err(denied("published complete inventory changed"));
+        }
+        Ok(())
+    }
+    fn read_security(handle: HANDLE) -> io::Result<PolicyFacts> {
+        let mut owner = null_mut();
+        let mut group = null_mut();
+        let mut dacl = null_mut();
+        let mut raw = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                null_mut(),
+                &mut raw,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _allocation = LocalAllocation(raw.cast());
+        let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+        if length < size_of::<SECURITY_DESCRIPTOR_RELATIVE>() || length > MAX_SD {
+            return Err(invalid("published descriptor size outside bound"));
+        }
+        ok(unsafe { IsValidSecurityDescriptor(raw) })?;
+        let owner = sid_copy(owner, raw.cast(), length)?;
+        let group = sid_copy(group, raw.cast(), length)?;
+        let mut control = 0;
+        let mut revision = 0;
+        ok(unsafe { GetSecurityDescriptorControl(raw, &mut control, &mut revision) })?;
+        let offset = (dacl as usize)
+            .checked_sub(raw as usize)
+            .ok_or_else(|| invalid("published ACL outside descriptor"))?;
+        if dacl.is_null()
+            || dacl as usize % 4 != 0
+            || offset
+                .checked_add(size_of::<ACL>())
+                .is_none_or(|n| n > length)
+        {
+            return Err(invalid("published ACL header invalid"));
+        }
+        let size = unsafe { (*dacl).AclSize } as usize;
+        if size < size_of::<ACL>() || offset.checked_add(size).is_none_or(|n| n > length) {
+            return Err(invalid("published ACL tail invalid"));
+        }
+        ok(unsafe { IsValidAcl(dacl) })?;
+        let dacl = unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), size) }.to_vec();
+        Ok(PolicyFacts {
+            owner,
+            group,
+            dacl,
+            control,
+        })
+    }
+    fn read_policy(handle: HANDLE, user: &[u8], root: bool) -> io::Result<(PolicyFacts, bool)> {
+        let facts = read_security(handle)?;
+        let acl = &facts.dacl;
+        let control = SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE;
+        if facts.control & control != control
+            || facts.owner != user
+            || acl.len() < 8
+            || u16::from_le_bytes([acl[4], acl[5]]) != 1
+        {
+            return Err(denied("published managed owner/private policy differs"));
+        }
+        // Byte decoding avoids creating aligned native references into Vec<u8>.
+        let ace = &acl[8..];
+        if ace.len() < 16 || ace[0] != 0 || ace[1] != 0 {
+            return Err(denied(
+                "published managed ACE must be ordinary zero-flag allow",
+            ));
+        }
+        let size = u16::from_le_bytes([ace[2], ace[3]]) as usize;
+        let sid_size = 8 + ace[9] as usize * 4;
+        if size < 16
+            || size > ace.len()
+            || ace[9] > 15
+            || size != 8 + sid_size
+            || ace[8..size] != *user
+        {
+            return Err(denied("published managed ACE SID/layout differs"));
+        }
+        let mask = u32::from_le_bytes(ace[4..8].try_into().unwrap());
+        let executable = if root && mask == FILE_ALL_ACCESS {
+            false
+        } else if !root && mask == FILE_GENERIC_READ {
+            false
+        } else if !root && mask == (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) {
+            true
+        } else {
+            return Err(denied("published managed rights are not canonical"));
+        };
+        // Independent original strict parser binds this object's actual GROUP.
+        if policy(handle, user, &facts.group, mask)? != facts {
+            return Err(denied("published descriptor changed during capture"));
+        }
+        Ok((facts, executable))
+    }
+    fn read_leaf(handle: HANDLE) -> io::Result<OsString> {
+        let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_NT;
+        let needed = unsafe { GetFinalPathNameByHandleW(handle, null_mut(), 0, flags) };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if needed > 32768 {
+            return Err(invalid("published leaf bound exceeded"));
+        }
+        let mut buffer = vec![0u16; needed as usize + 1];
+        let length = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags)
+        };
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length as usize >= buffer.len() {
+            return Err(denied("published leaf changed"));
+        }
+        buffer.truncate(length as usize);
+        let start = buffer.iter().rposition(|c| *c == 92).map_or(0, |i| i + 1);
+        let leaf = OsString::from_wide(&buffer[start..]);
+        validate_source_component(&leaf)?;
+        Ok(leaf)
+    }
+    enum ReadBasis<'a> {
+        Mutation(&'a Arc<Domain>),
+        Existing(&'a Arc<ReadDomain>),
+    }
+    impl ReadBasis<'_> {
+        fn facts(&self, raw: HANDLE, expected: &PolicyFacts, mask: u32) -> io::Result<PolicyFacts> {
+            match self {
+                Self::Mutation(d) => d.facts(raw, mask),
+                Self::Existing(d) => d.facts(raw, expected, mask),
+            }
+        }
+    }
+
     struct StageNode {
         name: OsString,
         identity: Option<FileIdentity>,
@@ -3105,7 +3663,7 @@ mod staged_package {
         proof: Option<io::Error>,
         anchor: Option<io::Error>,
         file: Option<io::Error>,
-        domain: Arc<Domain>,
+        domain: ReadOrigin,
     }
     #[cfg(test)]
     impl std::fmt::Debug for TestTransferError {
@@ -3114,9 +3672,9 @@ mod staged_package {
                 .field("proof", &self.proof)
                 .field("anchor", &self.anchor)
                 .field("file", &self.file)
-                .field("parent", &self.domain.parent_identity)
-                .field("lock", &self.domain.lock_identity)
-                .field("closes", &self.domain.closes)
+                .field("parent", &self.domain.identities().0)
+                .field("lock", &self.domain.identities().1)
+                .field("closes", self.domain.closes())
                 .finish()
         }
     }
@@ -3129,7 +3687,7 @@ mod staged_package {
                 self.proof,
                 self.anchor,
                 self.file,
-                self.domain.closes.poisoned.load(Ordering::Acquire)
+                self.domain.closes().poisoned.load(Ordering::Acquire)
             )
         }
     }
@@ -3206,7 +3764,7 @@ mod staged_package {
     #[cfg(test)]
     fn reject_test_view(
         view: &mut PackageFile<'_>,
-        domain: Arc<Domain>,
+        domain: ReadOrigin,
         proof: io::Error,
     ) -> io::Error {
         let file = view
@@ -3226,16 +3784,16 @@ mod staged_package {
     #[cfg(test)]
     impl TestLiveView {
         pub(super) fn detach(mut view: PackageFile<'_>) -> io::Result<Self> {
-            let domain = match &view.lease {
-                PackageLease::Stage(core) => Arc::clone(&core.domain),
-                PackageLease::Published(directory) => Arc::clone(&directory.domain),
+            let origin = match &view.lease {
+                PackageLease::Stage(core) => ReadOrigin::Accepted(Arc::clone(&core.domain)),
+                PackageLease::Published(directory) => directory.origin.clone(),
             };
             let core = match &view.lease {
                 PackageLease::Stage(core) => *core,
                 PackageLease::Published(_) => {
                     return Err(reject_test_view(
                         &mut view,
-                        domain,
+                        origin,
                         invalid("test transfer requires a normal stage view"),
                     ));
                 }
@@ -3245,7 +3803,7 @@ mod staged_package {
                 None => {
                     return Err(reject_test_view(
                         &mut view,
-                        domain,
+                        origin,
                         invalid("test stage root ID unavailable"),
                     ));
                 }
@@ -3255,11 +3813,12 @@ mod staged_package {
                 None => {
                     return Err(reject_test_view(
                         &mut view,
-                        domain,
+                        origin,
                         invalid("test stage root policy unavailable"),
                     ));
                 }
             };
+            let domain = Arc::clone(&core.domain);
             let mut holder = Self {
                 file: None,
                 root: None,
@@ -3333,7 +3892,7 @@ mod staged_package {
                         proof: Some(proof),
                         anchor,
                         file,
-                        domain: Arc::clone(&holder.domain),
+                        domain: ReadOrigin::Accepted(Arc::clone(&holder.domain)),
                     },
                 ));
             }
@@ -3364,7 +3923,7 @@ mod staged_package {
                     proof: None,
                     anchor,
                     file,
-                    domain: Arc::clone(&self.domain),
+                    domain: ReadOrigin::Accepted(Arc::clone(&self.domain)),
                 }));
             }
             self.domain.closes.check()
@@ -3528,13 +4087,15 @@ mod staged_package {
         identity: FileIdentity,
     }
     pub struct PackageDirectory {
-        domain: Arc<Domain>,
+        origin: ReadOrigin,
+        existing_root: Option<ReadRoot>,
         chain: Vec<(OwnedHandle, FileIdentity)>,
         identity: FileIdentity,
         ledger: Vec<ReadNode>,
         remaining_depth: usize,
         enumeration: Mutex<()>,
     }
+    #[derive(Eq, PartialEq)]
     struct ReadNode {
         name: OsString,
         identity: FileIdentity,
@@ -4037,11 +4598,23 @@ mod staged_package {
             expected: FileIdentity,
         ) -> io::Result<PackageDirectory> {
             validate_data_component(name)?;
-            self.require_lock(&guard, false)?;
             if expected.volume != self.identity.volume {
                 return Err(denied("published package volume differs from held parent"));
             }
-            Err(unsupported("published package opening is not implemented"))
+            let mut init = ReadInit::new(self, guard);
+            let (root, facts) = match init.construct(self, name, expected) {
+                Ok(value) => value,
+                Err(error) => return Err(init.fail(error)),
+            };
+            Ok(PackageDirectory {
+                origin: ReadOrigin::Existing(init.ready.take().unwrap()),
+                existing_root: Some(facts),
+                chain: vec![(init.slots[root].owner.take().unwrap(), expected)],
+                identity: expected,
+                ledger: std::mem::take(&mut init.ledger),
+                remaining_depth: 64,
+                enumeration: Mutex::new(()),
+            })
         }
 
         pub fn stage_directory(
@@ -4562,28 +5135,47 @@ mod staged_package {
     }
 
     impl PackageFile<'_> {
+        fn bind_read_error<T>(&self, result: io::Result<T>) -> io::Result<T> {
+            match &self.lease {
+                PackageLease::Published(directory)
+                    if matches!(&directory.origin, ReadOrigin::Existing(_)) =>
+                {
+                    result.map_err(|error| directory.origin.error(error, None))
+                }
+                _ => result,
+            }
+        }
         fn raw(&self) -> io::Result<HANDLE> {
             self.file
                 .as_ref()
                 .map(AsRawHandle::as_raw_handle)
                 .ok_or_else(|| invalid("package view is closed"))
         }
-        fn domain_root(&self) -> io::Result<(&Arc<Domain>, HANDLE, FileIdentity)> {
+        fn domain_root(&self) -> io::Result<(ReadBasis<'_>, HANDLE, FileIdentity)> {
             match &self.lease {
                 PackageLease::Stage(core) => {
                     core.check_root()?;
-                    Ok((&core.domain, core.raw()?, core.root_identity.unwrap()))
+                    Ok((
+                        ReadBasis::Mutation(&core.domain),
+                        core.raw()?,
+                        core.root_identity.unwrap(),
+                    ))
                 }
                 PackageLease::Published(directory) => {
                     directory.check()?;
-                    Ok((&directory.domain, directory.root(), directory.identity))
+                    let basis = match &directory.origin {
+                        ReadOrigin::Accepted(domain) => ReadBasis::Mutation(domain),
+                        ReadOrigin::Existing(domain) => ReadBasis::Existing(domain),
+                    };
+                    Ok((basis, directory.root(), directory.identity))
                 }
             }
         }
         fn check(&self) -> io::Result<()> {
             let (domain, _, parent) = self.domain_root()?;
             if self.identity.volume != parent.volume
-                || domain.facts(self.raw()?, mode(self.expected_executable))? != self.policy
+                || domain.facts(self.raw()?, &self.policy, mode(self.expected_executable))?
+                    != self.policy
                 || source_snapshot(self.raw()?, self.identity, false)? != self.snapshot
             {
                 return Err(denied("package read view identity/policy/snapshot changed"));
@@ -4594,46 +5186,55 @@ mod staged_package {
             self.identity
         }
         pub fn snapshot(&self) -> io::Result<SourceSnapshot> {
-            self.check()?;
-            source_snapshot(self.raw()?, self.identity, false)
+            let result = (|| {
+                self.check()?;
+                source_snapshot(self.raw()?, self.identity, false)
+            })();
+            self.bind_read_error(result)
         }
         pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
-            let before = self.snapshot()?;
-            let file = self
-                .file
-                .as_mut()
-                .ok_or_else(|| invalid("closed package view"))?;
-            file.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            (&mut *file)
-                .take(maximum.saturating_add(1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > maximum {
-                return Err(invalid("package file exceeds read limit"));
-            }
-            if self.snapshot()? != before {
-                return Err(denied("package changed during checked read"));
-            }
-            Ok(bytes)
+            let result = (|| {
+                let before = self.snapshot()?;
+                let file = self
+                    .file
+                    .as_mut()
+                    .ok_or_else(|| invalid("closed package view"))?;
+                file.seek(SeekFrom::Start(0))?;
+                let mut bytes = Vec::new();
+                (&mut *file)
+                    .take(maximum.saturating_add(1) as u64)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > maximum {
+                    return Err(invalid("package file exceeds read limit"));
+                }
+                if self.snapshot()? != before {
+                    return Err(denied("package changed during checked read"));
+                }
+                Ok(bytes)
+            })();
+            self.bind_read_error(result)
         }
         pub fn execution_permission(&self) -> io::Result<ExecutionPermission> {
-            self.check()?;
-            let (_, parent, parent_id) = self.domain_root()?;
-            let value = execution_observation::observe_package(
-                self.raw()?,
-                self.identity,
-                parent,
-                parent_id,
-                &self.name,
-                || self.snapshot(),
-                &self.closes,
-            )?;
-            if value.executable() != self.expected_executable {
-                return Err(denied(
-                    "package execution observation disagrees with declared mode",
-                ));
-            }
-            Ok(value)
+            let result = (|| {
+                self.check()?;
+                let (_, parent, parent_id) = self.domain_root()?;
+                let value = execution_observation::observe_package(
+                    self.raw()?,
+                    self.identity,
+                    parent,
+                    parent_id,
+                    &self.name,
+                    || self.snapshot(),
+                    &self.closes,
+                )?;
+                if value.executable() != self.expected_executable {
+                    return Err(denied(
+                        "package execution observation disagrees with declared mode",
+                    ));
+                }
+                Ok(value)
+            })();
+            self.bind_read_error(result)
         }
     }
     impl Drop for PackageFile<'_> {
@@ -4750,7 +5351,8 @@ mod staged_package {
                 .collect();
             let reader = self.core.reader.take().unwrap();
             let directory = PackageDirectory {
-                domain: self.core.domain,
+                origin: ReadOrigin::Accepted(self.core.domain),
+                existing_root: None,
                 chain: vec![(reader, self.identity)],
                 identity: self.identity,
                 ledger,
@@ -4769,13 +5371,26 @@ mod staged_package {
             self.chain.last().unwrap().0.as_raw_handle()
         }
         fn check(&self) -> io::Result<()> {
-            self.domain.check()?;
+            let domain = match &self.origin {
+                ReadOrigin::Accepted(domain) => domain,
+                ReadOrigin::Existing(domain) => {
+                    let result = (|| {
+                        let _serial = self
+                            .enumeration
+                            .lock()
+                            .map_err(|_| denied("published read serialization poisoned"))?;
+                        self.check_existing_inner(domain)
+                    })();
+                    return result.map_err(|error| self.origin.error(error, None));
+                }
+            };
+            domain.check()?;
             for (owner, expected) in &self.chain {
                 ensure_kind(owner.as_raw_handle(), true)?;
                 if identity(owner.as_raw_handle())? != *expected {
                     return Err(denied("accepted package chain identity changed"));
                 }
-                self.domain.facts(owner.as_raw_handle(), FILE_ALL_ACCESS)?;
+                domain.facts(owner.as_raw_handle(), FILE_ALL_ACCESS)?;
             }
             if self.chain.last().map(|(_, id)| *id) != Some(self.identity)
                 || self.remaining_depth == 0
@@ -4793,6 +5408,12 @@ mod staged_package {
             expected: FileIdentity,
             executable: bool,
         ) -> io::Result<PackageFile<'p>> {
+            let domain = match &self.origin {
+                ReadOrigin::Accepted(domain) => domain,
+                ReadOrigin::Existing(domain) => {
+                    return self.verify_existing(domain, name, expected, executable);
+                }
+            };
             let _serial = self
                 .enumeration
                 .lock()
@@ -4816,12 +5437,12 @@ mod staged_package {
                 FILE_GENERIC_READ,
                 READ_SHARE,
                 null(),
-                &self.domain.closes,
+                &domain.closes,
                 "accepted-package-reader",
             )?;
             let result = (|| {
                 if source_snapshot(owner.as_raw_handle(), expected, false)? != node.snapshot
-                    || self.domain.facts(owner.as_raw_handle(), mode(executable))? != node.policy
+                    || domain.facts(owner.as_raw_handle(), mode(executable))? != node.policy
                 {
                     return Err(denied("accepted package entry changed"));
                 }
@@ -4831,16 +5452,16 @@ mod staged_package {
             if let Err(error) = result {
                 return finish_owned(
                     owner,
-                    &self.domain.closes,
+                    &domain.closes,
                     Some(expected),
                     "failed accepted package view",
                     Err(error),
                 );
             }
-            if let Err(error) = self.domain.closes.acquire() {
+            if let Err(error) = domain.closes.acquire() {
                 return finish_owned(
                     owner,
-                    &self.domain.closes,
+                    &domain.closes,
                     Some(expected),
                     "unleased accepted view",
                     Err(error),
@@ -4854,10 +5475,140 @@ mod staged_package {
                 policy: node.policy.clone(),
                 name: node.name.clone(),
                 lease: PackageLease::Published(self),
-                closes: Arc::clone(&self.domain.closes),
+                closes: Arc::clone(&domain.closes),
             };
             view.execution_permission()?;
             Ok(view)
+        }
+        fn check_existing_inner(&self, domain: &Arc<ReadDomain>) -> io::Result<()> {
+            domain.check()?;
+            let facts = self
+                .existing_root
+                .as_ref()
+                .ok_or_else(|| invalid("published root facts missing"))?;
+            if self.chain.len() != 1 || self.remaining_depth == 0 {
+                return Err(invalid("published flat root chain invalid"));
+            }
+            let (owner, expected) = &self.chain[0];
+            let raw = owner.as_raw_handle();
+            ensure_kind(raw, true)?;
+            if *expected != self.identity
+                || identity(raw)? != self.identity
+                || read_leaf(raw)? != facts.name
+                || source_snapshot(raw, self.identity, true)? != facts.snapshot
+                || domain.facts(raw, &facts.policy, FILE_ALL_ACCESS)? != facts.policy
+            {
+                return Err(denied("published retained root facts changed"));
+            }
+            check_read_entries(raw, self.identity, facts.name_budget, &self.ledger)?;
+            domain.check()
+        }
+        fn verify_existing<'p>(
+            &'p self,
+            domain: &Arc<ReadDomain>,
+            name: &OsStr,
+            expected: FileIdentity,
+            executable: bool,
+        ) -> io::Result<PackageFile<'p>> {
+            let result = (|| {
+                let serial = self
+                    .enumeration
+                    .lock()
+                    .map_err(|_| denied("published read serialization poisoned"))?;
+                validate_source_component(name)?;
+                self.check_existing_inner(domain)?;
+                let node = self
+                    .ledger
+                    .iter()
+                    .find(|node| node.identity == expected && node.name == name)
+                    .ok_or_else(|| denied("published file name/full ID not in ledger"))?;
+                if node.executable != executable {
+                    return Err(denied("published declared mode differs"));
+                }
+                let prepared = PreparedName::new(name)?;
+                let owner = native_open(
+                    self.root(),
+                    &prepared,
+                    false,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ,
+                    READ_SHARE,
+                    null(),
+                    &domain.closes,
+                    "published-existing-reader",
+                )?;
+                let mut actual = None;
+                let proof = (|| {
+                    actual = Some(identity(owner.as_raw_handle())?);
+                    if actual != Some(expected) {
+                        return Err(denied("published reopened actual full ID differs"));
+                    }
+                    ensure_kind(owner.as_raw_handle(), false)?;
+                    if read_leaf(owner.as_raw_handle())? != node.name
+                        || source_snapshot(owner.as_raw_handle(), expected, false)? != node.snapshot
+                        || domain.facts(owner.as_raw_handle(), &node.policy, mode(executable))?
+                            != node.policy
+                    {
+                        return Err(denied("published reopened file facts changed"));
+                    }
+                    self.check_existing_inner(domain)
+                })();
+                if let Err(error) = proof {
+                    let close = close_owned(
+                        owner,
+                        &domain.closes,
+                        actual,
+                        "failed published existing view",
+                    )
+                    .err();
+                    return Err(self.origin.error(error, close));
+                }
+                if let Err(error) = domain.closes.acquire() {
+                    let close = close_owned(
+                        owner,
+                        &domain.closes,
+                        actual,
+                        "unleased published existing view",
+                    )
+                    .err();
+                    return Err(self.origin.error(error, close));
+                }
+                let mut view = PackageFile {
+                    file: Some(File::from(owner)),
+                    identity: expected,
+                    expected_executable: executable,
+                    snapshot: node.snapshot,
+                    policy: node.policy.clone(),
+                    name: node.name.clone(),
+                    lease: PackageLease::Published(self),
+                    closes: Arc::clone(&domain.closes),
+                };
+                // Later checks take their own enumeration guard; no recursive mutex.
+                drop(serial);
+                if let Err(error) = view.execution_permission() {
+                    let close = view
+                        .file
+                        .take()
+                        .and_then(|file| close_file_lease(file, &view.closes, view.identity).err());
+                    return Err(self.origin.error(error, close));
+                }
+                Ok(view)
+            })();
+            result.map_err(|error| self.origin.error(error, None))
+        }
+    }
+    impl Drop for PackageDirectory {
+        fn drop(&mut self) {
+            if let ReadOrigin::Existing(domain) = &self.origin {
+                while let Some((owner, actual)) = self.chain.pop() {
+                    let _ = close_owned(
+                        owner,
+                        &domain.closes,
+                        Some(actual),
+                        "published existing root drop",
+                    );
+                }
+            }
         }
     }
     impl PackageAcceptance {
@@ -5800,6 +6551,25 @@ mod execution_observation {
                 return Err(denied("test current effective context changed"));
             }
             Ok(key)
+        })();
+        handles.finish_package(result, state)
+    }
+
+    pub(super) fn package_read_context(
+        state: &Arc<staged_package::CloseState>,
+    ) -> io::Result<(ContextKey, Vec<u8>)> {
+        let mut handles = Handles::default();
+        let result = (|| {
+            let (original, key) = effective(&mut handles)?;
+            if context(handles.raw(original), key.thread_token)? != key {
+                return Err(denied("published original effective context changed"));
+            }
+            let (_, current) = effective(&mut handles)?;
+            if current != key {
+                return Err(denied("published current effective context changed"));
+            }
+            let user = key.user.clone();
+            Ok((key, user))
         })();
         handles.finish_package(result, state)
     }
