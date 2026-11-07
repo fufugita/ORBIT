@@ -175,11 +175,12 @@ $env:CARGO_BUILD_JOBS = '1'
 $env:CARGO_TERM_COLOR = 'never'
 $env:NO_COLOR = '1'
 if ($Group -eq 'PrivateStores') {
-    $log = Join-Path $EvidenceDir 'private-stores-lib.log'
-    cargo +1.99.0 test --locked --no-fail-fast -p orbit-adapter --lib -- --test-threads=1 --show-output 2>&1 |
+    if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'PrivateStores requires an exact source identity' }
+    $log = Join-Path $EvidenceDir 'private-stores.log'
+    cargo +1.99.0 test --locked --no-fail-fast -p orbit-adapter --lib --test provider_credentials -- --test-threads=1 --show-output 2>&1 |
         Tee-Object -FilePath $log
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $required = @(
+    $libraryRequired = @(
         'provider_credentials::tests::provider_storage_foreign_ownership_is_rejected_without_privileged_fixture',
         'provider_credentials::tests::provider_storage_held_directory_rejects_inode_substitution',
         'provider_credentials::tests::provider_storage_held_home_rejects_root_substitution',
@@ -239,29 +240,133 @@ if ($Group -eq 'PrivateStores') {
         'types::billing_kernel_tests::partial_v2_contracts_remain_incomplete_and_bind_spend_ceiling',
         'types::tool_round_quote_probe::tool_round_reasoning_exceeding_output_quotes_complete_zero'
     )
-    if ($required.Count -ne 58 -or @($required | Select-Object -Unique).Count -ne 58) {
+    $integrationRequired = @(
+        'exact_saved_binding_resolves_with_safe_status_and_private_modes',
+        'each_identity_field_is_isolated_including_path_query_and_reference',
+        'identity_hash_uses_field_boundaries',
+        'printable_provider_names_with_spaces_and_unicode_save_and_resolve_exactly',
+        'provider_name_edge_whitespace_slash_and_controls_are_rejected',
+        'provider_names_use_the_existing_utf8_byte_limit',
+        'provider_name_unicode_composition_and_interior_spaces_do_not_collapse_bindings',
+        'declared_environment_precedes_saved_value',
+        'empty_environment_falls_back_to_exact_saved_binding',
+        'no_declaration_never_calls_lookup_or_reads_saved_storage',
+        'missing_required_auth_does_not_create_storage',
+        'invalid_nonempty_environment_refuses_without_saved_fallback',
+        'environment_lookup_error_is_typed_and_does_not_fall_back',
+        'active_environment_does_not_require_healthy_unused_saved_storage',
+        'candidate_environment_precedes_matching_draft_and_saved_sources',
+        'exact_matching_draft_precedes_saved_without_publication',
+        'mismatched_draft_is_never_used_for_candidate',
+        'fresh_private_reference_does_not_query_old_environment',
+        'no_auth_cannot_save_a_binding',
+        'expected_absence_cannot_replace_existing_binding',
+        'exact_revision_replaces_and_stale_save_preserves_bytes',
+        'identical_save_requires_expected_revision_and_is_idempotent',
+        'returning_to_previous_key_does_not_revive_old_revision',
+        'removal_requires_revision_and_preserves_other_binding',
+        'absent_removal_does_not_create_a_store',
+        'diagnostic_surfaces_never_contain_keys',
+        'invalid_keys_refuse_before_creating_storage',
+        'maximum_key_size_is_accepted',
+        'malformed_identity_never_echoes_supplied_content',
+        'unsafe_home_permissions_are_refused_without_chmod',
+        'safe_existing_home_mode_is_preserved',
+        'unsafe_auth_directory_is_refused_without_repair_or_overwrite',
+        'symlink_home_or_auth_directory_never_follows_target',
+        'providers_directory_symlink_is_refused',
+        'record_symlink_is_refused_and_target_is_preserved',
+        'hardlinked_record_is_refused_and_alias_preserved',
+        'unsafe_record_modes_are_refused_without_repair',
+        'embedded_identity_mismatch_is_refused_without_disclosing_key',
+        'truncated_and_trailing_records_are_refused',
+        'oversized_record_is_refused_without_replacement',
+        'record_count_limit_refuses_new_binding_and_preserves_existing',
+        'unrelated_store_file_is_preserved_on_refusal',
+        'unsafe_lock_is_refused_without_touching_valid_record',
+        'store_requires_normal_absolute_home_and_does_not_create_it',
+        'read_only_status_missing_store_never_creates_directories',
+        'read_only_status_does_not_recreate_missing_lock_or_change_records',
+        'read_only_status_uses_validated_environment_and_saved_source_without_writes'
+    )
+    if ($libraryRequired.Count -ne 58 -or @($libraryRequired | Select-Object -Unique).Count -ne 58) {
         throw 'PrivateStores requires all 58 unique adapter library cases'
     }
+    if ($integrationRequired.Count -ne 47 -or @($integrationRequired | Select-Object -Unique).Count -ne 47) {
+        throw 'PrivateStores requires all 47 unique credential integration cases'
+    }
+    $required = @($libraryRequired) + @($integrationRequired)
+    if ($required.Count -ne 105 -or @($required | Select-Object -Unique).Count -ne 105) {
+        throw 'PrivateStores requires 105 disjoint library and integration cases'
+    }
     $report = Get-Content $log -Raw
-    $rows = [regex]::Matches($report, '(?m)^test (?<case>[^\r\n]+) \.\.\. (?<status>ok|FAILED|ignored)\r?$')
-    if ($rows.Count -ne $required.Count) { throw 'Adapter library case count differs from the exact manifest' }
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($row in $rows) {
-        $case = $row.Groups['case'].Value
-        if (-not $seen.Add($case) -or $case -cnotin $required -or $row.Groups['status'].Value -cne 'ok') {
-            throw "Unexpected, duplicate or unsuccessful adapter library case: $case"
+    $requiredByTarget = @{ lib = $libraryRequired; provider_credentials = $integrationRequired }
+    $seenTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $completedTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $globalSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $caseEvidence = [Collections.Generic.List[object]]::new()
+    $activeTarget = $null
+    $activeRequired = $null
+    $blockSeen = $null
+    $headerPattern = '^[ \t]*Running (?:(?<lib>unittests src[\\/]lib\.rs)|(?<integration>tests[\\/]provider_credentials\.rs)) \('
+    $rowPattern = '^test (?<case>[^\r\n]+) \.\.\. (?<status>ok|FAILED|ignored)\r?$'
+    $summaryPattern = '^test result: (?<status>ok|FAILED)\. (?<passed>[0-9]+) passed; (?<failed>[0-9]+) failed; (?<ignored>[0-9]+) ignored; (?<measured>[0-9]+) measured; (?<filtered>[0-9]+) filtered out;[^\r\n]*\r?$'
+    foreach ($line in ($report -split '\r?\n')) {
+        $header = [regex]::Match($line, $headerPattern)
+        if ($header.Success) {
+            $target = if ($header.Groups['lib'].Success) { 'lib' } else { 'provider_credentials' }
+            if ($null -ne $activeTarget -or -not $seenTargets.Add($target)) {
+                throw 'Duplicate adapter binary or preceding binary without its completed summary'
+            }
+            $activeTarget = $target
+            $activeRequired = @($requiredByTarget[$target])
+            $blockSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            continue
         }
+        if ($line -cmatch '^[ \t]*Running ') { throw 'Unexpected adapter test binary' }
+        $summary = [regex]::Match($line, $summaryPattern)
+        if ($summary.Success) {
+            if ($null -eq $activeTarget) { throw 'Adapter summary outside an active binary block' }
+            if ($summary.Groups['status'].Value -cne 'ok' -or
+                [int]$summary.Groups['passed'].Value -ne $activeRequired.Count) {
+                throw "Incorrect adapter summary for observed binary: $activeTarget"
+            }
+            foreach ($counter in @('failed', 'ignored', 'measured', 'filtered')) {
+                if ([int]$summary.Groups[$counter].Value -ne 0) { throw "Nonzero adapter suite counter: $counter" }
+            }
+            if ($blockSeen.Count -ne $activeRequired.Count) { throw "Incorrect case count in binary: $activeTarget" }
+            foreach ($case in $activeRequired) {
+                if (-not $blockSeen.Contains($case)) { throw "Missing case in observed binary $activeTarget : $case" }
+            }
+            if (-not $completedTargets.Add($activeTarget)) { throw 'Duplicate adapter binary summary' }
+            $activeTarget = $null
+            $activeRequired = $null
+            $blockSeen = $null
+            continue
+        }
+        $row = [regex]::Match($line, $rowPattern)
+        if ($row.Success) {
+            if ($null -eq $activeTarget) { throw 'Adapter case outside an active binary block' }
+            $case = $row.Groups['case'].Value
+            if ($case -cnotin $activeRequired -or $row.Groups['status'].Value -cne 'ok' -or
+                -not $blockSeen.Add($case) -or -not $globalSeen.Add($case)) {
+                throw "Unexpected, duplicate or unsuccessful case in observed binary $activeTarget : $case"
+            }
+            $caseEvidence.Add(@{ name = $case; status = $row.Groups['status'].Value; target = $activeTarget })
+            continue
+        }
+        if ($line -match '^test ') { throw 'Unparsed adapter case or summary line' }
     }
-    foreach ($case in $required) {
-        if (-not $seen.Contains($case)) { throw "Required native adapter library case did not pass: $case" }
+    if ($null -ne $activeTarget -or $seenTargets.Count -ne 2 -or $completedTargets.Count -ne 2 -or
+        -not $completedTargets.Contains('lib') -or -not $completedTargets.Contains('provider_credentials')) {
+        throw 'Both exact adapter binary blocks must complete once'
     }
-    if ($report -match '\b[1-9][0-9]* (ignored|filtered out)\b') { throw 'Adapter library cases were skipped' }
-    if ($report -notmatch '(?m)^test result: ok\. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;') {
-        throw 'Expected the exact nonzero adapter library test summary'
-    }
-    @{ required_cases = $required.Count; logical_cases = 57; credential_logical_cases = 9;
-       child_helper_cases = 1; status = 'passed'; source = $env:GITHUB_SHA } |
-        ConvertTo-Json | Out-File (Join-Path $EvidenceDir 'private-stores.json')
+    if ($globalSeen.Count -ne 105 -or $caseEvidence.Count -ne 105) { throw 'Expected exactly 105 observed adapter cases' }
+    if ($report -match '\b[1-9][0-9]* (ignored|filtered out)\b') { throw 'Adapter cases were skipped' }
+    @{ required_cases = 105; library_required_cases = 58; integration_required_cases = 47;
+       raw_cases = 105; logical_cases = 104; credential_logical_cases = 56; child_helper_cases = 1;
+       status = 'passed'; source = $env:GITHUB_SHA; cases = @($caseEvidence.ToArray()) } |
+        ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'private-stores.json')
     return
 }
 if ($Group -eq 'Foundation') {
