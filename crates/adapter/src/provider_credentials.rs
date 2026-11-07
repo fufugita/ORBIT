@@ -1949,6 +1949,7 @@ mod tests {
 
     #[cfg(windows)]
     fn fixture_command(
+        operation: &'static str,
         program: &Path,
         arguments: &[&std::ffi::OsStr],
         path: Option<&Path>,
@@ -1981,7 +1982,31 @@ mod tests {
         }
         // The terminal state was observed before moving out of the ownership guard.
         let output = child.0.take().unwrap().wait_with_output().unwrap();
-        assert!(output.status.success(), "native fixture command failed");
+        let diagnostic = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+            let mut clipped = String::new();
+            for character in text.chars() {
+                let character =
+                    if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                        '\u{fffd}'
+                    } else {
+                        character
+                    };
+                if clipped.len() + character.len_utf8() > 4096 {
+                    break;
+                }
+                clipped.push(character);
+            }
+            clipped
+        };
+        assert!(
+            output.status.success(),
+            "native fixture command failed: program={} operation={operation} status={}\nstdout (at most 4096 bytes):\n{}\nstderr (at most 4096 bytes):\n{}",
+            program.file_name().unwrap_or_default().to_string_lossy(),
+            output.status,
+            diagnostic(&output.stdout),
+            diagnostic(&output.stderr)
+        );
         assert!(output.stdout.len() <= 16384 && output.stderr.len() <= 16384);
         output
     }
@@ -1997,6 +2022,7 @@ mod tests {
     fn acl_snapshot(path: &Path) -> String {
         use std::ffi::OsStr;
         let output = fixture_command(
+            "acl_snapshot",
             &system_program("WindowsPowerShell/v1.0/powershell.exe"),
             &[
                 OsStr::new("-NoProfile"),
@@ -2015,6 +2041,7 @@ mod tests {
     fn owner_sid(path: &Path) -> String {
         use std::ffi::OsStr;
         let output = fixture_command(
+            "owner_sid",
             &system_program("WindowsPowerShell/v1.0/powershell.exe"),
             &[
                 OsStr::new("-NoProfile"),
@@ -2033,6 +2060,7 @@ mod tests {
     fn unsafe_directory_policy(path: &Path) -> String {
         use std::ffi::OsStr;
         let output = fixture_command(
+            "unsafe_directory_policy",
             &system_program("WindowsPowerShell/v1.0/powershell.exe"),
             &[
                 OsStr::new("-NoProfile"),
@@ -2096,13 +2124,14 @@ mod tests {
         use std::ffi::OsStr;
         let mut args = vec![path.as_os_str()];
         args.extend(arguments.iter().map(OsStr::new));
-        fixture_command(&system_program("icacls.exe"), &args, None);
+        fixture_command("icacls", &system_program("icacls.exe"), &args, None);
     }
 
     #[cfg(windows)]
     fn current_sid() -> String {
         use std::ffi::OsStr;
         let output = fixture_command(
+            "current_sid",
             &system_program("WindowsPowerShell/v1.0/powershell.exe"),
             &[
                 OsStr::new("-NoProfile"),
