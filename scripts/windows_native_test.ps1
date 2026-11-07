@@ -246,10 +246,11 @@ if ($Group -eq 'Foundation') {
         'windows::source_execution_permission_denial_is_extension_independent',
         'windows::staged_package_seals_and_publishes_one_file',
         'windows::staged_package_discard_removes_one_sealed_file',
-        'windows::staged_package_requires_matching_exclusive_parent_guard'
+        'windows::staged_package_requires_matching_exclusive_parent_guard',
+        'windows::staged_package_no_clobber_preserves_file_empty_and_populated_targets'
     )
-    if ($required.Count -ne 67 -or @($required | Select-Object -Unique).Count -ne 67) {
-        throw "Foundation's exact required-name manifest must contain 67 unique cases; found $($required.Count)"
+    if ($required.Count -ne 68 -or @($required | Select-Object -Unique).Count -ne 68) {
+        throw "Foundation's exact required-name manifest must contain 68 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {

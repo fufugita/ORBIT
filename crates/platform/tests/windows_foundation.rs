@@ -8394,6 +8394,769 @@ mod windows {
                             }),
                         }
                     }
+                    pub(in crate::windows) mod no_clobber_case {
+                        use super::*;
+                        const TARGET: &str = "occupied-target";
+                        const TARGET_CHILD: &str = "occupied-canary";
+                        const TARGET_BYTES: &[u8] = b"no-clobber-original-target";
+                        const CANARY_BYTES: &[u8] = b"no-clobber-original-child";
+                        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+                        enum TargetKind {
+                            File,
+                            EmptyDirectory,
+                            PopulatedDirectory,
+                        }
+                        impl TargetKind {
+                            fn directory(self) -> bool {
+                                self != Self::File
+                            }
+                        }
+                        struct Target {
+                            kind: TargetKind,
+                            attempted: bool,
+                            creator: Option<usize>,
+                            id: Option<FileIdentity>,
+                            last_observed: Option<FileIdentity>,
+                            facts: Option<SecurityFacts>,
+                            baseline: Option<SourceSnapshot>,
+                            canary: Option<Entry>,
+                            root_mark_attempted: bool,
+                            root_mark_result: Option<(i32, u32)>,
+                            child_mark_attempted: bool,
+                            child_mark_result: Option<(i32, u32)>,
+                            removed: bool,
+                        }
+                        fn write_fixture(raw: HANDLE, bytes: &[u8]) -> io::Result<()> {
+                            let mut written = 0;
+                            yes(unsafe {
+                                WriteFile(
+                                    raw,
+                                    bytes.as_ptr(),
+                                    bytes.len() as u32,
+                                    &mut written,
+                                    null_mut(),
+                                )
+                            })?;
+                            require(
+                                written as usize == bytes.len(),
+                                "no-clobber fixture short write",
+                            )?;
+                            yes(unsafe { FlushFileBuffers(raw) })
+                        }
+                        fn mark_fixture(
+                            raw: HANDLE,
+                            attempted: &mut bool,
+                            outcome: &mut Option<(i32, u32)>,
+                        ) -> io::Result<()> {
+                            let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+                            *attempted = true;
+                            // The native owner is NONALERT+SYNCHRONIZE; this
+                            // synchronous API has no overlapped request.
+                            let result = unsafe {
+                                SetFileInformationByHandle(
+                                    raw,
+                                    FileDispositionInfo,
+                                    (&information as *const FILE_DISPOSITION_INFO).cast(),
+                                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                                )
+                            };
+                            let error = if result == 0 {
+                                unsafe { GetLastError() }
+                            } else {
+                                0
+                            };
+                            *outcome = Some((result, error));
+                            if result == 0 {
+                                Err(io::Error::from_raw_os_error(error as i32))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        fn target_contents(raw: HANDLE, populated: bool) -> io::Result<()> {
+                            let mut words = vec![0usize; LIMIT / size_of::<usize>()];
+                            let mut class = FileIdBothDirectoryRestartInfo;
+                            let expected = TARGET_CHILD.encode_utf16().collect::<Vec<_>>();
+                            let mut children = 0;
+                            for _ in 0..4 {
+                                words.fill(0);
+                                let result = unsafe {
+                                    GetFileInformationByHandleEx(
+                                        raw,
+                                        class,
+                                        words.as_mut_ptr().cast(),
+                                        LIMIT as u32,
+                                    )
+                                };
+                                let error = if result == 0 {
+                                    unsafe { GetLastError() }
+                                } else {
+                                    0
+                                };
+                                if result == 0 {
+                                    if error != ERROR_NO_MORE_FILES {
+                                        return Err(io::Error::from_raw_os_error(error as i32));
+                                    }
+                                    return require(
+                                        children == usize::from(populated),
+                                        "no-clobber target inventory differs",
+                                    );
+                                }
+                                let mut offset = 0usize;
+                                let mut records = 0;
+                                loop {
+                                    require(
+                                        offset % std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>() == 0
+                                            && offset
+                                                .checked_add(size_of::<FILE_ID_BOTH_DIR_INFO>())
+                                                .is_some_and(|end| end <= LIMIT),
+                                        "no-clobber enumeration header bounds invalid",
+                                    )?;
+                                    let entry = unsafe {
+                                        words
+                                            .as_ptr()
+                                            .cast::<u8>()
+                                            .add(offset)
+                                            .cast::<FILE_ID_BOTH_DIR_INFO>()
+                                            .read()
+                                    };
+                                    let name_offset =
+                                        offset + offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                                    let length = entry.FileNameLength as usize;
+                                    require(
+                                        length != 0
+                                            && length % 2 == 0
+                                            && name_offset
+                                                .checked_add(length)
+                                                .is_some_and(|end| end <= LIMIT),
+                                        "no-clobber enumeration name bounds invalid",
+                                    )?;
+                                    let name = unsafe {
+                                        std::slice::from_raw_parts(
+                                            words
+                                                .as_ptr()
+                                                .cast::<u8>()
+                                                .add(name_offset)
+                                                .cast::<u16>(),
+                                            length / 2,
+                                        )
+                                    };
+                                    if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                                        require(
+                                            populated && name == expected && children == 0,
+                                            "no-clobber unexpected target child",
+                                        )?;
+                                        children += 1;
+                                    }
+                                    records += 1;
+                                    require(
+                                        records <= 4,
+                                        "no-clobber enumeration record bound exceeded",
+                                    )?;
+                                    if entry.NextEntryOffset == 0 {
+                                        break;
+                                    }
+                                    require(
+                                        entry.NextEntryOffset as usize
+                                            >= offset_of!(FILE_ID_BOTH_DIR_INFO, FileName) + length,
+                                        "no-clobber enumeration overlapping entries",
+                                    )?;
+                                    offset = offset
+                                        .checked_add(entry.NextEntryOffset as usize)
+                                        .ok_or_else(|| {
+                                            bad("no-clobber enumeration offset overflow")
+                                        })?;
+                                }
+                                class = FileIdBothDirectoryInfo;
+                            }
+                            Err(bad("no-clobber enumeration batch bound exceeded"))
+                        }
+                        impl Target {
+                            fn new(kind: TargetKind) -> Self {
+                                Self {
+                                    kind,
+                                    attempted: false,
+                                    creator: None,
+                                    id: None,
+                                    last_observed: None,
+                                    facts: None,
+                                    baseline: None,
+                                    canary: None,
+                                    root_mark_attempted: false,
+                                    root_mark_result: None,
+                                    child_mark_attempted: false,
+                                    child_mark_result: None,
+                                    removed: false,
+                                }
+                            }
+                            fn create(
+                                &mut self,
+                                h: &mut Harness,
+                                unknown: &mut Vec<CloseUnknown>,
+                            ) -> io::Result<()> {
+                                let f = &mut h.oracle;
+                                let parent = f.handles.raw(f.root.unwrap());
+                                let key = f.key.as_ref().unwrap().clone();
+                                scope_absent(
+                                    &mut f.handles,
+                                    parent,
+                                    OsStr::new(TARGET),
+                                    self.kind.directory(),
+                                )?;
+                                let sd = descriptor(&key, FILE_ALL_ACCESS)?;
+                                self.attempted = true;
+                                println!(
+                                    "no_clobber_target_create_attempt kind={:?} namespace_on_failure=unknown",
+                                    self.kind
+                                );
+                                let creator = relative(
+                                    &mut f.handles,
+                                    parent,
+                                    OsStr::new(TARGET),
+                                    self.kind.directory(),
+                                    FILE_CREATE,
+                                    FILE_ALL_ACCESS,
+                                    sd.as_ptr().cast(),
+                                )?;
+                                self.creator = Some(creator);
+                                let raw = f.handles.raw(creator);
+                                self.id = Some(identity(raw)?);
+                                kind(raw, self.kind.directory())?;
+                                granted(raw, FILE_ALL_ACCESS)?;
+                                self.facts =
+                                    Some(read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts);
+                                if self.kind == TargetKind::File {
+                                    write_fixture(raw, TARGET_BYTES)?;
+                                }
+                                if self.kind == TargetKind::PopulatedDirectory {
+                                    self.canary = Some(Entry {
+                                        name: OsString::from(TARGET_CHILD),
+                                        mask: FILE_ALL_ACCESS,
+                                        id: None,
+                                        facts: None,
+                                        snapshot: None,
+                                        observed: None,
+                                        removed: false,
+                                    });
+                                    let child = relative(
+                                        &mut f.handles,
+                                        raw,
+                                        OsStr::new(TARGET_CHILD),
+                                        false,
+                                        FILE_CREATE,
+                                        FILE_ALL_ACCESS,
+                                        sd.as_ptr().cast(),
+                                    )?;
+                                    let entry = self.canary.as_mut().unwrap();
+                                    let file = f.handles.raw(child);
+                                    entry.id = Some(identity(file)?);
+                                    entry.facts =
+                                        Some(read_descriptor(file, &key, FILE_ALL_ACCESS)?.facts);
+                                    write_fixture(file, CANARY_BYTES)?;
+                                    close_new(
+                                        &mut f.handles,
+                                        unknown,
+                                        child,
+                                        entry.id,
+                                        "no-clobber target child creator",
+                                    )?;
+                                }
+                                close_new(
+                                    &mut f.handles,
+                                    unknown,
+                                    creator,
+                                    self.id,
+                                    "no-clobber target creator",
+                                )?;
+                                self.creator = None;
+                                // Baseline by fresh name after all intended setup
+                                // and WRITE/DELETE creation owners have closed.
+                                self.observe(h, unknown, "baseline")
+                            }
+                            fn observe(
+                                &mut self,
+                                h: &mut Harness,
+                                unknown: &mut Vec<CloseUnknown>,
+                                phase: &'static str,
+                            ) -> io::Result<()> {
+                                let f = &mut h.oracle;
+                                let parent = f.handles.raw(f.root.unwrap());
+                                let key = f.key.as_ref().unwrap();
+                                let owner = shared(
+                                    &mut f.handles,
+                                    parent,
+                                    OsStr::new(TARGET),
+                                    self.kind.directory(),
+                                    if self.kind.directory() {
+                                        ROOT_READ
+                                    } else {
+                                        FILE_GENERIC_READ
+                                    },
+                                )?;
+                                let raw = f.handles.raw(owner);
+                                let actual = identity(raw)?;
+                                self.last_observed = Some(actual);
+                                require(
+                                    Some(actual) == self.id,
+                                    "no-clobber named target full ID differs",
+                                )?;
+                                kind(raw, self.kind.directory())?;
+                                require(
+                                    Some(read_descriptor(raw, key, FILE_ALL_ACCESS)?.facts)
+                                        == self.facts,
+                                    "no-clobber target policy changed",
+                                )?;
+                                let sampled = if self.kind.directory() {
+                                    directory_snapshot(raw)?
+                                } else {
+                                    snapshot(raw)?
+                                };
+                                if let Some(before) = self.baseline {
+                                    require(
+                                        before == sampled,
+                                        "no-clobber target snapshot changed",
+                                    )?;
+                                } else {
+                                    self.baseline = Some(sampled);
+                                }
+                                if self.kind == TargetKind::File {
+                                    raw_bytes(raw, TARGET_BYTES)?;
+                                } else {
+                                    target_contents(
+                                        raw,
+                                        self.kind == TargetKind::PopulatedDirectory,
+                                    )?;
+                                }
+                                if let Some(entry) = &mut self.canary {
+                                    let child = shared(
+                                        &mut f.handles,
+                                        raw,
+                                        &entry.name,
+                                        false,
+                                        FILE_GENERIC_READ,
+                                    )?;
+                                    let file = f.handles.raw(child);
+                                    let id = identity(file)?;
+                                    require(
+                                        Some(id) == entry.id
+                                            && Some(
+                                                read_descriptor(file, key, FILE_ALL_ACCESS)?.facts,
+                                            ) == entry.facts,
+                                        "no-clobber target child ID/policy changed",
+                                    )?;
+                                    let sampled = snapshot(file)?;
+                                    if let Some(before) = entry.snapshot {
+                                        require(
+                                            before == sampled,
+                                            "no-clobber target child snapshot changed",
+                                        )?;
+                                    } else {
+                                        entry.snapshot = Some(sampled);
+                                    }
+                                    raw_bytes(file, CANARY_BYTES)?;
+                                    close_new(
+                                        &mut f.handles,
+                                        unknown,
+                                        child,
+                                        Some(id),
+                                        "no-clobber target child observer",
+                                    )?;
+                                }
+                                close_new(
+                                    &mut f.handles,
+                                    unknown,
+                                    owner,
+                                    Some(actual),
+                                    "no-clobber target named observer",
+                                )?;
+                                println!(
+                                    "no_clobber_target_named_preimage kind={:?} phase={phase} full_id={actual:?} snapshot={sampled:?} policy_unchanged=true bytes_or_exact_contents=true all_observers_checked_closed=true share=READ_WRITE_DELETE",
+                                    self.kind
+                                );
+                                Ok(())
+                            }
+                            fn cleanup(
+                                &mut self,
+                                h: &mut Harness,
+                                unknown: &mut Vec<CloseUnknown>,
+                            ) -> io::Result<()> {
+                                let f = &mut h.oracle;
+                                let parent = f.handles.raw(f.root.unwrap());
+                                let key = f.key.as_ref().unwrap();
+                                let owner = relative(
+                                    &mut f.handles,
+                                    parent,
+                                    OsStr::new(TARGET),
+                                    self.kind.directory(),
+                                    FILE_OPEN,
+                                    if self.kind.directory() {
+                                        FILE_ALL_ACCESS
+                                    } else {
+                                        DELETE | META
+                                    },
+                                    null(),
+                                )?;
+                                let raw = f.handles.raw(owner);
+                                let actual = identity(raw)?;
+                                self.last_observed = Some(actual);
+                                require(
+                                    Some(actual) == self.id
+                                        && Some(read_descriptor(raw, key, FILE_ALL_ACCESS)?.facts)
+                                            == self.facts,
+                                    "no-clobber target cleanup ID/policy differs",
+                                )?;
+                                kind(raw, self.kind.directory())?;
+                                let sampled = if self.kind.directory() {
+                                    directory_snapshot(raw)?
+                                } else {
+                                    snapshot(raw)?
+                                };
+                                require(
+                                    Some(sampled) == self.baseline,
+                                    "no-clobber target cleanup preimage differs",
+                                )?;
+                                if let Some(entry) = &mut self.canary {
+                                    let child = relative(
+                                        &mut f.handles,
+                                        raw,
+                                        &entry.name,
+                                        false,
+                                        FILE_OPEN,
+                                        DELETE | META,
+                                        null(),
+                                    )?;
+                                    let file = f.handles.raw(child);
+                                    let id = identity(file)?;
+                                    require(
+                                        Some(id) == entry.id
+                                            && Some(snapshot(file)?) == entry.snapshot
+                                            && Some(
+                                                read_descriptor(file, key, FILE_ALL_ACCESS)?.facts,
+                                            ) == entry.facts,
+                                        "no-clobber child cleanup preimage differs",
+                                    )?;
+                                    mark_fixture(
+                                        file,
+                                        &mut self.child_mark_attempted,
+                                        &mut self.child_mark_result,
+                                    )?;
+                                    close_new(
+                                        &mut f.handles,
+                                        unknown,
+                                        child,
+                                        Some(id),
+                                        "no-clobber target child disposition",
+                                    )?;
+                                    scope_absent(&mut f.handles, raw, &entry.name, false)?;
+                                    entry.removed = true;
+                                }
+                                if self.kind.directory() {
+                                    scope_empty(raw)?;
+                                    // Intended child removal changes directory times;
+                                    // compare ID/policy/empty state, not stale times.
+                                    require(
+                                        identity(raw)? == actual
+                                            && Some(
+                                                read_descriptor(raw, key, FILE_ALL_ACCESS)?.facts,
+                                            ) == self.facts,
+                                        "no-clobber empty target identity/policy changed",
+                                    )?;
+                                }
+                                mark_fixture(
+                                    raw,
+                                    &mut self.root_mark_attempted,
+                                    &mut self.root_mark_result,
+                                )?;
+                                // Only close the marked owner, with its cached ID;
+                                // subsequent absence observes the held parent.
+                                close_new(
+                                    &mut f.handles,
+                                    unknown,
+                                    owner,
+                                    Some(actual),
+                                    "no-clobber target disposition",
+                                )?;
+                                scope_absent(
+                                    &mut f.handles,
+                                    parent,
+                                    OsStr::new(TARGET),
+                                    self.kind.directory(),
+                                )?;
+                                self.removed = true;
+                                println!(
+                                    "no_clobber_target_teardown kind={:?} full_id={actual:?} root_mark={:?} child_mark={:?} all_known_entries_absent=true checked_close=true acl_repair=false",
+                                    self.kind, self.root_mark_result, self.child_mark_result
+                                );
+                                Ok(())
+                            }
+                        }
+                        enum Error {
+                            Fixture(io::Error),
+                            Product(OperationError),
+                            UnexpectedPublication,
+                        }
+                        impl From<io::Error> for Error {
+                            fn from(error: io::Error) -> Self {
+                                Self::Fixture(error)
+                            }
+                        }
+                        impl std::fmt::Debug for Error {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                match self {
+                                    Self::Fixture(error) => {
+                                        f.debug_tuple("Fixture").field(error).finish()
+                                    }
+                                    Self::Product(error) => {
+                                        f.debug_tuple("Product").field(error).finish()
+                                    }
+                                    Self::UnexpectedPublication => {
+                                        f.write_str("UnexpectedPublicationRetained")
+                                    }
+                                }
+                            }
+                        }
+                        struct Row {
+                            h: DiscardHarness,
+                            target: Target,
+                            unknown: Vec<CloseUnknown>,
+                            phase: &'static str,
+                        }
+                        impl Row {
+                            fn new(kind: TargetKind) -> Self {
+                                Self {
+                                    h: DiscardHarness::new(),
+                                    target: Target::new(kind),
+                                    unknown: Vec::with_capacity(32),
+                                    phase: "setup",
+                                }
+                            }
+                            fn written_stage(&mut self) -> Result<(), Error> {
+                                let stage = self
+                                    .h
+                                    .base
+                                    .parent
+                                    .as_ref()
+                                    .unwrap()
+                                    .stage_directory(
+                                        Arc::clone(self.h.base.guard.as_ref().unwrap()),
+                                        OsStr::new(STAGE),
+                                    )
+                                    .map_err(|e| Error::Product(OperationError::Create(e)))?;
+                                self.h.base.product_root = Some(stage.identity());
+                                self.h.base.flight = Some(Flight::Stage(stage));
+                                {
+                                    let Some(Flight::Stage(stage)) = &mut self.h.base.flight else {
+                                        return Err(bad("no-clobber stage owner missing").into());
+                                    };
+                                    let mut file =
+                                        stage.write_new(OsStr::new(CHILD), PAYLOAD, false)?;
+                                    let before = file.snapshot()?;
+                                    self.h.base.product_file = Some(file.identity());
+                                    self.h.base.product_snapshot = Some(before);
+                                    require(
+                                        before.identity == file.identity()
+                                            && before.length == PAYLOAD.len() as u64
+                                            && before.kind == SourceKind::File
+                                            && before.link_count == 1
+                                            && file.read_limited(4096)? == PAYLOAD
+                                            && !file.execution_permission()?.executable()
+                                            && file.snapshot()? == before,
+                                        "no-clobber written stage differs",
+                                    )?;
+                                }
+                                {
+                                    let Some(Flight::Stage(stage)) = &self.h.base.flight else {
+                                        return Err(
+                                            bad("no-clobber verified stage owner missing").into()
+                                        );
+                                    };
+                                    let mut file =
+                                        stage.verify_package_mode(OsStr::new(CHILD), false)?;
+                                    require(
+                                        Some(file.identity()) == self.h.base.product_file
+                                            && Some(file.snapshot()?)
+                                                == self.h.base.product_snapshot
+                                            && file.read_limited(4096)? == PAYLOAD
+                                            && !file.execution_permission()?.executable(),
+                                        "no-clobber verified stage differs",
+                                    )?;
+                                }
+                                require(
+                                    self.target.id != self.h.base.product_root
+                                        && self.target.id != self.h.base.product_file,
+                                    "no-clobber stage and target identities not distinct",
+                                )?;
+                                Ok(())
+                            }
+                            fn execute(&mut self) -> Result<(), Error> {
+                                println!("no_clobber_row_begin kind={:?}", self.target.kind);
+                                self.h.base.prepare()?;
+                                self.phase = "registered occupied target";
+                                self.target.create(&mut self.h.base, &mut self.unknown)?;
+                                self.phase = "sealed stage and named preimages";
+                                self.written_stage()?;
+                                self.h.intact("no_clobber_before_collision")?;
+                                self.target.observe(
+                                    &mut self.h.base,
+                                    &mut self.unknown,
+                                    "before_collision",
+                                )?;
+                                self.phase = "actual no-replace collision";
+                                let stage = match self.h.base.flight.take() {
+                                    Some(Flight::Stage(stage)) => stage,
+                                    other => {
+                                        self.h.base.flight = other;
+                                        return Err(bad("no-clobber stage flight missing").into());
+                                    }
+                                };
+                                match stage.publish_directory(OsStr::new(TARGET)) {
+                                    Err(StagePublishError::Unchanged { source, stage })
+                                        if source.kind() == io::ErrorKind::AlreadyExists =>
+                                    {
+                                        let id = stage.identity();
+                                        self.h.base.flight = Some(Flight::Stage(stage));
+                                        require(
+                                            Some(id) == self.h.base.product_root,
+                                            "no-clobber returned stage identity differs",
+                                        )?;
+                                        // No Display parsing: raw C035 attribution comes
+                                        // from the reviewed private backend branch.
+                                        println!(
+                                            "no_clobber_typed_refusal kind={:?} variant=Unchanged io_kind=AlreadyExists same_stage_id={id:?} native_diagnostic={source} diagnostic_not_parsed=true",
+                                            self.target.kind
+                                        );
+                                        self.h.cause = Some(source);
+                                    }
+                                    Err(error) => {
+                                        return Err(Error::Product(OperationError::Publish(error)));
+                                    }
+                                    Ok(publication) => {
+                                        self.h.base.flight = Some(Flight::Publication(publication));
+                                        return Err(Error::UnexpectedPublication);
+                                    }
+                                }
+                                self.h.intact("no_clobber_after_collision")?;
+                                self.target.observe(
+                                    &mut self.h.base,
+                                    &mut self.unknown,
+                                    "after_collision",
+                                )?;
+                                self.phase = "same-stage alternate publication and acceptance";
+                                self.h.fallback().map_err(Error::Product)?;
+                                self.target.observe(
+                                    &mut self.h.base,
+                                    &mut self.unknown,
+                                    "while_alternate_accepted",
+                                )?;
+                                self.h.base.cleanup_completed_product()?;
+                                self.h
+                                    .base
+                                    .observe("no_clobber_accepted_product_removed", false)?;
+                                self.target.observe(
+                                    &mut self.h.base,
+                                    &mut self.unknown,
+                                    "before_target_cleanup",
+                                )?;
+                                self.phase = "known target then full fixture teardown";
+                                self.target.cleanup(&mut self.h.base, &mut self.unknown)?;
+                                self.h.base.observe("no_clobber_target_removed", false)?;
+                                self.h.base.cleanup()?;
+                                require(
+                                    self.h.cause.is_some()
+                                        && self.h.base.flight.is_none()
+                                        && self.h.receipt.is_none()
+                                        && self.h.base.parent.is_none()
+                                        && self.h.base.guard.is_none()
+                                        && self
+                                            .h
+                                            .base
+                                            .oracle
+                                            .handles
+                                            .slots
+                                            .iter()
+                                            .all(Option::is_none)
+                                        && self.unknown.is_empty()
+                                        && self.target.removed
+                                        && self.target.creator.is_none()
+                                        && self
+                                            .target
+                                            .canary
+                                            .as_ref()
+                                            .is_none_or(|entry| entry.removed),
+                                    "no-clobber incomplete final ownership/teardown",
+                                )?;
+                                println!(
+                                    "no_clobber_row_complete kind={:?} same_stage_alternate_published_and_accepted=true target_preserved_until_acceptance=true source_snapshot_R_bytes_mode=true complete_checked_teardown=true remaining_authority=false",
+                                    self.target.kind
+                                );
+                                Ok(())
+                            }
+                        }
+                        pub(in crate::windows) struct Failure {
+                            error: Error,
+                            retained: Box<Row>,
+                        }
+                        impl std::fmt::Debug for Failure {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                f.debug_struct("InvalidNoClobberControl")
+                                    .field("kind", &self.retained.target.kind)
+                                    .field("phase", &self.retained.phase)
+                                    .field("error", &self.error)
+                                    .field("original_refusal", &self.retained.h.cause)
+                                    .field(
+                                        "target_create_attempted",
+                                        &self.retained.target.attempted,
+                                    )
+                                    .field("target_creator", &self.retained.target.creator)
+                                    .field("target_id", &self.retained.target.id)
+                                    .field(
+                                        "last_observed_target_id",
+                                        &self.retained.target.last_observed,
+                                    )
+                                    .field(
+                                        "root_mark_attempted",
+                                        &self.retained.target.root_mark_attempted,
+                                    )
+                                    .field(
+                                        "root_mark_result",
+                                        &self.retained.target.root_mark_result,
+                                    )
+                                    .field(
+                                        "child_mark_attempted",
+                                        &self.retained.target.child_mark_attempted,
+                                    )
+                                    .field(
+                                        "child_mark_result",
+                                        &self.retained.target.child_mark_result,
+                                    )
+                                    .field("uncertain_closes", &self.retained.unknown)
+                                    .field(
+                                        "product_flight_retained",
+                                        &self.retained.h.base.flight.is_some(),
+                                    )
+                                    .field("typed_fixture_carrier_retained", &true)
+                                    .finish()
+                            }
+                        }
+                        pub(in crate::windows) fn run() -> Result<(), Failure> {
+                            for kind in [
+                                TargetKind::File,
+                                TargetKind::EmptyDirectory,
+                                TargetKind::PopulatedDirectory,
+                            ] {
+                                let mut row = Row::new(kind);
+                                if let Err(error) = row.execute() {
+                                    return Err(Failure {
+                                        error,
+                                        retained: Box::new(row),
+                                    });
+                                }
+                            }
+                            println!(
+                                "no_clobber_control_complete actual_rows=3 file_empty_populated=true all_same_stage_retries_accepted=true all_fixture_teardowns_complete=true"
+                            );
+                            Ok(())
+                        }
+                    }
                 }
             }
 
@@ -8552,6 +9315,13 @@ mod windows {
     fn staged_package_seals_and_publishes_one_file()
     -> Result<(), execution_oracle::first_stage::Failure> {
         execution_oracle::run_first_stage()
+    }
+
+    #[test]
+    fn staged_package_no_clobber_preserves_file_empty_and_populated_targets()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::no_clobber_case::Failure>
+    {
+        execution_oracle::first_stage::discard_case::guard_case::no_clobber_case::run()
     }
 
     #[test]

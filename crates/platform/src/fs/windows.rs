@@ -3441,6 +3441,95 @@ mod staged_package {
         pub recovery: StageRecovery,
     }
 
+    #[derive(Debug)]
+    struct RenameRefusalProofError {
+        rename: io::Error,
+        proof: io::Error,
+    }
+    impl std::fmt::Display for RenameRefusalProofError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{}; intact-stage proof failed: {}",
+                self.rename, self.proof
+            )
+        }
+    }
+    impl std::error::Error for RenameRefusalProofError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.proof)
+        }
+    }
+    impl StageCore {
+        fn prove_rename_refusal(
+            &self,
+            attempted: &OsStr,
+            prior_final_was_none: bool,
+        ) -> io::Result<()> {
+            if !prior_final_was_none
+                || self.final_name.as_deref() != Some(attempted)
+                || self.root.is_none()
+                || self.root_identity.is_none()
+                || self.root_policy.is_none()
+                || self.bridge.is_some()
+                || self.reader.is_some()
+                || self.removal.is_some()
+            {
+                return Err(denied("rename refusal has unexpected stage bookkeeping"));
+            }
+            self.check_root()?;
+            self.domain.closes.zero()?;
+            let creator = self.root.as_ref().unwrap().as_raw_handle();
+            let name = PreparedName::new(&self.original_name)?;
+            let observer = native_open(
+                self.domain.parent(),
+                &name,
+                true,
+                FILE_OPEN,
+                ROOT_READ,
+                OBSERVER_SHARE,
+                null(),
+                &self.domain.closes,
+                "package-rename-refusal-original-name",
+            )?;
+            let mut measured_identity = None;
+            let result = (|| {
+                let raw = observer.as_raw_handle();
+                let actual = identity(raw)?;
+                measured_identity = Some(actual);
+                if Some(actual) != self.root_identity || identity(creator)? != actual {
+                    return Err(denied("rename refusal original-name root identity differs"));
+                }
+                ensure_kind(raw, true)?;
+                if held_leaf(raw)? != self.original_name
+                    || held_leaf(creator)? != self.original_name
+                    || self.domain.facts(raw, FILE_ALL_ACCESS)?
+                        != *self.root_policy.as_ref().unwrap()
+                {
+                    return Err(denied("rename refusal original-name root facts changed"));
+                }
+                self.inventory(raw)?;
+                self.check_root()?;
+                self.domain.closes.zero()
+            })();
+            // None if querying identity failed; the measured foreign ID is
+            // retained if a mismatch was found. Never substitute an expected ID.
+            finish_owned(
+                observer,
+                &self.domain.closes,
+                measured_identity,
+                "package rename-refusal original-name observer",
+                result,
+            )?;
+            self.check_root()?;
+            if held_leaf(creator)? != self.original_name {
+                return Err(denied("rename refusal original root leaf changed"));
+            }
+            self.domain.check()?;
+            self.domain.closes.zero()
+        }
+    }
+
     impl Directory {
         pub fn stage_directory(
             &self,
@@ -3736,6 +3825,7 @@ mod staged_package {
             mut self,
             final_name: &OsStr,
         ) -> Result<PackagePublication, StagePublishError> {
+            let prior_final_was_none = self.core.final_name.is_none();
             let preflight = (|| {
                 validate_data_component(final_name)?;
                 self.core.check_root()?;
@@ -3782,6 +3872,39 @@ mod staged_package {
             };
             if returned != 0 {
                 let source = native_error("package-directory-rename", returned);
+                if returned == 0xc0000035u32 as i32 {
+                    match self
+                        .core
+                        .prove_rename_refusal(final_name, prior_final_was_none)
+                    {
+                        Ok(()) => {
+                            // Only the proved aborted attempt marker is reset.
+                            // All identities, inventory, phase and ownership stay intact.
+                            self.core.final_name = None;
+                            return Err(StagePublishError::Unchanged {
+                                source,
+                                stage: self,
+                            });
+                        }
+                        Err(proof) => {
+                            let source = io::Error::new(
+                                proof.kind(),
+                                RenameRefusalProofError {
+                                    rename: source,
+                                    proof,
+                                },
+                            );
+                            return Err(StagePublishError::Uncertain {
+                                source,
+                                state: PublicationState::NamespaceUnknown,
+                                recovery: StageRecovery {
+                                    core: self.core,
+                                    publication: None,
+                                },
+                            });
+                        }
+                    }
+                }
                 let state = self.core.phase;
                 return Err(StagePublishError::Uncertain {
                     source,
