@@ -4030,6 +4030,20 @@ mod staged_package {
     }
 
     impl Directory {
+        pub fn open_package(
+            &self,
+            guard: Arc<StateLock>,
+            name: &OsStr,
+            expected: FileIdentity,
+        ) -> io::Result<PackageDirectory> {
+            validate_data_component(name)?;
+            self.require_lock(&guard, false)?;
+            if expected.volume != self.identity.volume {
+                return Err(denied("published package volume differs from held parent"));
+            }
+            Err(unsupported("published package opening is not implemented"))
+        }
+
         pub fn stage_directory(
             &self,
             guard: Arc<StateLock>,

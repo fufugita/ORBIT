@@ -9157,6 +9157,891 @@ mod windows {
                             Ok(())
                         }
                     }
+                    pub(in crate::windows) mod read_seam_case {
+                        use super::*;
+                        use orbit_platform::fs::PackageDirectory;
+                        const MISSING_READ: &str = "published package opening is not implemented";
+                        #[derive(Clone, Debug, Eq, PartialEq)]
+                        struct Image {
+                            root: FileIdentity,
+                            file: FileIdentity,
+                            snapshot: SourceSnapshot,
+                            root_policy: SecurityFacts,
+                            file_policy: SecurityFacts,
+                            root_sd: Vec<u8>,
+                            file_sd: Vec<u8>,
+                        }
+                        #[derive(Debug, Default)]
+                        struct Progress {
+                            opened: Vec<(usize, Option<FileIdentity>)>,
+                            child_mark_attempted: bool,
+                            child_mark: Option<(i32, u32)>,
+                            child_absent: bool,
+                            root_mark_attempted: bool,
+                            root_mark: Option<(i32, u32)>,
+                            root_absent: bool,
+                        }
+                        fn sole_payload(raw: HANDLE) -> io::Result<()> {
+                            let mut words = vec![0usize; LIMIT / size_of::<usize>()];
+                            let mut class = FileIdBothDirectoryRestartInfo;
+                            let wanted = CHILD.encode_utf16().collect::<Vec<_>>();
+                            let mut children = 0;
+                            for _ in 0..4 {
+                                words.fill(0);
+                                let result = unsafe {
+                                    GetFileInformationByHandleEx(
+                                        raw,
+                                        class,
+                                        words.as_mut_ptr().cast(),
+                                        LIMIT as u32,
+                                    )
+                                };
+                                let error = if result == 0 {
+                                    unsafe { GetLastError() }
+                                } else {
+                                    0
+                                };
+                                if result == 0 {
+                                    if error != ERROR_NO_MORE_FILES {
+                                        return Err(io::Error::from_raw_os_error(error as i32));
+                                    }
+                                    return require(
+                                        children == 1,
+                                        "read seam accepted inventory differs",
+                                    );
+                                }
+                                let mut offset = 0usize;
+                                let mut records = 0;
+                                loop {
+                                    require(
+                                        offset % std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>() == 0
+                                            && offset
+                                                .checked_add(size_of::<FILE_ID_BOTH_DIR_INFO>())
+                                                .is_some_and(|end| end <= LIMIT),
+                                        "read seam inventory header bounds invalid",
+                                    )?;
+                                    let entry = unsafe {
+                                        words
+                                            .as_ptr()
+                                            .cast::<u8>()
+                                            .add(offset)
+                                            .cast::<FILE_ID_BOTH_DIR_INFO>()
+                                            .read()
+                                    };
+                                    let start =
+                                        offset + offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                                    let length = entry.FileNameLength as usize;
+                                    require(
+                                        length != 0
+                                            && length % 2 == 0
+                                            && start
+                                                .checked_add(length)
+                                                .is_some_and(|end| end <= LIMIT),
+                                        "read seam inventory name bounds invalid",
+                                    )?;
+                                    let name = unsafe {
+                                        std::slice::from_raw_parts(
+                                            words.as_ptr().cast::<u8>().add(start).cast::<u16>(),
+                                            length / 2,
+                                        )
+                                    };
+                                    if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                                        require(
+                                            name == wanted && children == 0,
+                                            "read seam unexpected accepted child",
+                                        )?;
+                                        children += 1;
+                                    }
+                                    records += 1;
+                                    require(
+                                        records <= 4,
+                                        "read seam inventory record bound exceeded",
+                                    )?;
+                                    if entry.NextEntryOffset == 0 {
+                                        break;
+                                    }
+                                    require(
+                                        entry.NextEntryOffset as usize
+                                            >= offset_of!(FILE_ID_BOTH_DIR_INFO, FileName) + length,
+                                        "read seam overlapping inventory entries",
+                                    )?;
+                                    offset = offset
+                                        .checked_add(entry.NextEntryOffset as usize)
+                                        .ok_or_else(|| {
+                                            bad("read seam inventory offset overflow")
+                                        })?;
+                                }
+                                class = FileIdBothDirectoryInfo;
+                            }
+                            Err(bad("read seam inventory batch bound exceeded"))
+                        }
+                        enum Error {
+                            Fixture(io::Error),
+                            Product(ProductFailure),
+                            Read(io::Error),
+                        }
+                        impl From<io::Error> for Error {
+                            fn from(e: io::Error) -> Self {
+                                Self::Fixture(e)
+                            }
+                        }
+                        impl std::fmt::Debug for Error {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                match self {
+                                    Self::Fixture(e) => f.debug_tuple("Fixture").field(e).finish(),
+                                    Self::Product(e) => f.debug_tuple("Product").field(e).finish(),
+                                    Self::Read(e) => {
+                                        f.debug_tuple("ReadErrorRetained").field(e).finish()
+                                    }
+                                }
+                            }
+                        }
+                        struct Fixture {
+                            h: Harness,
+                            reader: Option<PackageDirectory>,
+                            history: Option<Image>,
+                            accepted_history: bool,
+                            missing: Option<io::Error>,
+                            trials: Vec<LockTrial>,
+                            unknown: Vec<CloseUnknown>,
+                            progress: Progress,
+                            phase: &'static str,
+                        }
+                        impl Fixture {
+                            fn new() -> Self {
+                                Self {
+                                    h: Harness::new(),
+                                    reader: None,
+                                    history: None,
+                                    accepted_history: false,
+                                    missing: None,
+                                    trials: Vec::with_capacity(8),
+                                    unknown: Vec::with_capacity(32),
+                                    progress: Progress {
+                                        opened: Vec::with_capacity(64),
+                                        ..Progress::default()
+                                    },
+                                    phase: "native prerequisites",
+                                }
+                            }
+                            fn note(&mut self, owner: usize) -> usize {
+                                let slot = self.progress.opened.len();
+                                self.progress.opened.push((owner, None));
+                                slot
+                            }
+                            fn close(
+                                &mut self,
+                                owner: usize,
+                                id: Option<FileIdentity>,
+                                phase: &'static str,
+                            ) -> io::Result<()> {
+                                close_new(
+                                    &mut self.h.oracle.handles,
+                                    &mut self.unknown,
+                                    owner,
+                                    id,
+                                    phase,
+                                )
+                            }
+                            fn image(&mut self, phase: &'static str) -> io::Result<Image> {
+                                let parent = self.h.oracle.handles.raw(self.h.oracle.root.unwrap());
+                                let key = self.h.oracle.key.as_ref().unwrap().clone();
+                                let root_owner = shared(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    OsStr::new(FINAL),
+                                    true,
+                                    ROOT_READ,
+                                )?;
+                                let root_slot = self.note(root_owner);
+                                let root = self.h.oracle.handles.raw(root_owner);
+                                let root_id = identity(root)?;
+                                self.progress.opened[root_slot].1 = Some(root_id);
+                                require(
+                                    Some(root_id) == self.h.product_root,
+                                    "read seam named root full ID differs",
+                                )?;
+                                kind(root, true)?;
+                                granted(root, ROOT_READ)?;
+                                let root_policy =
+                                    read_descriptor(root, &key, FILE_ALL_ACCESS)?.facts;
+                                let root_sd = security_blob(root)?;
+                                sole_payload(root)?;
+                                let file_owner = shared(
+                                    &mut self.h.oracle.handles,
+                                    root,
+                                    OsStr::new(CHILD),
+                                    false,
+                                    FILE_GENERIC_READ,
+                                )?;
+                                let file_slot = self.note(file_owner);
+                                let file = self.h.oracle.handles.raw(file_owner);
+                                let file_id = identity(file)?;
+                                self.progress.opened[file_slot].1 = Some(file_id);
+                                kind(file, false)?;
+                                granted(file, FILE_GENERIC_READ)?;
+                                let sampled = snapshot(file)?;
+                                require(
+                                    Some(file_id) == self.h.product_file
+                                        && Some(sampled) == self.h.product_snapshot,
+                                    "read seam named payload snapshot/full ID differs",
+                                )?;
+                                let file_policy =
+                                    read_descriptor(file, &key, FILE_GENERIC_READ)?.facts;
+                                let file_sd = security_blob(file)?;
+                                raw_bytes(file, PAYLOAD)?;
+                                match relative(
+                                    &mut self.h.oracle.handles,
+                                    root,
+                                    OsStr::new(CHILD),
+                                    false,
+                                    FILE_OPEN,
+                                    META | FILE_EXECUTE,
+                                    null(),
+                                ) {
+                                    Err(e) if native_is(&e, DENIED) => {}
+                                    Err(e) => return Err(e),
+                                    Ok(owner) => {
+                                        self.note(owner);
+                                        return Err(bad(
+                                            "read seam R payload unexpectedly executable; owner retained",
+                                        ));
+                                    }
+                                }
+                                self.close(file_owner, Some(file_id), "read seam named payload")?;
+                                self.close(root_owner, Some(root_id), "read seam named root")?;
+                                let actual = Image {
+                                    root: root_id,
+                                    file: file_id,
+                                    snapshot: sampled,
+                                    root_policy,
+                                    file_policy,
+                                    root_sd,
+                                    file_sd,
+                                };
+                                if let Some(history) = &self.history {
+                                    require(
+                                        *history == actual,
+                                        "read seam accepted-history preimage changed",
+                                    )?;
+                                }
+                                println!(
+                                    "read_seam_named_preimage phase={phase} root={root_id:?} file={file_id:?} snapshot={sampled:?} actual_OWNER_GROUP_policy=true canonical_R_bytes=true native_EXEC_denied=true sole_payload=true RWD_observers_checked_closed=true"
+                                );
+                                Ok(actual)
+                            }
+                            fn world(&mut self, phase: &'static str) -> io::Result<()> {
+                                let parent = self.h.oracle.handles.raw(self.h.oracle.root.unwrap());
+                                let key = self.h.oracle.key.as_ref().unwrap().clone();
+                                kind(parent, true)?;
+                                require(
+                                    Some(identity(parent)?) == self.h.oracle.root_id,
+                                    "read seam retained parent ID differs",
+                                )?;
+                                for anchor in &self.h.anchors {
+                                    let raw = self.h.oracle.handles.raw(anchor.owner);
+                                    kind(raw, true)?;
+                                    require(
+                                        identity(raw)? == anchor.id
+                                            && security_blob(raw)? == anchor.security,
+                                        "read seam complete ancestor identity/policy changed",
+                                    )?;
+                                }
+                                let lock = relative(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    OsStr::new(LOCK),
+                                    false,
+                                    FILE_OPEN,
+                                    META,
+                                    null(),
+                                )?;
+                                let slot = self.note(lock);
+                                let raw = self.h.oracle.handles.raw(lock);
+                                let id = identity(raw)?;
+                                self.progress.opened[slot].1 = Some(id);
+                                require(
+                                    Some(id) == self.h.lock.as_ref().unwrap().id
+                                        && Some(snapshot(raw)?)
+                                            == self.h.lock.as_ref().unwrap().snapshot
+                                        && Some(private_lock_facts(raw, &key, phase)?)
+                                            == self.h.lock.as_ref().unwrap().facts,
+                                    "read seam actual lock image changed",
+                                )?;
+                                self.close(lock, Some(id), "read seam lock metadata")?;
+                                let canary = self.h.canary.as_ref().unwrap();
+                                let name = canary.name.clone();
+                                let expected_id = canary.id;
+                                let expected_snapshot = canary.snapshot;
+                                let expected_facts = canary.facts.clone();
+                                let canary = shared(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    &name,
+                                    false,
+                                    FILE_GENERIC_READ,
+                                )?;
+                                let slot = self.note(canary);
+                                let raw = self.h.oracle.handles.raw(canary);
+                                let actual = identity(raw)?;
+                                self.progress.opened[slot].1 = Some(actual);
+                                require(
+                                    Some(actual) == expected_id
+                                        && Some(snapshot(raw)?) == expected_snapshot
+                                        && Some(read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts)
+                                            == expected_facts,
+                                    "read seam native foreign canary changed",
+                                )?;
+                                raw_bytes(raw, PAYLOAD)?;
+                                self.close(canary, Some(actual), "read seam canary metadata")?;
+                                absent(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    OsStr::new(STAGE),
+                                    true,
+                                )?;
+                                let (token, current) = effective(&mut self.h.oracle.handles)?;
+                                self.note(token);
+                                let stable = current == key;
+                                self.close(token, None, "read seam current original token")?;
+                                require(
+                                    stable,
+                                    "read seam original/current token context changed",
+                                )?;
+                                println!(
+                                    "read_seam_native_world phase={phase} actual_parent_lock_anchors_canary_unchanged=true original_context_stable=true stage_absent=true public_inputs_may_be_absent=true"
+                                );
+                                Ok(())
+                            }
+                            fn read_directory(
+                                &self,
+                                directory: &PackageDirectory,
+                                phase: &'static str,
+                            ) -> io::Result<()> {
+                                let history = self
+                                    .history
+                                    .as_ref()
+                                    .ok_or_else(|| bad("read seam genuine history unavailable"))?;
+                                require(
+                                    directory.identity() == history.root,
+                                    "read seam returned directory ID differs",
+                                )?;
+                                let mut file = directory.verify_package_mode(
+                                    OsStr::new(CHILD),
+                                    history.file,
+                                    false,
+                                )?;
+                                let before = file.snapshot()?;
+                                let mode = file.execution_permission()?;
+                                require(
+                                    file.identity() == history.file
+                                        && before == history.snapshot
+                                        && !mode.executable()
+                                        && file.read_limited(4096)? == PAYLOAD
+                                        && file.snapshot()? == before
+                                        && file.execution_permission()? == mode,
+                                    "read seam actual owned reader differs",
+                                )?;
+                                println!(
+                                    "read_seam_owned_capability_read phase={phase} root={:?} file={:?} whole_snapshot_mode_stable=true bytes_verified=true after_input_drop=true",
+                                    history.root, history.file
+                                );
+                                Ok(())
+                            }
+                            fn drop_inputs(&mut self, unique: bool) -> io::Result<()> {
+                                if let Some(guard) = &self.h.guard {
+                                    let aliases = Arc::strong_count(guard);
+                                    if unique {
+                                        require(
+                                            aliases == 1,
+                                            "read seam unexpected external/domain guard alias",
+                                        )?;
+                                    }
+                                    println!(
+                                        "read_seam_input_release guard_aliases_before_release={aliases} actual_public_Drop=true direct_native_close_telemetry=false"
+                                    );
+                                }
+                                drop(self.h.parent.take());
+                                drop(self.h.guard.take());
+                                Ok(())
+                            }
+                            fn acquire(&mut self, mode: LockMode) -> io::Result<()> {
+                                require(
+                                    self.h.parent.is_none() && self.h.guard.is_none(),
+                                    "read seam previous inputs still present",
+                                )?;
+                                self.h.parent = Some(Directory::open(&self.h.oracle.path)?);
+                                require(
+                                    Some(self.h.parent.as_ref().unwrap().identity())
+                                        == self.h.oracle.root_id,
+                                    "read seam reopened private parent ID differs",
+                                )?;
+                                let lock = self
+                                    .h
+                                    .parent
+                                    .as_ref()
+                                    .unwrap()
+                                    .open_lock_existing(OsStr::new(LOCK), mode)?;
+                                self.h.guard = Some(Arc::new(lock));
+                                require(
+                                    Some(self.h.guard.as_ref().unwrap().identity())
+                                        == self.h.lock.as_ref().unwrap().id,
+                                    "read seam existing lock ID changed",
+                                )?;
+                                self.h.parent.as_ref().unwrap().check()?;
+                                self.h.guard.as_ref().unwrap().check()?;
+                                println!(
+                                    "read_seam_actual_existing_guard mode={mode:?} parent={:?} lock={:?} existing_only=true",
+                                    self.h.oracle.root_id,
+                                    self.h.lock.as_ref().unwrap().id
+                                );
+                                self.world("guard_handoff")
+                            }
+                            fn cleanup_history(&mut self) -> io::Result<()> {
+                                require(
+                                    self.accepted_history
+                                        && self.history.is_some()
+                                        && self.h.flight.is_none()
+                                        && self.reader.is_none()
+                                        && self.h.parent.is_some()
+                                        && self.h.guard.is_some()
+                                        && Arc::strong_count(self.h.guard.as_ref().unwrap()) == 1,
+                                    "read seam accepted-history cleanup authority incomplete",
+                                )?;
+                                self.world("accepted_history_cleanup_preflight")?;
+                                let _ = self.image("before_history_cleanup")?;
+                                let history = self.history.as_ref().unwrap().clone();
+                                let parent = self.h.oracle.handles.raw(self.h.oracle.root.unwrap());
+                                let key = self.h.oracle.key.as_ref().unwrap().clone();
+                                let hold = relative(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    OsStr::new(FINAL),
+                                    true,
+                                    FILE_OPEN,
+                                    ROOT_READ | FILE_DELETE_CHILD,
+                                    null(),
+                                )?;
+                                let slot = self.note(hold);
+                                let root = self.h.oracle.handles.raw(hold);
+                                let actual = identity(root)?;
+                                self.progress.opened[slot].1 = Some(actual);
+                                granted(root, ROOT_READ | FILE_DELETE_CHILD)?;
+                                kind(root, true)?;
+                                require(
+                                    actual == history.root
+                                        && read_descriptor(root, &key, FILE_ALL_ACCESS)?.facts
+                                            == history.root_policy
+                                        && security_blob(root)? == history.root_sd,
+                                    "read seam cleanup held root differs",
+                                )?;
+                                sole_payload(root)?;
+                                let child = relative(
+                                    &mut self.h.oracle.handles,
+                                    root,
+                                    OsStr::new(CHILD),
+                                    false,
+                                    FILE_OPEN,
+                                    DELETE | META,
+                                    null(),
+                                )?;
+                                let slot = self.note(child);
+                                let raw = self.h.oracle.handles.raw(child);
+                                let actual_file = identity(raw)?;
+                                self.progress.opened[slot].1 = Some(actual_file);
+                                granted(raw, DELETE | META)?;
+                                kind(raw, false)?;
+                                require(
+                                    actual_file == history.file
+                                        && snapshot(raw)? == history.snapshot
+                                        && read_descriptor(raw, &key, FILE_GENERIC_READ)?.facts
+                                            == history.file_policy
+                                        && security_blob(raw)? == history.file_sd,
+                                    "read seam cleanup DELETE owner preimage differs",
+                                )?;
+                                // DELETE|META does not grant READ_DATA. A compatible
+                                // RWD read owner proves bytes and closes BEFORE marking.
+                                let read = shared(
+                                    &mut self.h.oracle.handles,
+                                    root,
+                                    OsStr::new(CHILD),
+                                    false,
+                                    FILE_GENERIC_READ,
+                                )?;
+                                let slot = self.note(read);
+                                let read_raw = self.h.oracle.handles.raw(read);
+                                let read_id = identity(read_raw)?;
+                                self.progress.opened[slot].1 = Some(read_id);
+                                granted(read_raw, FILE_GENERIC_READ)?;
+                                require(
+                                    read_id == actual_file
+                                        && snapshot(read_raw)? == history.snapshot
+                                        && read_descriptor(read_raw, &key, FILE_GENERIC_READ)?
+                                            .facts
+                                            == history.file_policy
+                                        && security_blob(read_raw)? == history.file_sd,
+                                    "read seam cleanup read owner differs",
+                                )?;
+                                raw_bytes(read_raw, PAYLOAD)?;
+                                self.close(
+                                    read,
+                                    Some(read_id),
+                                    "read seam history payload byte oracle",
+                                )?;
+                                mark(
+                                    raw,
+                                    &mut self.progress.child_mark_attempted,
+                                    &mut self.progress.child_mark,
+                                )?;
+                                self.close(
+                                    child,
+                                    Some(actual_file),
+                                    "read seam history payload disposition",
+                                )?;
+                                scope_absent(
+                                    &mut self.h.oracle.handles,
+                                    root,
+                                    OsStr::new(CHILD),
+                                    false,
+                                )?;
+                                self.progress.child_absent = true;
+                                scope_empty(root)?;
+                                require(
+                                    identity(root)? == history.root
+                                        && read_descriptor(root, &key, FILE_ALL_ACCESS)?.facts
+                                            == history.root_policy
+                                        && security_blob(root)? == history.root_sd,
+                                    "read seam emptied root identity/policy changed",
+                                )?;
+                                self.close(
+                                    hold,
+                                    Some(actual),
+                                    "read seam close ALL noDELETE root cleanup holds",
+                                )?;
+                                let remove = relative(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    OsStr::new(FINAL),
+                                    true,
+                                    FILE_OPEN,
+                                    DELETE | META,
+                                    null(),
+                                )?;
+                                let slot = self.note(remove);
+                                let raw = self.h.oracle.handles.raw(remove);
+                                let root_id = identity(raw)?;
+                                self.progress.opened[slot].1 = Some(root_id);
+                                granted(raw, DELETE | META)?;
+                                kind(raw, true)?;
+                                require(
+                                    root_id == history.root
+                                        && read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts
+                                            == history.root_policy
+                                        && security_blob(raw)? == history.root_sd,
+                                    "read seam fresh DELETE root identity/policy differs",
+                                )?;
+                                mark(
+                                    raw,
+                                    &mut self.progress.root_mark_attempted,
+                                    &mut self.progress.root_mark,
+                                )?;
+                                self.close(
+                                    remove,
+                                    Some(root_id),
+                                    "read seam history root disposition",
+                                )?;
+                                scope_absent(
+                                    &mut self.h.oracle.handles,
+                                    parent,
+                                    OsStr::new(FINAL),
+                                    true,
+                                )?;
+                                self.progress.root_absent = true;
+                                println!(
+                                    "read_seam_accepted_history_removed root={root_id:?} file={actual_file:?} genuine_prior_acceptance=true payload_and_root_namespace_absent=true all_noDELETE_holds_closed_before_root_DELETE=true direct_native_checked_close=true acl_repair=false"
+                                );
+                                Ok(())
+                            }
+                            fn execute(&mut self) -> Result<(), Error> {
+                                self.h.prepare()?;
+                                self.phase = "genuine acceptance and stored actual preimages";
+                                self.h.happy().map_err(Error::Product)?;
+                                require(
+                                    matches!(&self.h.flight, Some(Flight::Acceptance(_))),
+                                    "read seam genuine acceptance missing",
+                                )?;
+                                self.world("genuine_accepted_baseline")?;
+                                self.history = Some(self.image("genuine_accepted_baseline")?);
+                                self.accepted_history = true;
+                                self.phase = "acceptance owns context after ORIGINAL inputs drop";
+                                self.drop_inputs(false)?;
+                                {
+                                    let Some(Flight::Acceptance(acceptance)) = &self.h.flight
+                                    else {
+                                        return Err(bad("read seam acceptance lost").into());
+                                    };
+                                    self.read_directory(
+                                        acceptance.directory(),
+                                        "accepted_after_original_input_drop",
+                                    )?;
+                                }
+                                self.world("accepted_after_original_input_drop")?;
+                                let _ = self.image("accepted_after_original_input_drop")?;
+                                lock_trial(
+                                    &mut self.h,
+                                    &mut self.unknown,
+                                    &mut self.trials,
+                                    "read_accepted_Exclusive_native_Shared",
+                                    false,
+                                    false,
+                                )?;
+                                // All borrowed files ended. Dropping this real acceptance
+                                // releases its read owners/Domain; history is data only.
+                                drop(self.h.flight.take());
+                                self.phase = "actual existing Shared handoff";
+                                self.acquire(LockMode::Shared)?;
+                                lock_trial(
+                                    &mut self.h,
+                                    &mut self.unknown,
+                                    &mut self.trials,
+                                    "read_input_Shared_native_Shared",
+                                    false,
+                                    true,
+                                )?;
+                                lock_trial(
+                                    &mut self.h,
+                                    &mut self.unknown,
+                                    &mut self.trials,
+                                    "read_input_Shared_native_Exclusive",
+                                    true,
+                                    false,
+                                )?;
+                                let entries = self.h.oracle.directory.as_ref().unwrap().enumerate(
+                                    EnumerationLimits {
+                                        max_entries: 16,
+                                        max_name_bytes: 4096,
+                                    },
+                                )?;
+                                let expected = entries
+                                    .iter()
+                                    .find(|entry| entry.name == OsStr::new(FINAL))
+                                    .map(|entry| entry.identity)
+                                    .ok_or_else(|| {
+                                        bad("read seam expected root missing from bounded metadata")
+                                    })?;
+                                require(
+                                    expected == self.history.as_ref().unwrap().root,
+                                    "read seam enumerated expected full ID differs",
+                                )?;
+                                let named = self.image("Shared_before_first_method")?;
+                                require(
+                                    named.root == expected,
+                                    "read seam fresh named expected full ID differs",
+                                )?;
+                                self.world("Shared_before_first_method")?;
+                                println!(
+                                    "read_seam_prerequisites_complete genuine_acceptance_history=true accepted_read_after_original_input_drop=true retained_Exclusive_native_Shared_denied=true old_Exclusive_released=true real_existing_Shared_native_proved=true expected_full_id={expected:?} stored_actual_OWNER_GROUP=true all_native_preimages=true first_open_package_not_yet_called=true"
+                                );
+                                self.phase = "first open_package under actual Shared";
+                                match self.h.parent.as_ref().unwrap().open_package(
+                                    Arc::clone(self.h.guard.as_ref().unwrap()),
+                                    OsStr::new(FINAL),
+                                    expected,
+                                ) {
+                                    Err(source)
+                                        if source.kind() == io::ErrorKind::Unsupported
+                                            && source.to_string() == MISSING_READ =>
+                                    {
+                                        self.missing = Some(source);
+                                        self.drop_inputs(true)?;
+                                    }
+                                    Err(source) => return Err(Error::Read(source)),
+                                    Ok(reader) => {
+                                        self.reader = Some(reader);
+                                        self.drop_inputs(false)?;
+                                        self.read_directory(
+                                            self.reader.as_ref().unwrap(),
+                                            "returned_reader_after_new_input_drop",
+                                        )?;
+                                        self.world("returned_reader_after_new_input_drop")?;
+                                        let _ =
+                                            self.image("returned_reader_after_new_input_drop")?;
+                                        lock_trial(
+                                            &mut self.h,
+                                            &mut self.unknown,
+                                            &mut self.trials,
+                                            "read_returned_Shared_native_Shared",
+                                            false,
+                                            true,
+                                        )?;
+                                        lock_trial(
+                                            &mut self.h,
+                                            &mut self.unknown,
+                                            &mut self.trials,
+                                            "read_returned_Shared_native_Exclusive",
+                                            true,
+                                            false,
+                                        )?;
+                                        drop(self.reader.take());
+                                    }
+                                }
+                                self.phase = "true Exclusive recovery for ACCEPTED-HISTORY cleanup";
+                                self.acquire(LockMode::Exclusive)?;
+                                lock_trial(
+                                    &mut self.h,
+                                    &mut self.unknown,
+                                    &mut self.trials,
+                                    "read_cleanup_Exclusive_native_Shared",
+                                    false,
+                                    false,
+                                )?;
+                                self.cleanup_history()?;
+                                self.h
+                                    .observe("read_seam_accepted_artifact_absent", false)?;
+                                self.phase = "full original fixture teardown";
+                                self.h.cleanup()?;
+                                require(
+                                    self.accepted_history
+                                        && self.progress.child_absent
+                                        && self.progress.root_absent
+                                        && self.h.flight.is_none()
+                                        && self.reader.is_none()
+                                        && self.h.parent.is_none()
+                                        && self.h.guard.is_none()
+                                        && self.unknown.is_empty()
+                                        && self.h.oracle.handles.slots.iter().all(Option::is_none)
+                                        && self.trials.len()
+                                            == if self.missing.is_some() { 4 } else { 6 }
+                                        && self.trials.iter().all(|trial| {
+                                            trial.closed
+                                                && (trial.lock_bool == 0
+                                                    || trial.unlock.is_some_and(|(ok, error)| {
+                                                        ok != 0 && error == 0
+                                                    }))
+                                        }),
+                                    "read seam cleanup/native ownership remains incomplete",
+                                )?;
+                                println!(
+                                    "read_seam_full_teardown_complete genuine_accepted_artifact_known_ID_cleanup=true original_cause_preserved={} all_parent_lock_canary_oracle_names_absent=true all_direct_native_owners_checked_closed=true public_release_distinct_from_native_CloseHandle=true remaining_authority=false",
+                                    self.missing.is_some()
+                                );
+                                Ok(())
+                            }
+                        }
+                        fn mark(
+                            raw: HANDLE,
+                            attempted: &mut bool,
+                            outcome: &mut Option<(i32, u32)>,
+                        ) -> io::Result<()> {
+                            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+                            *attempted = true;
+                            let result = unsafe {
+                                SetFileInformationByHandle(
+                                    raw,
+                                    FileDispositionInfo,
+                                    (&info as *const FILE_DISPOSITION_INFO).cast(),
+                                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                                )
+                            };
+                            let error = if result == 0 {
+                                unsafe { GetLastError() }
+                            } else {
+                                0
+                            };
+                            if result == 0 && error == ERROR_IO_PENDING {
+                                pending_disposition();
+                            }
+                            *outcome = Some((result, error));
+                            if result == 0 {
+                                Err(io::Error::from_raw_os_error(error as i32))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        fn pending_disposition() -> ! {
+                            static MESSAGE: &[u8] = b"READ_SEAM_UNCLASSIFIED: native disposition completion uncertain; no selected RED or cleanup; terminating without unwinding\r\n";
+                            unsafe {
+                                let stderr = GetStdHandle((-12i32) as u32);
+                                if !stderr.is_null() && stderr != INVALID_HANDLE_VALUE {
+                                    let mut written = 0;
+                                    let _ = WriteFile(
+                                        stderr,
+                                        MESSAGE.as_ptr(),
+                                        MESSAGE.len() as u32,
+                                        &mut written,
+                                        null_mut(),
+                                    );
+                                }
+                                let _ = TerminateProcess(GetCurrentProcess(), 0xe0150005);
+                            }
+                            std::process::abort()
+                        }
+                        pub(in crate::windows) struct Failure {
+                            cause: Option<io::Error>,
+                            error: Option<Error>,
+                            retained: Option<Box<Fixture>>,
+                            selected: bool,
+                        }
+                        impl std::fmt::Debug for Failure {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                let mut d = f.debug_struct(if self.selected {
+                                    "PublishedReadSeamMissingFeatureRed"
+                                } else {
+                                    "InvalidPublishedReadSeam"
+                                });
+                                d.field("original_missing_cause", &self.cause)
+                                    .field("error", &self.error)
+                                    .field("selected_only_after_full_teardown", &self.selected);
+                                if let Some(h) = &self.retained {
+                                    d.field("phase", &h.phase)
+                                        .field("saved_cause", &h.missing)
+                                        .field("history", &h.history)
+                                        .field("actual_prior_acceptance", &h.accepted_history)
+                                        .field("progress", &h.progress)
+                                        .field("raw_close_uncertainty", &h.unknown)
+                                        .field("native_lock_trials", &h.trials)
+                                        .field("actual_acceptance_retained", &h.h.flight.is_some())
+                                        .field("returned_reader_retained", &h.reader.is_some())
+                                        .field("caller_guard_retained", &h.h.guard.is_some());
+                                }
+                                d.field(
+                                    "owning_fixture_or_read_error_retained",
+                                    &self.retained.is_some(),
+                                )
+                                .finish()
+                            }
+                        }
+                        pub(in crate::windows) fn run() -> Result<(), Failure> {
+                            let mut fixture = Fixture::new();
+                            if let Err(error) = fixture.execute() {
+                                return Err(Failure {
+                                    cause: None,
+                                    error: Some(error),
+                                    retained: Some(Box::new(fixture)),
+                                    selected: false,
+                                });
+                            }
+                            match fixture.missing.take() {
+                                Some(cause) => {
+                                    println!(
+                                        "read_seam_RED_exact variant=io_Error kind=Unsupported literal={MISSING_READ:?} genuine_accepted_history=true all_native_preconditions_before_first_method=true full_checked_teardown_before_preserved_cause=true remaining_authority=false"
+                                    );
+                                    Err(Failure {
+                                        cause: Some(cause),
+                                        error: None,
+                                        retained: None,
+                                        selected: true,
+                                    })
+                                }
+                                None => {
+                                    println!(
+                                        "read_seam_GREEN_owned_reader_after_input_drop=true complete_checked_teardown=true"
+                                    );
+                                    Ok(())
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -9315,6 +10200,13 @@ mod windows {
     fn staged_package_seals_and_publishes_one_file()
     -> Result<(), execution_oracle::first_stage::Failure> {
         execution_oracle::run_first_stage()
+    }
+
+    #[test]
+    fn published_package_read_seam_reopens_expected_identity()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::Failure>
+    {
+        execution_oracle::first_stage::discard_case::guard_case::read_seam_case::run()
     }
 
     #[test]
