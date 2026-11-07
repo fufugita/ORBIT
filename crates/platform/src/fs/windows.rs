@@ -2416,6 +2416,86 @@ mod staged_package {
             Err(_) => Err(state.fault("package checked temporary close failed", result.err())),
         }
     }
+    fn close_file_lease(file: File, state: &Arc<CloseState>, id: FileIdentity) -> io::Result<()> {
+        let owner = unsafe { OwnedHandle::from_raw_handle(file.into_raw_handle()) };
+        let result = close_owned(owner, state, Some(id), "package read lease");
+        state.active.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+    impl CloseState {
+        fn healthy_count(self: &Arc<Self>) -> io::Result<u64> {
+            self.check()?;
+            let count = self.active.load(Ordering::Acquire);
+            self.check()?;
+            Ok(count)
+        }
+    }
+    impl StageCore {
+        fn prove_live_refusal(&self, expected_count: u64) -> io::Result<()> {
+            if expected_count == 0
+                || self.domain.closes.healthy_count()? != expected_count
+                || self.phase != PublicationState::NamespaceUnknown
+                || self.final_name.is_some()
+                || self.removal.is_some()
+                || self.root.is_none()
+                || self.root_identity.is_none()
+                || self.root_policy.is_none()
+                || self.bridge.is_some()
+                || self.reader.is_some()
+            {
+                return Err(denied("live-view refusal has incomplete stage facts"));
+            }
+            self.check_root()?;
+            let creator = self.root.as_ref().unwrap().as_raw_handle();
+            let name = PreparedName::new(&self.original_name)?;
+            let observer = native_open(
+                self.domain.parent(),
+                &name,
+                true,
+                FILE_OPEN,
+                ROOT_READ,
+                OBSERVER_SHARE,
+                null(),
+                &self.domain.closes,
+                "package-live-original-name",
+            )?;
+            let mut measured_identity = None;
+            let result = (|| {
+                let raw = observer.as_raw_handle();
+                let actual = identity(raw)?;
+                measured_identity = Some(actual);
+                if Some(actual) != self.root_identity || identity(creator)? != actual {
+                    return Err(denied("live-view original-name identity differs"));
+                }
+                ensure_kind(raw, true)?;
+                if held_leaf(raw)? != self.original_name
+                    || held_leaf(creator)? != self.original_name
+                    || self.domain.facts(raw, FILE_ALL_ACCESS)?
+                        != *self.root_policy.as_ref().unwrap()
+                {
+                    return Err(denied("live-view original-name policy or leaf changed"));
+                }
+                self.inventory(raw)?;
+                self.check_root()?;
+                self.domain.check()
+            })();
+            finish_owned(
+                observer,
+                &self.domain.closes,
+                measured_identity,
+                "package live-view original-name observer",
+                result,
+            )?;
+            self.check_root()?;
+            self.domain.check()?;
+            if held_leaf(creator)? != self.original_name
+                || self.domain.closes.healthy_count()? != expected_count
+            {
+                return Err(denied("live-view count or original namespace changed"));
+            }
+            Ok(())
+        }
+    }
 
     struct PreparedName {
         wide: Vec<u16>,
@@ -3018,6 +3098,425 @@ mod staged_package {
             };
             view.execution_permission()?;
             Ok(view)
+        }
+    }
+    #[cfg(test)]
+    struct TestTransferError {
+        proof: Option<io::Error>,
+        anchor: Option<io::Error>,
+        file: Option<io::Error>,
+        domain: Arc<Domain>,
+    }
+    #[cfg(test)]
+    impl std::fmt::Debug for TestTransferError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TestTransferError")
+                .field("proof", &self.proof)
+                .field("anchor", &self.anchor)
+                .field("file", &self.file)
+                .field("parent", &self.domain.parent_identity)
+                .field("lock", &self.domain.lock_identity)
+                .field("closes", &self.domain.closes)
+                .finish()
+        }
+    }
+    #[cfg(test)]
+    impl std::fmt::Display for TestTransferError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "actual view setup/close failed: {:?}; anchor={:?}; file={:?}; poisoned={}",
+                self.proof,
+                self.anchor,
+                self.file,
+                self.domain.closes.poisoned.load(Ordering::Acquire)
+            )
+        }
+    }
+    #[cfg(test)]
+    impl std::error::Error for TestTransferError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.proof
+                .as_ref()
+                .or(self.anchor.as_ref())
+                .or(self.file.as_ref())
+                .map(|e| e as _)
+        }
+    }
+    #[cfg(test)]
+    fn test_grant(raw: HANDLE, expected: u32) -> io::Result<()> {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Basic {
+            attributes: u32,
+            granted: u32,
+            handles: u32,
+            pointers: u32,
+            reserved: [u32; 10],
+        }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryObject(
+                raw: HANDLE,
+                class: i32,
+                value: *mut c_void,
+                bytes: u32,
+                returned: *mut u32,
+            ) -> i32;
+        }
+        let mut basic = Basic::default();
+        let mut returned = 0;
+        let status = unsafe {
+            NtQueryObject(
+                raw,
+                0,
+                (&mut basic as *mut Basic).cast(),
+                size_of::<Basic>() as u32,
+                &mut returned,
+            )
+        };
+        if status != 0 {
+            return Err(native_error("test genuine-view granted access", status));
+        }
+        if returned as usize != size_of::<Basic>() || basic.granted != expected {
+            return Err(denied("test genuine view actual access differs"));
+        }
+        println!(
+            "live_view_actual_grant expected=0x{expected:08x} actual=0x{:08x} query_status=0",
+            basic.granted
+        );
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) struct TestLiveView {
+        file: Option<File>,
+        root: Option<OwnedHandle>,
+        root_id: Option<FileIdentity>,
+        expected_root: FileIdentity,
+        root_policy: PolicyFacts,
+        root_name: OsString,
+        domain: Arc<Domain>,
+        identity: FileIdentity,
+        snapshot: SourceSnapshot,
+        policy: PolicyFacts,
+        name: OsString,
+        executable: bool,
+        context: Option<execution_observation::ContextKey>,
+    }
+    #[cfg(test)]
+    fn reject_test_view(
+        view: &mut PackageFile<'_>,
+        domain: Arc<Domain>,
+        proof: io::Error,
+    ) -> io::Error {
+        let file = view
+            .file
+            .take()
+            .and_then(|file| close_file_lease(file, &view.closes, view.identity).err());
+        io::Error::new(
+            proof.kind(),
+            TestTransferError {
+                proof: Some(proof),
+                anchor: None,
+                file,
+                domain,
+            },
+        )
+    }
+    #[cfg(test)]
+    impl TestLiveView {
+        pub(super) fn detach(mut view: PackageFile<'_>) -> io::Result<Self> {
+            let domain = match &view.lease {
+                PackageLease::Stage(core) => Arc::clone(&core.domain),
+                PackageLease::Published(directory) => Arc::clone(&directory.domain),
+            };
+            let core = match &view.lease {
+                PackageLease::Stage(core) => *core,
+                PackageLease::Published(_) => {
+                    return Err(reject_test_view(
+                        &mut view,
+                        domain,
+                        invalid("test transfer requires a normal stage view"),
+                    ));
+                }
+            };
+            let expected_root = match core.root_identity {
+                Some(identity) => identity,
+                None => {
+                    return Err(reject_test_view(
+                        &mut view,
+                        domain,
+                        invalid("test stage root ID unavailable"),
+                    ));
+                }
+            };
+            let root_policy = match core.root_policy.clone() {
+                Some(policy) => policy,
+                None => {
+                    return Err(reject_test_view(
+                        &mut view,
+                        domain,
+                        invalid("test stage root policy unavailable"),
+                    ));
+                }
+            };
+            let mut holder = Self {
+                file: None,
+                root: None,
+                root_id: None,
+                expected_root,
+                root_policy,
+                root_name: core.original_name.clone(),
+                domain,
+                identity: view.identity,
+                snapshot: view.snapshot,
+                policy: view.policy.clone(),
+                name: view.name.clone(),
+                executable: view.expected_executable,
+                context: None,
+            };
+            let proof = (|| {
+                view.check()?;
+                if !Arc::ptr_eq(&view.closes, &core.domain.closes) {
+                    return Err(denied(
+                        "test view is not from the actual stage lease domain",
+                    ));
+                }
+                test_grant(view.raw()?, FILE_GENERIC_READ)?;
+                if identity(view.raw()?)? != view.identity {
+                    return Err(denied("test original view ID differs"));
+                }
+                holder.context = Some(execution_observation::test_context(&holder.domain.closes)?);
+                let prepared = PreparedName::new(&holder.root_name)?;
+                let root = native_open(
+                    holder.domain.parent(),
+                    &prepared,
+                    true,
+                    FILE_OPEN,
+                    ROOT_READ,
+                    OBSERVER_SHARE,
+                    null(),
+                    &holder.domain.closes,
+                    "test genuine-view root anchor",
+                )?;
+                holder.root = Some(root);
+                let raw = holder.root.as_ref().unwrap().as_raw_handle();
+                let actual = identity(raw)?;
+                holder.root_id = Some(actual);
+                if actual != holder.expected_root {
+                    return Err(denied("test root anchor actual full ID differs"));
+                }
+                ensure_kind(raw, true)?;
+                test_grant(raw, ROOT_READ)?;
+                if held_leaf(raw)? != holder.root_name
+                    || holder.domain.facts(raw, FILE_ALL_ACCESS)? != holder.root_policy
+                {
+                    return Err(denied("test root anchor actual policy/leaf differs"));
+                }
+                core.check_root()?;
+                if execution_observation::test_context(&holder.domain.closes)?
+                    != *holder.context.as_ref().unwrap()
+                {
+                    return Err(denied("test transfer context changed during preparation"));
+                }
+                Ok(())
+            })();
+            if let Err(proof) = proof {
+                let anchor = holder.close_anchor().err();
+                let file = view
+                    .file
+                    .take()
+                    .and_then(|file| close_file_lease(file, &view.closes, view.identity).err());
+                return Err(io::Error::new(
+                    proof.kind(),
+                    TestTransferError {
+                        proof: Some(proof),
+                        anchor,
+                        file,
+                        domain: Arc::clone(&holder.domain),
+                    },
+                ));
+            }
+            // Everything fallible and every clone precedes this unique real
+            // owner transfer. Old PackageFile drops None, without releasing.
+            holder.file = view.file.take();
+            Ok(holder)
+        }
+        fn close_anchor(&mut self) -> io::Result<()> {
+            if let Some(root) = self.root.take() {
+                close_owned(
+                    root,
+                    &self.domain.closes,
+                    self.root_id,
+                    "test genuine-view read anchor",
+                )?;
+            }
+            Ok(())
+        }
+        fn close_parts(&mut self) -> io::Result<()> {
+            let anchor = self.close_anchor().err();
+            let file = self
+                .file
+                .take()
+                .and_then(|file| close_file_lease(file, &self.domain.closes, self.identity).err());
+            if anchor.is_some() || file.is_some() {
+                return Err(io::Error::other(TestTransferError {
+                    proof: None,
+                    anchor,
+                    file,
+                    domain: Arc::clone(&self.domain),
+                }));
+            }
+            self.domain.closes.check()
+        }
+        pub(super) fn close(mut self) -> io::Result<()> {
+            self.close_parts()?;
+            self.domain.closes.zero()
+        }
+        fn facts(&self) -> io::Result<SourceSnapshot> {
+            self.domain.check()?;
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("test view root anchor closed"))?
+                .as_raw_handle();
+            let file = self
+                .file
+                .as_ref()
+                .ok_or_else(|| invalid("test actual file closed"))?
+                .as_raw_handle();
+            ensure_kind(root, true)?;
+            if identity(root)? != self.expected_root
+                || held_leaf(root)? != self.root_name
+                || self.domain.facts(root, FILE_ALL_ACCESS)? != self.root_policy
+                || self.domain.facts(file, mode(self.executable))? != self.policy
+            {
+                return Err(denied("test actual view root/file facts changed"));
+            }
+            let actual = source_snapshot(file, self.identity, false)?;
+            if actual != self.snapshot
+                || execution_observation::test_context(&self.domain.closes)?
+                    != *self.context.as_ref().unwrap()
+            {
+                return Err(denied("test actual view snapshot/context changed"));
+            }
+            Ok(actual)
+        }
+        pub(super) fn read_actual(&mut self, expected: &[u8]) -> io::Result<()> {
+            let before = self.facts()?;
+            let raw = self.file.as_ref().unwrap().as_raw_handle();
+            test_grant(raw, FILE_GENERIC_READ)?;
+            let mut bytes = Vec::new();
+            {
+                let file = self.file.as_mut().unwrap();
+                file.seek(SeekFrom::Start(0))?;
+                (&mut *file).take(4097).read_to_end(&mut bytes)?;
+            }
+            if bytes != expected || self.facts()? != before {
+                return Err(denied("test transferred actual file bytes changed"));
+            }
+            let observed = execution_observation::observe_package(
+                raw,
+                self.identity,
+                self.root.as_ref().unwrap().as_raw_handle(),
+                self.expected_root,
+                &self.name,
+                || self.facts(),
+                &self.domain.closes,
+            )?;
+            if observed.executable() != self.executable {
+                return Err(denied("test actual view execution mode differs"));
+            }
+            println!(
+                "live_view_actual_read file_id={:?} root_id={:?} snapshot={before:?} bytes_verified=true executable={} same_transferred_file=true",
+                self.identity, self.expected_root, self.executable
+            );
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    impl Drop for TestLiveView {
+        fn drop(&mut self) {
+            let _ = self.close_parts();
+        }
+    }
+    #[cfg(test)]
+    impl StagedDirectory {
+        pub(super) fn test_context(&self) -> io::Result<execution_observation::ContextKey> {
+            execution_observation::test_context(&self.core.domain.closes)
+        }
+        pub(super) fn test_zero(&self) -> io::Result<()> {
+            self.core.domain.closes.zero()
+        }
+        pub(super) fn test_managed_policy(&self, raw: HANDLE, mask: u32) -> io::Result<()> {
+            let actual = self.core.domain.facts(raw, mask)?;
+            println!("live_view_managed_policy mask=0x{mask:08x} actual={actual:?}");
+            Ok(())
+        }
+        pub(super) fn test_finish_native<T>(
+            &self,
+            owner: OwnedHandle,
+            measured: Option<FileIdentity>,
+            result: io::Result<T>,
+        ) -> io::Result<T> {
+            finish_owned(
+                owner,
+                &self.core.domain.closes,
+                measured,
+                "live-view independent native observer",
+                result,
+            )
+        }
+        pub(super) fn test_unattempted(&self) -> io::Result<()> {
+            if self.core.final_name.is_some()
+                || self.core.removal.is_some()
+                || self.core.phase != PublicationState::NamespaceUnknown
+                || self.core.domain.closes.healthy_count()? != 1
+            {
+                return Err(denied("live-view marker/count facts changed"));
+            }
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    impl StageRemoval {
+        pub(super) fn test_finish_native<T>(
+            &self,
+            owner: OwnedHandle,
+            measured: Option<FileIdentity>,
+            result: io::Result<T>,
+        ) -> io::Result<T> {
+            finish_owned(
+                owner,
+                &self.domain.closes,
+                measured,
+                "live-view post-removal independent observer",
+                result,
+            )
+        }
+        pub(super) fn test_removed(
+            &self,
+            root: FileIdentity,
+            file: FileIdentity,
+        ) -> io::Result<execution_observation::ContextKey> {
+            self.domain.check()?;
+            self.domain.closes.zero()?;
+            if self.root.identity != root
+                || self.root.disposition_status != 0
+                || !self.root.close_confirmed
+                || !self.root.absence_confirmed
+                || self.entries.len() != 1
+                || self.entries[0].identity != file
+                || self.entries[0].disposition_status != 0
+                || !self.entries[0].close_confirmed
+                || !self.entries[0].absence_confirmed
+            {
+                return Err(denied("live-view source-guarded removal receipt differs"));
+            }
+            println!(
+                "live_view_actual_removal_receipt root={root:?} file={file:?} native_statuses=0 checked_closes=true measured_original_name_absence=true source_guarded_receipt=true"
+            );
+            execution_observation::test_context(&self.domain.closes)
         }
     }
     fn mode(executable: bool) -> u32 {
@@ -3785,6 +4284,32 @@ mod staged_package {
             self.core.make_view(name, executable)
         }
         pub fn discard(mut self) -> Result<StageRemoval, StageRemovalError> {
+            let live = (|| {
+                let count = self.core.domain.closes.healthy_count()?;
+                if count == 0 {
+                    return Ok(false);
+                }
+                self.core.prove_live_refusal(count)?;
+                Ok(true)
+            })();
+            match live {
+                Ok(true) => {
+                    return Err(StageRemovalError::Unchanged {
+                        source: denied("package has live read leases"),
+                        stage: self,
+                    });
+                }
+                Err(source) => {
+                    return Err(StageRemovalError::Uncertain {
+                        source,
+                        recovery: StageRecovery {
+                            core: self.core,
+                            publication: None,
+                        },
+                    });
+                }
+                Ok(false) => {}
+            }
             let result = (|| {
                 self.core.check_root()?;
                 self.core.domain.closes.zero()?;
@@ -3825,6 +4350,34 @@ mod staged_package {
             mut self,
             final_name: &OsStr,
         ) -> Result<PackagePublication, StagePublishError> {
+            let live = (|| {
+                validate_data_component(final_name)?;
+                let count = self.core.domain.closes.healthy_count()?;
+                if count == 0 {
+                    return Ok(false);
+                }
+                self.core.prove_live_refusal(count)?;
+                Ok(true)
+            })();
+            match live {
+                Ok(true) => {
+                    return Err(StagePublishError::Unchanged {
+                        source: denied("package has live read leases"),
+                        stage: self,
+                    });
+                }
+                Err(source) => {
+                    return Err(StagePublishError::Uncertain {
+                        source,
+                        state: PublicationState::NamespaceUnknown,
+                        recovery: StageRecovery {
+                            core: self.core,
+                            publication: None,
+                        },
+                    });
+                }
+                Ok(false) => {}
+            }
             let prior_final_was_none = self.core.final_name.is_none();
             let preflight = (|| {
                 validate_data_component(final_name)?;
@@ -4072,14 +4625,7 @@ mod staged_package {
     impl Drop for PackageFile<'_> {
         fn drop(&mut self) {
             if let Some(file) = self.file.take() {
-                let owner = unsafe { OwnedHandle::from_raw_handle(file.into_raw_handle()) };
-                let _ = close_owned(
-                    owner,
-                    &self.closes,
-                    Some(self.identity),
-                    "package read lease",
-                );
-                self.closes.active.fetch_sub(1, Ordering::AcqRel);
+                let _ = close_file_lease(file, &self.closes, self.identity);
             }
         }
     }
@@ -5225,6 +5771,23 @@ mod execution_observation {
                 result
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_context(state: &Arc<staged_package::CloseState>) -> io::Result<ContextKey> {
+        let mut handles = Handles::default();
+        let result = (|| {
+            let (original, key) = effective(&mut handles)?;
+            if context(handles.raw(original), key.thread_token)? != key {
+                return Err(denied("test original effective context changed"));
+            }
+            let (_, current) = effective(&mut handles)?;
+            if current != key {
+                return Err(denied("test current effective context changed"));
+            }
+            Ok(key)
+        })();
+        handles.finish_package(result, state)
     }
 
     pub(super) fn package_principal(
@@ -9729,6 +10292,595 @@ mod tests {
             evidence.disposition_calls
         );
         Ok(())
+    }
+
+    mod live_view_control {
+        use super::*;
+        const STAGE: &str = "live-view-stage";
+        const FINAL: &str = "live-view-final";
+        const PAYLOAD: &[u8] = b"live-view-genuine-owned-payload";
+        const ROOT_READ: u32 =
+            READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE | FILE_LIST_DIRECTORY | FILE_TRAVERSE;
+        const RWD: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct SdImage {
+            owner: Vec<u8>,
+            group: Vec<u8>,
+            control: u16,
+            dacl: Vec<u8>,
+        }
+        fn sid_image(sid: PSID, base: *const u8, bytes: usize) -> io::Result<Vec<u8>> {
+            let offset = (sid as usize)
+                .checked_sub(base as usize)
+                .ok_or_else(|| invalid("live-view SID outside descriptor"))?;
+            if sid.is_null()
+                || sid as usize % 4 != 0
+                || offset.checked_add(8).is_none_or(|end| end > bytes)
+            {
+                return Err(invalid("live-view SID header bounds invalid"));
+            }
+            let count = unsafe { *sid.cast::<u8>().add(1) } as usize;
+            let length = 8 + count * 4;
+            if count > 15
+                || offset.checked_add(length).is_none_or(|end| end > bytes)
+                || unsafe { IsValidSid(sid) } == 0
+                || unsafe { GetLengthSid(sid) } as usize != length
+            {
+                return Err(invalid("live-view SID extent invalid"));
+            }
+            Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
+        }
+        fn sd_image(raw: HANDLE) -> io::Result<SdImage> {
+            let mut owner = null_mut();
+            let mut group = null_mut();
+            let mut dacl = null_mut();
+            let mut sd = null_mut();
+            let status = unsafe {
+                GetSecurityInfo(
+                    raw,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION
+                        | GROUP_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    &mut group,
+                    &mut dacl,
+                    null_mut(),
+                    &mut sd,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            let _allocation = LocalAllocation(sd);
+            if sd.is_null() || unsafe { IsValidSecurityDescriptor(sd) } == 0 {
+                return Err(invalid("live-view descriptor invalid"));
+            }
+            let bytes = unsafe { GetSecurityDescriptorLength(sd) } as usize;
+            if !(size_of::<SECURITY_DESCRIPTOR_RELATIVE>()..=65536).contains(&bytes) {
+                return Err(invalid("live-view descriptor bounds invalid"));
+            }
+            let owner = sid_image(owner, sd.cast(), bytes)?;
+            let group = sid_image(group, sd.cast(), bytes)?;
+            let mut control = 0;
+            let mut revision = 0;
+            unsafe {
+                ok(GetSecurityDescriptorControl(
+                    sd,
+                    &mut control,
+                    &mut revision,
+                ))?;
+            }
+            let offset = (dacl as usize)
+                .checked_sub(sd as usize)
+                .ok_or_else(|| invalid("live-view ACL outside descriptor"))?;
+            if dacl.is_null()
+                || dacl as usize % 4 != 0
+                || offset
+                    .checked_add(size_of::<ACL>())
+                    .is_none_or(|end| end > bytes)
+                || control & SE_SELF_RELATIVE == 0
+            {
+                return Err(invalid("live-view ACL header invalid"));
+            }
+            let length = unsafe { (*dacl).AclSize } as usize;
+            if length < size_of::<ACL>()
+                || offset.checked_add(length).is_none_or(|end| end > bytes)
+                || unsafe { IsValidAcl(dacl) } == 0
+            {
+                return Err(invalid("live-view ACL extent invalid"));
+            }
+            Ok(SdImage {
+                owner,
+                group,
+                control,
+                dacl: unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), length) }.to_vec(),
+            })
+        }
+        fn chain_images(directory: &Directory) -> io::Result<Vec<SdImage>> {
+            directory
+                .chain
+                .iter()
+                .map(|h| sd_image(h.as_raw_handle()))
+                .collect()
+        }
+        enum Error {
+            Fixture(io::Error),
+            Create(StageCreateError),
+            Publish(StagePublishError),
+            Removal(StageRemovalError),
+            UnexpectedPublication(PackagePublication),
+            UnexpectedRemoval(StageRemoval),
+        }
+        impl From<io::Error> for Error {
+            fn from(error: io::Error) -> Self {
+                Self::Fixture(error)
+            }
+        }
+        impl std::fmt::Debug for Error {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::Fixture(e) => f.debug_tuple("Fixture").field(e).finish(),
+                    Self::Create(e) => f.debug_tuple("Create").field(e).finish(),
+                    Self::Publish(e) => f.debug_tuple("Publish").field(e).finish(),
+                    Self::Removal(e) => f.debug_tuple("Removal").field(e).finish(),
+                    Self::UnexpectedPublication(p) => f
+                        .debug_tuple("UnexpectedPublicationRetained")
+                        .field(&p.identity())
+                        .finish(),
+                    Self::UnexpectedRemoval(r) => {
+                        let _ = r;
+                        f.write_str("UnexpectedRemovalReceiptRetained")
+                    }
+                }
+            }
+        }
+        struct Fixture {
+            base: ProbeFixture,
+            guard: Option<Arc<StateLock>>,
+            stage: Option<StagedDirectory>,
+            view: Option<staged_package::TestLiveView>,
+            receipt: Option<StageRemoval>,
+            root: Option<FileIdentity>,
+            file: Option<FileIdentity>,
+            snapshot: Option<SourceSnapshot>,
+            root_sd: Option<SdImage>,
+            file_sd: Option<SdImage>,
+            state_sd: Vec<SdImage>,
+            foreign_sd: Vec<SdImage>,
+            base_sd: Vec<SdImage>,
+            lock_sd: Option<SdImage>,
+            canary_sd: Option<SdImage>,
+            lock_snapshot: Option<FileSnapshot>,
+            context: Option<execution_observation::ContextKey>,
+            causes: Vec<io::Error>,
+            phase: &'static str,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                Self {
+                    base: ProbeFixture::empty(),
+                    guard: None,
+                    stage: None,
+                    view: None,
+                    receipt: None,
+                    root: None,
+                    file: None,
+                    snapshot: None,
+                    root_sd: None,
+                    file_sd: None,
+                    state_sd: Vec::new(),
+                    foreign_sd: Vec::new(),
+                    base_sd: Vec::new(),
+                    lock_sd: None,
+                    canary_sd: None,
+                    lock_snapshot: None,
+                    context: None,
+                    causes: Vec::with_capacity(2),
+                    phase: "native fixture setup",
+                }
+            }
+            fn setup(&mut self) -> Result<(), Error> {
+                self.base.initialize()?;
+                let lock = self
+                    .base
+                    .lock
+                    .take()
+                    .ok_or_else(|| invalid("live-view actual lock missing"))?;
+                self.guard = Some(Arc::new(lock));
+                let foreign = self.base.foreign().handle();
+                let foreign_id = self.base.foreign_id.unwrap();
+                let sec = probe_security_copy(self.base.sec());
+                let canary = probe_create_payload(
+                    &mut self.base.ledger,
+                    foreign,
+                    foreign_id,
+                    OsStr::new("canary"),
+                    b"untouched foreign canary",
+                    &sec,
+                )?;
+                self.base.foreign_canary = Some(canary);
+                self.state_sd = chain_images(self.base.state())?;
+                self.foreign_sd = chain_images(self.base.foreign())?;
+                self.base_sd = chain_images(self.base.base())?;
+                let guard = self.guard.as_ref().unwrap();
+                self.base.state().require_lock(guard, true)?;
+                if Some(guard.identity()) != self.base.lock_id
+                    || probe_granted_access(guard.file.file.as_raw_handle())?
+                        != FILE_ALL_ACCESS & !DELETE
+                {
+                    return Err(denied("live-view actual matching lock/grant differs").into());
+                }
+                self.lock_sd = Some(sd_image(guard.file.file.as_raw_handle())?);
+                self.lock_snapshot = Some(guard.file.snapshot()?);
+                let stage = self
+                    .base
+                    .state()
+                    .stage_directory(Arc::clone(guard), OsStr::new(STAGE))
+                    .map_err(Error::Create)?;
+                self.root = Some(stage.identity());
+                self.stage = Some(stage);
+                {
+                    let mut file = self.stage.as_mut().unwrap().write_new(
+                        OsStr::new("payload"),
+                        PAYLOAD,
+                        false,
+                    )?;
+                    self.file = Some(file.identity());
+                    self.snapshot = Some(file.snapshot()?);
+                    if file.read_limited(4096)? != PAYLOAD
+                        || file.execution_permission()?.executable()
+                        || Some(file.snapshot()?) != self.snapshot
+                    {
+                        return Err(denied("live-view normal written file differs").into());
+                    }
+                }
+                self.context = Some(self.stage.as_ref().unwrap().test_context()?);
+                let normal = self
+                    .stage
+                    .as_ref()
+                    .unwrap()
+                    .verify_package_mode(OsStr::new("payload"), false)?;
+                self.view = Some(staged_package::TestLiveView::detach(normal)?);
+                self.view.as_mut().unwrap().read_actual(PAYLOAD)?;
+                self.observe_intact("before_publication")
+            }
+            fn world(&mut self, current: execution_observation::ContextKey) -> io::Result<()> {
+                if Some(current) != self.context {
+                    return Err(denied("live-view original/current context differs"));
+                }
+                probe_recheck_chain(self.base.state(), &self.base.state_chain)?;
+                probe_recheck_chain(self.base.foreign(), &self.base.foreign_chain)?;
+                probe_recheck_chain(self.base.base(), &self.base.base_chain)?;
+                if chain_images(self.base.state())? != self.state_sd
+                    || chain_images(self.base.foreign())? != self.foreign_sd
+                    || chain_images(self.base.base())? != self.base_sd
+                {
+                    return Err(denied("live-view outer policy image changed"));
+                }
+                let guard = self
+                    .guard
+                    .as_ref()
+                    .ok_or_else(|| invalid("live-view guard missing"))?;
+                self.base.state().require_lock(guard, true)?;
+                if Some(guard.identity()) != self.base.lock_id
+                    || Some(guard.file.snapshot()?) != self.lock_snapshot
+                    || Some(sd_image(guard.file.file.as_raw_handle())?) != self.lock_sd
+                {
+                    return Err(denied("live-view lock image changed"));
+                }
+                let (id, acl) = self.base.foreign_canary.clone().unwrap();
+                probe_verify_foreign(&mut self.base, id, &acl)?;
+                let foreign = self.base.foreign().handle();
+                let foreign_id = self.base.foreign_id.unwrap();
+                let owner = probe_open_bound(
+                    &mut self.base.ledger,
+                    foreign,
+                    foreign_id,
+                    OsStr::new("canary"),
+                    false,
+                    FILE_GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE,
+                    null(),
+                    None,
+                    true,
+                )?;
+                let raw = self.base.ledger.raw(owner);
+                let mut measured = None;
+                let result = (|| {
+                    let actual = identity(raw)?;
+                    measured = Some(actual);
+                    if actual != id {
+                        return Err(denied("live-view named canary identity changed"));
+                    }
+                    let image = sd_image(raw)?;
+                    if self
+                        .canary_sd
+                        .as_ref()
+                        .is_some_and(|before| *before != image)
+                    {
+                        return Err(denied("live-view canary OWNER/GROUP/control/DACL changed"));
+                    }
+                    self.canary_sd = Some(image);
+                    Ok(())
+                })();
+                self.close_observer(owner, measured, result)
+            }
+            fn close_observer<T>(
+                &mut self,
+                id: ProbeHandle,
+                measured: Option<FileIdentity>,
+                result: io::Result<T>,
+            ) -> io::Result<T> {
+                let owner = self.base.ledger.handles[id.0]
+                    .take()
+                    .ok_or_else(|| invalid("live-view observer already consumed"))?;
+                let result = if let Some(stage) = &self.stage {
+                    stage.test_finish_native(owner, measured, result)
+                } else {
+                    self.receipt
+                        .as_ref()
+                        .unwrap()
+                        .test_finish_native(owner, measured, result)
+                };
+                self.base.ledger.closed.push(format!(
+                    "live-view-observer#{} checked_finish_ok={}",
+                    id.0,
+                    result.is_ok()
+                ));
+                result
+            }
+            fn observe_intact(&mut self, phase: &'static str) -> Result<(), Error> {
+                self.world(self.stage.as_ref().unwrap().test_context()?)?;
+                self.stage.as_ref().unwrap().test_unattempted()?;
+                let parent = self.base.state().handle();
+                let parent_id = self.base.state_id.unwrap();
+                probe_check_absent(&mut self.base.ledger, parent, parent_id, OsStr::new(FINAL))?;
+                let root = probe_open_bound(
+                    &mut self.base.ledger,
+                    parent,
+                    parent_id,
+                    OsStr::new(STAGE),
+                    true,
+                    ROOT_READ,
+                    RWD,
+                    null(),
+                    None,
+                    true,
+                )?;
+                let raw = self.base.ledger.raw(root);
+                let mut root_id = None;
+                let result = (|| -> io::Result<()> {
+                    let actual = identity(raw)?;
+                    root_id = Some(actual);
+                    if Some(actual) != self.root || held_leaf(raw)? != OsStr::new(STAGE) {
+                        return Err(denied("live-view named stage identity differs"));
+                    }
+                    if probe_granted_access(raw)? != ROOT_READ {
+                        return Err(denied("live-view independent root grant differs"));
+                    }
+                    self.stage
+                        .as_ref()
+                        .unwrap()
+                        .test_managed_policy(raw, FILE_ALL_ACCESS)?;
+                    let root_sd = sd_image(raw)?;
+                    if self.root_sd.as_ref().is_some_and(|old| *old != root_sd) {
+                        return Err(denied("live-view root SD changed"));
+                    }
+                    self.root_sd = Some(root_sd);
+                    let listed = source_directory_entries(
+                        raw,
+                        EnumerationLimits {
+                            max_entries: 4,
+                            max_name_bytes: 4096,
+                        },
+                    )?;
+                    if listed.len() != 1
+                        || listed[0].name != OsStr::new("payload")
+                        || listed[0].directory
+                        || listed[0].identity != self.file.unwrap().file
+                    {
+                        return Err(denied("live-view stage full inventory differs"));
+                    }
+                    let file = probe_open_bound(
+                        &mut self.base.ledger,
+                        raw,
+                        actual,
+                        OsStr::new("payload"),
+                        false,
+                        FILE_GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_DELETE,
+                        null(),
+                        None,
+                        true,
+                    )?;
+                    let file_raw = self.base.ledger.raw(file);
+                    let mut measured_file = None;
+                    let read = (|| -> io::Result<()> {
+                        let actual = identity(file_raw)?;
+                        measured_file = Some(actual);
+                        if Some(actual) != self.file
+                            || Some(source_snapshot(file_raw, actual, false)?) != self.snapshot
+                            || probe_granted_access(file_raw)? != FILE_GENERIC_READ
+                        {
+                            return Err(denied("live-view named file metadata/grant differs"));
+                        }
+                        let sec = probe_security_copy(self.base.sec());
+                        let _ = probe_check_r(file_raw, &sec)?;
+                        self.stage
+                            .as_ref()
+                            .unwrap()
+                            .test_managed_policy(file_raw, FILE_GENERIC_READ)?;
+                        let image = sd_image(file_raw)?;
+                        if self.file_sd.as_ref().is_some_and(|old| *old != image) {
+                            return Err(denied("live-view named file SD changed"));
+                        }
+                        self.file_sd = Some(image);
+                        if probe_read_payload(file_raw, actual)? != PAYLOAD {
+                            return Err(denied("live-view named file bytes differ"));
+                        }
+                        Ok(())
+                    })();
+                    self.close_observer(file, measured_file, read)?;
+                    Ok(())
+                })();
+                self.close_observer(root, root_id, result)?;
+                self.view.as_mut().unwrap().read_actual(PAYLOAD)?;
+                println!(
+                    "live_view_intact phase={phase} root={:?} file={:?} complete_inventory=true managed_FA_R_OWNER_GROUP=true snapshot_bytes_unchanged=true original_context=true parent_lock_anchors_canary=true final_absent=true same_real_view=true pre_attempt_markers_none=true",
+                    self.root, self.file
+                );
+                Ok(())
+            }
+            fn execute(&mut self) -> Result<(), Error> {
+                self.setup()?;
+                self.phase = "publication with same genuine live view";
+                let stage = self.stage.take().unwrap();
+                match stage.publish_directory(OsStr::new(FINAL)) {
+                    Err(StagePublishError::Unchanged { source, stage })
+                        if source.kind() == io::ErrorKind::PermissionDenied
+                            && source.to_string() == "package has live read leases" =>
+                    {
+                        self.stage = Some(stage);
+                        self.causes.push(source);
+                    }
+                    Err(error) => return Err(Error::Publish(error)),
+                    Ok(publication) => return Err(Error::UnexpectedPublication(publication)),
+                }
+                if Some(self.stage.as_ref().unwrap().identity()) != self.root {
+                    return Err(denied("publication returned different stage").into());
+                }
+                self.observe_intact("after_publication_refusal")?;
+                self.phase = "discard with SAME genuine live view";
+                let stage = self.stage.take().unwrap();
+                match stage.discard() {
+                    Err(StageRemovalError::Unchanged { source, stage })
+                        if source.kind() == io::ErrorKind::PermissionDenied
+                            && source.to_string() == "package has live read leases" =>
+                    {
+                        self.stage = Some(stage);
+                        self.causes.push(source);
+                    }
+                    Err(error) => return Err(Error::Removal(error)),
+                    Ok(receipt) => return Err(Error::UnexpectedRemoval(receipt)),
+                }
+                if Some(self.stage.as_ref().unwrap().identity()) != self.root {
+                    return Err(denied("discard returned different stage").into());
+                }
+                self.observe_intact("after_discard_refusal")?;
+                self.phase = "actual view anchor/file checked close and real release";
+                self.view.take().unwrap().close()?;
+                self.stage.as_ref().unwrap().test_zero()?;
+                self.world(self.stage.as_ref().unwrap().test_context()?)?;
+                self.phase = "THAT stage actual discard";
+                let stage = self.stage.take().unwrap();
+                self.receipt = Some(stage.discard().map_err(Error::Removal)?);
+                let key = self
+                    .receipt
+                    .as_ref()
+                    .unwrap()
+                    .test_removed(self.root.unwrap(), self.file.unwrap())?;
+                self.world(key)?;
+                let parent = self.base.state().handle();
+                let parent_id = self.base.state_id.unwrap();
+                probe_check_absent(&mut self.base.ledger, parent, parent_id, OsStr::new(STAGE))?;
+                probe_check_absent(&mut self.base.ledger, parent, parent_id, OsStr::new(FINAL))?;
+                let entries = directory_entries(
+                    parent,
+                    EnumerationLimits {
+                        max_entries: 8,
+                        max_name_bytes: 4096,
+                    },
+                )?;
+                if entries.len() != 1
+                    || entries[0].name != OsStr::new("transaction.lock")
+                    || entries[0].identity != self.base.lock_id.unwrap().file
+                    || entries.iter().any(|entry| {
+                        entry.identity == self.root.unwrap().file
+                            || entry.identity == self.file.unwrap().file
+                    })
+                {
+                    return Err(
+                        denied("live-view bounded parent namespace exclusion failed").into(),
+                    );
+                }
+                println!(
+                    "live_view_actual_discard_names root={:?} file={:?} original_root_payload_namespace_absent=true final_unused=true bounded_parent_ID_exclusion=true volume_wide_ID_absence_claim=false receipt_held=true",
+                    self.root, self.file
+                );
+                drop(self.receipt.take());
+                self.phase = "restore original lock and full known fixture teardown";
+                let guard = self.guard.take().unwrap();
+                match Arc::try_unwrap(guard) {
+                    Ok(lock) => self.base.lock = Some(lock),
+                    Err(guard) => {
+                        self.guard = Some(guard);
+                        return Err(denied("live-view guard alias remains; retained").into());
+                    }
+                }
+                if !self.base.stages.is_empty()
+                    || self.causes.len() != 2
+                    || self.view.is_some()
+                    || self.stage.is_some()
+                {
+                    return Err(invalid("live-view final product authority remains").into());
+                }
+                self.base.finish_success()?;
+                if self.base.ledger.handles.iter().any(Option::is_some)
+                    || self.base.ledger.directories.iter().any(Option::is_some)
+                    || self.base.lock.is_some()
+                    || self.base.state_dir.is_some()
+                    || self.base.foreign_dir.is_some()
+                    || self.base.base_dir.is_some()
+                {
+                    return Err(invalid("live-view fixture owner remains after cleanup").into());
+                }
+                println!(
+                    "live_view_control_complete exact_refusals=2 SAME_actual_view=true actual_file_close_release=true real_discard_receipt=true all_fixture_names_removed=true all_direct_native_owners_checked_closed=true public_Arc_release_not_native_close=true remaining_authority=false"
+                );
+                Ok(())
+            }
+        }
+        pub(super) struct Failure {
+            error: Error,
+            retained: Box<Fixture>,
+        }
+        impl std::fmt::Debug for Failure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("InvalidGenuineLiveViewControl")
+                    .field("phase", &self.retained.phase)
+                    .field("error", &self.error)
+                    .field("refusal_causes", &self.retained.causes)
+                    .field("root", &self.retained.root)
+                    .field("file", &self.retained.file)
+                    .field("stage_retained", &self.retained.stage.is_some())
+                    .field("actual_view_retained", &self.retained.view.is_some())
+                    .field("receipt_retained", &self.retained.receipt.is_some())
+                    .field("guard_retained", &self.retained.guard.is_some())
+                    .field("created_fixture_names", &self.retained.base.ledger.created)
+                    .field(
+                        "consumed_fixture_close_facts",
+                        &self.retained.base.ledger.closed,
+                    )
+                    .field("owning_typed_carrier", &true)
+                    .finish()
+            }
+        }
+        pub(super) fn run() -> Result<(), Failure> {
+            let mut fixture = Fixture::new();
+            match fixture.execute() {
+                Ok(()) => Ok(()),
+                Err(error) => Err(Failure {
+                    error,
+                    retained: Box::new(fixture),
+                }),
+            }
+        }
+    }
+    #[test]
+    fn staged_package_live_views_refuse_publication_and_cleanup()
+    -> Result<(), live_view_control::Failure> {
+        live_view_control::run()
     }
 
     #[test]
