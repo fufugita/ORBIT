@@ -1892,13 +1892,26 @@ mod tests {
                 .store()
                 .save(&identity, secret(), ExpectedRevision::Absent)
                 .unwrap();
+            let providers = home.0.join("auth/providers");
+            let owner = owner_sid(&providers);
+            assert_eq!(owner, current_sid());
+            let group = group_sid(&providers);
+            let full_identity = object_identity(&providers);
+            let owner_grant = format!("*{owner}:(OI)(CI)F");
+            icacls(&providers, &["/grant:r", &owner_grant]);
+            assert_eq!(owner_sid(&providers), owner);
+            assert_eq!(group_sid(&providers), group);
+            assert_eq!(object_identity(&providers), full_identity);
+            {
+                let prepared = orbit_platform::fs::Directory::open(&providers).unwrap();
+                assert_eq!(prepared.identity(), full_identity);
+            }
             let directory = Directory::open(&home.0, false).unwrap().unwrap();
             let lock = StoreLock::acquire(&directory).unwrap();
             let current = directory.read(&identity).unwrap().unwrap();
             assert_eq!(current.revision, first.revision);
             let replacement = SecretBytes::new(b"synthetic-replacement-secret".to_vec());
             let bytes = encode(&identity, fresh_revision(&identity), replacement.expose()).unwrap();
-            let providers = home.0.join("auth/providers");
             let original_policy = acl_snapshot(&providers);
             let mut callback_ran = false;
             let mut unsafe_policy = String::new();
@@ -2058,6 +2071,27 @@ mod tests {
             Some(path),
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(windows)]
+    fn group_sid(path: &Path) -> String {
+        use std::ffi::OsStr;
+        let output = fixture_command(
+            "group_sid",
+            &system_program("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                OsStr::new("-NoProfile"),
+                OsStr::new("-NonInteractive"),
+                OsStr::new("-Command"),
+                OsStr::new(
+                    "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath $env:ORBIT_TEST_ACL_PATH).GetGroup([Security.Principal.SecurityIdentifier]).Value",
+                ),
+            ],
+            Some(path),
+        );
+        let group = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        assert!(!group.is_empty());
+        group
     }
 
     #[cfg(windows)]
