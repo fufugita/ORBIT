@@ -1382,23 +1382,6 @@ mod windows_fixture {
         }
         // The terminal state was observed before moving out of the ownership guard.
         let output = child.0.take().unwrap().wait_with_output().unwrap();
-        let diagnostic = |bytes: &[u8]| {
-            let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
-            let mut clipped = String::new();
-            for character in text.chars() {
-                let character =
-                    if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
-                        '\u{fffd}'
-                    } else {
-                        character
-                    };
-                if clipped.len() + character.len_utf8() > 4096 {
-                    break;
-                }
-                clipped.push(character);
-            }
-            clipped
-        };
         assert!(
             output.status.success(),
             "native fixture command failed: program={} operation={operation} status={}\nstdout (at most 4096 bytes):\n{}\nstderr (at most 4096 bytes):\n{}",
@@ -1411,17 +1394,34 @@ mod windows_fixture {
         output
     }
 
+    fn diagnostic(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+        let mut clipped = String::new();
+        for character in text.chars() {
+            let character = if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                '\u{fffd}'
+            } else {
+                character
+            };
+            if clipped.len() + character.len_utf8() > 4096 {
+                break;
+            }
+            clipped.push(character);
+        }
+        clipped
+    }
+
     fn system_program(name: &str) -> PathBuf {
         PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32")
             .join(name)
     }
 
-    fn icacls(path: &Path, arguments: &[&str]) {
+    fn icacls(path: &Path, arguments: &[&str]) -> std::process::Output {
         use std::ffi::OsStr;
         let mut args = vec![path.as_os_str()];
         args.extend(arguments.iter().map(OsStr::new));
-        fixture_command("icacls", &system_program("icacls.exe"), &args, None);
+        fixture_command("icacls", &system_program("icacls.exe"), &args, None)
     }
 
     fn current_sid() -> String {
@@ -1575,10 +1575,64 @@ mod windows_fixture {
         assert_eq!(security(path), expected.security);
     }
 
+    fn emit_acl_diagnostic(
+        operation: &'static str,
+        phase: &'static str,
+        bytes: &[u8],
+        path: &Path,
+    ) {
+        let redacted =
+            String::from_utf8_lossy(bytes).replace(path.to_string_lossy().as_ref(), "[fixture]");
+        let escaped = format!("{:?}", diagnostic(redacted.as_bytes()));
+        let prefix = format!("fixture_acl_diag operation={operation} phase={phase} ");
+        let budget = 4096usize.saturating_sub(prefix.len() + 1);
+        let mut end = escaped.len().min(budget);
+        while !escaped.is_char_boundary(end) {
+            end -= 1;
+        }
+        eprintln!("{prefix}{}", &escaped[..end]);
+    }
+
     pub(super) fn edit_acl(path: &Path, arguments: &[&str]) -> Observation {
+        let operation = match arguments {
+            ["/grant:r", grant] if grant.ends_with(":R") => Some("owner-R"),
+            ["/grant:r", grant] if grant.ends_with(":RX") => Some("owner-RX"),
+            _ => None,
+        };
         let before = observe(path);
-        icacls(path, arguments);
+        let editor = icacls(path, arguments);
+        if let Some(operation) = operation {
+            let immediate = security(path);
+            emit_acl_diagnostic(
+                operation,
+                "before_security",
+                format!("{:?}", before.security).as_bytes(),
+                path,
+            );
+            emit_acl_diagnostic(
+                operation,
+                "editor_status",
+                format!("{}", editor.status).as_bytes(),
+                path,
+            );
+            emit_acl_diagnostic(operation, "editor_stdout", &editor.stdout, path);
+            emit_acl_diagnostic(operation, "editor_stderr", &editor.stderr, path);
+            emit_acl_diagnostic(
+                operation,
+                "immediate_security",
+                format!("{immediate:?}").as_bytes(),
+                path,
+            );
+        }
         let after = observe(path);
+        if let Some(operation) = operation {
+            emit_acl_diagnostic(
+                operation,
+                "after_observation_security",
+                format!("{:?}", after.security).as_bytes(),
+                path,
+            );
+        }
         assert_eq!(after.identity, before.identity);
         assert_eq!(after.security.owner, before.security.owner);
         assert_eq!(after.security.group, before.security.group);
