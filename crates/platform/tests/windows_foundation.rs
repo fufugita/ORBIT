@@ -11209,6 +11209,1388 @@ mod windows {
                                 }
                             }
 
+                            pub(in crate::windows) mod initial_read_case {
+                                use super::*;
+
+                                const TARGET: &str = "initial-read-target";
+                                const LEAF: &str = "initial-read-payload";
+                                const DONOR: &str = "initial-read-id-donor";
+
+                                #[derive(Clone, Copy, Debug)]
+                                enum Fault {
+                                    Owner,
+                                    Permissive,
+                                    Flags,
+                                    Identity,
+                                }
+                                impl Fault {
+                                    fn bytes(self) -> &'static [u8] {
+                                        match self {
+                                            Self::Owner => b"initial-read-owner-native-v1",
+                                            Self::Permissive => {
+                                                b"initial-read-permissive-native-v1"
+                                            }
+                                            Self::Flags => b"initial-read-flags-native-v1",
+                                            Self::Identity => b"initial-read-identity-native-v1",
+                                        }
+                                    }
+                                    fn name(self) -> &'static str {
+                                        match self {
+                                            Self::Owner => "owner-r",
+                                            Self::Permissive => "permissive-r",
+                                            Self::Flags => "noncanonical-rx-flags",
+                                            Self::Identity => "wrong-root-id",
+                                        }
+                                    }
+                                    fn mask(self) -> u32 {
+                                        FILE_GENERIC_READ
+                                            | if matches!(self, Self::Flags) {
+                                                FILE_GENERIC_EXECUTE
+                                            } else {
+                                                0
+                                            }
+                                    }
+                                    fn executable(self) -> bool {
+                                        matches!(self, Self::Flags)
+                                    }
+                                    fn cause(self) -> &'static str {
+                                        match self {
+                                            Self::Flags => {
+                                                "published managed ACE must be ordinary zero-flag allow"
+                                            }
+                                            Self::Identity => {
+                                                "published root actual full ID differs"
+                                            }
+                                            _ => "published managed owner/private policy differs",
+                                        }
+                                    }
+                                }
+                                #[derive(Clone, Debug, Eq, PartialEq)]
+                                struct Ace {
+                                    flags: u8,
+                                    mask: u32,
+                                    sid: Vec<u8>,
+                                }
+                                struct RawPolicy {
+                                    descriptor: ReadDescriptor,
+                                    sd: Vec<u8>,
+                                    aces: Vec<Ace>,
+                                }
+                                fn raw_policy(raw: HANDLE) -> io::Result<RawPolicy> {
+                                    let sd = security_blob(raw)?;
+                                    let mut words =
+                                        vec![0usize; sd.len().div_ceil(size_of::<usize>())];
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            sd.as_ptr(),
+                                            words.as_mut_ptr().cast(),
+                                            sd.len(),
+                                        );
+                                    }
+                                    let base = words.as_mut_ptr().cast();
+                                    yes(unsafe { IsValidSecurityDescriptor(base) })?;
+                                    let mut owner = null_mut();
+                                    let mut group = null_mut();
+                                    let mut dacl = null_mut();
+                                    let mut defaulted = 0;
+                                    let mut present = 0;
+                                    let mut control = 0;
+                                    let mut revision = 0;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorOwner(base, &mut owner, &mut defaulted)
+                                    })?;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorGroup(base, &mut group, &mut defaulted)
+                                    })?;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorControl(
+                                            base,
+                                            &mut control,
+                                            &mut revision,
+                                        )
+                                    })?;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorDacl(
+                                            base,
+                                            &mut present,
+                                            &mut dacl,
+                                            &mut defaulted,
+                                        )
+                                    })?;
+                                    let owner = sid_bytes(owner, words.as_ptr().cast(), sd.len())?;
+                                    let group = sid_bytes(group, words.as_ptr().cast(), sd.len())?;
+                                    require(
+                                        present != 0
+                                            && !dacl.is_null()
+                                            && control
+                                                & (SE_DACL_PRESENT
+                                                    | SE_DACL_PROTECTED
+                                                    | SE_SELF_RELATIVE)
+                                                == SE_DACL_PRESENT
+                                                    | SE_DACL_PROTECTED
+                                                    | SE_SELF_RELATIVE,
+                                        "initial-read raw policy control invalid",
+                                    )?;
+                                    let start = (dacl as usize)
+                                        .checked_sub(words.as_ptr() as usize)
+                                        .ok_or_else(|| {
+                                            bad("initial-read DACL outside descriptor")
+                                        })?;
+                                    require(
+                                        start % std::mem::align_of::<ACL>() == 0
+                                            && start
+                                                .checked_add(size_of::<ACL>())
+                                                .is_some_and(|e| e <= sd.len()),
+                                        "initial-read DACL header bounds",
+                                    )?;
+                                    let size = unsafe { (*dacl).AclSize } as usize;
+                                    require(
+                                        size >= size_of::<ACL>()
+                                            && start
+                                                .checked_add(size)
+                                                .is_some_and(|e| e <= sd.len()),
+                                        "initial-read DACL extent",
+                                    )?;
+                                    yes(unsafe { IsValidAcl(dacl) })?;
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(dacl.cast::<u8>(), size)
+                                    }
+                                    .to_vec();
+                                    let count = unsafe { (*dacl).AceCount } as usize;
+                                    require(
+                                        (1..=2).contains(&count),
+                                        "initial-read actual ACE count outside row bound",
+                                    )?;
+                                    let mut aces = Vec::with_capacity(count);
+                                    let mut offset = 8usize;
+                                    for _ in 0..count {
+                                        require(
+                                            offset.checked_add(16).is_some_and(|e| e <= size),
+                                            "initial-read short ordinary ACE",
+                                        )?;
+                                        let n = u16::from_le_bytes([
+                                            bytes[offset + 2],
+                                            bytes[offset + 3],
+                                        ]) as usize;
+                                        require(
+                                            bytes[offset] == ACCESS_ALLOWED_ACE_TYPE
+                                                && n >= 16
+                                                && offset.checked_add(n).is_some_and(|e| e <= size),
+                                            "initial-read ACE type/extent",
+                                        )?;
+                                        let sid = sid_bytes(
+                                            unsafe { dacl.cast::<u8>().add(offset + 8).cast() },
+                                            unsafe { dacl.cast::<u8>().add(offset) },
+                                            n,
+                                        )?;
+                                        require(
+                                            n == 8 + sid.len(),
+                                            "initial-read ACE/SID exact extent",
+                                        )?;
+                                        aces.push(Ace {
+                                            flags: bytes[offset + 1],
+                                            mask: u32::from_le_bytes(
+                                                bytes[offset + 4..offset + 8].try_into().unwrap(),
+                                            ),
+                                            sid,
+                                        });
+                                        offset += n;
+                                    }
+                                    Ok(RawPolicy {
+                                        descriptor: ReadDescriptor {
+                                            words,
+                                            facts: SecurityFacts {
+                                                owner,
+                                                group,
+                                                dacl: bytes,
+                                                control,
+                                            },
+                                        },
+                                        sd,
+                                        aces,
+                                    })
+                                }
+                                fn set_dacl(
+                                    raw: HANDLE,
+                                    user: &[u8],
+                                    mask: u32,
+                                    flags: &str,
+                                    everyone: bool,
+                                ) -> io::Result<u32> {
+                                    let user = sid_text(user)?;
+                                    let extra = if everyone {
+                                        "(A;;0x00120089;;;S-1-1-0)"
+                                    } else {
+                                        ""
+                                    };
+                                    let text = wide(OsStr::new(&format!(
+                                        "D:P(A;{flags};0x{mask:08x};;;{user}){extra}"
+                                    )));
+                                    let mut sd = null_mut();
+                                    let mut bytes = 0;
+                                    yes(unsafe {
+                                        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                                            text.as_ptr(),
+                                            1,
+                                            &mut sd,
+                                            &mut bytes,
+                                        )
+                                    })?;
+                                    let allocation = LocalSecurityAllocation(sd.cast());
+                                    require(
+                                        bytes as usize <= LIMIT
+                                            && unsafe { GetSecurityDescriptorLength(sd) } == bytes,
+                                        "initial-read setter descriptor bound",
+                                    )?;
+                                    let mut present = 0;
+                                    let mut defaulted = 0;
+                                    let mut dacl = null_mut();
+                                    yes(unsafe {
+                                        GetSecurityDescriptorDacl(
+                                            sd,
+                                            &mut present,
+                                            &mut dacl,
+                                            &mut defaulted,
+                                        )
+                                    })?;
+                                    require(
+                                        present != 0 && !dacl.is_null(),
+                                        "initial-read setter missing DACL",
+                                    )?;
+                                    let status = unsafe {
+                                        SetSecurityInfo(
+                                            raw,
+                                            SE_FILE_OBJECT,
+                                            DACL_SECURITY_INFORMATION
+                                                | PROTECTED_DACL_SECURITY_INFORMATION,
+                                            null_mut(),
+                                            null_mut(),
+                                            dacl,
+                                            null_mut(),
+                                        )
+                                    };
+                                    drop(allocation);
+                                    if status != ERROR_SUCCESS {
+                                        return Err(io::Error::from_raw_os_error(status as i32));
+                                    }
+                                    Ok(status)
+                                }
+                                #[derive(Clone, Debug, Eq, PartialEq)]
+                                struct Image {
+                                    root: FileIdentity,
+                                    root_snapshot: SourceSnapshot,
+                                    root_policy: SecurityFacts,
+                                    root_sd: Vec<u8>,
+                                    file: FileImage,
+                                    aces: Vec<Ace>,
+                                }
+                                struct Row {
+                                    c: Control,
+                                    fault: Fault,
+                                    reader_error: Option<io::Error>,
+                                    mutator: Option<usize>,
+                                    attempted: [bool; 3],
+                                    created: [bool; 3],
+                                    ids: [Option<FileIdentity>; 3],
+                                    canonical: Option<Image>,
+                                    history: Option<Image>,
+                                    donor: Option<(SourceSnapshot, Vec<u8>)>,
+                                    different_owner: Option<Vec<u8>>,
+                                    parent_history: Option<(SourceSnapshot, Vec<u8>)>,
+                                    setter_status: Option<u32>,
+                                    removed: Removal,
+                                    donor_mark_attempted: bool,
+                                    donor_mark: Option<(i32, u32)>,
+                                    donor_removed: bool,
+                                }
+                                impl Row {
+                                    fn new(fault: Fault) -> Self {
+                                        Self {
+                                            c: Control::new(),
+                                            fault,
+                                            reader_error: None,
+                                            mutator: None,
+                                            attempted: [false; 3],
+                                            created: [false; 3],
+                                            ids: [None; 3],
+                                            canonical: None,
+                                            history: None,
+                                            donor: None,
+                                            different_owner: None,
+                                            parent_history: None,
+                                            setter_status: None,
+                                            removed: Removal::default(),
+                                            donor_mark_attempted: false,
+                                            donor_mark: None,
+                                            donor_removed: false,
+                                        }
+                                    }
+                                    fn parent(&self) -> HANDLE {
+                                        self.c.raw(self.c.base.h.oracle.root.unwrap())
+                                    }
+                                    fn measure(
+                                        &mut self,
+                                        owner: usize,
+                                    ) -> io::Result<FileIdentity>
+                                    {
+                                        let actual = identity(self.c.raw(owner))?;
+                                        self.c
+                                            .base
+                                            .progress
+                                            .opened
+                                            .iter_mut()
+                                            .rev()
+                                            .find(|(n, _)| *n == owner)
+                                            .unwrap()
+                                            .1 = Some(actual);
+                                        Ok(actual)
+                                    }
+                                    fn open(
+                                        &mut self,
+                                        parent: HANDLE,
+                                        name: &str,
+                                        dir: bool,
+                                        access: u32,
+                                    ) -> io::Result<usize> {
+                                        let owner = shared(
+                                            &mut self.c.base.h.oracle.handles,
+                                            parent,
+                                            OsStr::new(name),
+                                            dir,
+                                            access,
+                                        )?;
+                                        self.c.base.note(owner); // Registered before any fallible query.
+                                        Ok(owner)
+                                    }
+                                    fn create(
+                                        &mut self,
+                                        index: usize,
+                                        parent: HANDLE,
+                                        name: &str,
+                                        dir: bool,
+                                        sd: &[usize],
+                                    ) -> io::Result<usize> {
+                                        self.attempted[index] = true;
+                                        let owner = relative(
+                                            &mut self.c.base.h.oracle.handles,
+                                            parent,
+                                            OsStr::new(name),
+                                            dir,
+                                            FILE_CREATE,
+                                            FILE_ALL_ACCESS,
+                                            sd.as_ptr().cast(),
+                                        )?;
+                                        self.c.base.note(owner);
+                                        self.created[index] = true;
+                                        self.ids[index] = Some(self.measure(owner)?);
+                                        kind(self.c.raw(owner), dir)?;
+                                        granted(self.c.raw(owner), FILE_ALL_ACCESS)?;
+                                        self.c.observed_descriptor(
+                                            self.c.raw(owner),
+                                            FILE_ALL_ACCESS,
+                                        )?;
+                                        Ok(owner)
+                                    }
+                                    fn setup(&mut self) -> io::Result<()> {
+                                        self.c.base.h.prepare()?;
+                                        let key =
+                                            self.c.base.h.oracle.key.as_ref().unwrap().clone();
+                                        let sd = descriptor(&key, FILE_ALL_ACCESS)?;
+                                        let parent = self.parent();
+                                        scope_absent(
+                                            &mut self.c.base.h.oracle.handles,
+                                            parent,
+                                            OsStr::new(TARGET),
+                                            true,
+                                        )?;
+                                        let root =
+                                            self.create(0, self.parent(), TARGET, true, &sd)?;
+                                        let file =
+                                            self.create(1, self.c.raw(root), LEAF, false, &sd)?;
+                                        let mut written = 0;
+                                        yes(unsafe {
+                                            WriteFile(
+                                                self.c.raw(file),
+                                                self.fault.bytes().as_ptr(),
+                                                self.fault.bytes().len() as u32,
+                                                &mut written,
+                                                null_mut(),
+                                            )
+                                        })?;
+                                        require(
+                                            written as usize == self.fault.bytes().len(),
+                                            "initial-read native fixture short write",
+                                        )?;
+                                        yes(unsafe { FlushFileBuffers(self.c.raw(file)) })?;
+                                        if !matches!(self.fault, Fault::Identity) {
+                                            let access = META
+                                                | if matches!(self.fault, Fault::Owner) {
+                                                    WRITE_OWNER
+                                                } else {
+                                                    WRITE_DAC
+                                                };
+                                            let owner =
+                                                self.open(self.c.raw(root), LEAF, false, access)?;
+                                            self.mutator = Some(owner);
+                                            require(
+                                                self.measure(owner)? == self.ids[1].unwrap(),
+                                                "initial-read mutator full ID differs",
+                                            )?;
+                                            granted(self.c.raw(owner), access)?;
+                                            require(
+                                                access
+                                                    & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)
+                                                    == 0,
+                                                "initial-read mutator has data-write/DELETE",
+                                            )?;
+                                        }
+                                        set_dacl(
+                                            self.c.raw(file),
+                                            &key.user,
+                                            self.fault.mask(),
+                                            "",
+                                            false,
+                                        )?;
+                                        self.c.close(
+                                            file,
+                                            self.ids[1],
+                                            "initial-read setup data writer",
+                                        )?;
+                                        self.c.close(
+                                            root,
+                                            self.ids[0],
+                                            "initial-read setup root DELETE creator",
+                                        )?;
+                                        self.canonical =
+                                            Some(self.image("canonical_before_fault", false)?);
+                                        self.positive(TARGET, self.ids[0].unwrap(), true)?;
+                                        if matches!(self.fault, Fault::Identity) {
+                                            scope_absent(
+                                                &mut self.c.base.h.oracle.handles,
+                                                parent,
+                                                OsStr::new(DONOR),
+                                                true,
+                                            )?;
+                                            let owner =
+                                                self.create(2, self.parent(), DONOR, true, &sd)?;
+                                            self.c.close(
+                                                owner,
+                                                self.ids[2],
+                                                "initial-read donor DELETE creator",
+                                            )?;
+                                            let donor = self.donor_image()?;
+                                            require(
+                                                self.ids[2].unwrap().volume
+                                                    == self.ids[0].unwrap().volume
+                                                    && self.ids[2] != self.ids[0]
+                                                    && self.ids[2] != self.c.base.h.oracle.root_id
+                                                    && !self
+                                                        .c
+                                                        .base
+                                                        .h
+                                                        .anchors
+                                                        .iter()
+                                                        .any(|a| Some(a.id) == self.ids[2]),
+                                                "initial-read donor must be distinct actual same-volume directory",
+                                            )?;
+                                            self.donor = Some(donor);
+                                            self.positive(DONOR, self.ids[2].unwrap(), false)?;
+                                        }
+                                        self.c.trial(
+                                            "initial-read original Exclusive native Shared",
+                                            false,
+                                            false,
+                                        )?;
+                                        self.inject()?;
+                                        require(
+                                            self.mutator.is_none(),
+                                            "initial-read setup mutator still held",
+                                        )?;
+                                        self.parent_history = Some((
+                                            directory_snapshot(self.parent())?,
+                                            security_blob(self.parent())?,
+                                        ));
+                                        // The authoritative baseline follows checked-close of ALL setup owners.
+                                        self.history = Some(self.image(
+                                            "authoritative_faulted_after_setup_checked_closes",
+                                            true,
+                                        )?);
+                                        self.rehearse_delete()?;
+                                        self.compare("after_checked_closed_DELETE_rehearsal")?;
+                                        self.c.base.world("initial_read_faulted_baseline")?;
+                                        self.closed_slots()?;
+                                        Ok(())
+                                    }
+                                    fn positive(
+                                        &mut self,
+                                        name: &str,
+                                        id: FileIdentity,
+                                        leaf: bool,
+                                    ) -> io::Result<()> {
+                                        self.c.reader = Some(
+                                            self.c.base.h.parent.as_ref().unwrap().open_package(
+                                                Arc::clone(self.c.base.h.guard.as_ref().unwrap()),
+                                                OsStr::new(name),
+                                                id,
+                                            )?,
+                                        );
+                                        let reader = self.c.reader.as_ref().unwrap();
+                                        require(
+                                            reader.identity() == id,
+                                            "initial-read positive root ID differs",
+                                        )?;
+                                        if leaf {
+                                            let mut file = reader.verify_package_mode(
+                                                OsStr::new(LEAF),
+                                                self.ids[1].unwrap(),
+                                                self.fault.executable(),
+                                            )?;
+                                            let before = file.snapshot()?;
+                                            let mode = file.execution_permission()?;
+                                            require(
+                                                file.identity() == self.ids[1].unwrap()
+                                                    && mode.executable() == self.fault.executable()
+                                                    && file.read_limited(4096)?
+                                                        == self.fault.bytes()
+                                                    && file.snapshot()? == before
+                                                    && file.execution_permission()? == mode,
+                                                "initial-read positive canonical admission/read differs",
+                                            )?;
+                                        }
+                                        drop(self.c.reader.take());
+                                        require(
+                                            Arc::strong_count(
+                                                self.c.base.h.guard.as_ref().unwrap(),
+                                            ) == 1,
+                                            "initial-read positive reader origin still aliased",
+                                        )?;
+                                        println!(
+                                            "initial_read_positive row={} name={name} root={id:?} security_only_mutator_held={} canonical_actual_read=true",
+                                            self.fault.name(),
+                                            self.mutator.is_some()
+                                        );
+                                        Ok(())
+                                    }
+                                    fn inject(&mut self) -> io::Result<()> {
+                                        if matches!(self.fault, Fault::Identity) {
+                                            return Ok(());
+                                        }
+                                        let owner = self.mutator.unwrap();
+                                        let raw = self.c.raw(owner);
+                                        let key =
+                                            self.c.base.h.oracle.key.as_ref().unwrap().clone();
+                                        let status = match self.fault {
+                                            Fault::Owner => {
+                                                let sid = sid_from_text("S-1-5-32-544");
+                                                yes(unsafe { IsValidSid(sid.0.cast()) })?;
+                                                let length =
+                                                    unsafe { GetLengthSid(sid.0.cast()) } as usize;
+                                                require(
+                                                    (8..=68).contains(&length),
+                                                    "initial-read different OWNER SID bounds",
+                                                )?;
+                                                let bytes = unsafe {
+                                                    std::slice::from_raw_parts(
+                                                        sid.0.cast::<u8>(),
+                                                        length,
+                                                    )
+                                                }
+                                                .to_vec();
+                                                require(
+                                                    bytes != key.user,
+                                                    "initial-read OWNER fault is not different",
+                                                )?;
+                                                self.different_owner = Some(bytes);
+                                                unsafe {
+                                                    SetSecurityInfo(
+                                                        raw,
+                                                        SE_FILE_OBJECT,
+                                                        OWNER_SECURITY_INFORMATION,
+                                                        sid.0.cast(),
+                                                        null_mut(),
+                                                        null_mut(),
+                                                        null_mut(),
+                                                    )
+                                                }
+                                            }
+                                            Fault::Permissive => set_dacl(
+                                                raw,
+                                                &key.user,
+                                                self.fault.mask(),
+                                                "",
+                                                true,
+                                            )?,
+                                            Fault::Flags => set_dacl(
+                                                raw,
+                                                &key.user,
+                                                self.fault.mask(),
+                                                "OICI",
+                                                false,
+                                            )?,
+                                            Fault::Identity => unreachable!(),
+                                        };
+                                        self.setter_status = Some(status);
+                                        println!(
+                                            "initial_read_fault_setter row={} actual_DWORD={status} privileges_enabled=false",
+                                            self.fault.name()
+                                        );
+                                        if status != ERROR_SUCCESS {
+                                            return Err(io::Error::from_raw_os_error(
+                                                status as i32,
+                                            ));
+                                        }
+                                        let provisional = raw_policy(raw)?;
+                                        self.policy(&provisional, true)?;
+                                        require(
+                                            self.measure(owner)? == self.ids[1].unwrap(),
+                                            "initial-read fault setter changed ID",
+                                        )?;
+                                        self.mutator = None;
+                                        self.c.close(owner, self.ids[1], "initial-read security-only mutator BEFORE authoritative baseline")
+                                    }
+                                    fn policy(
+                                        &self,
+                                        p: &RawPolicy,
+                                        faulted: bool,
+                                    ) -> io::Result<()> {
+                                        let key = self.c.base.h.oracle.key.as_ref().unwrap();
+                                        let caller = Ace {
+                                            flags: 0,
+                                            mask: self.fault.mask(),
+                                            sid: key.user.clone(),
+                                        };
+                                        if faulted {
+                                            require(
+                                                p.descriptor.facts.group
+                                                    == self
+                                                        .canonical
+                                                        .as_ref()
+                                                        .unwrap()
+                                                        .file
+                                                        .policy
+                                                        .group,
+                                                "initial-read fault changed actual GROUP",
+                                            )?;
+                                            if matches!(self.fault, Fault::Identity) {
+                                                require(
+                                                    p.descriptor.facts
+                                                        == self
+                                                            .canonical
+                                                            .as_ref()
+                                                            .unwrap()
+                                                            .file
+                                                            .policy
+                                                        && p.sd
+                                                            == self
+                                                                .canonical
+                                                                .as_ref()
+                                                                .unwrap()
+                                                                .file
+                                                                .sd,
+                                                    "initial-read identity row changed canonical policy",
+                                                )?;
+                                            }
+                                        }
+                                        if !faulted || matches!(self.fault, Fault::Identity) {
+                                            return require(
+                                                p.descriptor.facts.owner == key.user
+                                                    && p.aces == [caller],
+                                                "initial-read canonical actual owner/ACE differs",
+                                            );
+                                        }
+                                        let original =
+                                            &self.canonical.as_ref().unwrap().file.policy;
+                                        require(
+                                            p.descriptor.facts.group == original.group,
+                                            "initial-read fault changed actual GROUP",
+                                        )?;
+                                        match self.fault {
+                                            Fault::Owner => require(
+                                                Some(&p.descriptor.facts.owner)
+                                                    == self.different_owner.as_ref()
+                                                    && p.descriptor.facts.owner != key.user
+                                                    && p.descriptor.facts.dacl == original.dacl
+                                                    && p.aces == [caller],
+                                                "initial-read actual foreign OWNER/R policy differs",
+                                            ),
+                                            Fault::Permissive => {
+                                                let world = Ace {
+                                                    flags: 0,
+                                                    mask: FILE_GENERIC_READ,
+                                                    sid: vec![1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+                                                };
+                                                require(
+                                                    p.descriptor.facts.owner == original.owner
+                                                        && p.aces == [caller, world],
+                                                    "initial-read effective Everyone R policy differs",
+                                                )
+                                            }
+                                            Fault::Flags => require(
+                                                p.descriptor.facts.owner == original.owner
+                                                    && p.aces == [Ace { flags: 3, ..caller }],
+                                                "initial-read actual persisted ordinary OI-CI RX flags differ",
+                                            ),
+                                            Fault::Identity => unreachable!(),
+                                        }
+                                    }
+                                    fn image(
+                                        &mut self,
+                                        phase: &'static str,
+                                        faulted: bool,
+                                    ) -> io::Result<Image> {
+                                        let root_owner =
+                                            self.open(self.parent(), TARGET, true, ROOT_READ)?;
+                                        let id = self.measure(root_owner)?;
+                                        let root = self.c.raw(root_owner);
+                                        require(
+                                            Some(id) == self.ids[0],
+                                            "initial-read named root ID differs",
+                                        )?;
+                                        kind(root, true)?;
+                                        granted(root, ROOT_READ)?;
+                                        let root_snapshot = directory_snapshot(root)?;
+                                        let (root_policy, root_sd) =
+                                            self.c.observed_descriptor(root, FILE_ALL_ACCESS)?;
+                                        if let Some(canonical) = &self.canonical {
+                                            require(
+                                                root_policy.facts == canonical.root_policy
+                                                    && root_sd == canonical.root_sd,
+                                                "initial-read fixture changed canonical root security",
+                                            )?;
+                                        }
+                                        self.c.inventory(
+                                            root,
+                                            &[Spec {
+                                                name: LEAF,
+                                                bytes: self.fault.bytes(),
+                                                mask: self.fault.mask(),
+                                                executable: self.fault.executable(),
+                                            }],
+                                        )?;
+                                        let owner =
+                                            self.open(root, LEAF, false, FILE_GENERIC_READ)?;
+                                        let file_id = self.measure(owner)?;
+                                        let raw = self.c.raw(owner);
+                                        require(
+                                            Some(file_id) == self.ids[1],
+                                            "initial-read named leaf ID differs",
+                                        )?;
+                                        kind(raw, false)?;
+                                        granted(raw, FILE_GENERIC_READ)?;
+                                        let before = snapshot(raw)?;
+                                        require(
+                                            before.identity == file_id
+                                                && before.kind == SourceKind::File
+                                                && before.link_count == 1
+                                                && before.length == self.fault.bytes().len() as u64,
+                                            "initial-read file snapshot kind/link/length",
+                                        )?;
+                                        let p = raw_policy(raw)?;
+                                        self.policy(&p, faulted)?;
+                                        raw_bytes(raw, self.fault.bytes())?;
+                                        let key =
+                                            self.c.base.h.oracle.key.as_ref().unwrap().clone();
+                                        let (original, current) =
+                                            effective(&mut self.c.base.h.oracle.handles)?;
+                                        self.c.base.note(original);
+                                        require(
+                                            current == key,
+                                            "initial-read original/current context differs",
+                                        )?;
+                                        let mut duplicate_raw = null_mut();
+                                        let level =
+                                            key.impersonation.unwrap_or(SecurityImpersonation);
+                                        yes(unsafe {
+                                            DuplicateTokenEx(
+                                                self.c.raw(original),
+                                                TOKEN_QUERY,
+                                                null(),
+                                                level,
+                                                TokenImpersonation,
+                                                &mut duplicate_raw,
+                                            )
+                                        })?;
+                                        let duplicate =
+                                            self.c.base.h.oracle.handles.own(duplicate_raw);
+                                        self.c.base.note(duplicate);
+                                        let stats: TOKEN_STATISTICS =
+                                            token_value(duplicate_raw, TokenStatistics)?;
+                                        require(
+                                            stats.TokenType == TokenImpersonation
+                                                && stats.ImpersonationLevel == level,
+                                            "initial-read AccessCheck duplicate type/level",
+                                        )?;
+                                        let allowed = access_check(&p.descriptor, duplicate_raw)?;
+                                        let native = match shared(
+                                            &mut self.c.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(LEAF),
+                                            false,
+                                            META | FILE_EXECUTE,
+                                        ) {
+                                            Err(e) if native_is(&e, DENIED) => false,
+                                            Err(e) => return Err(e),
+                                            Ok(execute) => {
+                                                self.c.base.note(execute);
+                                                let actual = self.measure(execute)?;
+                                                require(
+                                                    actual == file_id
+                                                        && snapshot(self.c.raw(execute))? == before
+                                                        && raw_policy(self.c.raw(execute))?.sd
+                                                            == p.sd,
+                                                    "initial-read native EXEC object differs",
+                                                )?;
+                                                granted(self.c.raw(execute), META | FILE_EXECUTE)?;
+                                                self.c.close(
+                                                    execute,
+                                                    Some(actual),
+                                                    "initial-read native EXEC oracle",
+                                                )?;
+                                                true
+                                            }
+                                        };
+                                        require(
+                                            allowed == native
+                                                && native == self.fault.executable()
+                                                && snapshot(raw)? == before
+                                                && raw_policy(raw)?.sd == p.sd,
+                                            "initial-read AccessCheck/nativeEXEC/policy agreement",
+                                        )?;
+                                        let (last, current) =
+                                            effective(&mut self.c.base.h.oracle.handles)?;
+                                        self.c.base.note(last);
+                                        require(
+                                            current == key
+                                                && token_key(
+                                                    self.c.raw(original),
+                                                    key.thread_token,
+                                                )? == key,
+                                            "initial-read effective context changed during oracles",
+                                        )?;
+                                        self.c.close(last, None, "initial-read current token")?;
+                                        self.c.close(
+                                            duplicate,
+                                            None,
+                                            "initial-read AccessCheck-only duplicate",
+                                        )?;
+                                        self.c.close(
+                                            original,
+                                            None,
+                                            "initial-read retained original oracle token",
+                                        )?;
+                                        println!(
+                                            "initial_read_native_history row={} phase={phase} root={id:?} root_snapshot={root_snapshot:?} file={file_id:?} snapshot={before:?} OWNER_GROUP_DACL={:?} ACEs={:?} rawSD={:?} AccessCheck={allowed} native_EXEC={native} bytes_verified=true",
+                                            self.fault.name(),
+                                            p.descriptor.facts,
+                                            p.aces,
+                                            p.sd
+                                        );
+                                        let image = Image {
+                                            root: id,
+                                            root_snapshot,
+                                            root_policy: root_policy.facts,
+                                            root_sd,
+                                            file: FileImage {
+                                                id: file_id,
+                                                snapshot: before,
+                                                policy: p.descriptor.facts,
+                                                sd: p.sd,
+                                            },
+                                            aces: p.aces,
+                                        };
+                                        self.c.close(
+                                            owner,
+                                            Some(file_id),
+                                            "initial-read named file oracle",
+                                        )?;
+                                        self.c.close(
+                                            root_owner,
+                                            Some(id),
+                                            "initial-read named root oracle",
+                                        )?;
+                                        Ok(image)
+                                    }
+                                    fn compare(&mut self, phase: &'static str) -> io::Result<()> {
+                                        require(
+                                            (
+                                                directory_snapshot(self.parent())?,
+                                                security_blob(self.parent())?,
+                                            ) == *self.parent_history.as_ref().unwrap(),
+                                            "initial-read parent full snapshot/security changed",
+                                        )?;
+                                        require(
+                                            self.image(phase, true)?
+                                                == *self.history.as_ref().unwrap(),
+                                            "initial-read complete faulted history changed",
+                                        )?;
+                                        if self.donor.is_some() {
+                                            require(
+                                                self.donor_image()?
+                                                    == *self.donor.as_ref().unwrap(),
+                                                "initial-read donor history changed",
+                                            )?;
+                                        }
+                                        Ok(())
+                                    }
+                                    fn donor_image(
+                                        &mut self,
+                                    ) -> io::Result<(SourceSnapshot, Vec<u8>)>
+                                    {
+                                        let owner =
+                                            self.open(self.parent(), DONOR, true, ROOT_READ)?;
+                                        let actual = self.measure(owner)?;
+                                        let raw = self.c.raw(owner);
+                                        require(
+                                            Some(actual) == self.ids[2],
+                                            "initial-read donor actual ID differs",
+                                        )?;
+                                        granted(raw, ROOT_READ)?;
+                                        scope_empty(raw)?;
+                                        let sampled = directory_snapshot(raw)?;
+                                        let (_, sd) =
+                                            self.c.observed_descriptor(raw, FILE_ALL_ACCESS)?;
+                                        self.c.close(
+                                            owner,
+                                            Some(actual),
+                                            "initial-read empty donor observer",
+                                        )?;
+                                        Ok((sampled, sd))
+                                    }
+                                    fn rehearse_delete(&mut self) -> io::Result<()> {
+                                        let root = self.open(
+                                            self.parent(),
+                                            TARGET,
+                                            true,
+                                            ROOT_READ | FILE_DELETE_CHILD,
+                                        )?;
+                                        let id = self.measure(root)?;
+                                        require(
+                                            Some(id) == self.ids[0],
+                                            "initial-read DC rehearsal root ID",
+                                        )?;
+                                        granted(self.c.raw(root), ROOT_READ | FILE_DELETE_CHILD)?;
+                                        self.c.observed_descriptor(
+                                            self.c.raw(root),
+                                            FILE_ALL_ACCESS,
+                                        )?;
+                                        let child = self.open(
+                                            self.c.raw(root),
+                                            LEAF,
+                                            false,
+                                            DELETE | META,
+                                        )?;
+                                        let file_id = self.measure(child)?;
+                                        granted(self.c.raw(child), DELETE | META)?;
+                                        let before = &self.history.as_ref().unwrap().file;
+                                        require(
+                                            file_id == before.id
+                                                && snapshot(self.c.raw(child))? == before.snapshot
+                                                && raw_policy(self.c.raw(child))?.sd == before.sd,
+                                            "initial-read parent DC DELETE rehearsal preimage",
+                                        )?;
+                                        self.c.close(
+                                            child,
+                                            Some(file_id),
+                                            "initial-read DELETE rehearsal without mark",
+                                        )?;
+                                        self.c.close(
+                                            root,
+                                            Some(id),
+                                            "initial-read DC rehearsal root",
+                                        )?;
+                                        println!(
+                                            "initial_read_DELETE_rehearsal row={} actual_parent_DC=true actual_child_DELETE_META=true faulted_same_ID_policy=true disposition_attempted=false checked_closed=true",
+                                            self.fault.name()
+                                        );
+                                        Ok(())
+                                    }
+                                    fn closed_slots(&self) -> io::Result<()> {
+                                        require(
+                                            self.c.base.unknown.is_empty()
+                                                && self.c.base.progress.opened.iter().all(
+                                                    |(n, _)| {
+                                                        self.c.base.h.oracle.handles.slots[*n]
+                                                            .is_none()
+                                                    },
+                                                ),
+                                            "initial-read native temporary owner/close uncertainty remains",
+                                        )
+                                    }
+                                    fn refuse(&mut self) -> io::Result<()> {
+                                        self.c.base.drop_inputs(true)?;
+                                        self.c.base.acquire(LockMode::Shared)?;
+                                        self.c.trial(
+                                            "initial-read Shared input native Shared",
+                                            false,
+                                            true,
+                                        )?;
+                                        self.c.trial(
+                                            "initial-read Shared input native Exclusive",
+                                            true,
+                                            false,
+                                        )?;
+                                        self.compare("immediately_before_negative_initial_open")?;
+                                        self.c.base.world("initial_read_before_negative")?;
+                                        self.closed_slots()?;
+                                        let expected = if matches!(self.fault, Fault::Identity) {
+                                            self.ids[2].unwrap()
+                                        } else {
+                                            self.ids[0].unwrap()
+                                        };
+                                        match self.c.base.h.parent.as_ref().unwrap().open_package(
+                                            Arc::clone(self.c.base.h.guard.as_ref().unwrap()),
+                                            OsStr::new(TARGET),
+                                            expected,
+                                        ) {
+                                            Ok(reader) => {
+                                                self.c.reader = Some(reader);
+                                                return Err(bad(
+                                                    "initial-read negative unexpectedly admitted; actual reader retained INVALID",
+                                                ));
+                                            }
+                                            Err(error) => self.reader_error = Some(error),
+                                        }
+                                        let error = self.reader_error.as_ref().unwrap();
+                                        require(
+                                            error.kind() == io::ErrorKind::PermissionDenied
+                                                && has_cause(error, self.fault.cause()),
+                                            "initial-read not healthy exact INITIAL policy/ID refusal; actual error retained INVALID",
+                                        )?;
+                                        self.c.base.drop_inputs(false)?;
+                                        self.compare(
+                                            "actual_error_only_after_external_inputs_drop",
+                                        )?;
+                                        self.c.base.world("initial_read_error_only")?;
+                                        self.c.trial(
+                                            "initial-read actual error-only native Shared",
+                                            false,
+                                            true,
+                                        )?;
+                                        self.c.trial(
+                                            "initial-read actual error-only native Exclusive",
+                                            true,
+                                            false,
+                                        )?;
+                                        self.closed_slots()?;
+                                        require(
+                                            self.c.reader.is_none()
+                                                && self.c.flight.is_none()
+                                                && self.mutator.is_none(),
+                                            "initial-read no-export premise incomplete",
+                                        )?;
+                                        // INITIAL only: fail() reverse-closes EVERY registered slot,
+                                        // then Acquire-loads its actual poison; Other on uncertainty.
+                                        // No exported reader/file/lease/state writer can race that sample.
+                                        // This is source-bound healthy error release, not close telemetry,
+                                        // constructor alias acknowledgment, recovery or deletion authority.
+                                        println!(
+                                            "initial_read_expected_refusal row={} outer=PermissionDenied primary={:?} actual_Shared_origin_retained=true faulted_preimages_unchanged=true INITIAL_no_export_boundary_source_reviewed=true",
+                                            self.fault.name(),
+                                            self.fault.cause()
+                                        );
+                                        drop(self.reader_error.take());
+                                        self.c.base.acquire(LockMode::Exclusive)?;
+                                        self.c.trial("initial-read reacquired same-ID Exclusive native Shared", false, false)?;
+                                        self.compare(
+                                            "after_healthy_INITIAL_error_release_before_cleanup",
+                                        )?;
+                                        self.c.base.world("initial_read_after_healthy_release")
+                                    }
+                                    fn cleanup_target(&mut self) -> io::Result<()> {
+                                        self.compare("complete_faulted_preflight_before_any_mark")?;
+                                        let history = self.history.as_ref().unwrap().clone();
+                                        require(
+                                            self.created[0]
+                                                && self.created[1]
+                                                && self.reader_error.is_none()
+                                                && self.c.reader.is_none()
+                                                && Arc::strong_count(
+                                                    self.c.base.h.guard.as_ref().unwrap(),
+                                                ) == 1,
+                                            "initial-read independent native creation cleanup authority incomplete",
+                                        )?;
+                                        let root_owner = self.open(
+                                            self.parent(),
+                                            TARGET,
+                                            true,
+                                            ROOT_READ | FILE_DELETE_CHILD,
+                                        )?;
+                                        let root_id = self.measure(root_owner)?;
+                                        let root = self.c.raw(root_owner);
+                                        require(
+                                            root_id == history.root
+                                                && directory_snapshot(root)?
+                                                    == history.root_snapshot
+                                                && self
+                                                    .c
+                                                    .observed_descriptor(root, FILE_ALL_ACCESS)?
+                                                    .1
+                                                    == history.root_sd,
+                                            "initial-read held DC root preimage",
+                                        )?;
+                                        granted(root, ROOT_READ | FILE_DELETE_CHILD)?;
+                                        self.c.inventory(
+                                            root,
+                                            &[Spec {
+                                                name: LEAF,
+                                                bytes: self.fault.bytes(),
+                                                mask: self.fault.mask(),
+                                                executable: self.fault.executable(),
+                                            }],
+                                        )?;
+                                        let child = self.open(root, LEAF, false, DELETE | META)?;
+                                        let id = self.measure(child)?;
+                                        let raw = self.c.raw(child);
+                                        kind(raw, false)?;
+                                        granted(raw, DELETE | META)?;
+                                        require(
+                                            id == history.file.id
+                                                && snapshot(raw)? == history.file.snapshot
+                                                && raw_policy(raw)?.sd == history.file.sd,
+                                            "initial-read DELETE file faulted preimage",
+                                        )?;
+                                        let read =
+                                            self.open(root, LEAF, false, FILE_GENERIC_READ)?;
+                                        let read_id = self.measure(read)?;
+                                        require(
+                                            read_id == id
+                                                && snapshot(self.c.raw(read))?
+                                                    == history.file.snapshot
+                                                && raw_policy(self.c.raw(read))?.sd
+                                                    == history.file.sd,
+                                            "initial-read separate premark byte oracle identity/policy",
+                                        )?;
+                                        raw_bytes(self.c.raw(read), self.fault.bytes())?;
+                                        self.c.close(
+                                            read,
+                                            Some(read_id),
+                                            "initial-read byte oracle BEFORE mark",
+                                        )?;
+                                        mark(
+                                            raw,
+                                            &mut self.removed.child_attempted[0],
+                                            &mut self.removed.child_mark[0],
+                                        )?;
+                                        self.c.close(
+                                            child,
+                                            Some(id),
+                                            "initial-read marked file cached-ID close ONLY",
+                                        )?;
+                                        scope_absent(
+                                            &mut self.c.base.h.oracle.handles,
+                                            root,
+                                            OsStr::new(LEAF),
+                                            false,
+                                        )?;
+                                        self.removed.child_absent[0] = true;
+                                        scope_empty(root)?;
+                                        require(
+                                            identity(root)? == history.root
+                                                && self
+                                                    .c
+                                                    .observed_descriptor(root, FILE_ALL_ACCESS)?
+                                                    .1
+                                                    == history.root_sd,
+                                            "initial-read empty root identity/policy",
+                                        )?;
+                                        self.c.close(root_owner, Some(root_id), "initial-read ALL noDELETE root owners before fresh DELETE")?;
+                                        let remove =
+                                            self.open(self.parent(), TARGET, true, DELETE | META)?;
+                                        let id = self.measure(remove)?;
+                                        let raw = self.c.raw(remove);
+                                        require(
+                                            id == history.root
+                                                && self
+                                                    .c
+                                                    .observed_descriptor(raw, FILE_ALL_ACCESS)?
+                                                    .1
+                                                    == history.root_sd,
+                                            "initial-read fresh DELETE root identity/policy",
+                                        )?;
+                                        kind(raw, true)?;
+                                        granted(raw, DELETE | META)?;
+                                        mark(
+                                            raw,
+                                            &mut self.removed.root_attempted,
+                                            &mut self.removed.root_mark,
+                                        )?;
+                                        self.c.close(
+                                            remove,
+                                            Some(id),
+                                            "initial-read marked root cached-ID close ONLY",
+                                        )?;
+                                        let parent = self.parent();
+                                        scope_absent(
+                                            &mut self.c.base.h.oracle.handles,
+                                            parent,
+                                            OsStr::new(TARGET),
+                                            true,
+                                        )?;
+                                        self.removed.root_absent = true;
+                                        if let Some((_, expected_sd)) = self.donor.clone() {
+                                            require(
+                                                self.created[2]
+                                                    && self.donor_image()?
+                                                        == *self.donor.as_ref().unwrap(),
+                                                "initial-read donor native creation preflight",
+                                            )?;
+                                            let owner = self.open(
+                                                self.parent(),
+                                                DONOR,
+                                                true,
+                                                DELETE | META,
+                                            )?;
+                                            let id = self.measure(owner)?;
+                                            let raw = self.c.raw(owner);
+                                            require(
+                                                Some(id) == self.ids[2]
+                                                    && self
+                                                        .c
+                                                        .observed_descriptor(raw, FILE_ALL_ACCESS)?
+                                                        .1
+                                                        == expected_sd,
+                                                "initial-read fresh donor DELETE identity/policy",
+                                            )?;
+                                            kind(raw, true)?;
+                                            granted(raw, DELETE | META)?;
+                                            mark(
+                                                raw,
+                                                &mut self.donor_mark_attempted,
+                                                &mut self.donor_mark,
+                                            )?;
+                                            self.c.close(
+                                                owner,
+                                                Some(id),
+                                                "initial-read marked donor cached-ID close ONLY",
+                                            )?;
+                                            scope_absent(
+                                                &mut self.c.base.h.oracle.handles,
+                                                parent,
+                                                OsStr::new(DONOR),
+                                                true,
+                                            )?;
+                                            self.donor_removed = true;
+                                        }
+                                        Ok(())
+                                    }
+                                    fn execute(&mut self) -> io::Result<()> {
+                                        self.c.phase = "initial-read native setup/positive sharing";
+                                        self.setup()?;
+                                        self.c.phase = "initial-read actual initial refusal/error-only/release";
+                                        self.refuse()?;
+                                        self.c.phase =
+                                            "initial-read no-restoration exact known-ID cleanup";
+                                        self.cleanup_target()?;
+                                        self.c
+                                            .base
+                                            .world("initial_read_all_native_artifacts_absent")?;
+                                        self.c
+                                            .base
+                                            .h
+                                            .observe("initial_read_artifacts_removed", false)?;
+                                        self.c.phase =
+                                            "initial-read full old parent/lock/canary teardown";
+                                        self.c.base.h.cleanup()?;
+                                        require(
+                                            self.removed.root_absent
+                                                && self.removed.child_absent[0]
+                                                && (!matches!(self.fault, Fault::Identity)
+                                                    || self.donor_removed)
+                                                && self.c.base.unknown.is_empty()
+                                                && self
+                                                    .c
+                                                    .base
+                                                    .h
+                                                    .oracle
+                                                    .handles
+                                                    .slots
+                                                    .iter()
+                                                    .all(Option::is_none)
+                                                && self.c.base.trials.len() == 6
+                                                && self.c.base.trials.iter().all(|t| {
+                                                    t.closed
+                                                        && (t.lock_bool == 0
+                                                            || t.unlock.is_some_and(|(ok, e)| {
+                                                                ok != 0 && e == 0
+                                                            }))
+                                                }),
+                                            "initial-read row final cleanup/trial inventory incomplete",
+                                        )?;
+                                        println!(
+                                            "initial_read_adversarial_row_complete row={} actual_trials=6 healthy_INITIAL_release=true native_roots_removed={} payloads_removed=1 original_fixture_teardown=true restoration=false",
+                                            self.fault.name(),
+                                            if self.donor_removed { 2 } else { 1 }
+                                        );
+                                        Ok(())
+                                    }
+                                }
+                                struct Case {
+                                    rows: Vec<Row>,
+                                }
+                                pub(in crate::windows) struct Failure {
+                                    error: io::Error,
+                                    retained: Box<Case>,
+                                }
+                                impl std::fmt::Debug for Failure {
+                                    fn fmt(
+                                        &self,
+                                        f: &mut std::fmt::Formatter<'_>,
+                                    ) -> std::fmt::Result {
+                                        let rows: Vec<_> = self
+                                            .retained
+                                            .rows
+                                            .iter()
+                                            .map(|r| {
+                                                (
+                                                    r.fault,
+                                                    r.c.phase,
+                                                    r.attempted,
+                                                    r.created,
+                                                    r.ids,
+                                                    &r.reader_error,
+                                                    r.c.reader.is_some(),
+                                                    &r.c.base.unknown,
+                                                    &r.removed,
+                                                    r.donor_removed,
+                                                )
+                                            })
+                                            .collect();
+                                        f.debug_struct(
+                                            "INITIAL_READ_ADVERSARIAL_INVALID_OWNING_FAILURE",
+                                        )
+                                        .field("error", &self.error)
+                                        .field("retained_rows", &rows)
+                                        .field("owns_unresolved_product_or_native_authority", &true)
+                                        .finish()
+                                    }
+                                }
+                                pub(in crate::windows) fn run() -> Result<(), Failure> {
+                                    let mut case = Case {
+                                        rows: [
+                                            Fault::Owner,
+                                            Fault::Permissive,
+                                            Fault::Flags,
+                                            Fault::Identity,
+                                        ]
+                                        .into_iter()
+                                        .map(Row::new)
+                                        .collect(),
+                                    };
+                                    for index in 0..case.rows.len() {
+                                        if let Err(error) = case.rows[index].execute() {
+                                            return Err(Failure {
+                                                error,
+                                                retained: Box::new(case),
+                                            });
+                                        }
+                                    }
+                                    println!(
+                                        "initial_read_adversarial_complete rows=4 actual_lock_trials=24 native_roots_removed=5 payloads_removed=4 original_fixture_teardowns=4 restoration=false native_failed_close_coverage=false general_recovery_claim=false"
+                                    );
+                                    Ok(())
+                                }
+                            }
+
                             pub(in crate::windows) mod consumption_case {
                                 use super::*;
                                 use orbit_platform::fs::ConstructorAliasesReleased;
@@ -11889,6 +13271,12 @@ mod windows {
     fn staged_package_consumption_prevents_recreation_over_published_identity()
     -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::Failure>{
         execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::run()
+    }
+
+    #[test]
+    fn published_package_initial_read_rejects_unsafe_leaf_policy_and_wrong_root_identity()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::initial_read_case::Failure>{
+        execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::initial_read_case::run()
     }
 
     #[test]
