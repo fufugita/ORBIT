@@ -11211,6 +11211,7 @@ mod windows {
 
                             pub(in crate::windows) mod initial_read_case {
                                 use super::*;
+                                use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
 
                                 const TARGET: &str = "initial-read-target";
                                 const LEAF: &str = "initial-read-payload";
@@ -11475,6 +11476,230 @@ mod windows {
                                     }
                                     Ok(status)
                                 }
+                                #[derive(Debug)]
+                                struct NtSecurityError {
+                                    status: i32,
+                                    information: u32,
+                                }
+                                impl std::fmt::Display for NtSecurityError {
+                                    fn fmt(
+                                        &self,
+                                        f: &mut std::fmt::Formatter<'_>,
+                                    ) -> std::fmt::Result {
+                                        write!(
+                                            f,
+                                            "NtSetSecurityObject domain=NTSTATUS status=0x{:08x} information=0x{:08x}",
+                                            self.status as u32, self.information
+                                        )
+                                    }
+                                }
+                                impl std::error::Error for NtSecurityError {}
+                                fn uncertain_security_set() -> ! {
+                                    static MESSAGE: &[u8] = b"INITIAL_READ_FLAGS_UNCLASSIFIED: pending/positive NtSetSecurityObject; no completion evidence; terminating without unwinding\r\n";
+                                    unsafe {
+                                        let stderr = GetStdHandle((-12i32) as u32);
+                                        if !stderr.is_null() && stderr != INVALID_HANDLE_VALUE {
+                                            let mut written = 0;
+                                            let _ = WriteFile(
+                                                stderr,
+                                                MESSAGE.as_ptr(),
+                                                MESSAGE.len() as u32,
+                                                &mut written,
+                                                null_mut(),
+                                            );
+                                        }
+                                        let _ = TerminateProcess(GetCurrentProcess(), 0xe0150066);
+                                    }
+                                    std::process::abort()
+                                }
+                                fn set_flags_native(
+                                    raw: HANDLE,
+                                    user: &[u8],
+                                    file: FileIdentity,
+                                    recorded: &mut Option<i32>,
+                                ) -> io::Result<()> {
+                                    let user_text = sid_text(user)?;
+                                    let text = wide(OsStr::new(&format!(
+                                        "D:P(A;OICI;0x001200a9;;;{user_text})"
+                                    )));
+                                    let mut sd = null_mut();
+                                    let mut returned = 0;
+                                    yes(unsafe {
+                                        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                                            text.as_ptr(),
+                                            1,
+                                            &mut sd,
+                                            &mut returned,
+                                        )
+                                    })?;
+                                    let allocation = LocalSecurityAllocation(sd.cast());
+                                    let length = returned as usize;
+                                    require(
+                                        !sd.is_null()
+                                            && (sd as usize)
+                                                % std::mem::align_of::<SECURITY_DESCRIPTOR_RELATIVE>(
+                                                )
+                                                == 0
+                                            && length >= size_of::<SECURITY_DESCRIPTOR_RELATIVE>()
+                                            && length <= LIMIT,
+                                        "initial-read native input SD allocation bound/alignment",
+                                    )?;
+                                    yes(unsafe { IsValidSecurityDescriptor(sd) })?;
+                                    require(
+                                        unsafe { GetSecurityDescriptorLength(sd) } as usize
+                                            == length,
+                                        "initial-read native input SD exact length",
+                                    )?;
+                                    let mut control = 0;
+                                    let mut revision = 0;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorControl(
+                                            sd,
+                                            &mut control,
+                                            &mut revision,
+                                        )
+                                    })?;
+                                    require(
+                                        control
+                                            & (SE_DACL_PRESENT
+                                                | SE_DACL_PROTECTED
+                                                | SE_SELF_RELATIVE)
+                                            == SE_DACL_PRESENT
+                                                | SE_DACL_PROTECTED
+                                                | SE_SELF_RELATIVE
+                                            && control & SE_SACL_PRESENT == 0,
+                                        "initial-read native input control not protected DACL-only self-relative",
+                                    )?;
+                                    let mut owner = null_mut();
+                                    let mut group = null_mut();
+                                    let mut defaulted = 0;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted)
+                                    })?;
+                                    yes(unsafe {
+                                        GetSecurityDescriptorGroup(sd, &mut group, &mut defaulted)
+                                    })?;
+                                    require(
+                                        owner.is_null() && group.is_null(),
+                                        "initial-read native input selects unexpected OWNER/GROUP",
+                                    )?;
+                                    let mut present = 0;
+                                    let mut dacl = null_mut();
+                                    yes(unsafe {
+                                        GetSecurityDescriptorDacl(
+                                            sd,
+                                            &mut present,
+                                            &mut dacl,
+                                            &mut defaulted,
+                                        )
+                                    })?;
+                                    require(
+                                        present != 0 && !dacl.is_null(),
+                                        "initial-read native input missing nonnull DACL",
+                                    )?;
+                                    let offset =
+                                        (dacl as usize).checked_sub(sd as usize).ok_or_else(
+                                            || bad("initial-read native input DACL offset"),
+                                        )?;
+                                    require(
+                                        offset % std::mem::align_of::<ACL>() == 0
+                                            && offset
+                                                .checked_add(size_of::<ACL>())
+                                                .is_some_and(|e| e <= length),
+                                        "initial-read native input DACL header bound/alignment",
+                                    )?;
+                                    let acl_size = unsafe { (*dacl).AclSize } as usize;
+                                    require(
+                                        acl_size >= size_of::<ACL>()
+                                            && offset
+                                                .checked_add(acl_size)
+                                                .is_some_and(|e| e <= length),
+                                        "initial-read native input DACL extent",
+                                    )?;
+                                    yes(unsafe { IsValidAcl(dacl) })?;
+                                    let count = unsafe { (*dacl).AceCount };
+                                    require(
+                                        count == 1,
+                                        "initial-read native input must have exactly one ACE",
+                                    )?;
+                                    let mut ace = null_mut();
+                                    yes(unsafe { GetAce(dacl, 0, &mut ace) })?;
+                                    let ace_offset =
+                                        (ace as usize).checked_sub(dacl as usize).ok_or_else(
+                                            || bad("initial-read native input ACE offset"),
+                                        )?;
+                                    require(
+                                        (ace as usize) % std::mem::align_of::<ACCESS_ALLOWED_ACE>()
+                                            == 0
+                                            && ace_offset >= size_of::<ACL>()
+                                            && ace_offset
+                                                .checked_add(16)
+                                                .is_some_and(|e| e <= acl_size),
+                                        "initial-read native input ACE prefix bound/alignment",
+                                    )?;
+                                    let prefix =
+                                        unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), 8) };
+                                    let ace_size =
+                                        u16::from_le_bytes([prefix[2], prefix[3]]) as usize;
+                                    let actual_type = prefix[0];
+                                    let actual_flags = prefix[1];
+                                    let actual_mask =
+                                        u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+                                    require(
+                                        actual_type == ACCESS_ALLOWED_ACE_TYPE
+                                            && actual_flags == 3
+                                            && actual_mask
+                                                == FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+                                            && ace_size >= 16
+                                            && ace_offset
+                                                .checked_add(ace_size)
+                                                .is_some_and(|e| e <= acl_size),
+                                        "initial-read native input actual ACE type/flags/mask/extent",
+                                    )?;
+                                    let actual_sid = sid_bytes(
+                                        unsafe { ace.cast::<u8>().add(8).cast() },
+                                        ace.cast(),
+                                        ace_size,
+                                    )?;
+                                    require(
+                                        ace_size == 8 + actual_sid.len() && actual_sid == user,
+                                        "initial-read native input exact caller SID/ACE extent",
+                                    )?;
+                                    let diagnostic = format!(
+                                        "initial_read_flags_native_input phase=before_NtSetSecurityObject domain=NTSTATUS information=0x{DACL_SECURITY_INFORMATION:08x} cached_file={file:?} SD_bytes={length} control=0x{control:04x} OWNER_present={} GROUP_present={} DACL_bytes={acl_size} ACE_count={count} ACE_type={actual_type} ACE_size={ace_size} ACE_flags={actual_flags} ACE_mask=0x{actual_mask:08x} caller_SID={actual_sid:?}",
+                                        !owner.is_null(),
+                                        !group.is_null()
+                                    );
+                                    let original_bytes = diagnostic.len();
+                                    let shown = &diagnostic[..original_bytes.min(3968)];
+                                    println!(
+                                        "{shown} diagnostic_original_bytes={original_bytes} diagnostic_truncated={}",
+                                        original_bytes > 3968
+                                    );
+                                    // Borrow the WHOLE owned SD. This is the same NONALERT/SYNCHRONIZE
+                                    // file object; no IOSB/event completion channel exists for this API.
+                                    let status = unsafe {
+                                        NtSetSecurityObject(raw, DACL_SECURITY_INFORMATION, sd)
+                                    };
+                                    if status > 0 {
+                                        // Includes STATUS_PENDING: no formatting, allocation, return or
+                                        // descriptor/owner Drop after an unclassified completion.
+                                        uncertain_security_set();
+                                    }
+                                    *recorded = Some(status);
+                                    println!(
+                                        "initial_read_fault_setter row=noncanonical-rx-flags phase=NtSetSecurityObject domain=NTSTATUS information=0x{DACL_SECURITY_INFORMATION:08x} raw_status=0x{:08x}",
+                                        status as u32
+                                    );
+                                    if status != 0 {
+                                        return Err(io::Error::other(NtSecurityError {
+                                            status,
+                                            information: DACL_SECURITY_INFORMATION,
+                                        }));
+                                    }
+                                    drop(allocation);
+                                    Ok(())
+                                }
                                 #[derive(Clone, Debug, Eq, PartialEq)]
                                 struct Image {
                                     root: FileIdentity,
@@ -11498,6 +11723,7 @@ mod windows {
                                     different_owner: Option<Vec<u8>>,
                                     parent_history: Option<(SourceSnapshot, Vec<u8>)>,
                                     setter_status: Option<u32>,
+                                    native_setter_status: Option<i32>,
                                     removed: Removal,
                                     donor_mark_attempted: bool,
                                     donor_mark: Option<(i32, u32)>,
@@ -11519,6 +11745,7 @@ mod windows {
                                             different_owner: None,
                                             parent_history: None,
                                             setter_status: None,
+                                            native_setter_status: None,
                                             removed: Removal::default(),
                                             donor_mark_attempted: false,
                                             donor_mark: None,
@@ -11779,6 +12006,22 @@ mod windows {
                                         let raw = self.c.raw(owner);
                                         let key =
                                             self.c.base.h.oracle.key.as_ref().unwrap().clone();
+                                        if matches!(self.fault, Fault::Flags) {
+                                            set_flags_native(
+                                                raw,
+                                                &key.user,
+                                                self.ids[1].unwrap(),
+                                                &mut self.native_setter_status,
+                                            )?;
+                                            let provisional = raw_policy(raw)?;
+                                            self.policy(&provisional, true)?;
+                                            require(
+                                                self.measure(owner)? == self.ids[1].unwrap(),
+                                                "initial-read fault setter changed ID",
+                                            )?;
+                                            self.mutator = None;
+                                            return self.c.close(owner, self.ids[1], "initial-read security-only mutator BEFORE authoritative baseline");
+                                        }
                                         let status = match self.fault {
                                             Fault::Owner => {
                                                 let sid = sid_from_text("S-1-5-32-544");
@@ -11820,13 +12063,7 @@ mod windows {
                                                 "",
                                                 true,
                                             )?,
-                                            Fault::Flags => set_dacl(
-                                                raw,
-                                                &key.user,
-                                                self.fault.mask(),
-                                                "OICI",
-                                                false,
-                                            )?,
+                                            Fault::Flags => unreachable!(),
                                             Fault::Identity => unreachable!(),
                                         };
                                         self.setter_status = Some(status);
@@ -12590,6 +12827,15 @@ mod windows {
                                             "INITIAL_READ_ADVERSARIAL_INVALID_OWNING_FAILURE",
                                         )
                                         .field("error", &self.error)
+                                        .field(
+                                            "native_setter_statuses",
+                                            &self
+                                                .retained
+                                                .rows
+                                                .iter()
+                                                .map(|r| r.native_setter_status)
+                                                .collect::<Vec<_>>(),
+                                        )
                                         .field("retained_rows", &rows)
                                         .field("owns_unresolved_product_or_native_authority", &true)
                                         .finish()
