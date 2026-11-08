@@ -11925,11 +11925,42 @@ mod windows {
                                                     "initial-read effective Everyone R policy differs",
                                                 )
                                             }
-                                            Fault::Flags => require(
-                                                p.descriptor.facts.owner == original.owner
-                                                    && p.aces == [Ace { flags: 3, ..caller }],
-                                                "initial-read actual persisted ordinary OI-CI RX flags differ",
-                                            ),
+                                            Fault::Flags => {
+                                                let expected = [Ace {
+                                                    flags: 3,
+                                                    ..caller.clone()
+                                                }];
+                                                // Only fixed labels and numeric/byte-vector Debug fields:
+                                                // ASCII slicing is safe; leave 128 bytes for metadata/newline.
+                                                let diagnostic = format!(
+                                                    "initial_read_flags_policy_probe row={} faulted={faulted} provisional_mutator_held={} caller_sid={:?} actual_OWNER={:?} expected_OWNER={:?} actual_GROUP={:?} expected_GROUP={:?} actual_ordered_ACEs={:?} expected_ordered_ACEs={expected:?} control=0x{:04x} raw_DACL_bytes={} raw_SD_bytes={} owner_equal={} group_equal={} ordered_ACEs_equal={}",
+                                                    self.fault.name(),
+                                                    self.mutator.is_some(),
+                                                    key.user,
+                                                    p.descriptor.facts.owner,
+                                                    original.owner,
+                                                    p.descriptor.facts.group,
+                                                    original.group,
+                                                    p.aces,
+                                                    p.descriptor.facts.control,
+                                                    p.descriptor.facts.dacl.len(),
+                                                    p.sd.len(),
+                                                    p.descriptor.facts.owner == original.owner,
+                                                    p.descriptor.facts.group == original.group,
+                                                    p.aces == expected,
+                                                );
+                                                let original_bytes = diagnostic.len();
+                                                let shown = &diagnostic[..original_bytes.min(3968)];
+                                                println!(
+                                                    "{shown} diagnostic_original_bytes={original_bytes} diagnostic_truncated={}",
+                                                    original_bytes > 3968
+                                                );
+                                                require(
+                                                    p.descriptor.facts.owner == original.owner
+                                                        && p.aces == [Ace { flags: 3, ..caller }],
+                                                    "initial-read actual persisted ordinary OI-CI RX flags differ",
+                                                )
+                                            }
                                             Fault::Identity => unreachable!(),
                                         }
                                     }
