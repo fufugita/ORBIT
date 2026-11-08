@@ -566,10 +566,11 @@ if ($Group -eq 'Foundation') {
         'windows::staged_package_no_clobber_preserves_file_empty_and_populated_targets',
         'fs::windows::tests::staged_package_live_views_refuse_publication_and_cleanup',
         'windows::published_package_read_seam_reopens_expected_identity',
-        'windows::staged_package_policy_stays_distinct_from_private_mutation'
+        'windows::staged_package_policy_stays_distinct_from_private_mutation',
+        'windows::staged_package_consumption_prevents_recreation_over_published_identity'
     )
-    if ($required.Count -ne 71 -or @($required | Select-Object -Unique).Count -ne 71) {
-        throw "Foundation's exact required-name manifest must contain 71 unique cases; found $($required.Count)"
+    if ($required.Count -ne 72 -or @($required | Select-Object -Unique).Count -ne 72) {
+        throw "Foundation's exact required-name manifest must contain 72 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {

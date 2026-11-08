@@ -3460,6 +3460,33 @@ mod staged_package {
         sealed: bool,
         poisoned: bool,
     }
+    #[derive(Clone, Copy)]
+    enum ConstructorProvenance {
+        TerminalNegativeNoOutput { status: i32 },
+        Unknown,
+    }
+    struct ConstructorFailureEvidence {
+        primary: io::Error,
+        provenance: ConstructorProvenance,
+    }
+    struct ConstructorFailureProxy {
+        evidence: Arc<ConstructorFailureEvidence>,
+    }
+    impl std::fmt::Debug for ConstructorFailureProxy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.evidence.primary, f)
+        }
+    }
+    impl std::fmt::Display for ConstructorFailureProxy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.evidence.primary, f)
+        }
+    }
+    impl std::error::Error for ConstructorFailureProxy {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.evidence.primary)
+        }
+    }
     struct StageCore {
         domain: Arc<Domain>,
         original_name: OsString,
@@ -3478,6 +3505,7 @@ mod staged_package {
         create_attempted: bool,
         phase: PublicationState,
         removal: Option<DiscardProgress>,
+        constructor_failure: Option<Arc<ConstructorFailureEvidence>>,
     }
     impl StageCore {
         fn raw(&self) -> io::Result<HANDLE> {
@@ -4496,6 +4524,153 @@ mod staged_package {
             recovery: StageRecovery,
         },
     }
+    /// Data acknowledgment for a failed constructor with no direct native owners.
+    /// The namespace remains unknown. This is not a close, removal, recovery,
+    /// retry, or namespace-absence receipt for the caller's retained inputs.
+    pub struct ConstructorAliasesReleased {
+        evidence: Arc<ConstructorFailureEvidence>,
+        namespace: PublicationState,
+    }
+    impl std::fmt::Debug for ConstructorAliasesReleased {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ConstructorAliasesReleased")
+                .field("namespace", &self.namespace)
+                .field("source", &self.evidence.primary)
+                .finish_non_exhaustive()
+        }
+    }
+    impl std::fmt::Display for ConstructorAliasesReleased {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "constructor aliases released; namespace remains unknown: {}",
+                self.evidence.primary
+            )
+        }
+    }
+    impl std::error::Error for ConstructorAliasesReleased {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.evidence.primary)
+        }
+    }
+    impl StageCreateError {
+        /// Relinquish only this failed constructor's aliases while the exact
+        /// original inputs are pinned. All direct-owner and unknown-provenance
+        /// cases remain owning errors. The result grants no namespace authority.
+        pub fn release_constructor_aliases(
+            self,
+            parent: &Directory,
+            guard: &Arc<StateLock>,
+        ) -> Result<ConstructorAliasesReleased, Self> {
+            let proved = match &self {
+                Self::Uncertain { source, recovery } => {
+                    let core = &recovery.core;
+                    let domain = &core.domain;
+                    let state = &domain.closes;
+                    // Sample even when another condition will already reject.
+                    let poisoned_before = state.poisoned.load(Ordering::Acquire);
+                    let active_before = state.active.load(Ordering::Acquire);
+                    let proof = (|| {
+                        let evidence = core.constructor_failure.as_ref()?;
+                        let proxy = source
+                            .get_ref()?
+                            .downcast_ref::<ConstructorFailureProxy>()?;
+                        if !Arc::ptr_eq(evidence, &proxy.evidence) {
+                            return None;
+                        }
+                        let ConstructorProvenance::TerminalNegativeNoOutput { status } =
+                            evidence.provenance
+                        else {
+                            return None;
+                        };
+                        // This is the actual immutable cause captured before
+                        // export, not a source supplied with a different Core.
+                        let native = evidence.primary.get_ref()?.downcast_ref::<NativeError>()?;
+                        if status >= 0
+                            || native.status != status
+                            || native.phase != "package-stage-create"
+                            || !core.create_attempted
+                            || core.phase != PublicationState::NamespaceUnknown
+                            || recovery.publication.is_some()
+                            || core.final_name.is_some()
+                            || core.root.is_some()
+                            || core.root_identity.is_some()
+                            || core.root_policy.is_some()
+                            || core.bridge.is_some()
+                            || core.bridge_identity.is_some()
+                            || core.reader.is_some()
+                            || core.reader_identity.is_some()
+                            || !core.ledger.is_empty()
+                            || core.removal.is_some()
+                            || Arc::strong_count(domain) != 1
+                            || Arc::weak_count(domain) != 0
+                            || Arc::strong_count(state) != 1
+                            || Arc::weak_count(state) != 0
+                            || !state.uncertain.try_lock().ok()?.is_empty()
+                            || !Arc::ptr_eq(&domain.guard, guard)
+                            || guard.mode != LockMode::Exclusive
+                            || parent.identity != domain.parent_identity
+                            || guard.identity() != domain.lock_identity
+                            || guard.file.parent != parent.identity
+                            || parent.chain.len() != domain.anchors.len()
+                            || domain.identities.len() != domain.anchors.len()
+                        {
+                            return None;
+                        }
+                        for ((input, captured), expected) in parent
+                            .chain
+                            .iter()
+                            .zip(&domain.anchors)
+                            .zip(&domain.identities)
+                        {
+                            if !Arc::ptr_eq(input, captured)
+                                || identity(input.as_raw_handle()).ok()? != *expected
+                            {
+                                return None;
+                            }
+                            ensure_kind(input.as_raw_handle(), true).ok()?;
+                        }
+                        if identity(guard.file.file.as_raw_handle()).ok()? != domain.lock_identity {
+                            return None;
+                        }
+                        parent.check().ok()?;
+                        guard.check().ok()?;
+                        domain.check().ok()?;
+                        Some(())
+                    })()
+                    .is_some();
+                    let poisoned_after = state.poisoned.load(Ordering::Acquire);
+                    let active_after = state.active.load(Ordering::Acquire);
+                    proof
+                        && !poisoned_before
+                        && !poisoned_after
+                        && active_before == 0
+                        && active_after == 0
+                        && Arc::strong_count(domain) == 1
+                        && Arc::weak_count(domain) == 0
+                        && Arc::strong_count(state) == 1
+                        && Arc::weak_count(state) == 0
+                }
+                Self::Unchanged(_) => false,
+            };
+            if !proved {
+                return Err(self);
+            }
+            let (source, recovery) = match self {
+                Self::Uncertain { source, recovery } => (source, recovery),
+                other => return Err(other),
+            };
+            let receipt = ConstructorAliasesReleased {
+                evidence: Arc::clone(recovery.core.constructor_failure.as_ref().unwrap()),
+                namespace: recovery.core.phase,
+            };
+            // No direct owner exists. These exact caller borrows keep every
+            // captured input Arc alive while only the constructor copies end.
+            drop(source);
+            drop(recovery);
+            Ok(receipt)
+        }
+    }
     pub enum StagePublishError {
         Unchanged {
             source: io::Error,
@@ -4654,6 +4829,7 @@ mod staged_package {
                 create_attempted: false,
                 phase: PublicationState::NamespaceUnknown,
                 removal: None,
+                constructor_failure: None,
             };
             core.ledger.reserve(1);
             core.create_attempted = true;
@@ -4681,13 +4857,38 @@ mod staged_package {
             })();
             match result {
                 Ok(identity) => Ok(StagedDirectory { core, identity }),
-                Err(source) => Err(StageCreateError::Uncertain {
-                    source,
-                    recovery: StageRecovery {
-                        core,
-                        publication: None,
-                    },
-                }),
+                Err(primary) => {
+                    // At this trusted boundary only a DIRECT NativeError from
+                    // this call's negative/null-output branch is eligible.
+                    // Unknown/positive/pending/invalid-success/output-owner and
+                    // post-create failures never acquire this provenance.
+                    let provenance = match primary
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<NativeError>())
+                    {
+                        Some(native)
+                            if native.phase == "package-stage-create" && native.status < 0 =>
+                        {
+                            ConstructorProvenance::TerminalNegativeNoOutput {
+                                status: native.status,
+                            }
+                        }
+                        _ => ConstructorProvenance::Unknown,
+                    };
+                    let kind = primary.kind();
+                    let evidence = Arc::new(ConstructorFailureEvidence {
+                        primary,
+                        provenance,
+                    });
+                    core.constructor_failure = Some(Arc::clone(&evidence));
+                    Err(StageCreateError::Uncertain {
+                        source: io::Error::new(kind, ConstructorFailureProxy { evidence }),
+                        recovery: StageRecovery {
+                            core,
+                            publication: None,
+                        },
+                    })
+                }
             }
         }
     }
@@ -5688,9 +5889,9 @@ mod staged_package {
 }
 
 pub use staged_package::{
-    PackageAcceptance, PackageDirectory, PackageFile, PackagePublication, StageAcceptError,
-    StageCreateError, StagePublishError, StageRecovery, StageRemoval, StageRemovalError,
-    StagedDirectory,
+    ConstructorAliasesReleased, PackageAcceptance, PackageDirectory, PackageFile,
+    PackagePublication, StageAcceptError, StageCreateError, StagePublishError, StageRecovery,
+    StageRemoval, StageRemovalError, StagedDirectory,
 };
 
 #[cfg(test)]

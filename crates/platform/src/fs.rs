@@ -79,11 +79,12 @@ pub fn validate_data_component(name: &OsStr) -> io::Result<()> {
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    Directory, DirectoryEntry, Durability, EnumerationLimits, ExecutionPermission, FileIdentity,
-    FileSnapshot, InspectionLimits, LockMode, MutationFile, OwnedContainer, PackageAcceptance,
-    PackageDirectory, PackageFile, PackagePublication, PrivateFile, PrivateFileAccess,
-    PrivateTreeEntry, PrivateTreeInspection, Publication, PublicationState, PublishError, Removal,
-    RemovalError, RemovalState, SourceDirectory, SourceEntry, SourceFile, SourceKind,
-    SourceSnapshot, StageAcceptError, StageCreateError, StagePublishError, StageRecovery,
-    StageRemoval, StageRemovalError, StagedDirectory, StateLock, UpdateFile,
+    ConstructorAliasesReleased, Directory, DirectoryEntry, Durability, EnumerationLimits,
+    ExecutionPermission, FileIdentity, FileSnapshot, InspectionLimits, LockMode, MutationFile,
+    OwnedContainer, PackageAcceptance, PackageDirectory, PackageFile, PackagePublication,
+    PrivateFile, PrivateFileAccess, PrivateTreeEntry, PrivateTreeInspection, Publication,
+    PublicationState, PublishError, Removal, RemovalError, RemovalState, SourceDirectory,
+    SourceEntry, SourceFile, SourceKind, SourceSnapshot, StageAcceptError, StageCreateError,
+    StagePublishError, StageRecovery, StageRemoval, StageRemovalError, StagedDirectory, StateLock,
+    UpdateFile,
 };

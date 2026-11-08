@@ -11208,6 +11208,508 @@ mod windows {
                                     }),
                                 }
                             }
+
+                            pub(in crate::windows) mod consumption_case {
+                                use super::*;
+                                use orbit_platform::fs::ConstructorAliasesReleased;
+
+                                struct Fixture {
+                                    c: Control,
+                                    errors: [Option<StageCreateError>; 2],
+                                    receipts: Vec<ConstructorAliasesReleased>,
+                                    fresh_parent: Option<Directory>,
+                                    native_hold: Option<(usize, FileIdentity)>,
+                                    phase: &'static str,
+                                }
+                                impl Fixture {
+                                    fn new() -> Self {
+                                        Self {
+                                            c: Control::new(),
+                                            errors: [None, None],
+                                            receipts: Vec::with_capacity(4),
+                                            fresh_parent: None,
+                                            native_hold: None,
+                                            phase: "native prerequisites",
+                                        }
+                                    }
+                                    fn primary_address(
+                                        error: &StageCreateError,
+                                    ) -> io::Result<usize> {
+                                        let StageCreateError::Uncertain { source, .. } = error
+                                        else {
+                                            return Err(bad(
+                                                "consumption requires actual uncertain constructor custody",
+                                            ));
+                                        };
+                                        let primary =
+                                            source.get_ref().and_then(|e| e.source()).ok_or_else(
+                                                || bad("consumption original bound cause missing"),
+                                            )?;
+                                        Ok(primary as *const dyn std::error::Error as *const ()
+                                            as usize)
+                                    }
+                                    fn receipt_address(
+                                        receipt: &ConstructorAliasesReleased,
+                                    ) -> io::Result<usize> {
+                                        let primary = std::error::Error::source(receipt)
+                                            .ok_or_else(|| {
+                                                bad("consumption acknowledged cause missing")
+                                            })?;
+                                        Ok(primary as *const dyn std::error::Error as *const ()
+                                            as usize)
+                                    }
+                                    fn attempt(
+                                        &mut self,
+                                        name: &'static str,
+                                        slot: usize,
+                                    ) -> Result<(), Cause> {
+                                        require(
+                                            self.errors[slot].is_none() && self.c.flight.is_none(),
+                                            "consumption previous constructor authority remains",
+                                        )?;
+                                        match self
+                                            .c
+                                            .base
+                                            .h
+                                            .parent
+                                            .as_ref()
+                                            .unwrap()
+                                            .stage_directory(
+                                                Arc::clone(self.c.base.h.guard.as_ref().unwrap()),
+                                                OsStr::new(name),
+                                            ) {
+                                            Err(error) => self.errors[slot] = Some(error),
+                                            Ok(stage) => {
+                                                self.c.flight = Some(Flight::Stage(stage));
+                                                return Err(bad("consumption recreation unexpectedly succeeded; actual stage retained INVALID").into());
+                                            }
+                                        }
+                                        require(
+                                            matches!(
+                                                &self.errors[slot],
+                                                Some(StageCreateError::Uncertain { .. })
+                                            ),
+                                            "consumption did not reach real create uncertainty; error retained",
+                                        )?;
+                                        println!(
+                                            "constructor_alias_actual_failure name={name} slot={slot} original={:?} status_diagnostic_only=true no_preferred_status=true namespace_not_classified_from_error=true",
+                                            self.errors[slot]
+                                        );
+                                        Ok(())
+                                    }
+                                    fn release_pair(
+                                        &mut self,
+                                        name: &'static str,
+                                        phase: &'static str,
+                                    ) -> Result<(), Cause> {
+                                        self.phase = phase;
+                                        self.attempt(name, 0)?;
+                                        self.attempt(name, 1)?;
+                                        let expected = [
+                                            Self::primary_address(
+                                                self.errors[0].as_ref().unwrap(),
+                                            )?,
+                                            Self::primary_address(
+                                                self.errors[1].as_ref().unwrap(),
+                                            )?,
+                                        ];
+                                        require(
+                                            expected[0] != expected[1],
+                                            "consumption actual attempts did not retain distinct cause objects",
+                                        )?;
+
+                                        // Equal full IDs through a fresh Directory are not
+                                        // the captured ancestry aliases that must stay pinned.
+                                        self.fresh_parent =
+                                            Some(Directory::open(&self.c.base.h.oracle.path)?);
+                                        require(
+                                            self.fresh_parent.as_ref().unwrap().identity()
+                                                == self
+                                                    .c
+                                                    .base
+                                                    .h
+                                                    .parent
+                                                    .as_ref()
+                                                    .unwrap()
+                                                    .identity(),
+                                            "consumption fresh parent full ID differs",
+                                        )?;
+                                        let error = self.errors[0].take().unwrap();
+                                        match error.release_constructor_aliases(
+                                            self.fresh_parent.as_ref().unwrap(),
+                                            self.c.base.h.guard.as_ref().unwrap(),
+                                        ) {
+                                            Err(error) => self.errors[0] = Some(error),
+                                            Ok(receipt) => {
+                                                self.receipts.push(receipt);
+                                                return Err(bad("consumption same-ID fresh parent incorrectly released captured aliases; receipt retained INVALID").into());
+                                            }
+                                        }
+                                        require(
+                                            Self::primary_address(
+                                                self.errors[0].as_ref().unwrap(),
+                                            )? == expected[0],
+                                            "consumption fresh-parent rejection lost original cause",
+                                        )?;
+                                        drop(self.fresh_parent.take());
+
+                                        self.cross()?;
+                                        for i in 0..2 {
+                                            let error = self.errors[i].take().unwrap();
+                                            match error.release_constructor_aliases(
+                                                self.c.base.h.parent.as_ref().unwrap(),
+                                                self.c.base.h.guard.as_ref().unwrap(),
+                                            ) {
+                                                Err(error) => self.errors[i] = Some(error),
+                                                Ok(receipt) => {
+                                                    self.receipts.push(receipt);
+                                                    return Err(bad("consumption crossed authentic cause/recovery released; receipt retained INVALID").into());
+                                                }
+                                            }
+                                            require(
+                                                Self::primary_address(
+                                                    self.errors[i].as_ref().unwrap(),
+                                                )? == expected[i],
+                                                "consumption crossed rejection lost actual primary",
+                                            )?;
+                                        }
+                                        self.cross()?; // Restore BOTH authentic original pairs.
+                                        for (i, address) in expected.iter().enumerate() {
+                                            let error = self.errors[i].take().unwrap();
+                                            match error.release_constructor_aliases(
+                                                self.c.base.h.parent.as_ref().unwrap(),
+                                                self.c.base.h.guard.as_ref().unwrap(),
+                                            ) {
+                                                Err(error) => {
+                                                    self.errors[i] = Some(error);
+                                                    return Err(bad("consumption legitimate alias acknowledgment failed; actual uncertain custody retained INVALID").into());
+                                                }
+                                                Ok(receipt) => {
+                                                    self.receipts.push(receipt);
+                                                    require(
+                                                        Self::receipt_address(
+                                                            self.receipts.last().unwrap(),
+                                                        )? == *address,
+                                                        "consumption receipt changed the actual original cause",
+                                                    )?;
+                                                }
+                                            }
+                                        }
+                                        println!(
+                                            "constructor_alias_pair_complete phase={phase} real_failures=2 fresh_same_ID_parent_rejected=true crossed_actual_pairs_rejected=true both_original_pairs_restored=true actual_primary_objects_preserved=true receipts_alive={} no_native_close_or_namespace_absence_claim=true",
+                                            self.receipts.len()
+                                        );
+                                        Ok(())
+                                    }
+                                    fn cross(&mut self) -> io::Result<()> {
+                                        require(
+                                            self.errors.iter().all(|e| {
+                                                matches!(
+                                                    e,
+                                                    Some(StageCreateError::Uncertain { .. })
+                                                )
+                                            }),
+                                            "consumption crossed pair custody incomplete",
+                                        )?;
+                                        let first = self.errors[0].take().unwrap();
+                                        let second = self.errors[1].take().unwrap();
+                                        match (first, second) {
+                                            (
+                                                StageCreateError::Uncertain {
+                                                    source: a,
+                                                    recovery: ar,
+                                                },
+                                                StageCreateError::Uncertain {
+                                                    source: b,
+                                                    recovery: br,
+                                                },
+                                            ) => {
+                                                self.errors[0] =
+                                                    Some(StageCreateError::Uncertain {
+                                                        source: a,
+                                                        recovery: br,
+                                                    });
+                                                self.errors[1] =
+                                                    Some(StageCreateError::Uncertain {
+                                                        source: b,
+                                                        recovery: ar,
+                                                    });
+                                                Ok(())
+                                            }
+                                            (first, second) => {
+                                                self.errors[0] = Some(first);
+                                                self.errors[1] = Some(second);
+                                                Err(bad(
+                                                    "consumption unexpected actual error pair retained",
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    fn relinquish_inputs(
+                                        &mut self,
+                                        phase: &'static str,
+                                    ) -> io::Result<()> {
+                                        require(
+                                            self.errors.iter().all(Option::is_none)
+                                                && self.c.reader.is_none()
+                                                && self.c.flight.is_none()
+                                                && self.fresh_parent.is_none()
+                                                && self.native_hold.is_none(),
+                                            "consumption unreleased authority remains",
+                                        )?;
+                                        // ALL receipts remain in this wrapper through these
+                                        // real lock probes and the full fixture teardown.
+                                        self.c.base.drop_inputs(true)?;
+                                        self.c.trial(phase, false, true)?;
+                                        self.c.trial(phase, true, true)?;
+                                        self.c.base.acquire(LockMode::Exclusive)?;
+                                        self.c.trial(phase, false, false)?;
+                                        println!(
+                                            "constructor_alias_receipts_alive_at_reacquisition phase={phase} count={} actual_same_full_lock_ID=true shared_and_exclusive_native_probes_checked_closed=true",
+                                            self.receipts.len()
+                                        );
+                                        Ok(())
+                                    }
+                                    fn native_prerequisite(&mut self) -> Result<(), Cause> {
+                                        self.phase = "native-owned zero-direct-owner prerequisite";
+                                        self.c.native_fixture()?;
+                                        let before = self.c.b.as_ref().unwrap().clone();
+                                        let parent = self.c.raw(self.c.base.h.oracle.root.unwrap());
+                                        let hold = relative(
+                                            &mut self.c.base.h.oracle.handles,
+                                            parent,
+                                            OsStr::new(NATIVE),
+                                            true,
+                                            FILE_OPEN,
+                                            ROOT_READ,
+                                            null(),
+                                        )?;
+                                        let id = self.c.note_id(hold)?;
+                                        self.native_hold = Some((hold, id));
+                                        require(
+                                            id == before.id,
+                                            "consumption native noDELETE hold ID differs",
+                                        )?;
+                                        granted(self.c.raw(hold), ROOT_READ)?;
+                                        kind(self.c.raw(hold), true)?;
+                                        self.c.trial(
+                                            "alias_native_input_Exclusive_native_Shared",
+                                            false,
+                                            false,
+                                        )?;
+                                        require(
+                                            self.c.image(
+                                                NATIVE,
+                                                before.id,
+                                                &B,
+                                                "alias_native_before_create",
+                                            )? == before,
+                                            "consumption native prerequisite changed",
+                                        )?;
+                                        self.c.base.world("alias_native_before_create")?;
+                                        self.release_pair(NATIVE, "native_owned_alias_release")?;
+                                        require(
+                                            self.c.image(
+                                                NATIVE,
+                                                before.id,
+                                                &B,
+                                                "alias_native_after_acknowledgment",
+                                            )? == before,
+                                            "consumption native target changed during failed creates/release",
+                                        )?;
+                                        self.c.base.world("alias_native_after_acknowledgment")?;
+                                        self.c.close(
+                                            hold,
+                                            Some(id),
+                                            "consumption native noDELETE hold",
+                                        )?;
+                                        self.native_hold = None;
+                                        self.relinquish_inputs("alias_native_receipts_alive")?;
+                                        self.c
+                                            .base
+                                            .world("alias_native_cleanup_original_authority")?;
+                                        self.c.remove_tree(1, NATIVE, before, &B)?;
+                                        require(
+                                            self.receipts.len() == 2
+                                                && self.c.removed[1].root_absent,
+                                            "consumption native receipt-lifetime cleanup incomplete",
+                                        )?;
+                                        println!(
+                                            "constructor_alias_native_owned_cleanup_complete receipts_still_alive=2 authority_native_creation_only=true receipt_is_not_deletion_authority=true"
+                                        );
+                                        Ok(())
+                                    }
+                                    fn execute(&mut self) -> Result<(), Cause> {
+                                        self.c.base.h.prepare()?;
+                                        self.native_prerequisite()?;
+                                        self.phase = "genuine managed publication and acceptance";
+                                        self.c.genuine()?;
+                                        let history = self.c.a.as_ref().unwrap().clone();
+                                        require(
+                                            self.c.accepted && self.c.flight.is_none(),
+                                            "consumption genuine accepted history missing",
+                                        )?;
+                                        self.c.reader = Some(
+                                            self.c.base.h.parent.as_ref().unwrap().open_package(
+                                                Arc::clone(self.c.base.h.guard.as_ref().unwrap()),
+                                                OsStr::new(FINAL),
+                                                history.id,
+                                            )?,
+                                        );
+                                        Control::read(
+                                            self.c.reader.as_ref().unwrap(),
+                                            &history,
+                                            &A,
+                                            "consumption_held_published_identity",
+                                        )?;
+                                        require(
+                                            self.c.image(
+                                                FINAL,
+                                                history.id,
+                                                &A,
+                                                "consumption_before_recreation",
+                                            )? == history,
+                                            "consumption published preimage changed",
+                                        )?;
+                                        self.c.base.world("consumption_before_recreation")?;
+                                        self.c.trial(
+                                            "consumption_artifact_Exclusive_native_Shared",
+                                            false,
+                                            false,
+                                        )?;
+                                        self.release_pair(
+                                            FINAL,
+                                            "genuine_accepted_identity_recreation",
+                                        )?;
+                                        Control::read(
+                                            self.c.reader.as_ref().unwrap(),
+                                            &history,
+                                            &A,
+                                            "consumption_after_blocked_recreation_and_acknowledgment",
+                                        )?;
+                                        require(
+                                            self.c.image(
+                                                FINAL,
+                                                history.id,
+                                                &A,
+                                                "consumption_after_recreation",
+                                            )? == history,
+                                            "consumption failed recreation changed accepted artifact",
+                                        )?;
+                                        self.c.base.world("consumption_after_recreation")?;
+                                        self.c.trial("consumption_receipts_and_artifact_Exclusive_native_Shared", false, false)?;
+                                        drop(self.c.reader.take());
+                                        self.relinquish_inputs("consumption_all_receipts_alive")?;
+                                        self.phase =
+                                            "genuine accepted-history cleanup with receipts alive";
+                                        self.c
+                                            .base
+                                            .world("consumption_before_legitimate_cleanup")?;
+                                        self.c.remove_tree(0, FINAL, history, &A)?;
+                                        require(
+                                            self.c.removed.iter().all(|r| r.root_absent),
+                                            "consumption both independently owned roots remain",
+                                        )?;
+                                        self.c
+                                            .base
+                                            .h
+                                            .observe("consumption_both_artifacts_absent", false)?;
+                                        self.phase =
+                                            "full original fixture cleanup with all receipts alive";
+                                        self.c.base.h.cleanup()?;
+                                        require(
+                                            self.receipts.len() == 4
+                                                && self.errors.iter().all(Option::is_none)
+                                                && self.c.base.unknown.is_empty()
+                                                && self
+                                                    .c
+                                                    .base
+                                                    .h
+                                                    .oracle
+                                                    .handles
+                                                    .slots
+                                                    .iter()
+                                                    .all(Option::is_none)
+                                                && self.c.base.trials.len() == 16
+                                                && self.c.base.trials.iter().all(|t| {
+                                                    t.closed
+                                                        && (t.lock_bool == 0
+                                                            || t.unlock.is_some_and(|(ok, e)| {
+                                                                ok != 0 && e == 0
+                                                            }))
+                                                }),
+                                            "consumption final native owners/trials or receipt lifetime incomplete",
+                                        )?;
+                                        // Standard Error exposes only the preserved data cause;
+                                        // it cannot export Core/guard/native custody from a receipt.
+                                        for receipt in &self.receipts {
+                                            require(
+                                                std::error::Error::source(receipt).is_some(),
+                                                "consumption final data-only cause missing",
+                                            )?;
+                                            println!(
+                                                "constructor_alias_receipt_alive_after_full_teardown receipt={receipt:?}"
+                                            );
+                                        }
+                                        println!(
+                                            "package_consumption_complete genuine_R_RX_accepted_identity_read_before_after=true recreation_attempts_actual=true private_per_attempt_bindings_cross_checked=true original_pins_required=true receipts_alive_through_same_ID_reacquisition_and_full_teardown=4 namespace_continues_Unknown=true receipt_deletion_authority=false native_input_close_telemetry=false unknown_fault_branches_source_review_only=true"
+                                        );
+                                        Ok(())
+                                    }
+                                }
+                                pub(in crate::windows) struct Failure {
+                                    cause: Cause,
+                                    retained: Box<Fixture>,
+                                }
+                                impl std::fmt::Debug for Failure {
+                                    fn fmt(
+                                        &self,
+                                        f: &mut std::fmt::Formatter<'_>,
+                                    ) -> std::fmt::Result {
+                                        let cause = match &self.cause {
+                                            Cause::Io(e) => format!("Io({e:?})"),
+                                            Cause::Product(e) => format!("Product({e:?})"),
+                                        };
+                                        f.debug_struct("PACKAGE_CONSUMPTION_INVALID_OWNING_FAILURE")
+                                            .field("phase", &self.retained.phase)
+                                            .field("cause", &cause)
+                                            .field(
+                                                "actual_constructor_errors",
+                                                &self.retained.errors,
+                                            )
+                                            .field(
+                                                "successful_data_receipts",
+                                                &self.retained.receipts,
+                                            )
+                                            .field("native_hold", &self.retained.native_hold)
+                                            .field(
+                                                "remaining_product_flight",
+                                                &self.retained.c.flight.is_some(),
+                                            )
+                                            .field(
+                                                "remaining_actual_reader",
+                                                &self.retained.c.reader.is_some(),
+                                            )
+                                            .field("native_progress", &self.retained.c.removed)
+                                            .field(
+                                                "uncertain_closes",
+                                                &self.retained.c.base.unknown,
+                                            )
+                                            .field("retained_state", &true)
+                                            .finish()
+                                    }
+                                }
+                                pub(in crate::windows) fn run() -> Result<(), Failure> {
+                                    let mut fixture = Fixture::new();
+                                    match fixture.execute() {
+                                        Ok(()) => Ok(()),
+                                        Err(cause) => Err(Failure {
+                                            cause,
+                                            retained: Box::new(fixture),
+                                        }),
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -11381,6 +11883,12 @@ mod windows {
     fn staged_package_policy_stays_distinct_from_private_mutation()
     -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::Failure>{
         execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::run()
+    }
+
+    #[test]
+    fn staged_package_consumption_prevents_recreation_over_published_identity()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::Failure>{
+        execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::run()
     }
 
     #[test]
