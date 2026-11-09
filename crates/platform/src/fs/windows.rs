@@ -3585,10 +3585,14 @@ mod staged_package {
                 let result = (|| {
                     if source_snapshot(handle.as_raw_handle(), id, node.directory)?
                         != node.snapshot.unwrap()
-                        || self
-                            .domain
-                            .facts(handle.as_raw_handle(), mode(node.executable))?
-                            != *node.policy.as_ref().unwrap()
+                        || self.domain.facts(
+                            handle.as_raw_handle(),
+                            if node.directory {
+                                FILE_ALL_ACCESS
+                            } else {
+                                mode(node.executable)
+                            },
+                        )? != *node.policy.as_ref().unwrap()
                     {
                         return Err(denied("package sealed entry changed"));
                     }
@@ -3602,10 +3606,16 @@ mod staged_package {
                             self.domain.check()?;
                             let sampled =
                                 source_snapshot(handle.as_raw_handle(), id, node.directory)?;
+                            // Directory nodes carry the owner-only FULL DACL
+                            // (they are not mode(executable)-sealed): re-verify
+                            // their facts against the creation mask.
+                            let mask = if node.directory {
+                                FILE_ALL_ACCESS
+                            } else {
+                                mode(node.executable)
+                            };
                             if Some(sampled) != node.snapshot
-                                || self
-                                    .domain
-                                    .facts(handle.as_raw_handle(), mode(node.executable))?
+                                || self.domain.facts(handle.as_raw_handle(), mask)?
                                     != *node.policy.as_ref().unwrap()
                             {
                                 return Err(denied(
@@ -3652,7 +3662,11 @@ mod staged_package {
                     .iter()
                     .find(|node| node.identity == Some(id))
                     .ok_or_else(|| denied("package reader is not a registered entry"))?;
-                if node.poisoned
+                // Directory nodes are not file views: file-view reads stay a
+                // file-only surface this tranche (nested reads are a later
+                // tranche per the packet non-goals).
+                if node.directory
+                    || node.poisoned
                     || !node.sealed
                     || !node.flushed
                     || node.creator.is_some()
@@ -4385,9 +4399,13 @@ mod staged_package {
                     }
                 }
                 let raw = step.owner.as_ref().unwrap().as_raw_handle();
+                let mask = if node.directory {
+                    FILE_ALL_ACCESS
+                } else {
+                    mode(node.executable)
+                };
                 if Some(source_snapshot(raw, step.identity, node.directory)?) != node.snapshot
-                    || self.domain.facts(raw, mode(node.executable))?
-                        != *node.policy.as_ref().unwrap()
+                    || self.domain.facts(raw, mask)? != *node.policy.as_ref().unwrap()
                 {
                     return Err(denied(
                         "package discard entry identity, snapshot or policy changed",
