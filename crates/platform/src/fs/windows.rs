@@ -2271,6 +2271,7 @@ mod staged_package {
     const MAX_ENTRIES: usize = 4096;
     const MAX_NAMES: usize = 1048576;
     const MAX_SD: usize = 65536;
+    const MISSING_NESTED_CREATE: &str = "nested child directory creation is not implemented";
 
     struct UncertainClose {
         raw: usize,
@@ -5143,6 +5144,20 @@ mod staged_package {
                 root,
                 entries: progress.confirmed,
             })
+        }
+
+        /// Declaration-only: nested child directory creation under a registered
+        /// parent. Missing-feature declaration; precedes any child mutation.
+        pub fn create_directory(
+            &mut self,
+            parent: FileIdentity,
+            argument_name: &OsStr,
+        ) -> io::Result<FileIdentity> {
+            validate_data_component(argument_name)?;
+            if parent.volume != self.identity.volume || parent != self.identity {
+                return Err(denied("parent identity is not the held stage root"));
+            }
+            Err(unsupported(MISSING_NESTED_CREATE))
         }
 
         pub fn publish_directory(

@@ -13368,6 +13368,637 @@ mod windows {
                                         }),
                                     }
                                 }
+
+                                pub(in crate::windows) mod nested_create_case {
+                                    use super::*;
+                                    use orbit_platform::fs::StageRemoval;
+
+                                    const MISSING_NESTED_CREATE: &str =
+                                        "nested child directory creation is not implemented";
+                                    const NESTED: &str = "nested-empty-child";
+
+                                    struct NestedHarness {
+                                        base: Harness,
+                                        cause: Option<io::Error>,
+                                        receipt: Option<StageRemoval>,
+                                        root_policy: Option<SecurityFacts>,
+                                        file_policy: Option<SecurityFacts>,
+                                    }
+                                    impl std::fmt::Debug for NestedHarness {
+                                        fn fmt(
+                                            &self,
+                                            f: &mut std::fmt::Formatter<'_>,
+                                        ) -> std::fmt::Result
+                                        {
+                                            f.debug_struct("NestedHarness")
+                                                .field("cause_saved", &self.cause.is_some())
+                                                .field("receipt_held", &self.receipt.is_some())
+                                                .field(
+                                                    "owns_remaining_fixture_or_product_authority",
+                                                    &self.base.flight.is_some(),
+                                                )
+                                                .finish()
+                                        }
+                                    }
+                                    impl NestedHarness {
+                                        fn new() -> Self {
+                                            Self {
+                                                base: Harness::new(),
+                                                cause: None,
+                                                receipt: None,
+                                                root_policy: None,
+                                                file_policy: None,
+                                            }
+                                        }
+
+                                        // Healthy-stage native observer: proves the
+                                        // held stage tree unchanged around the refused
+                                        // declaration call (same grammar as the discard
+                                        // intact observer; observe() requires STAGE
+                                        // absent so a separate observer is required).
+                                        fn intact(
+                                            &mut self,
+                                            phase: &'static str,
+                                        ) -> io::Result<()>
+                                        {
+                                            let h = &mut self.base;
+                                            let expected_root = h
+                                                .product_root
+                                                .ok_or_else(|| bad("nested root ID missing"))?;
+                                            let expected_file = h
+                                                .product_file
+                                                .ok_or_else(|| bad("nested file ID missing"))?;
+                                            let expected_snapshot = h
+                                                .product_snapshot
+                                                .ok_or_else(|| bad("nested snapshot missing"))?;
+                                            let f = &mut h.oracle;
+                                            h.parent.as_ref().unwrap().check()?;
+                                            h.guard.as_ref().unwrap().check()?;
+                                            require(
+                                                Some(h.parent.as_ref().unwrap().identity())
+                                                    == f.root_id
+                                                    && Some(h.guard.as_ref().unwrap().identity())
+                                                        == h.lock.as_ref().unwrap().id,
+                                                "nested parent/guard ID changed",
+                                            )?;
+                                            for anchor in &h.anchors {
+                                                let raw = f.handles.raw(anchor.owner);
+                                                kind(raw, true)?;
+                                                require(
+                                                    identity(raw)? == anchor.id
+                                                        && security_blob(raw)? == anchor.security,
+                                                    "nested outer anchor changed",
+                                                )?;
+                                            }
+                                            let parent = f.handles.raw(f.root.unwrap());
+                                            let key = f.key.as_ref().unwrap().clone();
+                                            let _ = read_descriptor(parent, &key, FILE_ALL_ACCESS)?;
+                                            let lock = relative(
+                                                &mut f.handles,
+                                                parent,
+                                                OsStr::new(LOCK),
+                                                false,
+                                                FILE_OPEN,
+                                                META,
+                                                null(),
+                                            )?;
+                                            require(
+                                                Some(snapshot(f.handles.raw(lock))?)
+                                                    == h.lock.as_ref().unwrap().snapshot
+                                                    && Some(private_lock_facts(
+                                                        f.handles.raw(lock),
+                                                        &key,
+                                                        "nested_intact_lock",
+                                                    )?) == h.lock.as_ref().unwrap().facts,
+                                                "nested lock image changed",
+                                            )?;
+                                            f.handles.close(lock)?;
+                                            let canary = h.canary.as_ref().unwrap();
+                                            let reader = relative(
+                                                &mut f.handles,
+                                                parent,
+                                                &canary.name,
+                                                false,
+                                                FILE_OPEN,
+                                                FILE_GENERIC_READ,
+                                                null(),
+                                            )?;
+                                            require(
+                                                Some(snapshot(f.handles.raw(reader))?)
+                                                    == canary.snapshot
+                                                    && Some(
+                                                        read_descriptor(
+                                                            f.handles.raw(reader),
+                                                            &key,
+                                                            FILE_ALL_ACCESS,
+                                                        )?
+                                                        .facts,
+                                                    ) == canary.facts,
+                                                "nested canary image changed",
+                                            )?;
+                                            raw_bytes(f.handles.raw(reader), PAYLOAD)?;
+                                            f.handles.close(reader)?;
+                                            absent(
+                                                &mut f.handles,
+                                                parent,
+                                                OsStr::new(FINAL),
+                                                true,
+                                            )?;
+                                            let root = shared(
+                                                &mut f.handles,
+                                                parent,
+                                                OsStr::new(STAGE),
+                                                true,
+                                                ROOT_READ,
+                                            )?;
+                                            let root_raw = f.handles.raw(root);
+                                            kind(root_raw, true)?;
+                                            require(
+                                                identity(root_raw)? == expected_root,
+                                                "nested intact root ID differs",
+                                            )?;
+                                            let root_policy =
+                                                read_descriptor(root_raw, &key, FILE_ALL_ACCESS)?
+                                                    .facts;
+                                            if let Some(before) = &self.root_policy {
+                                                require(
+                                                    *before == root_policy,
+                                                    "nested original root policy changed",
+                                                )?;
+                                            } else {
+                                                self.root_policy = Some(root_policy);
+                                            }
+                                            let file = shared(
+                                                &mut f.handles,
+                                                root_raw,
+                                                OsStr::new(CHILD),
+                                                false,
+                                                FILE_GENERIC_READ,
+                                            )?;
+                                            let raw = f.handles.raw(file);
+                                            require(
+                                                snapshot(raw)? == expected_snapshot
+                                                    && identity(raw)? == expected_file,
+                                                "nested intact payload ID/snapshot differs",
+                                            )?;
+                                            let file_policy =
+                                                read_descriptor(raw, &key, FILE_GENERIC_READ)?
+                                                    .facts;
+                                            if let Some(before) = &self.file_policy {
+                                                require(
+                                                    *before == file_policy,
+                                                    "nested original payload policy changed",
+                                                )?;
+                                            } else {
+                                                self.file_policy = Some(file_policy.clone());
+                                            }
+                                            raw_bytes(raw, PAYLOAD)?;
+                                            match shared(
+                                                &mut f.handles,
+                                                root_raw,
+                                                OsStr::new(CHILD),
+                                                false,
+                                                META | FILE_EXECUTE,
+                                            ) {
+                                                Err(error)
+                                                    if error
+                                                        .get_ref()
+                                                        .and_then(|e| {
+                                                            e.downcast_ref::<NativeOpenError>()
+                                                        })
+                                                        .is_some_and(|e| {
+                                                            e.phase == "NtCreateFile"
+                                                                && e.status == DENIED
+                                                                && e.desired == META | FILE_EXECUTE
+                                                        }) => {}
+                                                Ok(execute) => {
+                                                    f.handles.close(execute)?;
+                                                    return Err(bad(
+                                                        "nested R payload unexpectedly has native execute access",
+                                                    ));
+                                                }
+                                                Err(error) => return Err(error),
+                                            }
+                                            require(
+                                                snapshot(raw)? == expected_snapshot
+                                                    && read_descriptor(
+                                                        raw,
+                                                        &key,
+                                                        FILE_GENERIC_READ,
+                                                    )?
+                                                    .facts
+                                                        == file_policy,
+                                                "nested payload changed during native observation",
+                                            )?;
+                                            f.handles.close(file)?;
+                                            f.handles.close(root)?;
+                                            let (token, current) = effective(&mut f.handles)?;
+                                            let stable = current == key;
+                                            f.handles.close(token)?;
+                                            require(
+                                                stable,
+                                                "nested original/current token context changed",
+                                            )?;
+                                            for (index, slot) in f.handles.slots.iter().enumerate()
+                                            {
+                                                require(
+                                                    slot.is_none()
+                                                        || Some(index) == f.root
+                                                        || Some(index) == f.temp
+                                                        || h.anchors
+                                                            .iter()
+                                                            .any(|a| a.owner == index),
+                                                    "nested observer owner remained live",
+                                                )?;
+                                            }
+                                            println!(
+                                                "nested_intact_native_complete phase={phase} root_id={expected_root:?} payload_id={expected_file:?} snapshot={expected_snapshot:?} canonical_R=true bytes_verified=true native_execute_denied=true parent_lock_anchors_canary_unchanged=true original_context_stable=true fallback_absent=true all_observer_owners_checked_closed=true"
+                                            );
+                                            Ok(())
+                                        }
+
+                                        fn build(&mut self) -> Result<bool, OperationError> {
+                                            println!(
+                                                "nested_product_create native_prerequisites_complete=true"
+                                            );
+                                            let stage = self
+                                                .base
+                                                .parent
+                                                .as_ref()
+                                                .unwrap()
+                                                .stage_directory(
+                                                    Arc::clone(self.base.guard.as_ref().unwrap()),
+                                                    OsStr::new(STAGE),
+                                                )
+                                                .map_err(OperationError::Create)?;
+                                            self.base.product_root = Some(stage.identity());
+                                            self.base.flight = Some(Flight::Stage(stage));
+                                            {
+                                                let Some(Flight::Stage(stage)) =
+                                                    &mut self.base.flight
+                                                else {
+                                                    return Err(io(
+                                                        "write-state",
+                                                        bad("nested stage owner missing"),
+                                                    ));
+                                                };
+                                                let mut file = stage
+                                                    .write_new(OsStr::new(CHILD), PAYLOAD, false)
+                                                    .map_err(|e| io("write_new", e))?;
+                                                let before = file
+                                                    .snapshot()
+                                                    .map_err(|e| io("written snapshot", e))?;
+                                                self.base.product_file = Some(file.identity());
+                                                self.base.product_snapshot = Some(before);
+                                                require(
+                                                    before.identity == file.identity()
+                                                        && before.length == PAYLOAD.len() as u64
+                                                        && before.kind == SourceKind::File
+                                                        && before.link_count == 1
+                                                        && file
+                                                            .read_limited(4096)
+                                                            .map_err(|e| io("written read", e))?
+                                                            == PAYLOAD
+                                                        && !file
+                                                            .execution_permission()
+                                                            .map_err(|e| {
+                                                                io("written permission", e)
+                                                            })?
+                                                            .executable(),
+                                                    "nested written view differs",
+                                                )
+                                                .map_err(|e| io("written validation", e))?;
+                                            }
+                                            {
+                                                let Some(Flight::Stage(stage)) = &self.base.flight
+                                                else {
+                                                    return Err(io(
+                                                        "verify-state",
+                                                        bad("nested stage owner missing"),
+                                                    ));
+                                                };
+                                                let mut file = stage
+                                                    .verify_package_mode(OsStr::new(CHILD), false)
+                                                    .map_err(|e| io("verify mode", e))?;
+                                                require(
+                                                    Some(file.identity()) == self.base.product_file
+                                                        && Some(file.snapshot().map_err(|e| {
+                                                            io("verified snapshot", e)
+                                                        })?) == self.base.product_snapshot
+                                                        && file
+                                                            .read_limited(4096)
+                                                            .map_err(|e| io("verified read", e))?
+                                                            == PAYLOAD
+                                                        && !file
+                                                            .execution_permission()
+                                                            .map_err(|e| {
+                                                                io("verified permission", e)
+                                                            })?
+                                                            .executable(),
+                                                    "nested verified view differs",
+                                                )
+                                                .map_err(|e| io("verified validation", e))?;
+                                            }
+                                            self.intact("before_declaration").map_err(|e| {
+                                                io("before-declaration native observer", e)
+                                            })?;
+                                            let root_id = self.base.product_root.unwrap();
+                                            println!(
+                                                "nested_declaration_call root_id={root_id:?} all_views_and_native_observers_closed=true"
+                                            );
+                                            let refused = {
+                                                let Some(Flight::Stage(stage)) =
+                                                    &mut self.base.flight
+                                                else {
+                                                    return Err(io(
+                                                        "declaration-state",
+                                                        bad("nested stage owner missing"),
+                                                    ));
+                                                };
+                                                stage.create_directory(root_id, OsStr::new(NESTED))
+                                            };
+                                            match refused {
+                                                Err(error)
+                                                    if error.kind()
+                                                        == io::ErrorKind::Unsupported
+                                                        && error.to_string()
+                                                            == MISSING_NESTED_CREATE =>
+                                                {
+                                                    self.cause = Some(error);
+                                                    println!(
+                                                        "nested_exact_refusal_observed phase=nested_create kind=Unsupported literal={MISSING_NESTED_CREATE:?} parent_selector_root_only=true"
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    return Err(io(
+                                                        "declaration unexpected refusal",
+                                                        error,
+                                                    ));
+                                                }
+                                                Ok(child) => {
+                                                    // Genuine future success: retain the child ID
+                                                    // evidence; caller adjudicates. No forced RED.
+                                                    println!(
+                                                        "nested_declaration_unexpected_success child_id={child:?} no_forced_red=true"
+                                                    );
+                                                    return Ok(true);
+                                                }
+                                            }
+                                            self.intact("after_declaration_refused").map_err(
+                                                |e| io("after-declaration native observer", e),
+                                            )?;
+                                            Ok(false)
+                                        }
+
+                                        fn healthy_discard(
+                                            &mut self,
+                                        ) -> Result<(), OperationError>
+                                        {
+                                            let stage = match self.base.flight.take() {
+                                                Some(Flight::Stage(stage)) => stage,
+                                                other => {
+                                                    self.base.flight = other;
+                                                    return Err(io(
+                                                        "discard-state",
+                                                        bad("nested stage owner missing"),
+                                                    ));
+                                                }
+                                            };
+                                            println!(
+                                                "nested_healthy_discard_call root_id={:?} payload_id={:?} stage_genuinely_healthy=true",
+                                                self.base.product_root, self.base.product_file
+                                            );
+                                            let receipt =
+                                                stage.discard().map_err(|error| match error {
+                                                    StageRemovalError::Unchanged {
+                                                        source,
+                                                        stage,
+                                                    } => {
+                                                        self.base.flight =
+                                                            Some(Flight::Stage(stage));
+                                                        io(
+                                                            "healthy discard unexpectedly refused",
+                                                            source,
+                                                        )
+                                                    }
+                                                    StageRemovalError::Uncertain {
+                                                        source, ..
+                                                    } => io("healthy discard uncertain", source),
+                                                })?;
+                                            self.receipt = Some(receipt);
+                                            self.removed()
+                                                .map_err(|e| io("real removal proof", e))?;
+                                            Ok(())
+                                        }
+
+                                        fn removed(&mut self) -> io::Result<()> {
+                                            require(
+                                                self.receipt.is_some()
+                                                    && self.base.flight.is_none(),
+                                                "nested discard success receipt/ownership missing",
+                                            )?;
+                                            self.base
+                                                .observe("nested_discard_receipt_held", false)?;
+                                            let listed = self
+                                                .base
+                                                .oracle
+                                                .directory
+                                                .as_ref()
+                                                .unwrap()
+                                                .enumerate(EnumerationLimits {
+                                                    max_entries: 16,
+                                                    max_name_bytes: 4096,
+                                                })?;
+                                            require(
+                                                !listed.iter().any(|entry| {
+                                                    Some(entry.identity) == self.base.product_root
+                                                        || Some(entry.identity)
+                                                            == self.base.product_file
+                                                        || entry.name == OsStr::new(STAGE)
+                                                        || entry.name == OsStr::new(FINAL)
+                                                        || entry.name == OsStr::new(NESTED)
+                                                }),
+                                                "nested discard left original identities/names in parent",
+                                            )?;
+                                            println!(
+                                                "nested_discard_success_native_absence root_id={:?} payload_id={:?} original_stage_absent=true payload_namespace_absent=true nested_never_created=true parent_lock_anchors_canary_preserved=true receipt_retained_through_observations=true",
+                                                self.base.product_root, self.base.product_file
+                                            );
+                                            drop(self.receipt.take());
+                                            self.base.cleanup()
+                                        }
+                                    }
+
+                                    enum OperationError {
+                                        Create(StageCreateError),
+                                        Io {
+                                            phase: &'static str,
+                                            source: io::Error,
+                                        },
+                                    }
+                                    impl std::fmt::Debug for OperationError {
+                                        fn fmt(
+                                            &self,
+                                            f: &mut std::fmt::Formatter<'_>,
+                                        ) -> std::fmt::Result
+                                        {
+                                            match self {
+                                                Self::Create(error) => {
+                                                    f.debug_tuple("Create").field(error).finish()
+                                                }
+                                                Self::Io { phase, source } => f
+                                                    .debug_struct("Io")
+                                                    .field("phase", phase)
+                                                    .field("source", source)
+                                                    .finish(),
+                                            }
+                                        }
+                                    }
+                                    fn io(
+                                        phase: &'static str,
+                                        source: io::Error,
+                                    ) -> OperationError {
+                                        OperationError::Io { phase, source }
+                                    }
+
+                                    pub(in crate::windows) struct Failure {
+                                        phase: &'static str,
+                                        cause: Option<io::Error>,
+                                        operation: Option<OperationError>,
+                                        fixture: Option<io::Error>,
+                                        close_errors: Vec<String>,
+                                        retained: Option<Box<NestedHarness>>,
+                                        expected_nested: bool,
+                                    }
+                                    impl std::fmt::Debug for Failure {
+                                        fn fmt(
+                                            &self,
+                                            f: &mut std::fmt::Formatter<'_>,
+                                        ) -> std::fmt::Result
+                                        {
+                                            f.debug_struct(if self.expected_nested {
+                                                "NestedCreateMissingFeatureRed"
+                                            } else {
+                                                "InvalidNestedCreateRed"
+                                            })
+                                            .field("phase", &self.phase)
+                                            .field("original_nested_cause", &self.cause)
+                                            .field("operation", &self.operation)
+                                            .field("fixture", &self.fixture)
+                                            .field("close_errors", &self.close_errors)
+                                            .field(
+                                                "retained_original_nested_cause",
+                                                &self
+                                                    .retained
+                                                    .as_ref()
+                                                    .and_then(|h| h.cause.as_ref()),
+                                            )
+                                            .field(
+                                                "owns_remaining_fixture_or_product_authority",
+                                                &self.retained.is_some(),
+                                            )
+                                            .finish()
+                                        }
+                                    }
+                                    fn invalid(
+                                        mut harness: NestedHarness,
+                                        phase: &'static str,
+                                        operation: Option<OperationError>,
+                                        fixture: Option<io::Error>,
+                                    ) -> Failure {
+                                        let close_errors = harness.base.preserve();
+                                        println!(
+                                            "nested_fixture_invalid phase={phase} saved_nested_cause={} product_flight_retained={} receipt_retained={} no_nested_RED_acknowledgment=true",
+                                            harness.cause.is_some(),
+                                            harness.base.flight.is_some(),
+                                            harness.receipt.is_some()
+                                        );
+                                        Failure {
+                                            phase,
+                                            cause: None,
+                                            operation,
+                                            fixture,
+                                            close_errors,
+                                            retained: Some(Box::new(harness)),
+                                            expected_nested: false,
+                                        }
+                                    }
+
+                                    pub(in crate::windows) fn run() -> Result<(), Failure> {
+                                        let mut harness = NestedHarness::new();
+                                        if let Err(error) = harness.base.prepare() {
+                                            return Err(invalid(
+                                                harness,
+                                                "native/setup prerequisites",
+                                                None,
+                                                Some(error),
+                                            ));
+                                        }
+                                        let succeeded = match harness.build() {
+                                            Ok(value) => value,
+                                            Err(error) => {
+                                                return Err(invalid(
+                                                    harness,
+                                                    "declaration preparation/product",
+                                                    Some(error),
+                                                    None,
+                                                ));
+                                            }
+                                        };
+                                        if succeeded {
+                                            // Genuine future GREEN branch: verify the actual
+                                            // registered child is impossible here because none
+                                            // is created; leaf-first discard and full cleanup.
+                                            match harness.healthy_discard() {
+                                                Ok(()) => {}
+                                                Err(error) => {
+                                                    return Err(invalid(
+                                                        harness,
+                                                        "unexpected-success disposition",
+                                                        Some(error),
+                                                        None,
+                                                    ));
+                                                }
+                                            }
+                                            println!(
+                                                "nested_GREEN_actual_child_created full_cleanup=true"
+                                            );
+                                            return Ok(());
+                                        }
+                                        // Sole intended RED path: healthy real discard and
+                                        // complete checked teardown BEFORE preserving the cause.
+                                        if let Err(error) = harness.healthy_discard() {
+                                            return Err(invalid(
+                                                harness,
+                                                "healthy discard/teardown",
+                                                Some(error),
+                                                None,
+                                            ));
+                                        }
+                                        let cause =
+                                            harness.cause.take().ok_or_else(|| Failure {
+                                                phase: "saved cause missing",
+                                                cause: None,
+                                                operation: None,
+                                                fixture: Some(bad("nested original cause lost")),
+                                                close_errors: Vec::new(),
+                                                retained: None,
+                                                expected_nested: false,
+                                            })?;
+                                        println!(
+                                            "nested_create_RED_exact variant=io_Error kind=Unsupported literal={MISSING_NESTED_CREATE:?} parent_selector_root_only=true healthy_stage_real_discard=true full_checked_teardown_before_preserved_cause=true remaining_authority=false"
+                                        );
+                                        Err(Failure {
+                                            phase: "nested_create",
+                                            cause: Some(cause),
+                                            operation: None,
+                                            fixture: None,
+                                            close_errors: Vec::new(),
+                                            retained: None,
+                                            expected_nested: true,
+                                        })
+                                    }
+                                }
                             }
                         }
                     }
@@ -13485,6 +14116,12 @@ mod windows {
             first_stage::discard_case::run()
         }
 
+        pub(super) fn run_nested_create()
+        -> Result<(), first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::nested_create_case::Failure>
+        {
+            first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::nested_create_case::run()
+        }
+
         pub(super) fn run_first_stage() -> Result<(), first_stage::Failure> {
             first_stage::run()
         }
@@ -13573,5 +14210,12 @@ mod windows {
     fn staged_package_discard_removes_one_sealed_file()
     -> Result<(), execution_oracle::first_stage::discard_case::Failure> {
         execution_oracle::run_discard()
+    }
+
+    #[test]
+    fn staged_package_nested_create_directory_declares_missing_feature()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::read_seam_case::policy_case::consumption_case::nested_create_case::Failure>
+    {
+        execution_oracle::run_nested_create()
     }
 }

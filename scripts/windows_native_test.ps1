@@ -569,9 +569,10 @@ if ($Group -eq 'Foundation') {
         'windows::staged_package_policy_stays_distinct_from_private_mutation',
         'windows::staged_package_consumption_prevents_recreation_over_published_identity'
         'windows::published_package_initial_read_rejects_unsafe_leaf_policy_and_wrong_root_identity'
+        'windows::staged_package_nested_create_directory_declares_missing_feature'
     )
-    if ($required.Count -ne 73 -or @($required | Select-Object -Unique).Count -ne 73) {
-        throw "Foundation's exact required-name manifest must contain 73 unique cases; found $($required.Count)"
+    if ($required.Count -ne 74 -or @($required | Select-Object -Unique).Count -ne 74) {
+        throw "Foundation's exact required-name manifest must contain 74 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {
