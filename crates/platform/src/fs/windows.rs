@@ -3583,18 +3583,26 @@ mod staged_package {
                     "package-inventory",
                 )?;
                 let result = (|| {
+                    // Directory nodes carry the owner-only FULL DACL (they are
+                    // not mode(executable)-sealed) and observe_package is
+                    // FILE-ONLY grammar (package_open reopens with
+                    // FILE_NON_DIRECTORY_FILE). Their full inventory check is
+                    // the direct snapshot + creation-mask facts verification;
+                    // nested reads/execution are later tranches.
+                    let mask = if node.directory {
+                        FILE_ALL_ACCESS
+                    } else {
+                        mode(node.executable)
+                    };
                     if source_snapshot(handle.as_raw_handle(), id, node.directory)?
                         != node.snapshot.unwrap()
-                        || self.domain.facts(
-                            handle.as_raw_handle(),
-                            if node.directory {
-                                FILE_ALL_ACCESS
-                            } else {
-                                mode(node.executable)
-                            },
-                        )? != *node.policy.as_ref().unwrap()
+                        || self.domain.facts(handle.as_raw_handle(), mask)?
+                            != *node.policy.as_ref().unwrap()
                     {
                         return Err(denied("package sealed entry changed"));
+                    }
+                    if node.directory {
+                        return Ok(());
                     }
                     let observed = execution_observation::observe_package(
                         handle.as_raw_handle(),
@@ -3604,18 +3612,11 @@ mod staged_package {
                         &node.name,
                         || {
                             self.domain.check()?;
-                            let sampled =
-                                source_snapshot(handle.as_raw_handle(), id, node.directory)?;
-                            // Directory nodes carry the owner-only FULL DACL
-                            // (they are not mode(executable)-sealed): re-verify
-                            // their facts against the creation mask.
-                            let mask = if node.directory {
-                                FILE_ALL_ACCESS
-                            } else {
-                                mode(node.executable)
-                            };
+                            let sampled = source_snapshot(handle.as_raw_handle(), id, false)?;
                             if Some(sampled) != node.snapshot
-                                || self.domain.facts(handle.as_raw_handle(), mask)?
+                                || self
+                                    .domain
+                                    .facts(handle.as_raw_handle(), mode(node.executable))?
                                     != *node.policy.as_ref().unwrap()
                             {
                                 return Err(denied(
