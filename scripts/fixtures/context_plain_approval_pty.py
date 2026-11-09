@@ -22,7 +22,7 @@ SCHEMA = 'orbit.context-plain-approval-pty/v1'
 MAX_OUTPUT = 2 * 1024 * 1024
 MAX_BINARY = 1024 * 1024 * 1024
 PROMPT = b'approval needed: Bash'
-STARTUP = b'type /help for commands, exit to quit'
+STARTUP = b'Describe a task and press Enter. Try: Explain this project. /help shows commands; exit quits.'
 INTENT = b'request the one approval fixture command\n'
 
 

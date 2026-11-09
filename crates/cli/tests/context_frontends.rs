@@ -2976,7 +2976,7 @@ mod frontend_manual_baselines {
                 // NO_COLOR selects the actual HUD Plain mode, whose banner is stderr.
                 let out = signal_read_owned(&f, &process.paths[1], SIGNAL_CAPTURE_LIMIT);
                 if std::str::from_utf8(&out)
-                    .is_ok_and(|text| text.contains("type /help for commands, exit to quit"))
+                    .is_ok_and(|text| text.contains("Describe a task and press Enter. Try: Explain this project. /help shows commands; exit quits."))
                 {
                     break;
                 }
@@ -3121,7 +3121,11 @@ mod frontend_manual_baselines {
             }
 
             fn wait_plain_ready(f: &Fixture, process: &mut SignalCli) {
-                wait_text(f, process, "type /help for commands, exit to quit");
+                wait_text(
+                    f,
+                    process,
+                    "Describe a task and press Enter. Try: Explain this project. /help shows commands; exit quits.",
+                );
                 wait_input_poll(process);
                 assert!(
                     matches!(SessionLease::acquire(&f.home, SESSION, "signal-capability-live"),
@@ -3729,7 +3733,7 @@ mod frontend_manual_baselines {
             const ARGUMENTS: &str =
                 r#"{"command":"printf approval-must-not-run > approval-must-not-exist.txt"}"#;
             const SCRIPT_SHA256: &str =
-                "ab7e43dd01c5a2bf12aabb9c7ad788d68caa99d0564309478ee71f4bfc0aca1f";
+                "87485ca2278694ceac9f40d2504283159e46f691bfab29fed8f5c315b1521286";
 
             fn script_stamp(
                 value: &fs::Metadata,
