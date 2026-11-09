@@ -2271,7 +2271,6 @@ mod staged_package {
     const MAX_ENTRIES: usize = 4096;
     const MAX_NAMES: usize = 1048576;
     const MAX_SD: usize = 65536;
-    const MISSING_NESTED_CREATE: &str = "nested child directory creation is not implemented";
 
     struct UncertainClose {
         raw: usize,
@@ -3456,6 +3455,7 @@ mod staged_package {
         snapshot: Option<SourceSnapshot>,
         policy: Option<PolicyFacts>,
         executable: bool,
+        directory: bool,
         attempted: bool,
         flushed: bool,
         sealed: bool,
@@ -3564,7 +3564,9 @@ mod staged_package {
                 }
                 let id = node.identity.unwrap();
                 if !listed.iter().any(|entry| {
-                    entry.name == node.name && entry.identity == id.file && !entry.directory
+                    entry.name == node.name
+                        && entry.identity == id.file
+                        && entry.directory == node.directory
                 }) {
                     return Err(denied("package inventory name/identity/kind changed"));
                 }
@@ -3572,7 +3574,7 @@ mod staged_package {
                 let handle = native_open(
                     root,
                     &prepared,
-                    false,
+                    node.directory,
                     FILE_OPEN,
                     FILE_GENERIC_READ,
                     READ_SHARE,
@@ -3581,7 +3583,8 @@ mod staged_package {
                     "package-inventory",
                 )?;
                 let result = (|| {
-                    if source_snapshot(handle.as_raw_handle(), id, false)? != node.snapshot.unwrap()
+                    if source_snapshot(handle.as_raw_handle(), id, node.directory)?
+                        != node.snapshot.unwrap()
                         || self
                             .domain
                             .facts(handle.as_raw_handle(), mode(node.executable))?
@@ -3597,7 +3600,8 @@ mod staged_package {
                         &node.name,
                         || {
                             self.domain.check()?;
-                            let sampled = source_snapshot(handle.as_raw_handle(), id, false)?;
+                            let sampled =
+                                source_snapshot(handle.as_raw_handle(), id, node.directory)?;
                             if Some(sampled) != node.snapshot
                                 || self
                                     .domain
@@ -4362,7 +4366,7 @@ mod staged_package {
                 match native_open(
                     root,
                     &step.name,
-                    false,
+                    node.directory,
                     FILE_OPEN,
                     DELETE | META,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -4381,7 +4385,7 @@ mod staged_package {
                     }
                 }
                 let raw = step.owner.as_ref().unwrap().as_raw_handle();
-                if Some(source_snapshot(raw, step.identity, false)?) != node.snapshot
+                if Some(source_snapshot(raw, step.identity, node.directory)?) != node.snapshot
                     || self.domain.facts(raw, mode(node.executable))?
                         != *node.policy.as_ref().unwrap()
                 {
@@ -4415,7 +4419,7 @@ mod staged_package {
                 }
                 step.confirm_absence(
                     root,
-                    false,
+                    node.directory,
                     &self.domain.closes,
                     "package-discard-child-absence",
                 )?;
@@ -4920,6 +4924,7 @@ mod staged_package {
                 snapshot: None,
                 policy: None,
                 executable,
+                directory: false,
                 attempted: true,
                 flushed: false,
                 sealed: false,
@@ -5146,8 +5151,11 @@ mod staged_package {
             })
         }
 
-        /// Declaration-only: nested child directory creation under a registered
-        /// parent. Missing-feature declaration; precedes any child mutation.
+        /// Create one empty child directory under the held stage root
+        /// (root-parent selector only; deeper parent selectors are a later
+        /// tranche). Refusal order: component validation, parent selector,
+        /// then real native creation. Fail-before-mutation: the budget
+        /// check fires before ledger push and any native attempt.
         pub fn create_directory(
             &mut self,
             parent: FileIdentity,
@@ -5157,7 +5165,146 @@ mod staged_package {
             if parent.volume != self.identity.volume || parent != self.identity {
                 return Err(denied("parent identity is not the held stage root"));
             }
-            Err(unsupported(MISSING_NESTED_CREATE))
+            self.core.check_root()?;
+            self.core.domain.closes.zero()?;
+            let prepared = PreparedName::new(argument_name)?;
+            let name_bytes = prepared.wide.len() * 2;
+            if self.core.remaining_entries == 0 || name_bytes > self.core.remaining_name_bytes {
+                return Err(invalid("package construction bounds exceeded"));
+            }
+            self.core.ledger.reserve(1);
+            let index = self.core.ledger.len();
+            self.core.ledger.push(StageNode {
+                name: argument_name.to_os_string(),
+                identity: None,
+                creator: None,
+                snapshot: None,
+                policy: None,
+                executable: false,
+                directory: true,
+                attempted: true,
+                // Directory nodes carry no payload bytes; these lifecycle
+                // flags mean "metadata settled" for the inventory grammar.
+                flushed: true,
+                sealed: true,
+                poisoned: true,
+            });
+            self.core.remaining_entries -= 1;
+            self.core.remaining_name_bytes -= name_bytes;
+            let result = (|| {
+                let owner = match native_open(
+                    self.core.raw()?,
+                    &prepared,
+                    true,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    self.core.domain.full_sd.as_ptr().cast(),
+                    &self.core.domain.closes,
+                    "package-nested-directory-create",
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        // A DIRECT NativeError from this call's negative/null
+                        // output branch (e.g. duplicate-name collision) proves
+                        // no object was created: the pre-create ledger entry is
+                        // rolled back exactly (pop + budget refund), keeping
+                        // the stage intact. Any other failure class (positive
+                        // output, unclassified, post-create) keeps full custody.
+                        let rollback = matches!(
+                            error.get_ref().and_then(|e| e.downcast_ref::<NativeError>()),
+                            Some(native)
+                                if native.phase == "package-nested-directory-create"
+                                    && native.status < 0
+                        );
+                        if rollback {
+                            self.core.ledger.pop();
+                            self.core.remaining_entries += 1;
+                            self.core.remaining_name_bytes += name_bytes;
+                        }
+                        return Err(error);
+                    }
+                };
+                self.core.ledger[index].creator = Some(owner);
+                let raw = self.core.ledger[index]
+                    .creator
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_handle();
+                let id = identity(raw)?;
+                self.core.ledger[index].identity = Some(id);
+                ensure_kind(raw, true)?;
+                if id.volume != self.identity.volume {
+                    return Err(denied("nested package directory volume differs"));
+                }
+                let actual_name = held_leaf(raw)?;
+                validate_data_component(&actual_name)?;
+                if actual_name != argument_name {
+                    return Err(denied("created nested package directory leaf differs"));
+                }
+                self.core.ledger[index].policy =
+                    Some(self.core.domain.facts(raw, FILE_ALL_ACCESS)?);
+                // Post-seal metadata baseline through an independent reader,
+                // same checked grammar as write_new's postseal verification.
+                // The creator is checked-closed here (write_new grammar); from
+                // this point the entry's custody is its identity + policy +
+                // the stage root namespace — the object is deleted only by the
+                // discard sweep.
+                let creator = self.core.ledger[index].creator.take().unwrap();
+                close_owned(
+                    creator,
+                    &self.core.domain.closes,
+                    Some(id),
+                    "nested directory creator",
+                )?;
+                let reader = native_open(
+                    self.core.raw()?,
+                    &prepared,
+                    true,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ,
+                    READ_SHARE,
+                    null(),
+                    &self.core.domain.closes,
+                    "package-nested-directory-postseal-reader",
+                )?;
+                let checked = (|| {
+                    let sampled = source_snapshot(reader.as_raw_handle(), id, true)?;
+                    if self
+                        .core
+                        .domain
+                        .facts(reader.as_raw_handle(), FILE_ALL_ACCESS)?
+                        != *self.core.ledger[index].policy.as_ref().unwrap()
+                    {
+                        return Err(denied("nested directory post-writer baseline changed"));
+                    }
+                    Ok(sampled)
+                })();
+                let sampled = finish_owned(
+                    reader,
+                    &self.core.domain.closes,
+                    Some(id),
+                    "nested directory postseal verification",
+                    checked,
+                )?;
+                self.core.ledger[index].snapshot = Some(sampled);
+                self.core.ledger[index].sealed = true;
+                self.core.ledger[index].poisoned = false;
+                Ok(id)
+            })();
+            match result {
+                Ok(id) => Ok(id),
+                Err(source) => {
+                    // Post-create errors retain the created object: the
+                    // ledger entry keeps its identity/policy (creator already
+                    // released per the write_new grammar) and the node stays
+                    // poisoned (inventory never accepts it). The stage remains
+                    // owning; discard's leaf-first sweep removes the object.
+                    // Typed uncertainty: the native phase travels inside the
+                    // error; no stringify loss, no deletion here.
+                    Err(source)
+                }
+            }
         }
 
         pub fn publish_directory(
