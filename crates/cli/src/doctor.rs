@@ -613,6 +613,39 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
         ),
         false,
     );
+    // Cache introspection (REA G7): surface the on-disk caches with
+    // their sizes so `orbit doctor` doubles as `cache show`.
+    for (label, path) in [
+        ("cache.profile_backup", home.join("customization.json.bak")),
+        ("cache.context_history", home.join("context-history")),
+        (
+            "cache.context_history_archives",
+            home.join("context-history/owner/archives"),
+        ),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {
+                let (files, bytes) = directory_footprint(&path);
+                report.add(
+                    label,
+                    CheckStatus::Ready,
+                    &format!("{files} files, {bytes} bytes"),
+                    false,
+                );
+            }
+            Ok(metadata) if metadata.is_file() => {
+                report.add(
+                    label,
+                    CheckStatus::Ready,
+                    &format!("{} bytes", metadata.len()),
+                    false,
+                );
+            }
+            Ok(_) | Err(_) => {
+                report.add(label, CheckStatus::Missing, "No cache content yet", false);
+            }
+        }
+    }
     match verify_identity(home) {
         Ok(_) => report.add(
             "identity",
@@ -827,4 +860,35 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
         false,
     );
     report
+}
+
+/// Recursively count entries and bytes under a cache directory, bounded
+/// to keep `orbit doctor` fast on large histories.
+fn directory_footprint(dir: &Path) -> (usize, u64) {
+    const LIMIT: usize = 4096;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if files > LIMIT {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(_) => {
+                    files += 1;
+                    bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if files > LIMIT {
+                        return (files, bytes);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    (files, bytes)
 }
