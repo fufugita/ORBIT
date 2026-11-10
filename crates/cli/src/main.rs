@@ -3368,6 +3368,29 @@ fn cmd_chat(args: &[String]) -> i32 {
             match run_onboarding_command(&home, None, "setup") {
                 Ok(receipt) => {
                     println!("Provider configuration saved.");
+                    // Compact success summary: provider, main model, credential
+                    // mode and connectivity, so the saved state is visible at a
+                    // glance before the conversation starts.
+                    let provider = receipt
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let main = receipt
+                        .get("main")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("not set");
+                    let credential = receipt
+                        .get("credential_source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let models = receipt
+                        .get("models_configured")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!("  provider  {provider}");
+                    println!("  main      {main}");
+                    println!("  models    {models} configured");
+                    println!("  credential {credential}");
                     if let Some(warnings) = receipt
                         .get("warnings")
                         .and_then(serde_json::Value::as_array)
@@ -3384,11 +3407,13 @@ fn cmd_chat(args: &[String]) -> i32 {
                         println!(
                             "Saved for later. Set the credential environment variable shown above, then run orbit again. No model request was made."
                         );
+                        println!("Run `orbit doctor` to verify the local setup.");
                         return 0;
                     }
                     println!(
                         "Saved. Describe a task to begin; your first message will test the provider connection."
                     );
+                    println!("Run `orbit doctor` any time to verify the local setup.");
                 }
                 Err((code, message)) => {
                     eprintln!("{code}: {message}");

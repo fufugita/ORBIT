@@ -141,7 +141,11 @@ def run(argv, timeout=120, **kwargs):
 
 def download(url, path, limit):
     # Size is bounded by curl and checked before any parser reads the download.
-    run(["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https,http", "--proto-redir", "=https,http", "--connect-timeout", "10", "--max-time", "90", "--max-filesize", str(limit), "--output", str(path), url], timeout=100)
+    # A progress line prints only when stderr is a terminal; CI keeps --silent.
+    if sys.stderr.isatty() and not os.environ.get("ORBIT_QUIET"):
+        run(["curl", "--fail", "--show-error", "--location", "--proto", "=https,http", "--proto-redir", "=https,http", "--connect-timeout", "10", "--max-time", "90", "--max-filesize", str(limit), "--progress-bar", "--output", str(path), url], timeout=100)
+    else:
+        run(["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https,http", "--proto-redir", "=https,http", "--connect-timeout", "10", "--max-time", "90", "--max-filesize", str(limit), "--output", str(path), url], timeout=100)
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_size > limit: fail("download exceeds its allowed size")
 
@@ -385,6 +389,18 @@ def main():
             except FileNotFoundError: pass
         print(f"Installed ORBIT {args.version} ({target}) into {destination}")
         print("Both components use one managed bundle. Next: orbit setup; orbit doctor.")
+        bin_dir = str(Path(args.dir).resolve())
+        path_entries = [os.path.abspath(os.path.expanduser(entry))
+                        for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+        if bin_dir not in path_entries and not os.environ.get("ORBIT_SKIP_PATH_CHECK"):
+            print(f"NOTE: {bin_dir} is not on your PATH.")
+            print(f"  Add it with:  export PATH=\"{bin_dir}:$PATH\"")
+            for rc_name in (".bashrc", ".zshrc"):
+                rc = Path.home() / rc_name
+                if rc.is_file():
+                    print(f"  Or add the line above to ~/{rc_name} to keep it.")
+                    break
+            print("  (Set ORBIT_SKIP_PATH_CHECK=1 to silence this notice.)")
     except BaseException as error:
         if published:
             raise ValueError("bundle publication occurred, but durability is uncertain; inspect --dir before retrying") from error
