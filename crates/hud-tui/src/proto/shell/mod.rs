@@ -451,6 +451,7 @@ pub(super) fn draw_with_reading(
                 focus_idx: focus,
                 cwd: bars::cwd_label(),
                 branch: bars::branch_label(),
+                chip_visibility: &profile.chip_visibility,
                 saved_ms: inp.fx.saved_ms,
                 zoom: sh.zoom,
             },

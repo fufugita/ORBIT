@@ -6,6 +6,16 @@ pub const MAX_PROFILE_BYTES: usize = 128 * 1024;
 pub const MAX_PANE_OUTPUT_BYTES: usize = 32 * 1024;
 pub const MAX_PANE_LINES: usize = 512;
 
+/// The top-bar chips a user may toggle (REA G1). Keep in sync with
+/// hud-tui's `bars::top_bar` chip construction.
+pub const CHIP_IDS: [&str; 6] = ["cwd", "branch", "model", "context", "cost", "ledger"];
+pub const CHIP_IDS_LIST: &str = "cwd, branch, model, context, cost, ledger";
+
+/// Valid chip id for `customize set chip.<id> on|off`.
+pub fn valid_chip_id(chip: &str) -> bool {
+    CHIP_IDS.contains(&chip)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
@@ -21,6 +31,11 @@ pub struct Profile {
     pub browser: BrowserStyle,
     pub layout: Layout,
     pub panes: Vec<PaneDef>,
+    /// Per-chip visibility in the top bar (REA G1): the id is a chip name
+    /// (`cwd`, `branch`, `model`, `context`, `cost`, `ledger`) and the value
+    /// says whether it shows. Absent ids default to visible.
+    #[serde(default)]
+    pub chip_visibility: BTreeMap<String, bool>,
 }
 impl Default for Profile {
     fn default() -> Self {
@@ -36,6 +51,7 @@ impl Default for Profile {
             browser: BrowserStyle::default(),
             layout: Layout::default(),
             panes: Vec::new(),
+            chip_visibility: BTreeMap::new(),
         }
     }
 }
@@ -485,6 +501,17 @@ impl Profile {
         }
         if self.panes.len() > 32 {
             return Err(invalid("panes exceeds 32"));
+        }
+        // Chip visibility (REA G1): only known chip ids, bounded entries.
+        if self.chip_visibility.len() > 16 {
+            return Err(invalid("chip_visibility exceeds 16 entries"));
+        }
+        for chip in self.chip_visibility.keys() {
+            if !CHIP_IDS.contains(&chip.as_str()) {
+                return Err(invalid(&format!(
+                    "chip_visibility.{chip}: unknown chip (known: {CHIP_IDS_LIST})"
+                )));
+            }
         }
         let mut ids = BTreeSet::new();
         for pane in &self.panes {

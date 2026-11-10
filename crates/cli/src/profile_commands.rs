@@ -196,6 +196,21 @@ fn set(profile: &mut Profile, key: &str, value: &str) -> Result<(), Error> {
             }
         }
         "browser.font_family" => profile.browser.font_family = value.into(),
+        // Chip toggles (REA G1): `customize set chip.branch off`.
+        key if key.starts_with("chip.") => {
+            let chip = key.strip_prefix("chip.").unwrap_or_default();
+            if !orbit_frontend_protocol::customization::valid_chip_id(chip) {
+                return Err(invalid(
+                    "unknown chip; known: cwd, branch, model, context, cost, ledger",
+                ));
+            }
+            let shown = match value {
+                "on" | "true" => true,
+                "off" | "false" => false,
+                _ => return Err(invalid("chip visibility expects on or off")),
+            };
+            profile.chip_visibility.insert(chip.to_owned(), shown);
+        }
         "browser.font_size_px" => {
             profile.browser.font_size_px = value
                 .parse()
@@ -1030,5 +1045,31 @@ mod tests {
             assert_eq!(reopened.profile.layout.tree, portable_layout_preset(preset));
             assert_eq!(reopened.profile.theme, "paper");
         }
+    }
+}
+
+#[cfg(test)]
+mod chip_toggle_tests {
+    use super::*;
+
+    #[test]
+    fn chip_toggle_sets_visibility_and_validates_the_id() {
+        let mut profile = Profile::default();
+        set(&mut profile, "chip.branch", "off").expect("known chip toggles off");
+        assert_eq!(profile.chip_visibility.get("branch"), Some(&false));
+        set(&mut profile, "chip.branch", "on").expect("toggles back on");
+        assert_eq!(profile.chip_visibility.get("branch"), Some(&true));
+        set(&mut profile, "chip.cost", "off").expect("cost chip toggles off");
+        assert!(
+            set(&mut profile, "chip.bogus", "off").is_err(),
+            "unknown chip refused"
+        );
+        assert!(
+            set(&mut profile, "chip.branch", "maybe").is_err(),
+            "non-boolean refused"
+        );
+        // Validation round-trip: the profile with toggles still validates.
+        let bytes = serde_json::to_vec(&profile).unwrap();
+        crate::customization::validate(&bytes).expect("validated profile");
     }
 }

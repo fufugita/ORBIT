@@ -87,6 +87,15 @@ pub struct TopBar<'a> {
     pub focus_idx: usize,
     pub cwd: String,
     pub branch: Option<String>,
+    /// Per-chip visibility (REA G1): absent = visible.
+    pub chip_visibility: &'a std::collections::BTreeMap<String, bool>,
+}
+
+impl TopBar<'_> {
+    /// A chip shows unless the user turned it off.
+    pub fn chip_shown(&self, id: &str) -> bool {
+        self.chip_visibility.get(id).copied().unwrap_or(true)
+    }
 }
 
 /// Keep a contiguous window of tabs around the selected panel. Its title gets
@@ -338,14 +347,16 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     // Right: facts as pills; the least important drop first.
     let s = tb.scenario;
     let mut chips: Vec<(Vec<Seg>, Option<Rgb>, u8)> = Vec::new();
-    if !tb.cwd.is_empty() {
+    if tb.chip_shown("cwd") && !tb.cwd.is_empty() {
         chips.push((
             vec![Seg::new(tb.cwd.clone(), colors.ink2)],
             Some(colors.ink2),
             1,
         ));
     }
-    if let Some(b) = &tb.branch {
+    if tb.chip_shown("branch")
+        && let Some(b) = &tb.branch
+    {
         chips.push((
             vec![
                 Seg::new("⎇ ", colors.green),
@@ -355,14 +366,14 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             3,
         ));
     }
-    if !s.model_id.is_empty() {
+    if tb.chip_shown("model") && !s.model_id.is_empty() {
         chips.push((
             vec![Seg::bold(s.model_id.clone(), colors.violet)],
             Some(colors.violet),
             2,
         ));
     }
-    if s.window_tokens > 0 {
+    if tb.chip_shown("context") && s.window_tokens > 0 {
         // M18: the meter eases to the new fraction in 300 ms.
         let ctx = if tb.reduced {
             s.ctx_to
@@ -399,10 +410,12 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             },
         ));
         chips.push((meter, None, 9));
-    } else if s.session_binding().is_some() {
+    } else if tb.chip_shown("context") && s.session_binding().is_some() {
         chips.push((vec![Seg::new("ctx unknown", colors.faint)], None, 9));
     }
-    if let Some(n) = s.ledger_count {
+    if tb.chip_shown("ledger")
+        && let Some(n) = s.ledger_count
+    {
         chips.push((
             // M19: the dot flashes for 350 ms per record.
             vec![
@@ -425,7 +438,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             4,
         ));
     }
-    {
+    if tb.chip_shown("cost") {
         chips.push((
             vec![Seg::bold(cost_text, colors.amber)],
             Some(colors.amber),
@@ -778,6 +791,7 @@ mod tests {
                 focus_idx,
                 cwd: String::new(),
                 branch: None,
+                chip_visibility: &EMPTY_CHIPS,
             },
         );
         let hits = cv.take_hits();
@@ -787,6 +801,9 @@ mod tests {
     fn cells(buffer: &Buffer, from: u16, to: u16) -> String {
         (from..to).map(|x| buffer[(x, 0)].symbol()).collect()
     }
+
+    static EMPTY_CHIPS: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
 
     #[test]
     fn overflowing_switcher_keeps_selected_panel_visible_and_clickable() {
@@ -932,6 +949,7 @@ mod tests {
                         focus_idx: 11,
                         cwd: String::new(),
                         branch: None,
+                        chip_visibility: &EMPTY_CHIPS,
                     },
                 );
                 let hits = cv.take_hits();
@@ -1003,9 +1021,50 @@ mod tests {
                 focus_idx: 0,
                 cwd: String::new(),
                 branch: None,
+                chip_visibility: &EMPTY_CHIPS,
             },
         );
         let row = cells(&buffer, 0, 120);
         assert!(row.contains("40% · 120k left"), "meter line: {row}");
+    }
+    /// REA G1: a chip the user turned off does not render; the others do.
+    #[test]
+    fn hidden_chips_leave_the_bar_and_the_rest_show() {
+        let mut scenario = Scenario::new();
+        scenario.window_tokens = 200_000;
+        scenario.used_tokens = 80_000;
+        scenario.ctx_to = 0.4;
+        scenario.ctx_from = 0.4;
+        scenario.ctx_ms = 5000;
+        scenario.model_id = "test-model".into();
+        let mut chips = std::collections::BTreeMap::new();
+        chips.insert("model".to_owned(), false);
+        chips.insert("context".to_owned(), false);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 2));
+        let mut cv = Cv::new(&mut buffer);
+        top_bar(
+            &mut cv,
+            140,
+            &TopBar {
+                scenario: &scenario,
+                preset: None,
+                approval_pending: false,
+                now_ms: 5000,
+                reduced: true,
+                mono: false,
+                saved_ms: None,
+                zoom: false,
+                switcher: None,
+                focus_idx: 0,
+                cwd: "/tmp/work".into(),
+                branch: None,
+                chip_visibility: &chips,
+            },
+        );
+        let row = cells(&buffer, 0, 140);
+        assert!(!row.contains("test-model"), "hidden model chip: {row}");
+        assert!(!row.contains("ctx "), "hidden context chip: {row}");
+        assert!(row.contains("/tmp/work"), "cwd chip still shows: {row}");
+        assert!(row.contains("$"), "cost chip still shows: {row}");
     }
 }
