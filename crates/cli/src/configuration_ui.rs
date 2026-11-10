@@ -700,7 +700,7 @@ fn profile_value(profile: &Profile, key: &str) -> String {
         .unwrap_or_default()
 }
 
-fn edit_appearance<T: SetupTerminal>(
+pub fn edit_appearance<T: SetupTerminal>(
     home: &Path,
     workspace: &Path,
     terminal: &mut T,

@@ -60,3 +60,6 @@ docs/tui/review-receipts/
 # Local agent/tool working state (never part of the source)
 .serena/
 graphify-out/
+
+# floorplan skill output (self-contained map; stays out of git per skill contract)
+floorplan/

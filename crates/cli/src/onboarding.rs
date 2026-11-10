@@ -920,9 +920,7 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
                 // and drop the plain entry below to keep ids unique.
                 let mut choices: Vec<_> = offered
                     .iter()
-                    .filter(|preset| {
-                        Some(*preset) != browser_preset
-                    })
+                    .filter(|preset| Some(*preset) != browser_preset)
                     .map(|preset| SetupChoice {
                         id: preset.id,
                         label: preset.id,
@@ -934,8 +932,8 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
                         0,
                         SetupChoice {
                             id: preset.id,
-                            label: format!("{} — sign in with your browser", preset.id)
-                                .leak() as &'static str,
+                            label: format!("{} — sign in with your browser", preset.id).leak()
+                                as &'static str,
                             detail: Some(preset.blurb),
                         },
                     );

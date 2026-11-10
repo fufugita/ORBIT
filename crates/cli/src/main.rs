@@ -563,7 +563,12 @@ fn cmd_setup(
         if !terminal {
             return Err(("ORBIT-E1101", "interactive setup requires terminal input and output; use manual flags for automation".into()));
         }
-        return run_onboarding_command(home, None, if initialize { "init" } else { "setup" });
+        return run_onboarding_command(
+            home,
+            None,
+            if initialize { "init" } else { "setup" },
+            parsed.customize,
+        );
     }
     if initialize {
         orbit_cli::cli_release_commands::init(home, &tail)
@@ -576,11 +581,23 @@ fn run_onboarding_command(
     home: &Path,
     preset: Option<&str>,
     command: &str,
+    customize: bool,
 ) -> Result<serde_json::Value, (&'static str, String)> {
     let mut terminal = orbit_cli::onboarding::StdSetupTerminal::new()
         .map_err(|error| (error.code(), error.to_string()))?;
     let receipt = orbit_cli::onboarding::run_onboarding(home, preset, &mut terminal)
         .map_err(|error| (error.code(), error.to_string()))?;
+    // Optional theme stage (wizard item 10): after a saved, working provider,
+    // `--customize` jumps straight into the appearance editor. Opt-in because
+    // a default prompt after "confirm yes" would hang every scripted journey
+    // mid-grammar; the flag is explicit in both rich and plain terminals.
+    if customize
+        && let Ok(_) = orbit_cli::configuration_ui::edit_appearance(
+            home,
+            &std::env::current_dir().unwrap_or_else(|_| home.to_path_buf()),
+            &mut terminal,
+        )
+    {}
     let offline = receipt.catalog_status == "not_requested" && !receipt.authentication_online;
     let mut result = serde_json::to_value(receipt)
         .map_err(|_| ("ORBIT-E1101", "setup result could not be encoded".into()))?;
@@ -3409,7 +3426,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                 .or_else(|| std::env::var("ORBIT_ACTIVE_MODEL").ok())
                 .is_some_and(|value| !value.is_empty());
         if configured.provider.is_empty() && !environment_provider {
-            match run_onboarding_command(&home, None, "setup") {
+            match run_onboarding_command(&home, None, "setup", false) {
                 Ok(receipt) => {
                     println!("Provider configuration saved.");
                     // Compact success summary: provider, main model, credential
@@ -5388,7 +5405,7 @@ fn cmd_provider_add(
             "non-interactive add needs --model M[,M..] (and --url for custom)".into(),
         ));
     }
-    run_onboarding_command(home, preset_id.as_deref(), "provider add")
+    run_onboarding_command(home, preset_id.as_deref(), "provider add", false)
 }
 
 #[cfg(test)]

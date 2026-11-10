@@ -29,6 +29,8 @@ pub struct SetupArguments {
     pub request: identity::SetupRequest,
     pub dry_run: bool,
     pub guided: bool,
+    /// After an interactive save, run the appearance editor (wizard item 10).
+    pub customize: bool,
     /// The terminal frontend owns the provider wizard. This module never launches it.
     pub interactive_provider: bool,
     pub repair: bool,
@@ -55,6 +57,7 @@ pub fn parse_setup(args: &[String]) -> Result<SetupArguments, (&'static str, Str
             "--json" => {}
             "--dry-run" => parsed.dry_run = true,
             "--guided" => parsed.guided = true,
+            "--customize" => parsed.customize = true,
             "--interactive-provider" => parsed.interactive_provider = true,
             "--no-provider" => no_provider = true,
             "--provider" | "--gate" | "--model" | "--credential-env" | "--kind"
