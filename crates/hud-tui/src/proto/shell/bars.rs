@@ -387,7 +387,11 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             meter.push(Seg::new(if i < k { "▰" } else { "▱" }, col));
         }
         meter.push(Seg::new(
-            format!(" {}%", (ctx * 100.0).round() as u32),
+            format!(
+                " {}% · {} left",
+                (ctx * 100.0).round() as u32,
+                super::panes::tokens_short(s.window_tokens.saturating_sub(s.used_tokens))
+            ),
             if ctx > 0.85 {
                 colors.amber
             } else {
@@ -969,5 +973,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The ctx meter names the absolute free tokens beside the percentage:
+    /// the number the reader actually budgets with (task T1, REA pass 2 #6).
+    #[test]
+    fn context_meter_shows_tokens_left_beside_the_percentage() {
+        let mut scenario = Scenario::new();
+        scenario.window_tokens = 200_000;
+        scenario.used_tokens = 80_000;
+        scenario.ctx_to = 0.4;
+        scenario.ctx_from = 0.4;
+        scenario.ctx_ms = 5000;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 2));
+        let mut cv = Cv::new(&mut buffer);
+        top_bar(
+            &mut cv,
+            120,
+            &TopBar {
+                scenario: &scenario,
+                preset: None,
+                approval_pending: false,
+                now_ms: 5000,
+                reduced: true,
+                mono: false,
+                saved_ms: None,
+                zoom: false,
+                switcher: None,
+                focus_idx: 0,
+                cwd: String::new(),
+                branch: None,
+            },
+        );
+        let row = cells(&buffer, 0, 120);
+        assert!(row.contains("40% · 120k left"), "meter line: {row}");
     }
 }
