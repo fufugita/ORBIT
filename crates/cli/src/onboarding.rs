@@ -902,14 +902,44 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
                     "Provider",
                     "Choose a preset or a custom compatible endpoint.",
                 )?;
-                let choices: Vec<_> = offered
+                // The easiest path leads when one is offered (task T4): a
+                // browser-capable preset becomes a headline choice above the
+                // plain preset list. The numbered plain grammar keeps the
+                // same order, so scripted journeys see one extra choice.
+                let browser_preset = offered.iter().find(|preset| {
+                    provider_login::supports_browser_login(&ProviderConfig {
+                        name: preset.id.to_owned(),
+                        kind: preset.kind.to_owned(),
+                        url: preset.url.to_owned(),
+                        env: None,
+                        models: Vec::new(),
+                    })
+                });
+                // The headline is the SAME preset (same id) with a descriptor
+                // label — not a duplicate menu entry. Insert it at position 0
+                // and drop the plain entry below to keep ids unique.
+                let mut choices: Vec<_> = offered
                     .iter()
+                    .filter(|preset| {
+                        Some(*preset) != browser_preset
+                    })
                     .map(|preset| SetupChoice {
                         id: preset.id,
                         label: preset.id,
                         detail: Some(preset.blurb),
                     })
                     .collect();
+                if let Some(preset) = browser_preset {
+                    choices.insert(
+                        0,
+                        SetupChoice {
+                            id: preset.id,
+                            label: format!("{} — sign in with your browser", preset.id)
+                                .leak() as &'static str,
+                            detail: Some(preset.blurb),
+                        },
+                    );
+                }
                 let selected = match terminal.select(
                     "Provider (name or number)",
                     &choices,
