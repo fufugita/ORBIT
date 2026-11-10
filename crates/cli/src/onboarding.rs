@@ -874,7 +874,19 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
     let _ = ProviderCredentialStore::new(home)?;
     let baseline = setup::plan_setup(home, &SetupRequest::default())?;
     let existing = config_snapshot(home)?;
-    terminal.message("ORBIT\nConnect a provider, choose a model, then review and save.\nNothing is saved until you confirm. Ctrl-C cancels. Manual model entry works offline.")?;
+    // Rich terminals get a small ASCII wordmark; plain keeps the bare name so
+    // scripted journeys stay byte-identical (wizard item 7, task T7).
+    if terminal.rich_choices_available() {
+        terminal.message(concat!(
+            " ___  ____  ____  ____  ___\n",
+            "/ __)(  _ \\(  _ \\(  _ \\/ __)\n",
+            "( (__ ) __/ )   / ) __/\\__ \\\n",
+            " \\___)(_)  (__\\_)(_)  (___/\n",
+        ))?;
+    } else {
+        terminal.message("ORBIT")?;
+    }
+    terminal.message("Connect a provider, choose a model, then review and save.\nNothing is saved until you confirm. Ctrl-C cancels. Manual model entry works offline.")?;
     let offered = crate::presets::presets();
     let mut preset = preset_id
         .map(|id| {
