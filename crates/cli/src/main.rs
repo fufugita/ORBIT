@@ -1831,6 +1831,50 @@ fn validate_value(
     {
         problems.push(format!("{path}: not in enum"));
     }
+    // additionalProperties is enforced, not silently ignored (FX-03): an
+    // object with keys outside `properties` fails when the schema closes it.
+    if let (Some(additional), serde_json::Value::Object(map)) =
+        (schema.get("additionalProperties"), v)
+        && additional == &serde_json::Value::Bool(false)
+    {
+        let allowed = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|props| {
+                props
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        for key in map.keys() {
+            if !allowed.contains(key) {
+                problems.push(format!("{path}: unexpected field {key:?}"));
+            }
+        }
+    }
+    // Unsupported dialect keywords are rejected, not silently trusted: a
+    // schema that relies on them is not the documented supported subset, so
+    // the honest contract is an explicit refusal at validation time.
+    for keyword in [
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "$ref",
+        "patternProperties",
+        "dependencies",
+    ] {
+        if schema.get(keyword).is_some() {
+            problems.push(format!(
+                "{path}: schema uses unsupported keyword {keyword:?} (supported: type, properties, required, items, enum, additionalProperties)"
+            ));
+            break;
+        }
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -7940,5 +7984,74 @@ mod one_shot_billing_selection_tests {
         assert_eq!(result["usage"]["input_tokens"], 3);
         assert_eq!(result["usage"]["output_tokens"], 2);
         assert_eq!(result["usage"]["cost_microcents"], 32);
+    }
+}
+
+#[cfg(test)]
+mod schema_dialect_tests {
+    use super::*;
+
+    #[test]
+    fn additional_properties_false_rejects_unknown_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "additionalProperties": false
+        });
+        assert!(validate_json_against_schema(r#"{"name":"x"}"#, &schema).is_ok());
+        let error = validate_json_against_schema(r#"{"name":"x","extra":1}"#, &schema)
+            .expect_err("unknown field must fail");
+        assert!(error.contains("unexpected field \"extra\""), "{error}");
+    }
+
+    #[test]
+    fn additional_properties_true_or_absent_allows_extra_fields() {
+        let open = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        assert!(validate_json_against_schema(r#"{"a":"x","extra":1}"#, &open).is_ok());
+        let open_true = serde_json::json!({
+            "type": "object", "properties": {"a": {"type": "string"}},
+            "additionalProperties": true
+        });
+        assert!(validate_json_against_schema(r#"{"a":"x","extra":1}"#, &open_true).is_ok());
+    }
+
+    #[test]
+    fn unsupported_keywords_are_rejected_not_ignored() {
+        for (keyword, schema) in [
+            ("$ref", serde_json::json!({"$ref": "#/definitions/x"})),
+            ("oneOf", serde_json::json!({"oneOf": [{"type": "string"}]})),
+            ("allOf", serde_json::json!({"allOf": [{"type": "object"}]})),
+            (
+                "patternProperties",
+                serde_json::json!({"patternProperties": {"^x": {"type": "string"}}}),
+            ),
+        ] {
+            let error = validate_json_against_schema("null", &schema)
+                .expect_err("unsupported keyword must fail");
+            assert!(
+                error.contains(&format!("unsupported keyword \"{keyword}\"")),
+                "{keyword}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_keywords_still_validate() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "count": {"type": "integer"}
+            },
+            "required": ["mode"]
+        });
+        assert!(
+            validate_json_against_schema(r#"{"mode":"fast","tags":["a"],"count":3}"#, &schema)
+                .is_ok()
+        );
+        assert!(validate_json_against_schema(r#"{"mode":"bogus"}"#, &schema).is_err());
+        assert!(validate_json_against_schema(r#"{"count":1}"#, &schema).is_err());
     }
 }
