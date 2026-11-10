@@ -44,10 +44,29 @@ pub fn cwd_label() -> String {
 }
 
 /// The current git branch, read from `.git/HEAD` (cached).
+/// The branch label with status depth (REA G2): branch name, ahead/behind
+/// vs upstream, and an in-progress operation marker. Read from the .git
+/// files themselves — no process spawn, memoized per launch.
+/// The branch label with status depth (REA G2): branch name, ahead/behind
+/// vs upstream, and an in-progress operation marker — one bounded
+/// `git status -sb` per launch, memoized; any failure degrades to the
+/// plain name read from .git/HEAD.
 pub fn branch_label() -> Option<String> {
     static BRANCH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     BRANCH
         .get_or_init(|| {
+            // One bounded status call carries everything the chip shows.
+            if let Ok(output) = std::process::Command::new("git")
+                .args(["status", "-sb", "--porcelain"])
+                .output()
+                && output.status.success()
+                && let Ok(text) = String::from_utf8(output.stdout)
+                && let Some(first) = text.lines().next()
+            {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                return Some(decorate_branch(first, &cwd));
+            }
+            // Fallback without git in PATH: the bare name from .git/HEAD.
             let mut dir = std::env::current_dir().ok()?;
             loop {
                 let head = dir.join(".git/HEAD");
@@ -65,6 +84,45 @@ pub fn branch_label() -> Option<String> {
             }
         })
         .clone()
+}
+
+/// The chip decoration from a `git status -sb` header line, e.g.
+/// `## main...origin/main [ahead 2, behind 1]` plus the worktree's
+/// in-progress operation sentinel files (status -sb omits those).
+fn decorate_branch(status_header: &str, dir: &std::path::Path) -> String {
+    let header = status_header.trim_start_matches('#').trim();
+    let mut label = header.to_string();
+    // Detached: the header is a raw hash — keep it short.
+    if label.len() > 40 && !label.contains("...") {
+        label = label.chars().take(7).collect();
+    }
+    // In-progress operation markers from the sentinel files git writes
+    // in .git (status -sb does not carry them).
+    let mut git = dir.to_path_buf();
+    loop {
+        let candidate = git.join(".git");
+        if candidate.is_dir() || candidate.is_file() {
+            git = candidate;
+            break;
+        }
+        if !git.pop() {
+            git = dir.to_path_buf();
+            break;
+        }
+    }
+    for (file, marker) in [
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry"),
+        ("REVERT_HEAD", "revert"),
+    ] {
+        if git.join(file).exists() {
+            label.push_str(&format!(" ⚙{marker}"));
+            break;
+        }
+    }
+    label
 }
 
 /// What the top bar shows.
@@ -1066,5 +1124,32 @@ mod tests {
         assert!(!row.contains("ctx "), "hidden context chip: {row}");
         assert!(row.contains("/tmp/work"), "cwd chip still shows: {row}");
         assert!(row.contains("$"), "cost chip still shows: {row}");
+    }
+    /// REA G2: the chip decoration parses ahead/behind headers and adds
+    /// the in-progress marker from sentinel files only.
+    #[test]
+    fn branch_decoration_carries_ahead_behind_and_operations() {
+        let dir = std::env::temp_dir().join(format!("orbit-g2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        // Plain header: name passthrough.
+        assert_eq!(decorate_branch("## main", &dir), "main",);
+        // Ahead/behind header: kept as git reports it.
+        assert_eq!(
+            decorate_branch("## main...origin/main [ahead 2, behind 1]", &dir),
+            "main...origin/main [ahead 2, behind 1]",
+        );
+        // Detached hash: truncated to 7.
+        assert_eq!(
+            decorate_branch(
+                "## 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                &dir
+            ),
+            "0123456",
+        );
+        // Merge sentinel: the marker is appended.
+        std::fs::write(dir.join(".git").join("MERGE_HEAD"), b"ref").unwrap();
+        assert_eq!(decorate_branch("## main", &dir), "main ⚙merge");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
