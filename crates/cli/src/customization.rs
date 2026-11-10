@@ -574,6 +574,15 @@ pub fn replace_checked(
     if load(home, workspace)?.revision != expected_revision {
         return Err(Error::Busy);
     }
+    // Backup-on-write (REA G6): the previous profile survives a bad write
+    // as customization.json.bak. Only the profile path does this — the
+    // history journals reject unexpected directory entries, so their
+    // shared publish stays untouched. A failed backup does not block
+    // the save.
+    let target = dir.io()?.join(PROFILE);
+    if target.try_exists().map_err(io_error)? {
+        let _ = std::fs::copy(&target, target.with_extension("json.bak"));
+    }
     publish(&dir, PROFILE, &bytes, false)?;
     load(home, workspace)
 }
@@ -1276,5 +1285,44 @@ mod existing_read_lock_tests {
             Err(Error::UnsafePath(_))
         ));
         assert!(std::fs::read(retained).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    /// REA G6: a second write keeps the first generation as a .bak sibling.
+    #[test]
+    fn profile_replace_keeps_the_previous_generation_as_bak() {
+        let home = std::env::temp_dir().join(format!("orbit-g6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = home.join("ws");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let first = Profile {
+            name: "First".into(),
+            ..Profile::default()
+        };
+        let saved = replace(&home, &workspace, &first).expect("first save");
+        let second = Profile {
+            name: "Second".into(),
+            ..Profile::default()
+        };
+        replace(&home, &workspace, &second).expect("second save");
+        let bak = home.join("customization.json.bak");
+        assert!(bak.exists(), "backup written");
+        let text = std::fs::read_to_string(&bak).unwrap();
+        assert!(
+            text.contains("\"First\""),
+            "bak holds the first generation: {text}"
+        );
+        let live = std::fs::read_to_string(home.join("customization.json")).unwrap();
+        assert!(live.contains("\"Second\""));
+        let _ = saved;
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
