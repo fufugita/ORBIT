@@ -18,6 +18,9 @@ const IMAGE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 /// before base64 (the providers' own request limits sit above this;
 /// the cap keeps one image from eating the context budget).
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// PDF Read caps: file size, and pages delivered per read (task T9).
+const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_PDF_PAGES: usize = 8;
 
 // ============================== Read ==============================
 
@@ -81,6 +84,9 @@ impl Tool for ReadTool {
             .unwrap_or_default();
         if IMAGE_EXTS.contains(&ext.as_str()) {
             return read_image(&path, file_path, &metadata, &ext);
+        }
+        if ext == "pdf" {
+            return read_pdf(&path, file_path, &metadata);
         }
         if metadata.len() > MAX_READ_BYTES {
             return ToolResult::err(&format!(
@@ -177,6 +183,55 @@ fn read_image(path: &Path, file_path: &str, metadata: &std::fs::Metadata, ext: &
         "image_base64": data,
         "image_media_type": media_type,
     }))
+}
+
+/// A PDF Read: the first pages' extracted text (task T9). The honest,
+/// dependency-light path — pure-Rust extraction, no rasterizer, no system
+/// pdfium. Text PDFs become readable content; scanned image-only PDFs
+/// come back with empty page text and say so rather than pretending.
+/// The deny-read check already ran; the caps are the PDF's own.
+fn read_pdf(path: &Path, file_path: &str, metadata: &std::fs::Metadata) -> ToolResult {
+    if metadata.len() > MAX_PDF_BYTES {
+        return ToolResult::err(&format!(
+            "{file_path} is {} bytes; Read caps PDFs at {} bytes",
+            metadata.len(),
+            MAX_PDF_BYTES
+        ));
+    }
+    let document = match pdf_oxide::document::PdfDocument::open(path) {
+        Ok(document) => document,
+        Err(error) => {
+            return ToolResult::err(&format!("{file_path} is not a readable PDF: {error}"));
+        }
+    };
+    let page_count = document.page_count().unwrap_or(0);
+    let shown = page_count.min(MAX_PDF_PAGES);
+    let mut pages = Vec::with_capacity(shown);
+    let mut total_chars = 0usize;
+    for page in 0..shown {
+        let text = document.extract_text(page).unwrap_or_default();
+        total_chars += text.len();
+        pages.push(text);
+    }
+    if total_chars == 0 {
+        return ToolResult::err(&format!(
+            "{file_path} has {page_count} page(s) but no extractable text (likely scanned images); text extraction cannot read it"
+        ));
+    }
+    let mut content = String::new();
+    for (index, text) in pages.iter().enumerate() {
+        content.push_str(&format!("--- page {} ---\n{text}\n", index + 1));
+    }
+    let mut payload = json!({
+        "ok": true,
+        "content": content,
+        "pages_total": page_count,
+    });
+    if page_count > MAX_PDF_PAGES {
+        payload["partial"] = json!(true);
+        payload["note"] = json!(format!("showing pages 1..{MAX_PDF_PAGES} of {page_count}"));
+    }
+    ToolResult::ok(payload)
 }
 
 // ============================== Write ==============================
@@ -993,5 +1048,76 @@ mod image_read_tests {
             "the refusal names the cap: {}",
             v["error"]
         );
+    }
+}
+
+#[cfg(test)]
+mod pdf_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cx_in(dir: &std::path::Path) -> ToolContext {
+        ToolContext::new(dir.to_path_buf(), "pdf-test".into(), dir.to_path_buf())
+    }
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orbit-pdfread-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A two-page text PDF, built with pdf_oxide's own writer so the
+    /// fixture is a real document, not a fake signature.
+    fn two_page_pdf(dir: &std::path::Path, name: &str) {
+        use pdf_oxide::writer::PdfWriter;
+        let mut writer = PdfWriter::new();
+        writer.add_page(612.0, 792.0).add_text(
+            "orbit pdf page one",
+            72.0,
+            700.0,
+            "Helvetica",
+            12.0,
+        );
+        writer.add_page(612.0, 792.0).add_text(
+            "orbit pdf page two",
+            72.0,
+            700.0,
+            "Helvetica",
+            12.0,
+        );
+        writer.save(dir.join(name)).expect("save");
+    }
+
+    #[test]
+    fn a_pdf_read_returns_extracted_page_text() {
+        let d = temp_home("text");
+        two_page_pdf(&d, "doc.pdf");
+        let cx = cx_in(&d);
+        let r = ReadTool
+            .run(&json!({ "file_path": "doc.pdf" }), &cx)
+            .payload;
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(v["ok"].as_bool().unwrap(), "{r}");
+        assert_eq!(v["pages_total"], 2);
+        let content = v["content"].as_str().unwrap();
+        assert!(content.contains("--- page 1 ---"), "{content}");
+        assert!(content.contains("page one"), "{content}");
+        assert!(content.contains("page two"), "{content}");
+        assert!(v.get("partial").is_none(), "two pages fit the cap");
+    }
+
+    #[test]
+    fn a_non_pdf_with_pdf_extension_is_an_honest_error() {
+        let d = temp_home("fake");
+        std::fs::write(d.join("fake.pdf"), b"not a pdf at all").unwrap();
+        let cx = cx_in(&d);
+        let r = ReadTool
+            .run(&json!({ "file_path": "fake.pdf" }), &cx)
+            .payload;
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(v.get("ok") != Some(&json!(true)), "{r}");
+        let error = v["error"].as_str().unwrap_or(&r);
+        assert!(error.contains("not a readable PDF"), "{error}");
     }
 }

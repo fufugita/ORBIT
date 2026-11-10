@@ -27,3 +27,4 @@ toml_edit = { workspace = true }
 # Signals go through kill(2) itself (safe API, no `unsafe`): never through
 # /usr/bin/kill, whose operand parsing is not safe for process groups.
 rustix = { workspace = true, features = ["process"] }
+pdf_oxide = "0.3.78"
