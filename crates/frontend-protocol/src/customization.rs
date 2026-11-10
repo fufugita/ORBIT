@@ -36,6 +36,20 @@ pub struct Profile {
     /// says whether it shows. Absent ids default to visible.
     #[serde(default)]
     pub chip_visibility: BTreeMap<String, bool>,
+    /// Width-responsive chip bounds (REA G3): a chip with a minimum hides
+    /// below that terminal width; a maximum hides above it.
+    #[serde(default)]
+    pub chip_width_bounds: BTreeMap<String, ChipWidthBounds>,
+}
+
+/// The declared width window for one chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ChipWidthBounds {
+    #[serde(default)]
+    pub min: u16,
+    #[serde(default)]
+    pub max: u16,
 }
 impl Default for Profile {
     fn default() -> Self {
@@ -52,6 +66,7 @@ impl Default for Profile {
             layout: Layout::default(),
             panes: Vec::new(),
             chip_visibility: BTreeMap::new(),
+            chip_width_bounds: BTreeMap::new(),
         }
     }
 }
@@ -510,6 +525,22 @@ impl Profile {
             if !CHIP_IDS.contains(&chip.as_str()) {
                 return Err(invalid(&format!(
                     "chip_visibility.{chip}: unknown chip (known: {CHIP_IDS_LIST})"
+                )));
+            }
+        }
+        if self.chip_width_bounds.len() > 16 {
+            return Err(invalid("chip_width_bounds exceeds 16 entries"));
+        }
+        for (chip, bounds) in &self.chip_width_bounds {
+            if !CHIP_IDS.contains(&chip.as_str()) {
+                return Err(invalid(&format!(
+                    "chip_width_bounds.{chip}: unknown chip (known: {CHIP_IDS_LIST})"
+                )));
+            }
+            if bounds.min != 0 && bounds.max != 0 && bounds.min > bounds.max {
+                return Err(invalid(&format!(
+                    "chip_width_bounds.{chip}: min {0} exceeds max {1}",
+                    bounds.min, bounds.max
                 )));
             }
         }

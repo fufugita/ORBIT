@@ -147,14 +147,31 @@ pub struct TopBar<'a> {
     pub branch: Option<String>,
     /// Per-chip visibility (REA G1): absent = visible.
     pub chip_visibility: &'a std::collections::BTreeMap<String, bool>,
+    /// Per-chip terminal-width window (REA G3): a chip outside its
+    /// declared range hides.
+    pub chip_width_bounds: &'a std::collections::BTreeMap<String, ChipWidthBounds>,
+    /// The terminal width the bar draws into.
+    pub bar_width: i32,
 }
 
 impl TopBar<'_> {
-    /// A chip shows unless the user turned it off.
+    /// A chip shows unless the user turned it off or the terminal is
+    /// outside its declared width window.
     pub fn chip_shown(&self, id: &str) -> bool {
-        self.chip_visibility.get(id).copied().unwrap_or(true)
+        if !self.chip_visibility.get(id).copied().unwrap_or(true) {
+            return false;
+        }
+        match self.chip_width_bounds.get(id) {
+            Some(bounds) => {
+                (bounds.min == 0 || self.bar_width >= i32::from(bounds.min))
+                    && (bounds.max == 0 || self.bar_width <= i32::from(bounds.max))
+            }
+            None => true,
+        }
     }
 }
+
+use orbit_frontend_protocol::customization::ChipWidthBounds;
 
 /// Keep a contiguous window of tabs around the selected panel. Its title gets
 /// space before neighboring numbers, so a late or long-named panel stays visible.
@@ -850,6 +867,8 @@ mod tests {
                 cwd: String::new(),
                 branch: None,
                 chip_visibility: &EMPTY_CHIPS,
+                chip_width_bounds: &EMPTY_BOUNDS,
+                bar_width: 120,
             },
         );
         let hits = cv.take_hits();
@@ -861,6 +880,8 @@ mod tests {
     }
 
     static EMPTY_CHIPS: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
+    static EMPTY_BOUNDS: std::collections::BTreeMap<String, ChipWidthBounds> =
         std::collections::BTreeMap::new();
 
     #[test]
@@ -1008,6 +1029,8 @@ mod tests {
                         cwd: String::new(),
                         branch: None,
                         chip_visibility: &EMPTY_CHIPS,
+                        chip_width_bounds: &EMPTY_BOUNDS,
+                        bar_width: 120,
                     },
                 );
                 let hits = cv.take_hits();
@@ -1080,6 +1103,8 @@ mod tests {
                 cwd: String::new(),
                 branch: None,
                 chip_visibility: &EMPTY_CHIPS,
+                chip_width_bounds: &EMPTY_BOUNDS,
+                bar_width: 120,
             },
         );
         let row = cells(&buffer, 0, 120);
@@ -1117,6 +1142,8 @@ mod tests {
                 cwd: "/tmp/work".into(),
                 branch: None,
                 chip_visibility: &chips,
+                chip_width_bounds: &std::collections::BTreeMap::new(),
+                bar_width: 140,
             },
         );
         let row = cells(&buffer, 0, 140);
@@ -1151,5 +1178,45 @@ mod tests {
         std::fs::write(dir.join(".git").join("MERGE_HEAD"), b"ref").unwrap();
         assert_eq!(decorate_branch("## main", &dir), "main ⚙merge");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// REA G3: a chip inside its width window shows; outside it hides.
+    #[test]
+    fn width_bounds_gate_the_chip_by_the_bar_width() {
+        let mut scenario = Scenario::new();
+        scenario.window_tokens = 200_000;
+        scenario.used_tokens = 80_000;
+        scenario.ctx_to = 0.4;
+        scenario.ctx_from = 0.4;
+        scenario.ctx_ms = 5000;
+        let mut bounds = std::collections::BTreeMap::new();
+        bounds.insert("context".to_owned(), ChipWidthBounds { min: 120, max: 0 });
+        let draw = |width: i32| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width as u16, 2));
+            let mut cv = Cv::new(&mut buffer);
+            top_bar(
+                &mut cv,
+                width,
+                &TopBar {
+                    scenario: &scenario,
+                    preset: None,
+                    approval_pending: false,
+                    now_ms: 5000,
+                    reduced: true,
+                    mono: false,
+                    saved_ms: None,
+                    zoom: false,
+                    switcher: None,
+                    focus_idx: 0,
+                    cwd: String::new(),
+                    branch: None,
+                    chip_visibility: &EMPTY_CHIPS,
+                    chip_width_bounds: &bounds,
+                    bar_width: width,
+                },
+            );
+            cells(&buffer, 0, width as u16)
+        };
+        assert!(!draw(100).contains("ctx "), "below min: hidden");
+        assert!(draw(130).contains("ctx "), "at min: shown");
     }
 }

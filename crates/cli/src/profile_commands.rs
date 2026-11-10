@@ -198,18 +198,49 @@ fn set(profile: &mut Profile, key: &str, value: &str) -> Result<(), Error> {
         "browser.font_family" => profile.browser.font_family = value.into(),
         // Chip toggles (REA G1): `customize set chip.branch off`.
         key if key.starts_with("chip.") => {
-            let chip = key.strip_prefix("chip.").unwrap_or_default();
+            use orbit_frontend_protocol::customization::ChipWidthBounds;
+            let setting = key.strip_prefix("chip.").unwrap_or_default();
+            let (chip, kind) = match setting.split_once('.') {
+                Some((chip, kind @ ("min_width" | "max_width"))) => (chip, kind),
+                _ => (setting, "visible"),
+            };
             if !orbit_frontend_protocol::customization::valid_chip_id(chip) {
                 return Err(invalid(
                     "unknown chip; known: cwd, branch, model, context, cost, ledger",
                 ));
             }
-            let shown = match value {
-                "on" | "true" => true,
-                "off" | "false" => false,
-                _ => return Err(invalid("chip visibility expects on or off")),
-            };
-            profile.chip_visibility.insert(chip.to_owned(), shown);
+            if kind == "visible" {
+                let shown = match value {
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    _ => return Err(invalid("chip visibility expects on or off")),
+                };
+                profile.chip_visibility.insert(chip.to_owned(), shown);
+            } else {
+                let bound = value
+                    .parse::<u16>()
+                    .map_err(|_| invalid("width bound expects a terminal-column number"))?;
+                let existing = profile
+                    .chip_width_bounds
+                    .entry(chip.to_owned())
+                    .or_default();
+                let candidate = ChipWidthBounds {
+                    min: if kind == "min_width" {
+                        bound
+                    } else {
+                        existing.min
+                    },
+                    max: if kind == "max_width" {
+                        bound
+                    } else {
+                        existing.max
+                    },
+                };
+                if candidate.min != 0 && candidate.max != 0 && candidate.min > candidate.max {
+                    return Err(invalid("min_width exceeds max_width"));
+                }
+                *existing = candidate;
+            }
         }
         "browser.font_size_px" => {
             profile.browser.font_size_px = value
@@ -1067,6 +1098,17 @@ mod chip_toggle_tests {
         assert!(
             set(&mut profile, "chip.branch", "maybe").is_err(),
             "non-boolean refused"
+        );
+        set(&mut profile, "chip.context.min_width", "120").expect("width window sets");
+        set(&mut profile, "chip.context.max_width", "200").expect("max sets");
+        assert_eq!(profile.chip_width_bounds["context"].min, 120);
+        assert!(
+            set(&mut profile, "chip.context.max_width", "100").is_err(),
+            "max below min refused"
+        );
+        assert!(
+            set(&mut profile, "chip.branch.min_width", "frog").is_err(),
+            "non-number refused"
         );
         // Validation round-trip: the profile with toggles still validates.
         let bytes = serde_json::to_vec(&profile).unwrap();
