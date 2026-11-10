@@ -3481,6 +3481,20 @@ fn cmd_chat(args: &[String]) -> i32 {
                         "Saved. Describe a task to begin; your first message will test the provider connection."
                     );
                     println!("Run `orbit doctor` any time to verify the local setup.");
+                    // Doctor auto-suggest (wizard item 9, task T8): arm a
+                    // one-time inline offer on the NEXT fresh interactive
+                    // launch within an hour. The marker lives in the private
+                    // home; scripted and nonTTY launches never consult it.
+                    let _ = std::fs::write(
+                        home.join("doctor-suggest.json"),
+                        format!(
+                            "{{\"schema\":\"orbit.cli/v1\",\"until_ms\":{}}}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64 + 3_600_000)
+                                .unwrap_or(0)
+                        ),
+                    );
                 }
                 Err((code, message)) => {
                     eprintln!("{code}: {message}");
@@ -3492,6 +3506,44 @@ fn cmd_chat(args: &[String]) -> i32 {
     if let Err((code, msg)) = ensure_initialized(&home) {
         eprintln!("{code}: {msg}");
         return 2;
+    }
+    // One-time doctor offer (task T8): only a fresh interactive launch after
+    // a recent successful save, never in scripted or nonTTY contexts.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && !args.iter().any(|a| a == "--resume" || a == "--continue")
+        && let Ok(marker) = std::fs::read_to_string(home.join("doctor-suggest.json"))
+    {
+        let _ = std::fs::remove_file(home.join("doctor-suggest.json"));
+        let due = serde_json::from_str::<serde_json::Value>(&marker)
+            .ok()
+            .and_then(|v| v["until_ms"].as_u64())
+            .is_some_and(|until| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                now < until
+            });
+        if due {
+            match orbit_cli::cli_release_commands::doctor(&home, &[]) {
+                Ok(result) => {
+                    let ready = result
+                        .get("report")
+                        .and_then(|report| report.get("ready"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if ready {
+                        println!("Readiness check passed (orbit doctor). Starting your session.");
+                    } else {
+                        println!(
+                            "Readiness check found problems above; see `orbit doctor` for detail."
+                        );
+                    }
+                }
+                Err((_, message)) => eprintln!("readiness check skipped: {message}"),
+            }
+        }
     }
 
     let requested_gate =
