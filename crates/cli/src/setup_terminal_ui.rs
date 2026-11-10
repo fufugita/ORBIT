@@ -73,6 +73,29 @@ fn is_default_ignorable(character: char) -> bool {
 }
 
 /// Controls are separated; default-ignorable code points stay visible in labels.
+/// REA G4: keep ANSI color/move sequences while stripping other control
+/// characters, so detail lines can carry palette swatches safely.
+pub(crate) fn safe_with_ansi(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' && chars.peek() == Some(&'[') {
+            result.push('\x1b');
+            for escape in chars.by_ref() {
+                result.push(escape);
+                if escape.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if character.is_control() {
+            result.push(' ');
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+
 pub(crate) fn safe(value: &str) -> String {
     use std::fmt::Write as _;
 
@@ -88,6 +111,21 @@ pub(crate) fn safe(value: &str) -> String {
         }
     }
     safe
+}
+
+pub(crate) fn clip_ansi(value: &str, columns: usize) -> String {
+    let clean = safe_with_ansi(value);
+    let mut result = String::new();
+    let mut used = 0;
+    for cluster in clean.graphemes(true) {
+        let width = UnicodeWidthStr::width(cluster);
+        if used + width > columns {
+            break;
+        }
+        used += width;
+        result.push_str(cluster);
+    }
+    result
 }
 
 pub(crate) fn clip(value: &str, columns: usize) -> String {
@@ -190,11 +228,21 @@ pub(crate) fn frame(
         }
         .to_owned(),
     );
+    // The detail line may carry ANSI swatches (REA G4); other lines stay plain.
+    let detail = selected
+        .and_then(|c| c.detail)
+        .map(|detail| clip_ansi(detail, columns.saturating_sub(1)));
+    let mut rendered: Vec<String> = lines
+        .into_iter()
+        .map(|s| clip(&s, columns.saturating_sub(1)))
+        .collect();
+    if let Some(detail) = detail {
+        // The detail sits after the choice lines: header(3) + page choices.
+        let index = 3 + (end - start);
+        rendered[index] = detail;
+    }
     Frame {
-        lines: lines
-            .into_iter()
-            .map(|s| clip(&s, columns.saturating_sub(1)))
-            .collect(),
+        lines: rendered,
         selected_line,
         page,
     }

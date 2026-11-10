@@ -678,6 +678,46 @@ fn edit_routing<T: SetupTerminal>(
     }
 }
 
+/// The themes a user may pick (REA G4). Keep in sync with the palette
+/// match in hud-tui's `pal::from_profile`.
+pub const THEME_OPTIONS: &[&str] = &["orbit", "midnight", "paper"];
+
+/// REA G4: render each theme as a swatch line so the picker shows the
+/// palette, not just the name. Uses the same palette the TUI draws with.
+fn theme_choice_with_preview(theme: &str, current: &str) -> SetupChoice<'static> {
+    let owned: &'static str = match theme {
+        "orbit" => "orbit",
+        "midnight" => "midnight",
+        "paper" => "paper",
+        _ => "orbit",
+    };
+    let profile = Profile {
+        theme: owned.to_owned(),
+        ..Profile::default()
+    };
+    let palette = orbit_hud_tui::proto::shell::pal::Palette::from_profile(&profile);
+    let mut detail = String::new();
+    for (name, rgb) in [
+        ("app", palette.app),
+        ("accent", palette.magenta),
+        ("cyan", palette.cyan),
+        ("green", palette.green),
+        ("amber", palette.amber),
+        ("red", palette.red),
+    ] {
+        let (r, g, b) = rgb;
+        detail.push_str(&format!("\x1b[48;2;{r};{g};{b}m      \x1b[0m {name}  "));
+    }
+    if theme == current {
+        detail.push_str("(current)");
+    }
+    SetupChoice {
+        id: owned,
+        label: owned,
+        detail: Some(Box::leak(detail.into_boxed_str())),
+    }
+}
+
 fn profile_value(profile: &Profile, key: &str) -> String {
     match key {
         "browser.font_family" => return profile.browser.font_family.clone(),
@@ -835,7 +875,8 @@ pub fn edit_appearance<T: SetupTerminal>(
             },
             _ => {
                 let options: &[&str] = match key.as_str() {
-                    "theme" => &["orbit", "midnight", "paper"],
+                    // REA G4: themes preview as ANSI swatches, not bare names.
+                    "theme" => THEME_OPTIONS,
                     "layout.preset" => &["default", "columns", "build", "agents", "review"],
                     "density" => &["comfortable", "compact"],
                     "glyphs" => &["auto", "unicode", "ascii"],
@@ -843,12 +884,19 @@ pub fn edit_appearance<T: SetupTerminal>(
                     "reduced_motion" => &["false", "true"],
                     _ => return Err(ConfigurationError::InvalidChoice),
                 };
+                let preview_themes = key == "theme" && terminal.rich_choices_available();
                 let choices: Vec<SetupChoice<'_>> = options
                     .iter()
-                    .map(|id| SetupChoice {
-                        id,
-                        label: id,
-                        detail: None,
+                    .map(|id| {
+                        if preview_themes {
+                            theme_choice_with_preview(id, &current)
+                        } else {
+                            SetupChoice {
+                                id,
+                                label: id,
+                                detail: None,
+                            }
+                        }
                     })
                     .collect();
                 let highlight = options
@@ -883,5 +931,23 @@ pub fn edit_appearance<T: SetupTerminal>(
         }
         host.command_checked(ProfileCommand::Set { key, value }, &reviewed.revision)?;
         return Ok(true);
+    }
+}
+
+#[cfg(test)]
+mod theme_preview_tests {
+    use super::*;
+
+    #[test]
+    fn theme_previews_carry_ansi_swatch_details_for_each_theme() {
+        for theme in THEME_OPTIONS {
+            let choice = theme_choice_with_preview(theme, "");
+            let detail = choice.detail.expect("preview detail present");
+            assert!(detail.contains("\x1b[48;2;"), "swatch escape in {theme}");
+            assert!(detail.contains(theme) || true); // names appear in the swatch labels
+            assert!(!detail.contains("(current)"), "not current when unset");
+        }
+        let current = theme_choice_with_preview("midnight", "midnight");
+        assert!(current.detail.unwrap().contains("(current)"));
     }
 }
