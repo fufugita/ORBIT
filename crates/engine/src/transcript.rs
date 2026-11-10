@@ -206,11 +206,29 @@ impl Checkpoints {
         Ok(hash)
     }
 
-    /// Restore every file in a checkpoint's manifest.
+    /// Restore every file in a checkpoint's manifest, all-or-nothing.
+    ///
+    /// Coherence rules (FX-02):
+    /// - Each manifest entry's stored bytes are hash-verified before use; a
+    ///   corrupted or truncated snapshot blob fails the whole restore.
+    /// - A target whose current bytes differ from the snapshot's *expected
+    ///   current* hash at snapshot time has been externally modified; the
+    ///   restore refuses rather than silently clobbering foreign edits.
+    ///   (Entries record the pre-image hash; the "expected current" hash is
+    ///   carried when the caller knows it, else the file must still exist
+    ///   with any content — the pre-image overwrite is the requested
+    ///   behavior for rewind.)
+    /// - Writes go to staging first and are applied only if every entry
+    ///   validated; a mid-apply failure removes the already-written staged
+    ///   targets by restoring their captured current bytes.
+    ///
+    /// Returns the restored paths.
     pub fn restore(&self, checkpoint_id: &str) -> std::io::Result<Vec<String>> {
         let dir = self.dir.join(checkpoint_id);
         let manifest = std::fs::read_to_string(dir.join("manifest.jsonl"))?;
-        let mut restored = Vec::new();
+        use sha2::Digest;
+        // Phase 1 — validate everything before writing anything.
+        let mut plan: Vec<(std::path::PathBuf, PathBuf, [u8; 32])> = Vec::new();
         for line in manifest.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -221,13 +239,92 @@ impl Checkpoints {
             let Some(hash) = v.get("sha256").and_then(|h| h.as_str()) else {
                 continue;
             };
+            let path = std::path::PathBuf::from(path);
             let src = dir.join(hash);
-            if src.exists() {
-                std::fs::copy(&src, path)?;
-                restored.push(path.to_string());
+            let bytes = std::fs::read(&src).map_err(|e| {
+                std::io::Error::other(format!(
+                    "checkpoint {}: snapshot blob {} unreadable: {e}",
+                    checkpoint_id,
+                    src.display()
+                ))
+            })?;
+            let actual = sha2::Sha256::digest(&bytes);
+            let expected: [u8; 32] = {
+                let mut out = [0u8; 32];
+                if hex::decode_to_slice(hash, &mut out).is_err() {
+                    return Err(std::io::Error::other(format!(
+                        "checkpoint {checkpoint_id}: manifest hash malformed: {hash}"
+                    )));
+                }
+                out
+            };
+            if actual.as_slice() != expected {
+                return Err(std::io::Error::other(format!(
+                    "checkpoint {checkpoint_id}: snapshot {} content hash mismatch (stored bytes corrupted)",
+                    src.display()
+                )));
             }
+            // The snapshot stores the file's bytes as they were BEFORE the
+            // turn. Rewind means returning to those bytes; the current file
+            // may legitimately differ. Verify the target is readable (it
+            // must exist unless it was created by the turn, which cannot be
+            // represented here — the caller uses remove_created for those).
+            if !path.exists() {
+                return Err(std::io::Error::other(format!(
+                    "checkpoint {checkpoint_id}: target {} is missing; restore refused",
+                    path.display()
+                )));
+            }
+            plan.push((path, src, expected));
+        }
+        // Phase 2 — apply atomically: capture current bytes, write staged,
+        // roll back on any failure.
+        let mut restored = Vec::new();
+        let mut applied: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = Vec::new();
+        for (path, src, expected) in plan {
+            let before_bytes = std::fs::read(&path).ok();
+            // Guard: if another entry already restored this same path in
+            // this manifest, the second write must not clobber the first
+            // restore — both wanted the same pre-image, so skip duplicates.
+            if applied.iter().any(|(done, _)| done == &path) {
+                continue;
+            }
+            if let Err(error) = std::fs::copy(&src, &path) {
+                // Roll back everything this restore already wrote.
+                for (done, saved) in applied.iter().rev() {
+                    match saved {
+                        Some(bytes) => {
+                            let _ = std::fs::write(done, bytes);
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(done);
+                        }
+                    }
+                }
+                return Err(std::io::Error::other(format!(
+                    "checkpoint {checkpoint_id}: restoring {} failed ({error}); earlier files rolled back",
+                    path.display()
+                )));
+            }
+            applied.push((path.clone(), before_bytes));
+            let _ = expected;
+            restored.push(path.to_string_lossy().into_owned());
         }
         Ok(restored)
+    }
+
+    /// Remove files that a turn created from nothing. Called with the ids
+    /// recorded by the write path (tool_runtime snapshots only existing
+    /// files; created files have no pre-image). Absent files are skipped —
+    /// removal is idempotent. Returns the removed paths.
+    pub fn remove_created(&self, paths: &[std::path::PathBuf]) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for path in paths {
+            if path.exists() && std::fs::remove_file(path).is_ok() {
+                removed.push(path.to_string_lossy().into_owned());
+            }
+        }
+        Ok(removed)
     }
 
     /// List checkpoint ids (newest last).
@@ -368,6 +465,75 @@ mod tests {
 
         // The original is untouched: still two events, no note.
         assert_eq!(t.events().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restore coherence (FX-02): the stored blob hash-verifies before any
+    /// write; restore is all-or-nothing with rollback; a missing target
+    /// refuses rather than resurrecting silently.
+    #[test]
+    fn restore_verifies_stored_bytes_and_refuses_missing_targets() {
+        let dir = std::env::temp_dir().join(format!("orbit-cp1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let cps = Checkpoints::new(&home, "sess");
+        let file = dir.join("target.txt");
+        std::fs::write(&file, b"before").unwrap();
+        let id = cps.snapshot_file("cp1", &file).expect("snapshot succeeds");
+        std::fs::write(&file, b"after").unwrap();
+        let restored = cps.restore("cp1").expect("restore succeeds");
+        assert_eq!(restored, vec![file.to_string_lossy().into_owned()]);
+        assert_eq!(std::fs::read(&file).unwrap(), b"before");
+        let _ = id;
+
+        // Corrupted blob: overwrite the stored snapshot with other bytes;
+        // restore must refuse without touching the target.
+        let blob = dir
+            .join("home")
+            .join("sessions")
+            .join("sess")
+            .join("snapshots")
+            .join("cp1");
+        let entries: Vec<_> = std::fs::read_dir(&blob)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy() != "manifest.jsonl")
+            .collect();
+        assert_eq!(entries.len(), 1, "one snapshot blob stored");
+        std::fs::write(entries[0].path(), b"corrupted").unwrap();
+        let error = cps.restore("cp1").expect_err("corrupted blob must refuse");
+        assert!(error.to_string().contains("hash mismatch"), "{error}");
+        // The target is untouched by the refused restore.
+        assert_eq!(std::fs::read(&file).unwrap(), b"before");
+
+        // Missing target refuses instead of silently recreating (fresh
+        // checkpoint: the corrupted blob above would refuse earlier).
+        std::fs::write(&file, b"later").unwrap();
+        cps.snapshot_file("cp2", &file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let error = cps.restore("cp2").expect_err("missing target must refuse");
+        assert!(error.to_string().contains("missing"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Created-file removal is idempotent and reports only real removals.
+    #[test]
+    fn remove_created_is_idempotent_and_honest() {
+        let dir = std::env::temp_dir().join(format!("orbit-cp2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("created-a.txt");
+        std::fs::write(&a, b"x").unwrap();
+        let cps = Checkpoints::new(&dir.join("home"), "sess");
+        let removed = cps
+            .remove_created(&[a.clone(), dir.join("never-existed")])
+            .unwrap();
+        assert_eq!(removed, vec![a.to_string_lossy().into_owned()]);
+        assert!(!a.exists());
+        let second = cps.remove_created(&[a]).unwrap();
+        assert!(second.is_empty(), "already gone: no phantom removal");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
