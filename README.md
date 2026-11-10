@@ -50,6 +50,15 @@ Add the installation directory to `PATH`. The managed installer switches both
 executables together and preserves your configuration. See [installation details](docs/setup.md)
 for bundle installation, upgrades, prerequisites, and uninstall instructions.
 
+Verify what you installed against the built binary:
+
+```sh
+orbit version
+```
+
+The output reports the running version and, on release builds, the build commit
+the binary was made from.
+
 ### Install with npm (Linux)
 
 The launcher package is `@fufugita/orbit`; once a prerelease is published under
@@ -178,6 +187,13 @@ For a read-only view, including from a script:
 ```sh
 orbit config show
 orbit config show --json
+```
+
+To let your shell complete ORBIT's commands, emit the completion script for
+your shell and source it from your profile (`bash`, `zsh`, or `fish`):
+
+```sh
+orbit completions bash >> ~/.bashrc
 ```
 
 To create only the local identity and configure providers later:
