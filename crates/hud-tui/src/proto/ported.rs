@@ -689,9 +689,9 @@ pub fn draw_council(
                 _ => ("○", palette.mute()),
             };
             let name = format!("{}·{:02} ", seat.name, index + 1);
-            at += cv.text(at, row, &name, palette.mute(), None);
-            at += cv.text(at, row, &format!("{} ", seat.lab), palette.body, None);
-            at += cv.text(at, row, &format!(" {dot}  ",), colour, None);
+            at = cv.text(at, row, &name, palette.mute(), None);
+            at = cv.text(at, row, &format!("{} ", seat.lab), palette.body, None);
+            at = cv.text(at, row, &format!(" {dot}  ",), colour, None);
         }
         row += 1;
     }
@@ -699,8 +699,8 @@ pub fn draw_council(
     // The strip.
     for (label, label_colour, body, body_colour) in strip_lines {
         let mut at = x;
-        at += cv.bold(at, row, &label, label_colour, None);
-        at += cv.text(at, row, "▏", palette.dim, None);
+        at = cv.bold(at, row, &label, label_colour, None);
+        at = cv.text(at, row, "▏", palette.dim, None);
         cv.text(at, row, &body, body_colour, None);
         row += 1;
     }
@@ -735,11 +735,11 @@ pub fn draw_council(
             " "
         };
         let mut at = x;
-        at += cv.text(at, row, " PHASE ", palette.mute(), None);
-        at += cv.bold(at, row, state.phase.hangul(), colour, None);
+        at = cv.text(at, row, " PHASE ", palette.mute(), None);
+        at = cv.bold(at, row, state.phase.hangul(), colour, None);
         if width >= 44 {
-            at += cv.text(at, row, " ", palette.dim, None);
-            at += cv.text(
+            at = cv.text(at, row, " ", palette.dim, None);
+            at = cv.text(
                 at,
                 row,
                 state.phase.english().unwrap_or(&state.phase.name),
@@ -747,7 +747,7 @@ pub fn draw_council(
                 None,
             );
         }
-        at += cv.text(at, row, &format!(" {blink}"), colour, None);
+        at = cv.text(at, row, &format!(" {blink}"), colour, None);
         let _ = at;
         if state.history.seen > 0 {
             let mut record = format!("기록 {}/{}", state.history.finished, state.history.seen);
@@ -1585,6 +1585,38 @@ mod tests {
         assert!(lines[1].ends_with('…'));
         assert!(lines.iter().all(|line| text_width(line) <= 9));
         assert_eq!(wrap("short", 20, 3), vec!["short"]);
+    }
+
+    #[test]
+    fn council_text_positions_translate_with_the_panel_origin() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut state = bench();
+        state.seats.push(state.seats[0].clone());
+        let render = |x, y| {
+            let area = Rect::new(x, y, 70, 18);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 60));
+            let mut cv = Cv::new(&mut buffer);
+            let palette = BenchPalette::from_shell(&cv.palette);
+            cv.clipped(area, |cv| {
+                draw_council(
+                    cv,
+                    (x as i32, y as i32, 70, 18),
+                    &state,
+                    palette,
+                    4_000,
+                    true,
+                );
+            });
+            (0..area.height)
+                .flat_map(|row| {
+                    let buffer = &buffer;
+                    (0..area.width).map(move |column| buffer[(x + column, y + row)].clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (index, (origin, moved)) in render(0, 0).iter().zip(render(37, 11)).enumerate() {
+            assert_eq!(origin, &moved, "at {},{}", index % 70, index / 70);
+        }
     }
 
     #[test]

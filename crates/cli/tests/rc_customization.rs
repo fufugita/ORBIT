@@ -1052,3 +1052,83 @@ fn council_snapshot_refuses_a_symlinked_state_file() {
     assert_eq!(council_snapshot_at(&link, 1.0, false).0, PaneState::Error);
     assert_eq!(council_snapshot_at(&real, 1.0, false).0, PaneState::Ready);
 }
+
+#[test]
+fn council_panel_refresh_observes_time_and_history_without_blocking() {
+    const CHILD: &str = "ORBIT_COUNCIL_REFRESH_TEST_CHILD";
+    const TEST: &str = "council_panel_refresh_observes_time_and_history_without_blocking";
+    if std::env::var_os(CHILD).is_some() {
+        let path = PathBuf::from(std::env::var_os("ORBIT_COUNCIL_STATE").unwrap());
+        let active = council_from_state_file(1000.0).unwrap();
+        assert_eq!(active.phase, "DELIBERATING");
+        assert_eq!(active.seats.len(), 1);
+
+        // Elapsed time changes the view even when state.json is unchanged.
+        let idle = council_from_state_file(1421.0).unwrap();
+        assert_eq!(idle.phase, "IDLE");
+        assert!(idle.last_final.is_empty());
+
+        // History changes independently of state.json and must refresh too.
+        let history = path.with_file_name("history.jsonl");
+        std::fs::write(
+            &history,
+            "{\"ts\":1001,\"final\":\"FINAL: first conclusion\"}\n",
+        )
+        .unwrap();
+        let first = council_from_state_file(1421.0).unwrap();
+        assert_eq!(first.last_final, "first conclusion");
+        assert_eq!(first.finished, 1);
+        {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&history)
+                    .unwrap(),
+                "{{\"ts\":1002,\"final\":\"FINAL: second conclusion\"}}"
+            )
+            .unwrap();
+        }
+        let second = council_from_state_file(1421.0).unwrap();
+        assert_eq!(second.last_final, "second conclusion");
+        assert_eq!(second.finished, 2);
+        println!("ORBIT_COUNCIL_REFRESH_CHECKED");
+        return;
+    }
+
+    let f = Fixture::new();
+    let path = f.root.join("state.json");
+    std::fs::write(
+        &path,
+        br#"{"ts":1000,"phase":"DELIBERATING","seats":[{"model":"fixture","status":"computing"}]}"#,
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .env("ORBIT_COUNCIL_STATE", &path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Council panel refresh blocked while reading an existing state file");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ORBIT_COUNCIL_REFRESH_CHECKED"));
+}
