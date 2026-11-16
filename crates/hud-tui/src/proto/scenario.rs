@@ -12,6 +12,7 @@ pub(super) enum OrdinaryIntent {
     Prompt(String),
     PlanPrompt(String),
     ModCommand(String, String),
+    SlashCommand(String, String),
 }
 
 impl std::fmt::Debug for OrdinaryIntent {
@@ -20,6 +21,7 @@ impl std::fmt::Debug for OrdinaryIntent {
             Self::Prompt(_) => "Prompt(..)",
             Self::PlanPrompt(_) => "PlanPrompt(..)",
             Self::ModCommand(_, _) => "ModCommand(..)",
+            Self::SlashCommand(_, _) => "SlashCommand(..)",
         })
     }
 }
@@ -32,6 +34,9 @@ impl OrdinaryIntent {
             WorkerCommand::ModCommand(module, command) => {
                 Some(Self::ModCommand(module.clone(), command.clone()))
             }
+            WorkerCommand::SlashCommand(name, args) => {
+                Some(Self::SlashCommand(name.clone(), args.clone()))
+            }
             _ => None,
         }
     }
@@ -39,7 +44,9 @@ impl OrdinaryIntent {
     fn kind(&self) -> ForegroundKind {
         match self {
             Self::PlanPrompt(_) => ForegroundKind::PlanPrompt,
-            Self::Prompt(_) | Self::ModCommand(_, _) => ForegroundKind::Prompt,
+            Self::Prompt(_) | Self::ModCommand(_, _) | Self::SlashCommand(_, _) => {
+                ForegroundKind::Prompt
+            }
         }
     }
 
@@ -50,6 +57,9 @@ impl OrdinaryIntent {
             Self::ModCommand(module, command) => {
                 WorkerCommand::ModCommand(module.clone(), command.clone())
             }
+            Self::SlashCommand(name, args) => {
+                WorkerCommand::SlashCommand(name.clone(), args.clone())
+            }
         }
     }
 
@@ -57,6 +67,7 @@ impl OrdinaryIntent {
         match self {
             Self::Prompt(text) | Self::PlanPrompt(text) => text.clone(),
             Self::ModCommand(module, command) => format!("/{module}:{command}"),
+            Self::SlashCommand(name, args) => format!("/{name} {args}").trim_end().to_owned(),
         }
     }
 }
@@ -92,8 +103,19 @@ pub struct SessionViewState {
 pub struct Scenario {
     pub frontend: SessionViewState,
     pub routing_lines: Vec<String>,
+    /// The line the operator's status-line command last printed.
+    pub status_line: Option<String>,
+    /// The newest answer of the `/goal` check, until the automation reads it.
+    pub goal_verdict: Option<crate::proto::runtime::GoalVerdict>,
+    /// A file the worker asked to have opened in the editor, and the
+    /// inspection to ask for afterwards. Taken by the event loop, which
+    /// owns the terminal.
+    pub edit_request: Option<(std::path::PathBuf, String)>,
     pub custom_panes:
         std::collections::BTreeMap<String, orbit_frontend_protocol::customization::PaneOutput>,
+    /// The council engine's state as the pane draws it. Filled from the
+    /// session's pane context; `None` when no council has published.
+    pub council: Option<crate::proto::ported::CouncilState>,
     /// The model being waited on (M05's "waiting for {model}").
     pub model: String,
     /// The session's permission mode (S5), updated by ModeChanged and
@@ -237,6 +259,23 @@ pub struct Scenario {
     pub turn_started_ms: u64,
     /// Tools run this turn (the M5 report's count).
     pub turn_tools: u64,
+    /// Cache-read, cache-write and reasoning tokens observed this run, with
+    /// the session they belong to.
+    pub usage_detail: Option<(String, u64, u64, u64)>,
+    /// Reactor meter (the built-in `reactor` pane). Rates are thousandths
+    /// of a token per second: the last finished turn, the session peak and
+    /// a bounded history for a sparkline.
+    pub turn_rate_milli: Option<u64>,
+    pub peak_rate_milli: Option<u64>,
+    pub rate_history: std::collections::VecDeque<u64>,
+    /// Which turn the meter is counting (`turn_started_ms`) and the output
+    /// total when that turn began.
+    pub meter_turn_ms: Option<u64>,
+    pub meter_output_base: u64,
+    /// Text streamed in the current turn: characters, first and last arrival.
+    pub stream_chars: u64,
+    pub stream_started_ms: Option<u64>,
+    pub stream_last_ms: u64,
     /// The reactor phase (§6.10): 0 orient … 4 respond — the
     /// workspace stepper.
     pub phase: usize,
@@ -941,6 +980,51 @@ impl Scenario {
         "New session".into()
     }
 
+    /// Reactor meter: start counting a new turn the first time it is seen.
+    pub fn mark_turn_meter(&mut self) {
+        if self.meter_turn_ms != Some(self.turn_started_ms) {
+            self.meter_turn_ms = Some(self.turn_started_ms);
+            self.meter_output_base = self.output_tokens;
+            self.stream_chars = 0;
+            self.stream_started_ms = None;
+        }
+    }
+
+    /// Reactor meter: streamed text arrived.
+    pub fn meter_stream(&mut self, chars: usize, now_ms: u64) {
+        self.mark_turn_meter();
+        self.stream_started_ms.get_or_insert(now_ms);
+        self.stream_last_ms = now_ms;
+        self.stream_chars = self.stream_chars.saturating_add(chars as u64);
+    }
+
+    /// Reactor meter: settle the finished turn's output rate. The rate is
+    /// output tokens over the whole turn, tool time included.
+    pub fn settle_turn_rate(&mut self, turn_output: u64, now_ms: u64) {
+        let elapsed_ms = now_ms.saturating_sub(self.turn_started_ms);
+        if turn_output == 0 || elapsed_ms == 0 {
+            return;
+        }
+        let rate = turn_output.saturating_mul(1_000_000) / elapsed_ms;
+        self.turn_rate_milli = Some(rate);
+        self.peak_rate_milli = Some(self.peak_rate_milli.map_or(rate, |peak| peak.max(rate)));
+        if self.rate_history.len() >= 400 {
+            self.rate_history.pop_front();
+        }
+        self.rate_history.push_back(rate);
+    }
+
+    /// Reactor meter: a rough rate while text streams (about four characters
+    /// per token). `None` once the turn is over or before any text arrived.
+    pub fn live_rate_milli(&self) -> Option<u64> {
+        let started = self.stream_started_ms?;
+        if !self.turn_live || self.meter_turn_ms != Some(self.turn_started_ms) {
+            return None;
+        }
+        let elapsed_ms = self.stream_last_ms.saturating_sub(started).max(250);
+        Some(self.stream_chars.saturating_mul(250_000) / elapsed_ms)
+    }
+
     /// The current reactor phase (the workspace stepper, §9.17):
     /// 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
     pub fn phase_index(&self) -> usize {
@@ -1241,4 +1325,57 @@ mod tests {
         s.file_sel = 9;
         assert_eq!(s.selected_file(), Some(0), "an out-of-range file clamps");
     }
+}
+
+#[cfg(test)]
+mod reactor_meter_tests {
+    use super::*;
+
+    #[test]
+    fn meter_estimates_while_streaming_and_settles_per_turn() {
+        let mut s = Scenario::default();
+        assert_eq!(s.live_rate_milli(), None);
+        s.turn_started_ms = 1_000;
+        s.turn_live = true;
+        s.meter_stream(400, 1_500);
+        s.meter_stream(400, 2_500);
+        // 800 characters, about 200 tokens, over one second.
+        assert_eq!(s.live_rate_milli(), Some(200_000));
+        // 100 output tokens over the two-second turn.
+        s.settle_turn_rate(100, 3_000);
+        assert_eq!(s.turn_rate_milli, Some(50_000));
+        assert_eq!(s.peak_rate_milli, Some(50_000));
+
+        s.turn_live = false;
+        assert_eq!(s.live_rate_milli(), None);
+        s.turn_started_ms = 5_000;
+        s.mark_turn_meter();
+        assert_eq!(s.stream_chars, 0);
+        s.settle_turn_rate(10, 6_000);
+        assert_eq!(s.turn_rate_milli, Some(10_000));
+        assert_eq!(s.peak_rate_milli, Some(50_000), "the peak is kept");
+        // A turn with no output, or no elapsed time, changes nothing.
+        s.settle_turn_rate(0, 9_000);
+        s.settle_turn_rate(10, 5_000);
+        assert_eq!(s.turn_rate_milli, Some(10_000));
+        assert_eq!(s.rate_history.len(), 2);
+    }
+
+    #[test]
+    fn meter_history_is_bounded() {
+        let mut s = Scenario::default();
+        for turn in 1..=450u64 {
+            s.settle_turn_rate(turn, 1_000);
+        }
+        assert_eq!(s.rate_history.len(), 400);
+        assert_eq!(s.peak_rate_milli, Some(450_000));
+    }
+}
+
+/// Whether a refused call's fact says who refused it — a channel answering
+/// for the operator, or the harness blocking the call (a hook, a rule, plan
+/// mode, auto mode). Such a card shows the fact; any other refusal was the
+/// operator's own.
+pub(crate) fn names_who_refused(fact: &str) -> bool {
+    fact.starts_with("denied by the channel ") || fact.starts_with("blocked")
 }

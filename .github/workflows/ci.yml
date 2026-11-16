@@ -35,9 +35,18 @@ jobs:
       - name: install bubblewrap
         # The shell sandbox tests are real: they run bwrap and assert
         # confined writes succeed, /etc writes fail, and the network is
-        # unreachable. Without bwrap they silently skip — which is fine
-        # locally but hides regressions in CI.
+        # unreachable. Release validation requires these assertions to run;
+        # ORBIT_REQUIRE_SANDBOX below refuses the local skip behavior.
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: release test environment
+        run: python3 -B scripts/release_preflight.py
+      - name: dependency policy
+        run: |
+          cargo install --locked --version 0.20.2 cargo-deny >/dev/null 2>&1
+          cargo deny --locked check
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -49,8 +58,8 @@ jobs:
       - name: allow user namespaces
         # bwrap needs unprivileged user namespaces, which Ubuntu 24.04
         # runners restrict through AppArmor. Lift that for this job so the
-        # sandbox tests run against a real sandbox instead of skipping. If
-        # the key does not exist they still skip, with a printed reason.
+        # sandbox tests run against a real sandbox. ORBIT_REQUIRE_SANDBOX
+        # below makes a failed capability check fail instead of skipping.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: prepare terminal test dependencies
         run: python3 scripts/prepare_manual_pty_dependencies.py
@@ -59,21 +68,27 @@ jobs:
           scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_prepare_manual_pty_dependencies.py -v
           scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_priorities_3_5_acceptance.py -v
           scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_homebrew_distribution.py -v
+          scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release_preflight.py -v
+          scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_check_release_test_log.py -v
+          scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_check_release_package.py -v
       - name: test
         # The whole workspace in one run. (The interrupt and sandbox tests
         # used to be fenced off because the job kept dying when they ran;
         # that was the test process signalling its whole user session via
         # `kill -TERM -<pgid>`, not the runner — fixed in the code.)
-        run: cargo test --workspace --locked
-      - uses: actions/setup-node@v4
+        shell: bash
+        run: |
+          scripts/in-jail.sh env ORBIT_REQUIRE_SANDBOX=1 ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION=1 cargo test --workspace --locked --no-fail-fast -- --test-threads=1 2>&1 | tee target/release-workspace-tests.log
+          python3 -B scripts/check_release_test_log.py target/release-workspace-tests.log
+      - name: retain workspace test log
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          node-version: "22"
+          name: release-workspace-tests
+          path: target/release-workspace-tests.log
+          if-no-files-found: ignore
       - name: npm distribution contracts
         run: scripts/in-jail.sh node scripts/npm_distribution_test.mjs
       - name: disk after test
         if: always()
         run: df -h /
-      - name: deny
-        run: |
-          cargo install --locked --version 0.20.2 cargo-deny >/dev/null 2>&1
-          cargo deny --locked check

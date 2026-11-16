@@ -229,7 +229,134 @@ impl std::fmt::Debug for NamespaceAccounting {
         f.write_str("NamespaceAccounting")
     }
 }
+/// Whether the saved session `session_id` can take no more requests: one of
+/// its requests was stopped, or timed out, before its outcome was known,
+/// and admission stays closed on a cost that is not known. `false` when
+/// its accounting cannot be read (an untracked session admits as before).
+pub fn admission_blocked_for(home: &Path, session_id: &str) -> bool {
+    crate::context_history::context_journal(home, session_id, None)
+        .ok()
+        .and_then(|journal| journal.accounting_checkpoint_detailed().ok())
+        .is_some_and(|checkpoint| checkpoint_blocks_admission(&checkpoint))
+}
+
+/// Close the saved session's stopped request as abandoned (see
+/// [`NamespaceAccounting::abandon_stopped_request`]) so the session can be
+/// resumed. The caller holds the session's lease. The session's cost status
+/// from then on when a request was abandoned (the saved session's
+/// watermark, written while the request was still pending, must be brought
+/// to it); `None` when there was none to abandon.
+pub fn abandon_stopped_for(
+    home: &Path,
+    session_id: &str,
+) -> Result<Option<FullCostStatus>, AccountingError> {
+    let journal = crate::context_history::context_journal(home, session_id, None)?;
+    match abandon_pending(journal.as_ref(), &journal.accounting_checkpoint_detailed()?)? {
+        Some(next) => Ok(Some(Projection::from_checkpoint(&next)?.status)),
+        None => Ok(None),
+    }
+}
+
+/// The cost status of a saved session whose last request was abandoned
+/// (nothing pending, and the last settlement is that request's uncertain
+/// receipt); `None` for any other session. A saved session file written
+/// while the request was still pending says `Uncertain`: this is what it
+/// should say now.
+pub fn abandoned_status_for(home: &Path, session_id: &str) -> Option<FullCostStatus> {
+    let inspection =
+        crate::context_history::inspect_accounting_detailed(home, session_id, None).ok()?;
+    let abandoned = inspection.checkpoint.pending().is_none()
+        && inspection
+            .last_legacy_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.knownness == AccountingKnownness::Uncertain);
+    abandoned
+        .then(|| Projection::from_checkpoint(&inspection.checkpoint).ok())
+        .flatten()
+        .map(|projection| projection.status)
+}
+
+/// Abandon the checkpoint's pending attempt when it holds an uncertain
+/// receipt; the new checkpoint, or `None` when nothing is pending that way.
+fn abandon_pending(
+    journal: &dyn CompactionJournal,
+    checkpoint: &DetailedAccountingCheckpoint,
+) -> Result<Option<DetailedAccountingCheckpoint>, AccountingError> {
+    match checkpoint.pending() {
+        Some(pending) if pending.uncertain => {
+            Ok(Some(journal.abandon_uncertain(&pending.reference)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn checkpoint_blocks_admission(checkpoint: &DetailedAccountingCheckpoint) -> bool {
+    checkpoint.pending().is_some()
+        || checkpoint.totals().knownness == AccountingKnownness::Uncertain
+}
+
 impl NamespaceAccounting {
+    /// Whether this namespace would refuse the next request (see
+    /// [`admission_blocked_for`]). An unreadable checkpoint is not a block:
+    /// the request itself reports that.
+    pub fn admission_blocked(&self) -> bool {
+        self.checkpoint_detailed()
+            .is_ok_and(|checkpoint| checkpoint_blocks_admission(&checkpoint))
+    }
+
+    /// A request the operator stopped, or that timed out, after it was
+    /// sent leaves this namespace closed to more requests: what it cost is
+    /// not known. For a person who wants to go on in the same session,
+    /// close that request as abandoned: the session's full cost is unknown
+    /// from here on (a lower bound is still shown) and requests are
+    /// admitted again. `Ok(true)` when a request was abandoned. A spend cap
+    /// still refuses a namespace whose earlier usage is unknown.
+    pub fn abandon_stopped_request(&self) -> Result<bool, AccountingError> {
+        let checkpoint = self.journal.accounting_checkpoint_detailed()?;
+        match abandon_pending(self.journal.as_ref(), &checkpoint)? {
+            Some(next) => {
+                // The one step that changes a checkpoint without moving
+                // its revision: what the namespace follows from now on is
+                // the abandoned state, with every count as it was.
+                let abandoned = Projection::from_checkpoint(&next)?;
+                let mut floor = self.floor.lock().map_err(|_| {
+                    AccountingError::InvalidState("accounting projection state is unavailable")
+                })?;
+                if next.owner_session_id() != self.owner
+                    || next.child_id() != self.child.as_deref()
+                    || abandoned.revision < floor.revision
+                    || abandoned.input < floor.input
+                    || abandoned.output < floor.output
+                {
+                    return Err(AccountingError::InvalidState(
+                        "accounting checkpoint is behind or inconsistent with its anchor",
+                    ));
+                }
+                *floor = abandoned;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Reopen a session's own namespace for a request made outside its turn
+    /// (the auto-mode classifier, `/btw`): a fresh admission check against
+    /// the journal's current checkpoint. The caller still holds the session
+    /// lease; this borrows the same journal, never replacing its floor.
+    pub(crate) fn reopen(
+        home: &Path,
+        owner: &str,
+        journal: Arc<dyn CompactionJournal>,
+        checkpoint: &DetailedAccountingCheckpoint,
+    ) -> Result<Self, AccountingError> {
+        Self::new(home, owner, None, journal, checkpoint)
+    }
+
+    /// The session id this namespace bills under.
+    pub(crate) fn session_id(&self) -> &str {
+        self.child.as_deref().unwrap_or(&self.owner)
+    }
+
     fn new(
         home: &Path,
         owner: &str,
@@ -389,6 +516,15 @@ impl NamespaceAccounting {
         // Every validation and arithmetic operation completes before assignment.
         options.journal = Some(Arc::clone(&self.journal));
         options.spend_allowance = allowance;
+        if let Some(policy) = policy {
+            options.namespace_spend_ceiling_microcents = Some(
+                options
+                    .namespace_spend_ceiling_microcents
+                    .map_or(policy.maximum_microcents, |prior| {
+                        prior.min(policy.maximum_microcents)
+                    }),
+            );
+        }
         Ok(())
     }
 }

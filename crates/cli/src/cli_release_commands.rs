@@ -331,6 +331,66 @@ pub fn pentest(home: &Path, args: &[String]) -> CommandResult {
         .first()
         .map(|s| s.as_str())
         .ok_or_else(|| invalid("usage: pentest init|status|templates|readiness"))?;
+    let engagement_path = if verb == "finding" || verb == "evidence" {
+        Some(checked_workspace(
+            words
+                .get(1)
+                .filter(|s| !s.starts_with("--"))
+                .ok_or_else(|| invalid("pentest command requires DIR"))?,
+        )?)
+    } else {
+        None
+    };
+    if verb == "finding" {
+        // orbit pentest finding DIR list
+        // orbit pentest finding DIR set <id> <status>
+        let path = engagement_path.as_deref().unwrap();
+        let sub = words.get(2).map(|s| s.as_str()).unwrap_or("list");
+        return match sub {
+            "list" if words.len() == 3 => {
+                let (findings, invalid_files) = engagement::load_findings(path);
+                Ok(json!({
+                    "schema":"orbit.cli/v1",
+                    "command":"pentest finding list",
+                    "findings": findings,
+                    "invalid_files": invalid_files,
+                }))
+            }
+            "set" if words.len() == 5 => {
+                let id = &words[3];
+                let status =
+                    engagement::FindingStatus::parse(words[4].as_str()).ok_or_else(|| {
+                        invalid("status must be candidate|validated|retested|remediated|closed")
+                    })?;
+                let finding = engagement::set_finding_status(path, id, status).map_err(storage)?;
+                Ok(
+                    json!({"schema":"orbit.cli/v1","command":"pentest finding set","finding":finding}),
+                )
+            }
+            _ => Err(invalid(
+                "usage: pentest finding DIR list | pentest finding DIR set <id> <status>",
+            )),
+        };
+    }
+    if verb == "evidence" {
+        let path = engagement_path.as_deref().unwrap();
+        let sub = words.get(2).map(|s| s.as_str()).unwrap_or("verify");
+        if sub == "verify" && words.len() == 3 {
+            let report = engagement::verify_evidence(path).map_err(storage)?;
+            return Ok(
+                json!({"schema":"orbit.cli/v1","command":"pentest evidence verify","report":report}),
+            );
+        }
+        if sub == "record" && words.len() == 4 {
+            let hash = engagement::record_evidence(path, words[3].as_str()).map_err(storage)?;
+            return Ok(
+                json!({"schema":"orbit.cli/v1","command":"pentest evidence record","file":words[3],"sha256":hash}),
+            );
+        }
+        return Err(invalid(
+            "usage: pentest evidence DIR verify | pentest evidence DIR record <file>",
+        ));
+    }
     if verb == "templates" {
         if words.len() != 1 {
             return Err(invalid("usage: pentest templates [--json]"));
@@ -488,6 +548,40 @@ pub fn human_report(value: &Value) -> String {
         if actions.is_empty() {
             out.push_str("Existing identity and configuration already match.\n");
         }
+    } else if let (Some(verified), Some(mismatched), Some(missing), Some(unlisted)) = (
+        value.pointer("/report/verified").and_then(Value::as_array),
+        value
+            .pointer("/report/mismatched")
+            .and_then(Value::as_array),
+        value.pointer("/report/missing").and_then(Value::as_array),
+        value.pointer("/report/unlisted").and_then(Value::as_array),
+    ) {
+        // `pentest evidence DIR verify`: the evidence report. It has a
+        // `missing` list too, and was printed as the repair report below.
+        out.push_str(if mismatched.is_empty() && missing.is_empty() {
+            "Every recorded evidence file matches its recorded hash.\n"
+        } else {
+            "Evidence does not match the manifest. Nothing was changed.\n"
+        });
+        out.push_str(&format!("Verified: {}\n", verified.len()));
+        // Names come from a manifest anyone with the workspace can edit.
+        let name = |item: &Value| -> String {
+            item.as_str()
+                .unwrap_or("")
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .take(256)
+                .collect()
+        };
+        for (label, items) in [
+            ("Mismatched", mismatched),
+            ("Missing", missing),
+            ("Not in the manifest", unlisted),
+        ] {
+            for item in items {
+                out.push_str(&format!("{label}: {}\n", name(item)));
+            }
+        }
     } else if let Some(missing) = value.pointer("/report/missing").and_then(Value::as_array) {
         out.push_str("Repair dry run; no files changed. Identity is never regenerated.\n");
         for item in missing {
@@ -531,4 +625,48 @@ pub fn human_report(value: &Value) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod human_report_tests {
+    use super::*;
+
+    /// The evidence report is printed as what it is, with names made safe
+    /// for a terminal; the repair report, which also has a `missing` list,
+    /// keeps its own words.
+    #[test]
+    fn the_evidence_report_is_not_the_repair_report() {
+        let clean = human_report(&json!({
+            "command": "pentest evidence verify",
+            "report": {"verified": ["a.txt"], "mismatched": [], "missing": [], "unlisted": []},
+        }));
+        assert_eq!(
+            clean,
+            "pentest evidence verify\nEvery recorded evidence file matches its recorded hash.\nVerified: 1\n"
+        );
+        let tampered = human_report(&json!({
+            "command": "pentest evidence verify",
+            "report": {
+                "verified": [],
+                "mismatched": ["a.txt", "../x\u{1b}[2J"],
+                "missing": ["gone.txt"],
+                "unlisted": ["new.txt"],
+            },
+        }));
+        assert!(
+            tampered.contains("Evidence does not match the manifest."),
+            "{tampered}"
+        );
+        assert!(
+            tampered.contains("Mismatched: a.txt\nMismatched: ../x?[2J\n"),
+            "{tampered}"
+        );
+        assert!(tampered.contains("Missing: gone.txt\nNot in the manifest: new.txt\n"));
+        assert!(!tampered.contains("Repair dry run"));
+
+        let repair =
+            human_report(&json!({"command": "setup", "report": {"missing": ["pib.json"]}}));
+        assert!(repair.contains("Repair dry run"), "{repair}");
+        assert!(repair.contains("Missing: pib.json"));
+    }
 }

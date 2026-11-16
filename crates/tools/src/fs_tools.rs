@@ -10,6 +10,10 @@ use std::path::Path;
 
 const MAX_READ_LINES: usize = 2000;
 const MAX_READ_BYTES: u64 = 256 * 1024;
+/// Room for file lines in one Read result. It sits under the inline
+/// limit with space for the wrapper and the note, so a long file comes
+/// back as a window of whole lines and not as a spilled result.
+const READ_INLINE_BUDGET: usize = crate::INLINE_LIMIT - 1_000;
 
 /// An image a Read returns as data instead of text: the extension the
 /// Anthropic and OpenAI vision APIs both accept.
@@ -18,7 +22,7 @@ const IMAGE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 /// before base64 (the providers' own request limits sit above this;
 /// the cap keeps one image from eating the context budget).
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
-/// PDF Read caps: file size, and pages delivered per read (task T9).
+/// PDF Read caps: file size, and pages delivered per read.
 const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_PDF_PAGES: usize = 8;
 
@@ -111,16 +115,28 @@ impl Tool for ReadTool {
             .unwrap_or(MAX_READ_LINES as u64) as usize;
         let mut numbered = String::new();
         let mut total = 0usize;
+        // A window too long for one inline result is cut at a line
+        // boundary, so the model gets real lines and the place to go on
+        // from instead of a short preview of a spilled result.
+        let mut cut_at: Option<usize> = None;
+        let mut inline_cost = 0usize;
         for (i, line) in text.lines().enumerate() {
             let n = i + 1;
             total = n;
             if n < offset {
                 continue;
             }
-            if n >= offset + limit {
+            if n >= offset + limit || cut_at.is_some() {
                 continue;
             }
-            numbered.push_str(&format!("{n}\t{line}\n"));
+            let row = format!("{n}\t{line}\n");
+            let cost = serde_json::to_string(&row).map_or(row.len(), |quoted| quoted.len() - 2);
+            if inline_cost + cost > READ_INLINE_BUDGET && !numbered.is_empty() {
+                cut_at = Some(n);
+                continue;
+            }
+            inline_cost += cost;
+            numbered.push_str(&row);
         }
         // Record the content hash for read-before-edit. A partial read
         // (offset/limit) does NOT satisfy the read-before-edit rule —
@@ -138,7 +154,13 @@ impl Tool for ReadTool {
             scanned.text
         };
         let mut payload = json!({ "ok": true, "content": content });
-        if partial {
+        if let Some(next) = cut_at {
+            payload["partial"] = json!(true);
+            payload["note"] = json!(format!(
+                "showing lines {offset}..{} of {total}: the rest did not fit in one result; go on with offset {next}",
+                next - 1
+            ));
+        } else if partial {
             payload["partial"] = json!(true);
             payload["note"] = json!(format!(
                 "showing lines {offset}..{} of {total}; use offset/limit for the rest",
@@ -185,7 +207,7 @@ fn read_image(path: &Path, file_path: &str, metadata: &std::fs::Metadata, ext: &
     }))
 }
 
-/// A PDF Read: the first pages' extracted text (task T9). The honest,
+/// A PDF Read: the first pages' extracted text. The honest,
 /// dependency-light path — pure-Rust extraction, no rasterizer, no system
 /// pdfium. Text PDFs become readable content; scanned image-only PDFs
 /// come back with empty page text and say so rather than pretending.
@@ -420,52 +442,81 @@ impl Tool for EditTool {
     }
 }
 
-/// A minimal line diff for display (first differing region).
+/// A line diff for display: the lines that left (`- `) and the lines that
+/// arrived (`+ `), in file order, at most [`DIFF_LINES`] of them. Lines the
+/// two texts share are left out, wherever they sit.
 fn simple_diff(old: &str, new: &str) -> String {
+    const DIFF_LINES: usize = 40;
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
+    let head = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let tail = old_lines[head..]
+        .iter()
+        .rev()
+        .zip(new_lines[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_mid = &old_lines[head..old_lines.len() - tail];
+    let new_mid = &new_lines[head..new_lines.len() - tail];
     let mut out = String::new();
-    let mut shown = 0;
-    let mut i = 0;
-    let mut j = 0;
-    while i < old_lines.len() && j < new_lines.len() {
-        if old_lines[i] == new_lines[j] {
-            i += 1;
-            j += 1;
-            continue;
-        }
-        // find resync point (up to 20 lines of context)
-        let mut oi = i;
-        let mut nj = j;
-        while oi < old_lines.len() && nj < new_lines.len() && old_lines[oi] != new_lines[nj] {
-            oi += 1;
-            nj += 1;
-        }
-        for l in &old_lines[i..oi] {
-            out.push_str(&format!("- {l}\n"));
-            shown += 1;
-        }
-        for l in &new_lines[j..nj] {
-            out.push_str(&format!("+ {l}\n"));
-            shown += 1;
-        }
-        if shown > 40 {
+    for (shown, (sign, line)) in diff_middle(old_mid, new_mid).into_iter().enumerate() {
+        if shown == DIFF_LINES {
             out.push_str("…\n");
             break;
         }
-        i = oi;
-        j = nj;
+        out.push(sign);
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
     }
-    while i < old_lines.len() && shown < 40 {
-        out.push_str(&format!("- {}\n", old_lines[i]));
-        i += 1;
-        shown += 1;
+    out
+}
+
+/// The changed lines between two runs of lines that share no first and no
+/// last line, by longest common subsequence. Two runs too large for the
+/// table are reported as all removed, then all added.
+fn diff_middle<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(char, &'a str)> {
+    const TABLE_CELLS: usize = 4_000_000;
+    let (n, m) = (old.len(), new.len());
+    if n.saturating_mul(m) > TABLE_CELLS {
+        return old
+            .iter()
+            .map(|line| ('-', *line))
+            .chain(new.iter().map(|line| ('+', *line)))
+            .collect();
     }
-    while j < new_lines.len() && shown < 40 {
-        out.push_str(&format!("+ {}\n", new_lines[j]));
-        j += 1;
-        shown += 1;
+    // lcs[i][j]: the longest common subsequence of old[i..] and new[j..].
+    let width = m + 1;
+    let mut lcs = vec![0u32; (n + 1) * width];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i * width + j] = if old[i] == new[j] {
+                lcs[(i + 1) * width + j + 1] + 1
+            } else {
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
+            };
+        }
     }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old[i] == new[j] {
+            i += 1;
+            j += 1;
+        } else if lcs[(i + 1) * width + j] >= lcs[i * width + j + 1] {
+            out.push(('-', old[i]));
+            i += 1;
+        } else {
+            out.push(('+', new[j]));
+            j += 1;
+        }
+    }
+    out.extend(old[i..].iter().map(|line| ('-', *line)));
+    out.extend(new[j..].iter().map(|line| ('+', *line)));
     out
 }
 
@@ -508,7 +559,7 @@ impl Tool for GlobTool {
             .get("path")
             .and_then(|v| v.as_str())
             .map(|p| resolve_path(cx, p))
-            .unwrap_or_else(|| cx.working_dir.clone());
+            .unwrap_or_else(|| cx.cwd());
         if is_deny_read(&base) {
             return ToolResult::denied("that path is on the deny-read list");
         }
@@ -638,7 +689,7 @@ impl Tool for GrepTool {
             .get("path")
             .and_then(|v| v.as_str())
             .map(|p| resolve_path(cx, p))
-            .unwrap_or_else(|| cx.working_dir.clone());
+            .unwrap_or_else(|| cx.cwd());
         if is_deny_read(&base) {
             return ToolResult::denied("that path is on the deny-read list");
         }
@@ -1119,5 +1170,115 @@ mod pdf_read_tests {
         assert!(v.get("ok") != Some(&json!(true)), "{r}");
         let error = v["error"].as_str().unwrap_or(&r);
         assert!(error.contains("not a readable PDF"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod long_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A file under the line cap but too long for one inline result used
+    /// to come back as a 2,000-character preview of a spilled result. It
+    /// now comes back as a window of whole lines with the line to go on
+    /// from, and the windows together are the whole file.
+    #[test]
+    fn a_long_file_is_read_in_windows_of_whole_lines() {
+        let d = std::env::temp_dir().join(format!("orbit-longread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let body: String = (1..=1600)
+            .map(|n| {
+                format!(
+                    "line {n:04} \"quoted\" and a tab\tthen filler {}\n",
+                    "x".repeat(40)
+                )
+            })
+            .collect();
+        std::fs::write(d.join("long.txt"), &body).unwrap();
+        let cx = ToolContext::new(d.clone(), "long-read-test".into(), d.clone());
+
+        let mut offset = 1usize;
+        let mut seen = String::new();
+        let mut windows = 0;
+        loop {
+            let raw = ReadTool.run(&json!({ "file_path": "long.txt", "offset": offset }), &cx);
+            let finished = crate::finish(raw, &cx, "call");
+            assert!(finished.spilled_to.is_none(), "a window fits inline");
+            assert!(finished.payload.len() <= crate::INLINE_LIMIT);
+            let v: serde_json::Value = serde_json::from_str(&finished.payload).unwrap();
+            let content = v["content"].as_str().unwrap();
+            assert!(content.ends_with('\n'), "whole lines only");
+            for row in content.lines() {
+                let (_, line) = row.split_once('\t').unwrap();
+                seen.push_str(line);
+                seen.push('\n');
+            }
+            windows += 1;
+            let Some(note) = v["note"].as_str() else {
+                break;
+            };
+            assert_eq!(v["partial"], true);
+            let next: usize = note.rsplit(' ').next().unwrap().parse().expect(note);
+            assert!(next > offset, "{note}");
+            assert!(
+                note.contains(&format!("showing lines {offset}..{} of 1600", next - 1)),
+                "{note}"
+            );
+            offset = next;
+        }
+        assert!(windows > 1, "the file does not fit one result");
+        assert_eq!(seen, body);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A short file is unchanged: whole, no note.
+    #[test]
+    fn a_short_file_is_still_one_result_with_no_note() {
+        let d = std::env::temp_dir().join(format!("orbit-shortread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("s.txt"), "a\nb\n").unwrap();
+        let cx = ToolContext::new(d.clone(), "short-read-test".into(), d.clone());
+        let v: serde_json::Value =
+            serde_json::from_str(&ReadTool.run(&json!({ "file_path": "s.txt" }), &cx).payload)
+                .unwrap();
+        assert_eq!(v["content"], "1\ta\n2\tb\n");
+        assert!(v.get("note").is_none() && v.get("partial").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::simple_diff;
+
+    #[test]
+    fn a_change_of_line_count_does_not_drag_the_rest_of_the_file_in() {
+        let old = "import sys\n\ndef count(text):\n    # BUG\n    return len(text.split(\" \"))\n\n\ndef main():\n    return 0\n";
+        let new = "import sys\n\ndef count(text):\n    return len(text.split())\n\n\ndef main():\n    return 0\n";
+        assert_eq!(
+            simple_diff(old, new),
+            "-     # BUG\n-     return len(text.split(\" \"))\n+     return len(text.split())\n"
+        );
+    }
+
+    #[test]
+    fn separate_changes_are_each_reported_and_shared_lines_between_them_are_not() {
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "a\nB\nc\nd\nE\nf\n";
+        assert_eq!(simple_diff(old, new), "- b\n+ B\n- e\n+ E\n+ f\n");
+        assert_eq!(simple_diff("same\n", "same\n"), "");
+        assert_eq!(simple_diff("", "x\n"), "+ x\n");
+        assert_eq!(simple_diff("x\n", ""), "- x\n");
+    }
+
+    #[test]
+    fn a_long_diff_is_cut_with_a_mark() {
+        let old: String = (0..100).map(|n| format!("old {n}\n")).collect();
+        let new: String = (0..100).map(|n| format!("new {n}\n")).collect();
+        let diff = simple_diff(&old, &new);
+        assert_eq!(diff.lines().count(), 41);
+        assert!(diff.ends_with("…\n"), "{diff}");
     }
 }

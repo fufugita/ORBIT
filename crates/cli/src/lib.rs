@@ -413,15 +413,23 @@ pub fn validate_owner_arguments(command: &str, args: &[String]) -> Result<(), Cl
 }
 
 pub mod attach;
+pub mod auto_mode;
+pub mod channels;
+pub mod claude_permissions;
 pub mod cli_release_commands;
 pub mod config;
+pub mod config_edit;
 pub mod configuration_ui;
 pub mod context_history;
+pub mod custom_commands;
 #[allow(unsafe_code)]
 pub mod customization;
 pub mod customization_host;
 pub mod daemon;
 pub mod doctor;
+pub mod elicitation;
+pub mod fallback;
+pub mod hook_handlers;
 pub mod plain_input;
 pub mod profile_commands;
 mod recovery;
@@ -429,6 +437,9 @@ pub mod recovery_commands;
 // The stdio backend confines Unix descriptor/signal operations to reviewed helpers.
 #[allow(unsafe_code)]
 pub mod lsp;
+pub mod marketplace;
+pub mod mcp_commands;
+pub mod migration;
 pub mod model_limits;
 pub mod mods;
 pub mod onboarding;
@@ -443,16 +454,20 @@ pub mod provider_discovery;
 pub mod provider_policies;
 pub mod session_accounting;
 pub mod session_config;
+pub mod session_names;
 pub mod sessions;
 #[allow(unsafe_code)]
 pub mod setup;
 pub mod setup_terminal_ui;
 #[allow(unsafe_code)]
 pub mod signed_packages;
+pub mod status_line;
+pub mod telemetry;
 pub mod tool_runtime;
 pub mod tools;
 #[cfg(feature = "tui")]
 pub mod tui_worker;
+pub mod worktree;
 
 use std::path::Path;
 

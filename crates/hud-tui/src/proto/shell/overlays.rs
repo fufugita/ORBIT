@@ -7,7 +7,7 @@ use super::canvas::{Cv, Rgb, Seg, clip_text, mix, segs_width, text_width, tint};
 use super::frame::{hints_width, keyhints};
 use super::motion::{ease_in_out, ease_out, prog, secs};
 use super::pal::Palette;
-use crate::proto::chrome::{COMMANDS, subsequence};
+use crate::proto::chrome::subsequence;
 use crate::proto::layout::View;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -92,8 +92,7 @@ fn frame_box(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, reveal: i32, title: &s
 /// The palette's matching commands for `query`.
 pub fn palette_items(query: &str) -> Vec<(&'static str, &'static str)> {
     let q = query.trim_start_matches('/');
-    COMMANDS
-        .iter()
+    crate::proto::chrome::all_commands()
         .filter(|(c, _)| subsequence(q, c.trim_start_matches('/')))
         .copied()
         .collect()
@@ -705,7 +704,8 @@ fn quit(cv: &mut Cv, sw: i32, sh: i32, turn_live: bool) {
 pub fn picker(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduced: bool) {
     let colors = cv.palette;
     let views = super::PICKER_VIEWS;
-    let (bw, bh) = (36, views.len() as i32 + 5);
+    let panes = super::PICKER_PANES;
+    let (bw, bh) = (36, (views.len() + panes.len()) as i32 + 5);
     let (x, y) = ((sw - bw) / 2, (sh - bh) / 2);
     let reveal = if reduced {
         bh
@@ -748,11 +748,34 @@ pub fn picker(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduce
                 );
                 cv.text(x + 8, yy, v.title(), colors.ink2, Some(colors.raise));
             }
+            // Built-in panes follow the views; their key names the row.
+            for (j, (key, _, title)) in panes.iter().enumerate() {
+                let yy = y + 2 + (views.len() + j) as i32;
+                cv.hit(
+                    x + 2,
+                    yy,
+                    bw - 4,
+                    1,
+                    super::hits::Click::Key(
+                        crossterm::event::KeyCode::Char(*key),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                );
+                cv.put(
+                    x + 3,
+                    yy,
+                    &format!(" {key} "),
+                    colors.on_accent,
+                    Some(colors.magenta),
+                    Modifier::BOLD,
+                );
+                cv.text(x + 8, yy, title, colors.ink2, Some(colors.raise));
+            }
             keyhints(
                 cv,
                 x + 3,
                 y + bh - 1,
-                &[("1-8", "pick"), ("esc", "cancel")],
+                &[("1-0", "pick"), ("esc", "cancel")],
                 Some(colors.raise),
             );
         },

@@ -342,6 +342,8 @@ fn compaction_display(summary: &str) -> String {
 pub struct TurnOptions {
     pub max_rounds: u32,
     pub max_attempts: u32,
+    /// Ordinary conversation or session-owned classifier/hook work.
+    pub request_purpose: AttemptPurpose,
     /// The session this turn belongs to (E7): the ledger session id,
     /// the checkpoint owner, and the tie between rounds and turns.
     /// Front-ends mint one ULID session at startup and reuse it.
@@ -391,6 +393,62 @@ pub struct TurnOptions {
     pub journal: Option<std::sync::Arc<dyn crate::compaction::CompactionJournal>>,
     /// Explicit namespace-local allowance; never inherited as a global cap.
     pub spend_allowance: Option<SpendAllowance>,
+    /// Absolute namespace ceiling, rechecked after independently billed work.
+    pub namespace_spend_ceiling_microcents: Option<u64>,
+    /// Set for a subagent's turn: its end fires `SubagentStop` (and
+    /// `TeammateIdle` for a background agent) in place of `Stop`.
+    pub subagent: Option<SubagentTurn>,
+}
+
+/// Where notes for a running turn come from. Called after each tool round
+/// with a function that tries to hand over a batch: it answers whether the
+/// round could carry them, and only then may the source forget them.
+pub type RoundNotesSource = std::sync::Arc<dyn Fn(&mut dyn FnMut(&[String]) -> bool) + Send + Sync>;
+
+static ROUND_NOTES: std::sync::Mutex<Option<RoundNotesSource>> = std::sync::Mutex::new(None);
+
+/// Name the source of notes for the session's running turn. One per
+/// process; `None` removes it.
+pub fn set_round_notes_source(source: Option<RoundNotesSource>) {
+    if let Ok(mut slot) = ROUND_NOTES.lock() {
+        *slot = source;
+    }
+}
+
+fn deliver_round_notes(results: &mut [crate::ToolRoundResult]) {
+    let source = ROUND_NOTES.lock().ok().and_then(|slot| slot.clone());
+    if let Some(source) = source {
+        source(&mut |notes| attach_round_notes(results, notes));
+    }
+}
+
+/// Put `notes` on the newest result of the round as `background_events`.
+/// A result is a JSON object whose own fields (its `ok`, its output) stay
+/// as they are. False when no result of the round can carry them.
+fn attach_round_notes(results: &mut [crate::ToolRoundResult], notes: &[String]) -> bool {
+    if notes.is_empty() {
+        return true;
+    }
+    for result in results.iter_mut().rev() {
+        if let Ok(serde_json::Value::Object(mut fields)) =
+            serde_json::from_str::<serde_json::Value>(&result.content)
+            && !fields.contains_key("background_events")
+        {
+            fields.insert("background_events".into(), serde_json::json!(notes));
+            result.content = serde_json::Value::Object(fields).to_string();
+            return true;
+        }
+    }
+    false
+}
+
+/// Which subagent a turn belongs to, for the hooks that fire when it ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubagentTurn {
+    /// The agent's type: its profile name.
+    pub agent_type: String,
+    /// It runs in the background and waits for messages once this turn ends.
+    pub background: bool,
 }
 
 /// Legacy transcript-only display estimate retained for API compatibility.
@@ -447,6 +505,7 @@ impl Default for TurnOptions {
         TurnOptions {
             max_rounds: DEFAULT_MAX_ROUNDS,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            request_purpose: AttemptPurpose::Ordinary,
             // No tools by default: the caller passes its tool set
             // explicitly (every front-end resolves its own today).
             // Phase 3 moves the tool runtime into the engine.
@@ -464,6 +523,8 @@ impl Default for TurnOptions {
             compaction_budget: None,
             journal: None,
             spend_allowance: None,
+            namespace_spend_ceiling_microcents: None,
+            subagent: None,
         }
     }
 }
@@ -472,7 +533,7 @@ impl Default for TurnOptions {
 /// path, the pattern — or, for a subagent, who and what. It reaches the
 /// screen and the stream (`stream-json` lands in CI logs), so it passes the
 /// secret scanner first, like every other summary of a call.
-fn call_target(name: &str, arguments: &[u8]) -> String {
+pub fn call_target(name: &str, arguments: &[u8]) -> String {
     let Ok(args) = serde_json::from_slice::<serde_json::Value>(arguments) else {
         return String::new();
     };
@@ -496,6 +557,11 @@ fn call_target(name: &str, arguments: &[u8]) -> String {
             .or_else(|| get("path"))
             .or_else(|| get("pattern"))
             .or_else(|| get("prompt"))
+            // A fetch's address, a search's words, the skill being loaded.
+            .or_else(|| get("url"))
+            .or_else(|| get("query"))
+            .or_else(|| get("skill"))
+            .or_else(|| get("name"))
             .map(String::from)
             .unwrap_or_default()
     };
@@ -726,6 +792,24 @@ fn safe_failure(message: &str) -> String {
     compaction_display(&plain)
 }
 
+/// Keep cancellation installed through hooks, early returns and unwinding.
+struct ExecutorCancelScope<'a> {
+    executor: &'a mut dyn ToolExecutor,
+}
+
+impl<'a> ExecutorCancelScope<'a> {
+    fn new(executor: &'a mut dyn ToolExecutor, cancel: &orbit_provider_http::CancelToken) -> Self {
+        executor.begin_cancel_scope(cancel);
+        Self { executor }
+    }
+}
+
+impl Drop for ExecutorCancelScope<'_> {
+    fn drop(&mut self) {
+        self.executor.end_cancel_scope();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_turn_observed(
     home: &std::path::Path,
@@ -740,6 +824,11 @@ fn run_turn_observed(
     policy: Option<&crate::retry::RetryPolicyBinding>,
     refusals: &mut Vec<crate::retry::RefusalRecord>,
 ) -> Result<(), String> {
+    let cancel_scope = ExecutorCancelScope::new(executor, cancel);
+    let _handler_scope = cancel_scope
+        .executor
+        .hook_handler_runner()
+        .map(crate::hooks::handler_runner_scope);
     let mut ended = false;
     let result = run_turn_inner(
         home,
@@ -747,7 +836,7 @@ fn run_turn_observed(
         options,
         prompt,
         transcript,
-        executor,
+        cancel_scope.executor,
         cancel,
         &mut |event| {
             let event = match event {
@@ -767,6 +856,16 @@ fn run_turn_observed(
         policy,
         refusals,
     );
+    // A turn that failed outright (a provider or local error) tells
+    // StopFailure hooks, as the filtered/incomplete endings do.
+    if let Err(message) = &result
+        && !report.interrupted
+    {
+        let _ = crate::hooks::Hooks::load(home, crate::hooks::project_trusted(home)).fire(
+            crate::hooks::HookEvent::StopFailure,
+            &serde_json::json!({ "reason": "error", "error": safe_failure(message) }),
+        );
+    }
     if !ended {
         if let Err(message) = &result {
             events(FrontendEvent::Error {
@@ -792,8 +891,22 @@ fn run_turn_inner(
     policy: Option<&crate::retry::RetryPolicyBinding>,
     refusals: &mut Vec<crate::retry::RefusalRecord>,
 ) -> Result<(), String> {
+    if !matches!(
+        options.request_purpose,
+        AttemptPurpose::Ordinary | AttemptPurpose::Housekeeping
+    ) {
+        return Err("invalid turn request purpose".into());
+    }
+    if options.namespace_spend_ceiling_microcents.is_some()
+        && (options.journal.is_none() || options.spend_allowance.is_none())
+    {
+        return Err("namespace spend ceiling requires accounted allowance".into());
+    }
     // Reject retry-ineligible turns before hooks, transcript mutation or summaries.
     if policy.is_some() {
+        if options.request_purpose != AttemptPurpose::Ordinary {
+            return Err("final-rejection retry is only available for ordinary requests".into());
+        }
         if options.journal.is_none() {
             return Err("final-rejection retry requires a context journal".into());
         }
@@ -809,15 +922,41 @@ fn run_turn_inner(
     }
     // Reject invalid selections before hooks, transcript mutation or tools.
     config.validate_effort()?;
-    // E9: hooks — the prompt enters the session before the turn runs.
+    // E9: hooks — the prompt enters the session before the turn runs. Its
+    // id and effort ride on every payload until the next prompt. A
+    // subagent's turn belongs to the prompt that started it.
+    if options.subagent.is_none() && options.request_purpose == AttemptPurpose::Ordinary {
+        let effort = config.effort.as_ref().map(|effort| match effort {
+            orbit_adapter::types::EffortValue::Level(level) => level.clone(),
+            orbit_adapter::types::EffortValue::Bool(on) => on.to_string(),
+        });
+        crate::hooks::begin_prompt(effort.as_deref());
+    }
     let hooks = crate::hooks::Hooks::load(home, crate::hooks::project_trusted(home));
-    let _ = hooks.fire(
-        crate::hooks::HookEvent::UserPromptSubmit,
-        &serde_json::json!({ "prompt": prompt }),
-    );
+    // The event is the operator's prompt entering the session. The task a
+    // subagent is given was written by the model, not submitted by anyone:
+    // it does not fire (and is not checked or annotated as if it had been).
+    let submitted = if options.subagent.is_none() {
+        hooks.fire(
+            crate::hooks::HookEvent::UserPromptSubmit,
+            &serde_json::json!({ "prompt": prompt }),
+        )
+    } else {
+        Vec::new()
+    };
+    // A hook may refuse the prompt (exit 2 or a deny): nothing is sent.
+    if let Some(reason) = crate::hooks::blocked(&submitted) {
+        let message = format!("prompt blocked by hook: {reason}");
+        return Err(local_turn_error(events, report, 0, message));
+    }
 
     executor.begin_turn(config);
     let mut user = user_message(prompt);
+    if let Some(context) = crate::hooks::prompt_context(&submitted) {
+        // What the hooks added rides with the prompt, marked as theirs.
+        user.content = format!("{prompt}\n\n<hook-context>\n{context}\n</hook-context>");
+    }
+
     if let Some(blocks) = &options.user_blocks {
         user.blocks = Some(blocks.clone());
     }
@@ -825,6 +964,9 @@ fn run_turn_inner(
     transcript.push(user);
 
     let mut round: u32 = 0;
+    // How often a Stop hook has sent the model back to work this turn.
+    const MAX_STOP_CONTINUATIONS: u32 = 3;
+    let mut stop_continuations: u32 = 0;
     // Compaction latch: once this turn has compacted, do not compact
     // again until the transcript grows past the threshold by NEW
     // content (the summary itself is near the threshold when the
@@ -868,16 +1010,81 @@ fn run_turn_inner(
             })
         });
         if let Some(budget) = &budget {
-            let before = estimate_prepared_request(&prepared, budget)
+            let mut before = estimate_prepared_request(&prepared, budget)
                 .map_err(|e| local_turn_error(events, report, round, e.to_string()))?;
+            // A summary can only cover what came before this turn. When this
+            // turn's own tool results are what fills the context, the oldest
+            // long ones are dropped so the turn goes on instead of failing.
+            if assess_request(&before, budget) == BudgetDecision::Compact && !options.compacting {
+                let probe = crate::dispatch::measurement_probe(&context).ok();
+                let dropped =
+                    drop_old_tool_results(transcript, current_user_index, report, |messages| {
+                        let estimate = probe.as_ref()?.estimate_messages(messages, budget).ok()?;
+                        let room = budget
+                            .compaction_threshold(estimate.requested_output_tokens)
+                            .unwrap_or(u64::MAX);
+                        Some((estimate.estimated_input_tokens, room))
+                    });
+                if dropped > 0 {
+                    prepared = crate::dispatch::prepare_provider_request(
+                        &context,
+                        prompt,
+                        Some(transcript.clone()),
+                        &options.request_stem,
+                        &options.session_id,
+                    )
+                    .map_err(|(code, message)| {
+                        local_turn_error(events, report, round, format!("{code}: {message}"))
+                    })?;
+                    before = estimate_prepared_request(&prepared, budget)
+                        .map_err(|e| local_turn_error(events, report, round, e.to_string()))?;
+                    events(FrontendEvent::Status {
+                        text: format!(
+                            "context limit reached in this turn: {dropped} earlier tool result{} dropped so it can go on; the model can run a tool again if it needs one",
+                            if dropped == 1 { " was" } else { "s were" }
+                        ),
+                    });
+                }
+            }
             let decision = assess_request(&before, budget);
             if matches!(decision, BudgetDecision::Refuse | BudgetDecision::Unknown) {
                 return Err(local_turn_error(events, report, round, "context budget policy refuses this request; check selected limits or media policy".into()));
             }
-            if decision == BudgetDecision::Compact
+            let wants_compaction = decision == BudgetDecision::Compact
                 && !options.compacting
-                && compacted_at.is_none_or(|at| before.estimated_input_tokens > at)
-            {
+                && compacted_at.is_none_or(|at| before.estimated_input_tokens > at);
+            // PreCompact can refuse the summary. While the request still
+            // fits the conversation goes on uncompacted, and is not asked
+            // again until it has grown; once it no longer fits the turn
+            // stops, because there is nothing else left to do.
+            let compaction_blocked = wants_compaction
+                .then(|| {
+                    crate::hooks::blocked(&hooks.fire(
+                        crate::hooks::HookEvent::PreCompact,
+                        &serde_json::json!({
+                            "trigger": "auto",
+                            "estimated_tokens": before.estimated_input_tokens,
+                        }),
+                    ))
+                })
+                .flatten();
+            if let Some(reason) = &compaction_blocked {
+                if !fits(&before, budget) {
+                    return Err(local_turn_error(
+                        events,
+                        report,
+                        round,
+                        format!(
+                            "the context is full and a PreCompact hook blocked compaction: {reason}"
+                        ),
+                    ));
+                }
+                events(FrontendEvent::Status {
+                    text: format!("a PreCompact hook blocked compaction: {reason}"),
+                });
+                compacted_at = Some(before.estimated_input_tokens);
+            }
+            if wants_compaction && compaction_blocked.is_none() {
                 use crate::compaction::{CompactionContexts, CompactionStatus};
                 if transcript
                     .iter()
@@ -917,13 +1124,10 @@ fn run_turn_inner(
                             .map_err(|message| {
                                 local_turn_error(events, report, round, message.into())
                             })?,
+                        requested: false,
                     },
                     cancel,
                     &mut |estimate| {
-                        let _ = hooks.fire(
-                            crate::hooks::HookEvent::PreCompact,
-                            &serde_json::json!({ "estimated_tokens": estimate.estimated_input_tokens }),
-                        );
                         events(FrontendEvent::Compacting {
                             used_tokens: estimate.estimated_input_tokens,
                             window_tokens: budget
@@ -1139,6 +1343,10 @@ fn run_turn_inner(
             );
             report.final_text = o.output;
             report.ok = false;
+            let _ = hooks.fire(
+                crate::hooks::HookEvent::StopFailure,
+                &serde_json::json!({ "reason": format!("{stop_reason:?}") }),
+            );
             if stop_reason == StopReason::Truncated {
                 let _ = hooks.fire(
                     crate::hooks::HookEvent::Notification,
@@ -1185,20 +1393,65 @@ fn run_turn_inner(
                 Some(&occupancy),
                 events,
             );
+            // E9: Stop fires when the turn ends its reply — the
+            // main loop's natural pause point. A hook that blocks (exit 2
+            // or a deny) sends its reason back as the next instruction and
+            // the model keeps working, at most MAX_STOP_CONTINUATIONS times
+            // a turn; the payload says when that has already happened.
+            // A subagent's turn ends with SubagentStop instead, and a
+            // background agent's with TeammateIdle after it: each can send
+            // the agent back to work the same way.
+            let stop = match &options.subagent {
+                None => hooks.fire(
+                    crate::hooks::HookEvent::Stop,
+                    &serde_json::json!({
+                        "final_text_bytes": o.output.len(),
+                        "last_assistant_message": o.output,
+                        "stop_hook_active": stop_continuations > 0,
+                    }),
+                ),
+                Some(agent) => {
+                    let payload = serde_json::json!({
+                        "agent_type": agent.agent_type,
+                        "agent_id": options.session_id,
+                        "teammate_name": agent.agent_type,
+                        "last_assistant_message": o.output,
+                        "ok": true,
+                        "stop_hook_active": stop_continuations > 0,
+                    });
+                    let mut fired = hooks.fire(crate::hooks::HookEvent::SubagentStop, &payload);
+                    if agent.background && crate::hooks::blocked(&fired).is_none() {
+                        fired = hooks.fire(crate::hooks::HookEvent::TeammateIdle, &payload);
+                    }
+                    fired
+                }
+            };
+            if let Some(reason) = crate::hooks::blocked(&stop)
+                && stop_continuations < MAX_STOP_CONTINUATIONS
+                && round + 1 < options.max_rounds
+            {
+                stop_continuations += 1;
+                transcript.push(crate::user_message(format!(
+                    "<stop-hook>\n{reason}\n</stop-hook>"
+                )));
+                events(FrontendEvent::Status {
+                    text: "a stop hook asked the model to continue".into(),
+                });
+                round += 1;
+                continue;
+            }
             report.final_text = o.output.clone();
             report.ok = true;
+            let _ = hooks.fire(
+                crate::hooks::HookEvent::MessageDisplay,
+                &serde_json::json!({ "message": o.output }),
+            );
             events(FrontendEvent::ResponseFinished {
                 output: o.output.clone(),
                 input_tokens: report.input_tokens,
                 output_tokens: report.output_tokens,
                 cost_microcents: report.cost_microcents,
             });
-            // E9: Stop fires when the turn ends its reply — the
-            // main loop's natural pause point.
-            let _ = hooks.fire(
-                crate::hooks::HookEvent::Stop,
-                &serde_json::json!({ "final_text_bytes": o.output.len() }),
-            );
             emit_turn_ended(events, report, report.rounds);
             return Ok(());
         }
@@ -1237,14 +1490,19 @@ fn run_turn_inner(
                 target: call_target(&tc.name, &tc.arguments),
             });
         }
-        // Esc (MD §The agent loop): install the turn's cancel-checker
-        // so long-running tool children (Bash) die with the stream.
-        // Cleared after the round so a later turn starts clean.
-        // The turn's token is current for the round's tools, then the
-        // previous one (a parent turn's) is again.
-        executor.begin_cancel_scope(cancel);
-        let results = executor.execute(&o.tool_calls, round);
-        executor.end_cancel_scope();
+        // Tools retain their nested scope; the enclosing turn scope also
+        // covers model hooks before and after tool execution.
+        let mut results = {
+            let scope = ExecutorCancelScope::new(executor, cancel);
+            scope.executor.execute(&o.tool_calls, round)
+        };
+        // Something outside the turn (a watched background command) may
+        // have news for it: it rides on this round's results, so the model
+        // sees it before its next request and not only when the turn ends.
+        // A subagent's rounds are left alone: the news is the session's.
+        if options.subagent.is_none() {
+            deliver_round_notes(&mut results);
+        }
         for r in &results {
             // A result fact for the settle animation: first small
             // truth in the payload (lines, tests, exit code).
@@ -1311,6 +1569,21 @@ fn run_turn_inner(
             events,
         );
 
+        // PostToolBatch: every call of this round has returned. A hook that
+        // blocks ends the turn here, before another model request.
+        let batch = hooks.fire(
+            crate::hooks::HookEvent::PostToolBatch,
+            &serde_json::json!({ "round": round, "tool_count": o.tool_calls.len() }),
+        );
+        if let Some(reason) = crate::hooks::blocked(&batch) {
+            events(FrontendEvent::Status {
+                text: format!("turn stopped by a PostToolBatch hook: {reason}"),
+            });
+            report.final_text = o.output;
+            emit_turn_ended(events, report, round + 1);
+            return Ok(());
+        }
+
         round += 1;
         if round >= options.max_rounds {
             let msg = format!(
@@ -1340,6 +1613,81 @@ fn image_block_of(content: &str) -> Option<Vec<orbit_adapter::types::ContentBloc
         data,
         media_type,
     }])
+}
+
+/// A tool result shorter than this is never dropped: it costs little and
+/// usually says what a change did.
+const DROPPABLE_RESULT_BYTES: usize = 2_000;
+
+/// What a dropped tool result becomes. The verdict is kept; the content is
+/// gone, and the model is told so.
+fn dropped_tool_result(original: &str) -> String {
+    serde_json::json!({
+        "ok": !orbit_tools::result_is_error(original),
+        "dropped": true,
+        "note": "this result was dropped to keep the turn within the context limit; run the tool again if it is still needed",
+    })
+    .to_string()
+}
+
+/// Drop the oldest long tool results of the current turn (the messages
+/// from `current_user_index` on) until the turn, with the leading system
+/// messages, sits at two thirds of the room left before compaction.
+/// `measure` returns the estimated input tokens of a message list and that
+/// room. Nothing is touched while the turn is under the room, and results
+/// that carry media are left alone. Returns how many were dropped.
+fn drop_old_tool_results(
+    transcript: &mut [ChatMessage],
+    current_user_index: usize,
+    report: &mut TurnReport,
+    measure: impl Fn(&[ChatMessage]) -> Option<(u64, u64)>,
+) -> usize {
+    let prefix = transcript
+        .iter()
+        .take_while(|message| message.role == ChatRole::System)
+        .count();
+    if current_user_index < prefix || current_user_index >= transcript.len() {
+        return 0;
+    }
+    let turn_alone = |transcript: &[ChatMessage]| {
+        let mut messages = transcript[..prefix].to_vec();
+        messages.extend_from_slice(&transcript[current_user_index..]);
+        measure(&messages)
+    };
+    let Some((mut used, room)) = turn_alone(transcript) else {
+        return 0;
+    };
+    if used < room {
+        return 0;
+    }
+    let target = room / 3 * 2;
+    let mut dropped = 0;
+    for index in current_user_index..transcript.len() {
+        if used <= target {
+            break;
+        }
+        let message = &transcript[index];
+        let Some(result) = message.tool_result.as_deref() else {
+            continue;
+        };
+        if message.role != ChatRole::Tool
+            || message.blocks.is_some()
+            || result.len() < DROPPABLE_RESULT_BYTES
+        {
+            continue;
+        }
+        let stub = dropped_tool_result(result);
+        let message = &mut transcript[index];
+        message.content = stub.clone();
+        message.tool_result = Some(stub);
+        dropped += 1;
+        match turn_alone(transcript) {
+            Some((now, _)) => used = now,
+            None => break,
+        }
+    }
+    report.dropped_tool_results = report.dropped_tool_results.saturating_add(dropped);
+    dropped
 }
 
 fn emit_turn_ended(events: EventSink<'_>, report: &TurnReport, rounds: u32) {
@@ -1434,7 +1782,7 @@ fn dispatch_with_retry(
         }
         let estimate = crate::context_budget::estimate_prepared_request(&request, &budget)
             .map_err(|error| error.to_string())?;
-        let allowance = remaining_allowance(options, report)?;
+        let mut allowance = remaining_allowance(options, report)?;
         let mut checkpoint = if let Some(journal) = &options.journal {
             let checkpoint = journal
                 .accounting_checkpoint_detailed()
@@ -1447,7 +1795,7 @@ fn dispatch_with_retry(
             if checkpoint.pending().is_some()
                 || checkpoint.totals().knownness == AccountingKnownness::Uncertain
             {
-                mark_ordinary_uncertain(report);
+                mark_request_uncertain(report, options.request_purpose);
                 return Err(OrdinaryDispatchError::accounting(
                     "context accounting has a pending uncertain request; run: orbit recovery status --session <session-id>",
                 ));
@@ -1459,16 +1807,23 @@ fn dispatch_with_retry(
                     || (checkpoint.totals().housekeeping.cost_microcents.is_none()
                         && !allowance.allow_unpriced_housekeeping))
             {
+                mark_request_uncertain(report, options.request_purpose);
                 report.accounting.knownness = checkpoint.totals().knownness;
-                report.accounting.ordinary.cost_microcents = None;
                 return Err("spend allowance cannot use unknown historical namespace costs".into());
             }
             Some(checkpoint)
         } else {
             None
         };
-        crate::compaction::admit_spend(allowance, config, &estimate, 0, false)
-            .map_err(str::to_owned)?;
+        allowance = namespace_allowance(options, checkpoint.as_ref(), allowance)?;
+        crate::compaction::admit_spend(
+            allowance,
+            config,
+            &estimate,
+            0,
+            options.request_purpose != AttemptPurpose::Ordinary,
+        )
+        .map_err(str::to_owned)?;
         let binding = policy
             .map(|policy| request.ordinary_attempt_binding(policy))
             .transpose()
@@ -1482,7 +1837,7 @@ fn dispatch_with_retry(
                 .as_ref()
                 .and_then(|c| c.child_id().map(str::to_owned)),
             request_id: request.request_id().into(),
-            purpose: AttemptPurpose::Ordinary,
+            purpose: options.request_purpose,
             budget: budget.identity,
         };
         let digest = intent.digest().map_err(OrdinaryDispatchError::accounting)?;
@@ -1505,7 +1860,7 @@ fn dispatch_with_retry(
                 .begin_attempt_detailed(checkpoint.revision(), &intent, binding.as_ref())
                 .map_err(|error| {
                     if error == crate::HistoryError::Uncertain {
-                        mark_ordinary_uncertain(report);
+                        mark_request_uncertain(report, options.request_purpose);
                     }
                     OrdinaryDispatchError::accounting(error)
                 })?;
@@ -1513,7 +1868,7 @@ fn dispatch_with_retry(
                 || reference.intent_digest != digest
                 || reference.revision.0 != checkpoint.revision().0 + 1
             {
-                mark_ordinary_uncertain(report);
+                mark_request_uncertain(report, options.request_purpose);
                 return Err(OrdinaryDispatchError::accounting(
                     "context accounting begin publication is uncertain",
                 ));
@@ -1527,7 +1882,7 @@ fn dispatch_with_retry(
                 // This is the only proven NotSent path after a successful begin.
                 let receipt = RequestAccountingReceipt {
                     request_id: intent.request_id.clone(),
-                    purpose: AttemptPurpose::Ordinary,
+                    purpose: options.request_purpose,
                     totals: AccountingTotals::known_zero(),
                     usage: None,
                     knownness: AccountingKnownness::Known,
@@ -1539,7 +1894,7 @@ fn dispatch_with_retry(
                     std::slice::from_ref(&receipt),
                 );
                 settle_ordinary(options, &mut checkpoint, reference, &intent, &receipt)
-                    .inspect_err(|_| mark_ordinary_uncertain(report))
+                    .inspect_err(|_| mark_request_uncertain(report, options.request_purpose))
                     .map_err(OrdinaryDispatchError::accounting)?;
                 recorded.map_err(OrdinaryDispatchError::accounting)?;
             }
@@ -1585,10 +1940,10 @@ fn dispatch_with_retry(
             })?;
             let ack = journal
                 .settle_refused_ordinary(refusal.attempt(), &refusal)
-                .inspect_err(|_| mark_ordinary_uncertain(report))
+                .inspect_err(|_| mark_request_uncertain(report, options.request_purpose))
                 .map_err(OrdinaryDispatchError::accounting)?;
             ack.validate_for(&refusal, before)
-                .inspect_err(|_| mark_ordinary_uncertain(report))
+                .inspect_err(|_| mark_request_uncertain(report, options.request_purpose))
                 .map_err(OrdinaryDispatchError::accounting)?;
             require_accounting_slot(report, refusals)?;
             let record = refusal.to_record();
@@ -1623,8 +1978,9 @@ fn dispatch_with_retry(
         let lifecycle_valid = result
             .as_ref()
             .is_ok_and(|o| lifecycle.matches(&o.tool_calls) && valid_tool_set(&o.tool_calls));
-        let receipt =
+        let mut receipt =
             metadata.ordinary_receipt(intent.request_id.clone(), config, &result, lifecycle_valid);
+        receipt.purpose = options.request_purpose;
         #[cfg(test)]
         {
             let snapshot = metadata.provisional_usage_observation();
@@ -1640,7 +1996,7 @@ fn dispatch_with_retry(
         }
         if let Some(reference) = &reference {
             settle_ordinary(options, &mut checkpoint, reference, &intent, &receipt)
-                .inspect_err(|_| mark_ordinary_uncertain(report))
+                .inspect_err(|_| mark_request_uncertain(report, options.request_purpose))
                 .map_err(OrdinaryDispatchError::accounting)?;
         }
         recorded.map_err(OrdinaryDispatchError::accounting)?;
@@ -1697,7 +2053,7 @@ fn dispatch_with_retry(
                 // The observation receipt above records any usage and
                 // settles incomplete dispatch conservatively. Preserve
                 // that uncertainty in the report when cancellation wins.
-                mark_ordinary_uncertain(report);
+                mark_request_uncertain(report, options.request_purpose);
                 return Err(OrdinaryDispatchError::Cancelled);
             }
             Err((code, message))
@@ -1738,9 +2094,49 @@ fn observe_ordinary_event(
     }
 }
 
-fn mark_ordinary_uncertain(report: &mut TurnReport) {
+/// Re-evaluate an absolute namespace ceiling against its current journal.
+/// A classifier/hook can settle between the parent's provider rounds; its
+/// paid work must reduce the parent's next admission as well as its own.
+pub(crate) fn namespace_allowance(
+    options: &TurnOptions,
+    checkpoint: Option<&crate::retry::DetailedAccountingCheckpoint>,
+    allowance: Option<SpendAllowance>,
+) -> Result<Option<SpendAllowance>, String> {
+    let Some(ceiling) = options.namespace_spend_ceiling_microcents else {
+        return Ok(allowance);
+    };
+    let checkpoint = checkpoint.ok_or("namespace spend ceiling requires a checkpoint")?;
+    let mut allowance = allowance.ok_or("namespace spend ceiling requires an allowance")?;
+    if checkpoint.pending().is_some()
+        || checkpoint.baseline() == crate::AccountingBaseline::UnknownLegacy
+        || checkpoint.totals().knownness != AccountingKnownness::Known
+        || checkpoint.totals().ordinary.cost_microcents.is_none()
+        || (!allowance.allow_unpriced_housekeeping
+            && checkpoint.totals().housekeeping.cost_microcents.is_none())
+    {
+        return Err("namespace spend ceiling cannot use unknown accounting".into());
+    }
+    let priced = checkpoint
+        .known_priced_subtotals()
+        .ok_or("namespace priced subtotals are unavailable")?;
+    let spent = priced
+        .ordinary_microcents
+        .checked_add(priced.housekeeping_microcents)
+        .ok_or("namespace spend subtotal overflows")?;
+    let remaining = ceiling
+        .checked_sub(spent)
+        .ok_or("namespace spend ceiling is exhausted")?;
+    allowance.remaining_microcents = allowance.remaining_microcents.min(remaining);
+    Ok(Some(allowance))
+}
+
+fn mark_request_uncertain(report: &mut TurnReport, purpose: AttemptPurpose) {
     report.accounting.knownness = AccountingKnownness::Uncertain;
-    report.accounting.ordinary.cost_microcents = None;
+    if purpose == AttemptPurpose::Ordinary {
+        report.accounting.ordinary.cost_microcents = None;
+    } else {
+        report.accounting.housekeeping.cost_microcents = None;
+    }
 }
 
 fn require_accounting_slot(
@@ -2896,5 +3292,399 @@ mod usage_observation_owner_tests {
             "whole actual owner snapshot equals standalone B"
         );
         baseline_wire.finish(1);
+    }
+}
+
+#[cfg(test)]
+mod prompt_hook_tests {
+    use super::*;
+
+    /// A cancelled turn with `hook` as the home's only UserPromptSubmit
+    /// hook: the result and the transcript, without reaching a provider.
+    fn submit(hook: &str) -> (Result<TurnReport, String>, Vec<ChatMessage>) {
+        let home = std::env::temp_dir().join(format!("orbit-prompt-hook-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            format!("[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = \"{hook}\"\n"),
+        )
+        .unwrap();
+        let config = TurnConfig {
+            provider_id: "test".into(),
+            gate: "http://127.0.0.1:1".into(),
+            model: "test".into(),
+            kind: crate::dispatch::ProviderKind::OpenAiCompatible,
+            credential_env: None,
+            billing: None,
+            pricing: None,
+            max_output_tokens: 32,
+            sampling: None,
+            effort: None,
+            supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
+        };
+        let cancel = orbit_provider_http::CancelToken::new();
+        cancel.cancel();
+        let mut transcript = vec![user_message("earlier turn")];
+        let result = run_turn(
+            &home,
+            &config,
+            &TurnOptions::default(),
+            "ship it",
+            &mut transcript,
+            &mut NoopExecutor,
+            &cancel,
+            &mut |_| {},
+        );
+        std::fs::remove_dir_all(home).unwrap();
+        (result, transcript)
+    }
+
+    #[test]
+    fn a_user_prompt_hook_can_refuse_the_prompt_before_it_enters_the_transcript() {
+        let (result, transcript) = submit("echo freeze in effect >&2; exit 2");
+        let error = result.unwrap_err();
+        assert!(
+            error.starts_with("prompt blocked by hook: freeze in effect"),
+            "{error}"
+        );
+        assert_eq!(transcript.len(), 1, "the refused prompt was not recorded");
+    }
+
+    #[test]
+    fn what_a_user_prompt_hook_prints_rides_with_the_prompt() {
+        let (result, transcript) = submit("echo branch is release-7");
+        assert!(result.unwrap().interrupted);
+        let prompt = &transcript.last().unwrap().content;
+        assert_eq!(
+            prompt,
+            "ship it\n\n<hook-context>\nbranch is release-7\n</hook-context>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod round_note_tests {
+    use super::*;
+
+    fn result(content: &str) -> crate::ToolRoundResult {
+        crate::ToolRoundResult {
+            call_id: "c".into(),
+            content: content.into(),
+        }
+    }
+
+    /// Notes ride on the newest result that is a JSON object, beside its
+    /// own fields; a round with none to carry them says so.
+    #[test]
+    fn notes_ride_on_the_newest_result_without_changing_its_verdict() {
+        let mut results = vec![
+            result(r#"{"ok":true,"output":"first"}"#),
+            result(r#"{"ok":false,"error":"denied","denied":true}"#),
+            result("not json"),
+        ];
+        let notes = vec!["<monitor>build failed</monitor>".to_owned()];
+        assert!(attach_round_notes(&mut results, &notes));
+        assert_eq!(results[2].content, "not json");
+        assert_eq!(results[0].content, r#"{"ok":true,"output":"first"}"#);
+        let carried: serde_json::Value = serde_json::from_str(&results[1].content).unwrap();
+        assert_eq!(carried["ok"], false);
+        assert_eq!(carried["error"], "denied");
+        assert_eq!(
+            carried["background_events"],
+            serde_json::json!(["<monitor>build failed</monitor>"])
+        );
+        assert!(orbit_tools::result_is_error(&results[1].content));
+        assert!(orbit_tools::result_is_denial(&results[1].content));
+
+        let mut bare = vec![result("plain text"), result("[1,2]")];
+        assert!(
+            !attach_round_notes(&mut bare, &notes),
+            "nothing can carry them"
+        );
+        assert!(attach_round_notes(&mut bare, &[]), "nothing to carry");
+        assert!(!attach_round_notes(&mut [], &notes));
+    }
+}
+
+#[cfg(test)]
+mod drop_old_tool_results_tests {
+    use super::*;
+
+    fn tool(id: &str, content: String) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: content.clone(),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            tool_result: Some(content),
+            blocks: None,
+            origin_model: None,
+            origin_provider: None,
+        }
+    }
+
+    fn long(ok: bool, bytes: usize) -> String {
+        serde_json::json!({ "ok": ok, "content": "x".repeat(bytes) }).to_string()
+    }
+
+    /// Four bytes a token, like the real estimate; `room` tokens before
+    /// compaction.
+    fn measure(room: u64) -> impl Fn(&[ChatMessage]) -> Option<(u64, u64)> {
+        move |messages| {
+            let bytes: usize = messages.iter().map(|m| m.content.len()).sum();
+            Some((bytes as u64 / 4, room))
+        }
+    }
+
+    fn turn() -> Vec<ChatMessage> {
+        vec![
+            user_message("an earlier prompt"),
+            tool("earlier", long(true, 40_000)),
+            assistant_message("an earlier answer".to_string()),
+            user_message("the current prompt"),
+            tool("a", long(true, 12_000)),
+            tool("b", long(false, 12_000)),
+            tool("small", long(true, 100)),
+            tool("c", long(true, 12_000)),
+        ]
+    }
+
+    #[test]
+    fn nothing_is_dropped_while_the_turn_is_under_the_room() {
+        let mut transcript = turn();
+        let before = transcript.clone();
+        let mut report = TurnReport::default();
+        assert_eq!(
+            drop_old_tool_results(&mut transcript, 3, &mut report, measure(20_000)),
+            0
+        );
+        assert_eq!(transcript, before);
+        assert_eq!(report.dropped_tool_results, 0);
+    }
+
+    #[test]
+    fn the_oldest_long_results_of_this_turn_go_first_and_keep_their_verdict() {
+        let mut transcript = turn();
+        let before = transcript.clone();
+        let mut report = TurnReport::default();
+        // 36 KB of results is about 9,000 tokens: over a room of 8,000,
+        // and two thirds of that room is reached after two drops.
+        assert_eq!(
+            drop_old_tool_results(&mut transcript, 3, &mut report, measure(8_000)),
+            2
+        );
+        assert_eq!(report.dropped_tool_results, 2);
+        // Earlier turns are a summary's business, not this one's.
+        assert_eq!(transcript[..4], before[..4]);
+        for (index, ok) in [(4, true), (5, false)] {
+            let stub: serde_json::Value =
+                serde_json::from_str(transcript[index].tool_result.as_deref().unwrap()).unwrap();
+            assert_eq!(stub["ok"], ok);
+            assert_eq!(stub["dropped"], true);
+            assert!(
+                stub["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("run the tool again")
+            );
+            assert_eq!(
+                transcript[index].content,
+                transcript[index].tool_result.clone().unwrap()
+            );
+            assert_eq!(transcript[index].tool_call_id, before[index].tool_call_id);
+        }
+        // The short result and the newest long one are untouched.
+        assert_eq!(transcript[6..], before[6..]);
+    }
+
+    #[test]
+    fn a_turn_that_cannot_be_brought_under_is_left_for_the_refusal_to_report() {
+        let mut transcript = vec![
+            user_message("p".repeat(80_000)),
+            tool("a", long(true, 12_000)),
+        ];
+        let mut report = TurnReport::default();
+        assert_eq!(
+            drop_old_tool_results(&mut transcript, 0, &mut report, measure(8_000)),
+            1
+        );
+        assert_eq!(report.dropped_tool_results, 1);
+        let mut media = turn();
+        for message in &mut media[4..] {
+            message.blocks = Some(Vec::new());
+        }
+        let before = media.clone();
+        let mut media_report = TurnReport::default();
+        assert_eq!(
+            drop_old_tool_results(&mut media, 3, &mut media_report, measure(8_000)),
+            0
+        );
+        assert_eq!(media, before);
+        assert_eq!(media_report.dropped_tool_results, 0);
+        assert_eq!(report.dropped_tool_results, 1);
+    }
+
+    #[test]
+    fn concurrent_turns_keep_their_own_drop_counts_across_rounds() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = barrier.clone();
+        let other = std::thread::spawn(move || {
+            let mut transcript = turn();
+            let mut report = TurnReport::default();
+            drop_old_tool_results(&mut transcript, 3, &mut report, measure(8_000));
+            other_barrier.wait();
+            other_barrier.wait();
+            report
+        });
+        let mut transcript = turn();
+        let mut report = TurnReport::default();
+        drop_old_tool_results(&mut transcript, 3, &mut report, measure(8_000));
+        barrier.wait();
+        // Another tool round in this turn adds enough output for two more drops.
+        transcript.push(tool("next-round", long(true, 24_000)));
+        drop_old_tool_results(&mut transcript, 3, &mut report, measure(8_000));
+        // A different turn on the same thread starts without any inherited drops.
+        let mut untouched = TurnReport::default();
+        drop_old_tool_results(&mut turn(), 3, &mut untouched, measure(20_000));
+        barrier.wait();
+        assert_eq!(other.join().unwrap().dropped_tool_results, 2);
+        assert_eq!(report.dropped_tool_results, 4);
+        assert_eq!(untouched.dropped_tool_results, 0);
+    }
+}
+
+#[cfg(test)]
+mod housekeeping_accounting_tests {
+    use super::*;
+
+    fn after_paid_housekeeping() -> crate::retry::DetailedAccountingCheckpoint {
+        let receipt = RequestAccountingReceipt {
+            request_id: "paid-housekeeping".into(),
+            purpose: AttemptPurpose::Housekeeping,
+            totals: AccountingTotals {
+                input_tokens: 11,
+                output_tokens: 7,
+                cost_microcents: Some(40),
+            },
+            usage: Some(orbit_adapter::types::ProviderUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                ..Default::default()
+            }),
+            knownness: AccountingKnownness::Known,
+            completed: true,
+        };
+        let totals = crate::AccountingDelta::known_zero()
+            .checked_with(&receipt)
+            .unwrap();
+        // Validated inert checkpoint metadata exercises admission arithmetic;
+        // it is not a live provider settlement or a retry authorization.
+        crate::retry::DetailedAccountingCheckpoint::from_legacy(crate::AccountingCheckpoint {
+            owner_session_id: "owner".into(),
+            child_id: None,
+            revision: crate::AccountingRevision(2),
+            baseline: crate::AccountingBaseline::FreshKnownZero,
+            totals,
+            pending: None,
+            last_settlement: Some(crate::SettledAttempt {
+                reference: crate::AttemptRef {
+                    revision: crate::AccountingRevision(1),
+                    request_id: receipt.request_id.clone(),
+                    intent_digest: "a".repeat(64),
+                },
+                receipt_digest: receipt.digest().unwrap(),
+            }),
+            known_priced_subtotals: Some(crate::KnownPricedSubtotals {
+                ordinary_microcents: 0,
+                housekeeping_microcents: 40,
+            }),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn paid_classifier_work_reduces_the_parent_next_admission() {
+        let options = TurnOptions {
+            namespace_spend_ceiling_microcents: Some(100),
+            spend_allowance: Some(SpendAllowance {
+                remaining_microcents: 100,
+                allow_unpriced_housekeeping: false,
+            }),
+            ..Default::default()
+        };
+        let checkpoint = after_paid_housekeeping();
+        let remaining = namespace_allowance(&options, Some(&checkpoint), options.spend_allowance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.remaining_microcents, 60);
+        assert!(namespace_allowance(&options, None, options.spend_allowance).is_err());
+        assert!(namespace_allowance(&options, Some(&checkpoint), None).is_err());
+        let tighter = Some(SpendAllowance {
+            remaining_microcents: 15,
+            ..remaining
+        });
+        assert_eq!(
+            namespace_allowance(&options, Some(&checkpoint), tighter)
+                .unwrap()
+                .unwrap()
+                .remaining_microcents,
+            15
+        );
+        let exhausted = TurnOptions {
+            namespace_spend_ceiling_microcents: Some(39),
+            ..options
+        };
+        assert!(
+            namespace_allowance(&exhausted, Some(&checkpoint), exhausted.spend_allowance).is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_housekeeping_marks_only_its_own_cost_bucket() {
+        let mut report = TurnReport::default();
+        mark_request_uncertain(&mut report, AttemptPurpose::Housekeeping);
+        assert_eq!(report.accounting.knownness, AccountingKnownness::Uncertain);
+        assert_eq!(report.accounting.ordinary.cost_microcents, Some(0));
+        assert_eq!(report.accounting.housekeeping.cost_microcents, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_housekeeping_request_is_attributed_separately_from_conversation() {
+        use crate::compaction::usage_observation_owner_test_support::{
+            OwnerHome, OwnerReply, OwnerWire,
+        };
+        let home = OwnerHome::new();
+        let mut wire = OwnerWire::new(vec![OwnerReply::HealthyB]);
+        let options = TurnOptions {
+            request_purpose: AttemptPurpose::Housekeeping,
+            max_attempts: 1,
+            max_rounds: 1,
+            ..Default::default()
+        };
+        let completion = crate::hooks::without_hooks(|| {
+            run_turn(
+                &home.0,
+                &wire.config(),
+                &options,
+                "one model check",
+                &mut Vec::new(),
+                &mut NoopExecutor,
+                &orbit_provider_http::CancelToken::new(),
+                &mut |_| {},
+            )
+        })
+        .unwrap();
+        assert!(completion.ok);
+        assert_eq!(completion.final_text, "B-answer");
+        assert_eq!(completion.attempts.len(), 1);
+        assert_eq!(completion.attempts[0].purpose, AttemptPurpose::Housekeeping);
+        assert_eq!(completion.accounting.ordinary.input_tokens, 0);
+        assert_eq!(completion.accounting.ordinary.output_tokens, 0);
+        assert_eq!(completion.accounting.housekeeping.input_tokens, 11);
+        assert_eq!(completion.accounting.housekeeping.output_tokens, 7);
+        wire.finish(1);
     }
 }

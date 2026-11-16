@@ -196,7 +196,7 @@ fn directive_target_unknown_axis_refused() {
 
 // ── ORBIT-F-HUD-007/009: cost + brand invariants ──────────────────
 
-/// cost_no_float — cost is integer µ¢ (H-17), no float in the HUD bar.
+/// cost_no_float — cost is an integer of micro-dollars (H-17), no float in the HUD bar.
 #[test]
 fn cost_no_float() {
     let env = orbit_hud::Env {

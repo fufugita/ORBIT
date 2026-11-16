@@ -289,6 +289,26 @@ impl ReadState {
         self.mode = ReadMode::Follow;
         self.navigation_start = None;
     }
+    /// Put the transcript line `index` at the top of the view, at the row
+    /// that holds byte `raw` of its text (`/find next`). Nothing moves when
+    /// the line is not one the view knows.
+    fn jump_to(&mut self, index: usize, raw: usize) {
+        if !self.valid {
+            return;
+        }
+        let Some(id) = self.entries.get(index).copied() else {
+            return;
+        };
+        self.navigation_start = None;
+        self.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(id),
+                part: ReadPart::Text,
+                raw,
+            },
+            bias: 0,
+        });
+    }
     fn scroll(&mut self, delta: isize) {
         let Some(frame) = &self.frame else {
             return;
@@ -1063,6 +1083,198 @@ pub struct Tui {
     /// is answered from this and nothing else, so a click can only reach
     /// what is on screen.
     pub hits: Vec<super::shell::hits::Hit>,
+    /// `/goal` or `/loop`, while one is active.
+    pub automation: Option<Automation>,
+    /// The `/goal` check for the round that just ended was requested and
+    /// its answer has not been read yet.
+    pub goal_asked: bool,
+    /// Vim-style composer editing, when `ORBIT_VIM=1` turned it on.
+    pub vim: Option<super::vim::VimState>,
+    /// Operator key bindings from `keybindings.toml`.
+    pub keybindings: super::keybindings::Keybindings,
+    /// When the schedule file was last checked for due prompts.
+    pub schedule_polled_ms: u64,
+    /// A draft set aside with Ctrl+S.
+    pub stash: Option<String>,
+    /// The last `/find`: what was searched and which match is shown,
+    /// counted back from the newest (`None` until `/find next`).
+    pub find: Option<(String, Option<usize>)>,
+    /// A match the conversation should move to: the transcript line and
+    /// the place in its text. Taken by the event loop, which owns the view.
+    pub find_jump: Option<(usize, usize)>,
+}
+
+/// Prompts ORBIT sends by itself between turns: `/goal` keeps working until
+/// the model reports the condition met, `/loop` repeats a prompt on an
+/// interval. Either stops on a failed turn, on Esc during a turn, when the
+/// person sends their own prompt, or at its round limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Automation {
+    Goal {
+        condition: String,
+        rounds: u32,
+    },
+    Loop {
+        prompt: String,
+        every_ms: u64,
+        due_ms: u64,
+        rounds: u32,
+    },
+}
+
+/// What a separate check of a `/goal` round found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoalVerdict {
+    pub met: bool,
+    pub impossible: bool,
+    /// A check was made. When false, the reply's own first words decide.
+    pub available: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutomationStep {
+    Send(String),
+    Wait,
+    Done(String),
+}
+
+impl Automation {
+    pub const GOAL_MAX_ROUNDS: u32 = 20;
+    pub const LOOP_MAX_ROUNDS: u32 = 50;
+
+    /// `/loop 5m check the deploy`: an interval (`30s`, `5m`, `2h`; ten
+    /// minutes when absent, never under ten seconds) and the prompt.
+    pub fn parse_loop(arg: &str) -> Option<Self> {
+        let (first, rest) = arg
+            .split_once(char::is_whitespace)
+            .map_or((arg, ""), |(first, rest)| (first, rest.trim()));
+        let interval = first
+            .strip_suffix(['s', 'm', 'h'])
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .map(|n| match first.chars().last() {
+                Some('s') => n.saturating_mul(1_000),
+                Some('m') => n.saturating_mul(60_000),
+                _ => n.saturating_mul(3_600_000),
+            });
+        let (every_ms, prompt) = match interval {
+            Some(every_ms) => (every_ms.max(10_000), rest),
+            None => (600_000, arg.trim()),
+        };
+        (!prompt.is_empty()).then(|| Self::Loop {
+            prompt: prompt.to_string(),
+            every_ms,
+            due_ms: 0,
+            rounds: 0,
+        })
+    }
+
+    /// What to do now that the session is idle. `last_reply` is the newest
+    /// model text; `failed` says the last turn failed.
+    pub fn step(&mut self, last_reply: Option<&str>, failed: bool, now_ms: u64) -> AutomationStep {
+        match self {
+            Self::Goal { condition, rounds } => {
+                let reply = last_reply.unwrap_or("").trim_start().to_uppercase();
+                if *rounds > 0 && failed {
+                    return AutomationStep::Done("goal stopped: the last turn failed".into());
+                }
+                if *rounds > 0 && reply.starts_with("GOAL MET") {
+                    return AutomationStep::Done(format!("goal met after {rounds} rounds"));
+                }
+                if *rounds > 0 && reply.starts_with("GOAL IMPOSSIBLE") {
+                    return AutomationStep::Done("goal judged impossible; stopped".into());
+                }
+                if *rounds >= Self::GOAL_MAX_ROUNDS {
+                    return AutomationStep::Done(format!(
+                        "goal stopped after {} rounds without being met",
+                        Self::GOAL_MAX_ROUNDS
+                    ));
+                }
+                *rounds += 1;
+                let lead = if *rounds == 1 {
+                    "Work toward this goal until it is met"
+                } else {
+                    "The goal is not met yet. Continue toward it"
+                };
+                AutomationStep::Send(format!(
+                    "{lead}: {condition}\n\nWhen it is fully met, start your reply with GOAL MET and stop. If it cannot be met, start your reply with GOAL IMPOSSIBLE and say why."
+                ))
+            }
+            Self::Loop {
+                prompt,
+                every_ms,
+                due_ms,
+                rounds,
+            } => {
+                if *rounds > 0 && failed {
+                    return AutomationStep::Done("loop stopped: the last turn failed".into());
+                }
+                if *rounds >= Self::LOOP_MAX_ROUNDS {
+                    return AutomationStep::Done(format!(
+                        "loop stopped after {} runs",
+                        Self::LOOP_MAX_ROUNDS
+                    ));
+                }
+                if now_ms < *due_ms {
+                    return AutomationStep::Wait;
+                }
+                *rounds += 1;
+                *due_ms = now_ms.saturating_add(*every_ms);
+                AutomationStep::Send(prompt.clone())
+            }
+        }
+    }
+
+    /// The goal's next step when a separate check judged the round that
+    /// just ended: its word, not the reply's own claim, decides. For a loop,
+    /// or before the first round, there is nothing to judge.
+    pub fn judged_step(&mut self, verdict: &GoalVerdict) -> AutomationStep {
+        let Self::Goal { condition, rounds } = self else {
+            return AutomationStep::Wait;
+        };
+        let reason = verdict.reason.trim();
+        let because = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" · {reason}")
+        };
+        if verdict.met {
+            return AutomationStep::Done(format!("goal met after {rounds} rounds{because}"));
+        }
+        if verdict.impossible {
+            return AutomationStep::Done(format!("goal judged impossible; stopped{because}"));
+        }
+        if *rounds >= Self::GOAL_MAX_ROUNDS {
+            return AutomationStep::Done(format!(
+                "goal stopped after {} rounds without being met",
+                Self::GOAL_MAX_ROUNDS
+            ));
+        }
+        *rounds += 1;
+        let check = if reason.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nA separate check of your last reply found: {reason}")
+        };
+        AutomationStep::Send(format!(
+            "The goal is not met yet. Continue toward it: {condition}{check}\n\nWhen it is fully met, start your reply with GOAL MET and stop. If it cannot be met, start your reply with GOAL IMPOSSIBLE and say why."
+        ))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Goal { condition, rounds } => format!("goal · round {rounds} · {condition}"),
+            Self::Loop {
+                prompt,
+                every_ms,
+                rounds,
+                ..
+            } => format!(
+                "loop · every {}s · run {rounds} · {prompt}",
+                every_ms / 1_000
+            ),
+        }
+    }
 }
 
 impl Default for Tui {
@@ -1092,6 +1304,14 @@ impl Tui {
             file_completion: super::composer::FileCompletion::default(),
             history_search: None,
             hits: Vec::new(),
+            automation: None,
+            goal_asked: false,
+            vim: None,
+            keybindings: super::keybindings::Keybindings::default(),
+            schedule_polled_ms: 0,
+            stash: None,
+            find: None,
+            find_jump: None,
         }
     }
 
@@ -1269,6 +1489,16 @@ fn run_proto_inner(
         file_completion: super::composer::FileCompletion::default(),
         history_search: None,
         hits: Vec::new(),
+        automation: None,
+        goal_asked: false,
+        vim: std::env::var("ORBIT_VIM")
+            .is_ok_and(|value| value == "1")
+            .then(super::vim::VimState::default),
+        keybindings: super::keybindings::Keybindings::default(),
+        schedule_polled_ms: 0,
+        stash: None,
+        find: None,
+        find_jump: None,
     };
     if let Some(session) = tui.customization.as_mut() {
         match crate::customization::profile_tree(&session.resolved.profile) {
@@ -1293,6 +1523,21 @@ fn run_proto_inner(
     let mut palette_sel = 0usize;
     let mut completion_sel = 0usize;
     let mut toast: Option<Toast> = None;
+    // The inspection to ask for once an editor opened by `/memory edit` or
+    // `/config edit` has closed.
+    let mut after_edit: Option<String> = None;
+    if !safe_session {
+        match super::keybindings::Keybindings::load(&home) {
+            Ok(keys) => tui.keybindings = keys,
+            Err(error) => {
+                toast = Some(Toast {
+                    text: error,
+                    ok: false,
+                    shown_ms: 0,
+                });
+            }
+        }
+    }
     // Queued prompts (§11.4): sent while a turn runs, shown as a
     // queued row until their TurnStarted.
     let mut queued: Vec<String> = Vec::new();
@@ -1349,16 +1594,87 @@ fn run_proto_inner(
 
     let mut reading = ReadState::new(&scenario);
     let mut exit_code = 0;
+    let mut builtin_panes_ms = 0u64;
+    // Opt-in completion bell: ORBIT_BELL=1 rings the terminal bell when a
+    // turn that ran ten seconds or longer ends.
+    let notify_enabled = std::env::var("ORBIT_BELL").is_ok_and(|value| value == "notify");
+    let bell_enabled =
+        notify_enabled || std::env::var("ORBIT_BELL").is_ok_and(|value| value == "1");
+    let mut bell_turn_end = scenario.turn_ended_ms;
     loop {
         let timeout = UI_TICK
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::from_millis(0));
         let now_ms = boot_ms.elapsed().as_millis() as u64;
         tui.tick_ms = now_ms;
+        // Built-in panes are meters, not documents: while the layout shows
+        // one, re-read it once a second and redraw only when it changed.
+        if now_ms.saturating_sub(builtin_panes_ms) >= 1_000 {
+            builtin_panes_ms = now_ms;
+            if let Some(session) = tui.customization.as_mut() {
+                let ids = session.builtin_ids_in_layout();
+                if !ids.is_empty() {
+                    // The reactor is a pure view of the session facts: skip
+                    // its read (and the profile load behind it) when nothing
+                    // changed. The council reads a file, so it always runs.
+                    let context = pane_context(&scenario, session.context.controller);
+                    // The council state is a live file: it is read on every
+                    // beat the pane is visible, and the pane draws it as
+                    // cards rather than re-parsing the text.
+                    if let Some(state) = session.context.council.as_ref() {
+                        let drawn = crate::proto::ported::CouncilState::from_snapshot(state);
+                        if scenario.council.as_ref() != Some(&drawn) {
+                            scenario.council = Some(drawn);
+                            overlay_dirty = true;
+                        }
+                    } else if scenario.council.is_some() {
+                        scenario.council = None;
+                        overlay_dirty = true;
+                    }
+                    let unchanged = context == session.context;
+                    session.context = context;
+                    for id in &ids {
+                        if unchanged && id == "reactor" && session.outputs.contains_key(id) {
+                            continue;
+                        }
+                        let _ = session.refresh(id);
+                    }
+                    if scenario.custom_panes != session.outputs {
+                        scenario.custom_panes = session.outputs.clone();
+                        overlay_dirty = true;
+                    }
+                }
+            }
+        }
+        // A council seat that is working animates its card (about 8 fps),
+        // only while the layout shows the pane and motion is not reduced.
+        if !tui.reduced
+            && now_ms / 125 != now_ms.saturating_sub(UI_TICK.as_millis() as u64) / 125
+            && scenario
+                .custom_panes
+                .get("council")
+                .is_some_and(|pane| pane.text.contains("심의중") || pane.text.contains("SYNK"))
+            && (0..tui.app.tree.panel_count())
+                .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("council"))
+        {
+            overlay_dirty = true;
+        }
+        // The reactor scene moves at about 8 fps during a turn and once a
+        // second at rest, under the same two conditions.
+        let reactor_beat = if scenario.turn_live { 125 } else { 1_000 };
+        if !tui.reduced
+            && now_ms / reactor_beat
+                != now_ms.saturating_sub(UI_TICK.as_millis() as u64) / reactor_beat
+            && (0..tui.app.tree.panel_count())
+                .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("reactor"))
+        {
+            overlay_dirty = true;
+        }
         // A deleted terminal (closed window, dead PTY) makes poll/read
         // fail with EIO — swallow nothing: treat any input error as
         // "terminal gone" and quit at once (the same rule as SIGHUP).
         // unwrap_or(false) here would busy-loop the EIO at 100% CPU.
+        let mut bound_command: Option<String> = None;
         let ev = if let Some(click) = pending_picker_click.take() {
             picker_click_key(click, &mut scenario, overlay, now_ms).map(Event::Key)
         } else if let Some(click) = pending_palette_click.take() {
@@ -1368,7 +1684,17 @@ fn run_proto_inner(
             match injected.take() {
                 Some(e) => Some(e),
                 None => match event::poll(timeout) {
-                    Ok(true) => event::read().ok(),
+                    Ok(true) => event::read().ok().and_then(|event| match event {
+                        Event::Key(key) => match tui.keybindings.resolve(key) {
+                            super::keybindings::Bound::Key(key) => Some(Event::Key(key)),
+                            super::keybindings::Bound::Command(command) => {
+                                bound_command = Some(command);
+                                None
+                            }
+                            super::keybindings::Bound::Ignore => None,
+                        },
+                        other => Some(other),
+                    }),
                     Ok(false) => None,
                     Err(_) => {
                         exit_code = crate::terminal::take_pending_signal()
@@ -1378,23 +1704,98 @@ fn run_proto_inner(
                 },
             }
         };
+        // A key bound to a slash command runs it as if typed, and only
+        // when nothing else is in the way: a draft is never overwritten.
+        if let Some(command) = bound_command {
+            overlay_dirty = true;
+            if composer.is_empty()
+                && overlay.is_none()
+                && tui.focus == Focus::Conversation
+                && !tui.app.arranging
+                && tui.app.picker.is_none()
+                && scenario.approval_call_id.is_none()
+            {
+                composer = command;
+                tui.composer_cursor = super::composer::grapheme_count(&composer);
+                injected = Some(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+            } else {
+                toast = Some(Toast {
+                    text: format!("{command}: focus the empty composer first"),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
+        }
         if let Some(ev) = ev {
             match ev {
                 Event::Key(k) => {
                     overlay_dirty = true;
                     let snap_before =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
-                    let handled_custom = handle_custom_key_with_history(
-                        k,
-                        &mut tui,
-                        &mut scenario,
-                        &mut composer,
-                        cancel_handle.as_ref(),
-                        &mut toast,
-                        now_ms,
-                        overlay.is_some(),
-                        &mut history_draft,
-                    );
+                    // Ctrl+G edits the draft in $EDITOR; Ctrl+S stashes it (or
+                    // brings the stash back into an empty composer).
+                    let draft_key = match k.code {
+                        KeyCode::Char(c @ ('g' | 's'))
+                            if k.modifiers == KeyModifiers::CONTROL
+                                && tui.focus == Focus::Conversation
+                                && overlay.is_none()
+                                && !tui.app.arranging
+                                && tui.app.picker.is_none()
+                                && scenario.approval_call_id.is_none() =>
+                        {
+                            Some(c)
+                        }
+                        _ => None,
+                    };
+                    match draft_key {
+                        Some('g') => match edit_externally(&mut guard, &composer) {
+                            Ok(text) => {
+                                composer = text;
+                                tui.composer_cursor = super::composer::grapheme_count(&composer);
+                            }
+                            Err(message) => {
+                                toast = Some(Toast {
+                                    text: message,
+                                    ok: false,
+                                    shown_ms: now_ms,
+                                });
+                            }
+                        },
+                        Some(_) => {
+                            let text = if !composer.is_empty() {
+                                tui.stash = Some(std::mem::take(&mut composer));
+                                tui.composer_cursor = 0;
+                                "draft stashed · Ctrl+S brings it back"
+                            } else if let Some(stashed) = tui.stash.take() {
+                                composer = stashed;
+                                tui.composer_cursor = super::composer::grapheme_count(&composer);
+                                "draft restored"
+                            } else {
+                                "nothing stashed"
+                            };
+                            toast = Some(Toast {
+                                text: text.into(),
+                                ok: true,
+                                shown_ms: now_ms,
+                            });
+                        }
+                        None => {}
+                    }
+                    let handled_custom = draft_key.is_some()
+                        || handle_custom_key_with_history(
+                            k,
+                            &mut tui,
+                            &mut scenario,
+                            &mut composer,
+                            cancel_handle.as_ref(),
+                            &mut toast,
+                            now_ms,
+                            overlay.is_some(),
+                            &mut history_draft,
+                        );
                     let quit = if handled_custom {
                         false
                     } else {
@@ -1587,6 +1988,51 @@ fn run_proto_inner(
                 }
             }
             let mut bus_dirty = scenario.state_version() != msgs_before;
+            // `/memory edit`, `/config edit`: the editor gets the terminal.
+            if let Some((path, then)) = scenario.edit_request.take() {
+                match open_in_editor(&mut guard, &path) {
+                    Ok(()) => after_edit = Some(then),
+                    Err(text) => {
+                        toast = Some(Toast {
+                            text,
+                            ok: false,
+                            shown_ms: now_ms,
+                        });
+                    }
+                }
+                bus_dirty = true;
+            }
+            // What was saved is reported by the worker, once the command
+            // that asked for the editor has ended.
+            if !scenario.is_busy()
+                && let Some(then) = after_edit.take()
+                && submit_foreground(
+                    &mut scenario,
+                    &command_sink,
+                    WorkerCommand::Inspect(then.clone()),
+                )
+                .is_err()
+            {
+                after_edit = Some(then);
+            }
+            if bell_enabled && scenario.turn_ended_ms != bell_turn_end {
+                bell_turn_end = scenario.turn_ended_ms;
+                if scenario
+                    .turn_report
+                    .as_ref()
+                    .is_some_and(|report| report.duration_ms >= 10_000)
+                {
+                    use std::io::Write;
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(b"\x07");
+                    // ORBIT_BELL=notify also raises a desktop notification
+                    // on terminals that understand OSC 9.
+                    if notify_enabled {
+                        let _ = out.write_all(b"\x1b]9;ORBIT finished a turn\x07");
+                    }
+                    let _ = out.flush();
+                }
+            }
             // The queue (§11.4): when the turn ends and prompts are
             // queued, the head becomes the next user turn.
             if !scenario.is_busy() && !queued.is_empty() {
@@ -1609,6 +2055,125 @@ fn run_proto_inner(
                     }
                     scenario.turn_started_ms = now_ms;
                     scenario.apply("round_started", 0);
+                }
+            }
+            // Scheduled prompts (CronCreate, ScheduleWakeup): polled every
+            // ten seconds while idle; a due job queues its prompt like one
+            // typed during a turn, so the ordinary drain above sends it.
+            if !scenario.is_busy()
+                && queued.is_empty()
+                && now_ms.saturating_sub(tui.schedule_polled_ms) >= 10_000
+            {
+                tui.schedule_polled_ms = now_ms;
+                let unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                if let Ok(cwd) = std::env::current_dir() {
+                    for prompt in
+                        crate::schedule::fire_due(&tui.app.home, &cwd.to_string_lossy(), unix)
+                    {
+                        push_display_line(
+                            &mut scenario,
+                            TranscriptLine {
+                                kind: LineKind::Queued,
+                                text: prompt.clone(),
+                                ..Default::default()
+                            },
+                            EditOrigin::Local,
+                        );
+                        queued.push(prompt);
+                        bus_dirty = true;
+                    }
+                }
+            }
+            // `/find next` and `/find prev` asked the conversation to move.
+            if let Some((index, raw)) = tui.find_jump.take() {
+                reading.jump_to(index, raw);
+            }
+            // /goal and /loop: idle with nothing queued, the automation
+            // decides whether to send its next prompt, wait, or stop.
+            if !scenario.is_busy()
+                && queued.is_empty()
+                && let Some(automation) = tui.automation.as_mut()
+            {
+                let last_reply = scenario
+                    .transcript
+                    .iter()
+                    .rev()
+                    .find(|line| line.kind == LineKind::Model)
+                    .map(|line| line.text.clone());
+                // A goal round that ended is judged by a separate check
+                // before anything is decided: the worker is asked once, and
+                // its answer is read the next time the session is idle.
+                let mut judged: Option<GoalVerdict> = None;
+                let mut asked_now = false;
+                if let Automation::Goal { condition, rounds } = &*automation
+                    && *rounds > 0
+                    && !scenario.last_failed
+                {
+                    if tui.goal_asked {
+                        tui.goal_asked = false;
+                        judged = scenario
+                            .goal_verdict
+                            .take()
+                            .filter(|verdict| verdict.available);
+                    } else {
+                        scenario.goal_verdict = None;
+                        asked_now = submit_foreground(
+                            &mut scenario,
+                            &command_sink,
+                            WorkerCommand::Inspect(format!("goal-check {condition}")),
+                        )
+                        .is_ok();
+                        tui.goal_asked = asked_now;
+                    }
+                }
+                let step = match (&judged, asked_now) {
+                    (_, true) => AutomationStep::Wait,
+                    (Some(verdict), false) => automation.judged_step(verdict),
+                    (None, false) => {
+                        automation.step(last_reply.as_deref(), scenario.last_failed, now_ms)
+                    }
+                };
+                match step {
+                    AutomationStep::Wait => {}
+                    AutomationStep::Done(reason) => {
+                        tui.automation = None;
+                        push_display_line(
+                            &mut scenario,
+                            TranscriptLine {
+                                kind: LineKind::System,
+                                text: reason,
+                                ..Default::default()
+                            },
+                            EditOrigin::Local,
+                        );
+                    }
+                    AutomationStep::Send(prompt) => {
+                        if submit_foreground(
+                            &mut scenario,
+                            &command_sink,
+                            WorkerCommand::Prompt(prompt.clone()),
+                        )
+                        .is_ok()
+                        {
+                            push_display_line(
+                                &mut scenario,
+                                TranscriptLine {
+                                    kind: LineKind::User,
+                                    text: prompt,
+                                    time: Some(now_hhmm()),
+                                    ..Default::default()
+                                },
+                                EditOrigin::Input,
+                            );
+                            tui.scroll_follow();
+                            scenario.turn_started_ms = now_ms;
+                            scenario.apply("round_started", 0);
+                        } else {
+                            tui.automation = None;
+                        }
+                    }
                 }
             }
             let view_dirty = scenario.take_view_dirty();
@@ -2022,6 +2587,8 @@ fn handle_key_with_read(
     // each running tool's process group". Outside a turn Esc keeps its
     // per-context meaning (close completion, defocus…).
     if k.code == KeyCode::Esc && scenario.is_busy() {
+        // Stopping the turn also stops /goal or /loop.
+        tui.automation = None;
         if let Some(search) = tui.history_search.take() {
             tui.composer_cursor = search.restore(composer);
         }
@@ -2053,6 +2620,33 @@ fn handle_key_with_read(
             KeyCode::Char(ch @ '1'..='8') => {
                 let i = ch as usize - '1' as usize;
                 if tui.app.pick(super::shell::PICKER_VIEWS[i]) {
+                    save_layout(tui, toast, now_ms);
+                }
+            }
+            // Built-in panes (council, reactor): whatever key the picker
+            // lists for one picks it, so a pane added later needs no change
+            // here. They need the checked profile host; without one the
+            // picker stays open and says why nothing happened.
+            KeyCode::Char(ch)
+                if super::shell::PICKER_PANES
+                    .iter()
+                    .any(|(key, _, _)| *key == ch) =>
+            {
+                let pane = super::shell::PICKER_PANES
+                    .iter()
+                    .find(|(key, _, _)| *key == ch);
+                if tui.customization.is_none() {
+                    *toast = Some(Toast {
+                        text: format!(
+                            "{} is not available: no customization profile is loaded",
+                            pane.map_or("that pane", |(_, _, title)| *title)
+                        ),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                } else if let Some((_, id, _)) = pane
+                    && tui.app.pick_custom(id)
+                {
                     save_layout(tui, toast, now_ms);
                 }
             }
@@ -2192,9 +2786,16 @@ fn handle_key_with_read(
                 return false;
             }
             // Shift+Tab cycles the permission mode (S5, Claude Code
-            // parity): default → acceptEdits → plan → dontAsk →
+            // parity): default → acceptEdits → plan → auto → dontAsk →
             // bypass → default. Focus cycling stays on Tab.
-            const MODES: [&str; 5] = ["default", "acceptEdits", "plan", "dontAsk", "bypass"];
+            const MODES: [&str; 6] = [
+                "default",
+                "acceptEdits",
+                "plan",
+                "auto",
+                "dontAsk",
+                "bypass",
+            ];
             let current = scenario
                 .permission_mode
                 .as_deref()
@@ -2274,6 +2875,11 @@ fn handle_key_with_read(
                     finish_history_navigation(history_idx, history_draft);
                     return false;
                 }
+                // `/name args` that is not a built-in command but names an
+                // installed skill runs that skill as an ordinary prompt.
+                if let Some(prompt) = skill_command_prompt(&tui.app.home, composer.trim()) {
+                    *composer = prompt;
+                }
                 if composer.starts_with('/') && !composer.trim().eq("/") {
                     let mut text = composer.trim().to_string();
                     // A partly typed command runs the highlighted match
@@ -2282,6 +2888,18 @@ fn handle_key_with_read(
                     let list = super::chrome::slash_list(&text);
                     if !list.is_empty() && !list.iter().any(|(c, _)| *c == text) {
                         text = list[(*completion_sel).min(list.len() - 1)].0.to_string();
+                    }
+                    // A command that has to wait for the turn stays in the
+                    // composer, so Enter after the turn runs it as typed.
+                    if scenario.is_busy()
+                        && !runs_while_busy(text.split(' ').next().unwrap_or(""))
+                    {
+                        *toast = Some(Toast {
+                            text: "wait for the active work to finish; draft retained".into(),
+                            ok: false,
+                            shown_ms: now_ms,
+                        });
+                        return false;
                     }
                     composer.clear();
                     tui.composer_cursor = 0;
@@ -2309,6 +2927,8 @@ fn handle_key_with_read(
                         *sessions_pushed = true;
                     }
                 } else if !composer.trim().is_empty() && !composer.starts_with('/') {
+                    // The person's own prompt takes over from /goal or /loop.
+                    tui.automation = None;
                     let text = composer.clone();
                     let queue_prompt = scenario.ordinary_pending();
                     if !queue_prompt
@@ -2677,6 +3297,29 @@ fn composer_key(
         return true;
     }
 
+    // Vim mode: NORMAL takes its keys here; INSERT passes all but Esc on.
+    if let Some(vim) = tui.vim.as_mut() {
+        let before = vim.mode;
+        let mut cursor = tui.composer_cursor;
+        let outcome = vim.key(k.code, k.modifiers, draft, &mut cursor);
+        let mode = vim.mode;
+        if outcome == super::vim::VimOutcome::Consumed {
+            tui.composer_cursor = super::composer::clamp_cursor(draft, cursor);
+            tui.file_completion.dismiss();
+            finish_history_navigation(history_idx, history_draft);
+            if mode != before {
+                // The cursor shape tells the modes apart: a block in NORMAL.
+                let style = if mode == super::vim::VimMode::Normal {
+                    crossterm::cursor::SetCursorStyle::SteadyBlock
+                } else {
+                    crossterm::cursor::SetCursorStyle::SteadyBar
+                };
+                let _ = crossterm::execute!(std::io::stdout(), style);
+            }
+            return true;
+        }
+    }
+
     if history_idx.is_some() && matches!(k.code, KeyCode::Up | KeyCode::Down) {
         return false;
     }
@@ -2787,6 +3430,10 @@ fn copy_mode_rows(scenario: &Scenario) -> Vec<String> {
                 let tool_name = copy_mode_metadata(&line.tool_name);
                 let state = match line.tool_state {
                     ToolState::Done => ": done",
+                    ToolState::Denied if line.meta.starts_with("denied by the channel ") => {
+                        ": denied by a channel"
+                    }
+                    ToolState::Denied if line.meta.starts_with("blocked") => ": blocked",
                     ToolState::Denied => ": denied by you",
                     ToolState::Failed => ": failed",
                     ToolState::Running => ": running",
@@ -3051,32 +3698,160 @@ fn restored_transcript_scan(text: &str) -> Result<String, ()> {
 /// Gate the printable restored transcript against both its visible form and
 /// a control-free scan. A scan redaction cannot be mapped safely back to
 /// visible spans, so any such change withholds the whole message.
+///
+/// A role marker (`prompt:` and the like) that is spelled out in the visible
+/// text is part of the conversation: people write "the system prompt: ..."
+/// and must be able to read their own message back. One that exists only
+/// once terminal controls or invisible separators are taken out, so that
+/// the visible text does not show it as written, still withholds the
+/// message.
 fn project_restored_transcript_text(text: &str) -> String {
-    let visible = copy_mode_message(text);
-    let visible = match orbit_hud::display_safe(&visible) {
-        Ok(visible) => visible,
-        Err(_) => return RESTORED_TRANSCRIPT_REDACTED.to_string(),
-    };
+    let shown = copy_mode_message(text);
+    let visible = orbit_hud::display_safe_content(&shown);
     let scan = match restored_transcript_scan(text) {
         Ok(scan) => scan,
         Err(()) => return RESTORED_TRANSCRIPT_REDACTED.to_string(),
     };
-    match orbit_hud::display_safe(&scan) {
-        Ok(checked) if checked == scan => visible,
-        Ok(_) | Err(_) => RESTORED_TRANSCRIPT_REDACTED.to_string(),
+    if orbit_hud::role_marker_count(&scan) > orbit_hud::role_marker_count(&shown)
+        || orbit_hud::display_safe_content(&scan) != scan
+    {
+        return RESTORED_TRANSCRIPT_REDACTED.to_string();
     }
+    visible
 }
 
 /// Copy mode (§9.25): leave the alt screen, print the transcript,
 /// wait for a key, return.
+/// Ctrl+G: hand the draft to `$VISUAL` / `$EDITOR` and take back what was
+/// saved. The screen is given to the editor for the duration.
+fn edit_externally(
+    guard: &mut crate::terminal::TerminalGuard,
+    draft: &str,
+) -> Result<String, String> {
+    const MAX_DRAFT_BYTES: u64 = 1024 * 1024;
+    let editor = configured_editor().ok_or("set $EDITOR to edit the draft in an editor")?;
+    let path = std::env::temp_dir().join(format!(
+        "orbit-draft-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("draft file: {error}"))?;
+        std::io::Write::write_all(&mut file, draft.as_bytes())
+            .map_err(|error| format!("draft file: {error}"))?;
+    }
+    let status = run_editor(guard, &editor, &path);
+    let result = match status {
+        Ok(status) if status.success() => std::fs::metadata(&path)
+            .ok()
+            .filter(|meta| meta.len() <= MAX_DRAFT_BYTES)
+            .and_then(|_| std::fs::read_to_string(&path).ok())
+            .map(|text| text.trim_end_matches(['\n', '\r']).to_owned())
+            .ok_or_else(|| "the edited draft could not be read back".to_owned()),
+        Ok(_) => Err("the editor exited with an error; draft unchanged".into()),
+        Err(error) => Err(format!("could not start the editor: {error}")),
+    };
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// `$VISUAL`, else `$EDITOR`, when one is set.
+fn configured_editor() -> Option<String> {
+    ["VISUAL", "EDITOR"].iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// The shell words that start `editor` on one file. The editor setting may
+/// carry arguments ("code -w"); the path is a positional parameter, never
+/// spliced into the command text.
+fn editor_command(editor: &str, path: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("orbit-editor")
+        .arg(path);
+    command
+}
+
+/// Give the screen to the editor until it exits, then take it back.
+fn run_editor(
+    guard: &mut crate::terminal::TerminalGuard,
+    editor: &str,
+    path: &std::path::Path,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut stdout = std::io::stdout();
+    if guard.mouse_capture {
+        let _ = crossterm::execute!(stdout, crossterm::event::DisableMouseCapture);
+    }
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
+    let status = editor_command(editor, path).status();
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
+        crossterm::cursor::Hide
+    );
+    if guard.mouse_capture {
+        let _ = crossterm::execute!(stdout, crossterm::event::EnableMouseCapture);
+    }
+    guard.terminal.clear().ok();
+    status
+}
+
+/// `/memory edit`, `/config edit`: the file itself in `$VISUAL` / `$EDITOR`.
+fn open_in_editor(
+    guard: &mut crate::terminal::TerminalGuard,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let editor = configured_editor()
+        .ok_or_else(|| format!("set $EDITOR to edit {} from here", path.display()))?;
+    match run_editor(guard, &editor, path) {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err("the editor exited with an error".into()),
+        Err(error) => Err(format!("could not start the editor: {error}")),
+    }
+}
+
+/// The plain-text view as it is written to a raw-mode terminal.
+fn copy_mode_text(scenario: &Scenario) -> String {
+    let mut text = String::new();
+    for row in copy_mode_rows(scenario) {
+        for line in row.replace("\r\n", "\n").split('\n') {
+            text.push_str(line.trim_end_matches('\r'));
+            text.push_str("\r\n");
+        }
+    }
+    text
+}
+
 fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
     let _ = guard.terminal.draw(|_| {});
     let mut stdout = std::io::stdout();
     let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
     // §9.25: one event per line, no box drawing or colour.
-    for row in copy_mode_rows(scenario) {
-        println!("{row}");
-    }
+    // The terminal stays in raw mode, where a bare line feed does not
+    // return the carriage: every line ends in CR LF.
+    let _ = std::io::Write::write_all(&mut stdout, copy_mode_text(scenario).as_bytes());
+    let _ = std::io::Write::flush(&mut stdout);
     let _ = event::read();
     let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
     guard.terminal.clear().ok();
@@ -3085,6 +3860,22 @@ fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
 #[cfg(test)]
 mod copy_mode_tests {
     use super::*;
+
+    #[test]
+    fn the_plain_view_never_sends_a_bare_line_feed() {
+        let mut scenario = Scenario::new();
+        scenario.transcript = vec![TranscriptLine {
+            kind: LineKind::Model,
+            text: "first\nsecond\r\nthird".into(),
+            ..TranscriptLine::default()
+        }];
+        let text = copy_mode_text(&scenario);
+        assert!(text.contains("first\r\n"), "{text:?}");
+        assert!(text.contains("second\r\n"), "{text:?}");
+        assert!(text.ends_with("\r\n"), "{text:?}");
+        assert!(!text.replace("\r\n", "").contains('\n'), "{text:?}");
+        assert!(!text.replace("\r\n", "").contains('\r'), "{text:?}");
+    }
 
     fn line(kind: LineKind, time: &str, tool_name: &str, text: &str) -> TranscriptLine {
         TranscriptLine {
@@ -3194,6 +3985,24 @@ mod restored_transcript_projection_tests {
             RESTORED_TRANSCRIPT_REDACTED,
             "unsafe restored transcript was not withheld: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_role_marker_in_plain_sight_is_conversation_and_a_hidden_one_is_not() {
+        // What a person types, or a model answers, about prompts.
+        for text in [
+            "fix the system prompt: it is too long",
+            "Prompt: reply with exactly OK",
+            "the USER_MESSAGE field and the chain_of_thought flag",
+        ] {
+            assert_eq!(project_restored_transcript_text(text), text);
+        }
+        // The same word put together only once terminal controls are taken
+        // out: the screen does not show it as written, so it is withheld.
+        assert_withheld("pro\u{001b}[31mmpt: split by a colour change");
+        assert_withheld("prompt: shown, and pro\u{200b}mpt: once more, split");
+        // A secret still withholds a message that also names a marker.
+        assert_withheld(&format!("prompt: token = {API_TOKEN}"));
     }
 
     #[test]
@@ -3391,6 +4200,233 @@ fn submit_foreground(
     Ok(())
 }
 
+/// `/find`: where `needle` occurs in the conversation (prompts, replies and
+/// tool lines; case-insensitive), newest last, with a little of the text
+/// around each hit. At most twelve are shown.
+/// Where `needle` occurs in the conversation, oldest first: the transcript
+/// line and the byte in its text where the first occurrence in that line
+/// begins. The same lines `/find` lists: prompts, replies and tool lines.
+fn find_matches(transcript: &[TranscriptLine], needle: &str) -> Vec<(usize, usize)> {
+    let wanted = needle.to_lowercase();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            !line.local_notice
+                && matches!(line.kind, LineKind::User | LineKind::Model | LineKind::Tool)
+        })
+        .filter_map(|(index, line)| {
+            // Lowercasing can change a character's length; the offset is
+            // brought back onto a boundary of the text as written.
+            let at = line.text.to_lowercase().find(&wanted)?;
+            let mut at = at.min(line.text.len());
+            while !line.text.is_char_boundary(at) {
+                at -= 1;
+            }
+            Some((index, at))
+        })
+        .collect()
+}
+
+/// Which match `/find next` (older) or `/find prev` (newer) shows, counted
+/// back from the newest: the newest first, then round and round.
+fn find_step(total: usize, shown: Option<usize>, older: bool) -> usize {
+    match (shown, older) {
+        (None, _) => 0,
+        (Some(at), true) => (at + 1) % total,
+        (Some(at), false) => (at + total - 1) % total,
+    }
+}
+
+fn find_in_transcript(transcript: &[TranscriptLine], needle: &str) -> String {
+    const SHOWN: usize = 12;
+    const AROUND: usize = 36;
+    let wanted: Vec<char> = needle.to_lowercase().chars().collect();
+    let mut hits = Vec::new();
+    for line in transcript {
+        let who = match line.kind {
+            LineKind::User => "you",
+            LineKind::Model => "orbit",
+            LineKind::Tool => "tool",
+            LineKind::Queued | LineKind::System => continue,
+        };
+        if line.local_notice {
+            continue;
+        }
+        let text: Vec<char> = printable_text(&line.text).chars().collect();
+        let lower: Vec<char> = text
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        let Some(at) = lower
+            .windows(wanted.len().max(1))
+            .position(|window| window == wanted.as_slice())
+        else {
+            continue;
+        };
+        let from = at.saturating_sub(AROUND);
+        let to = (at + wanted.len() + AROUND).min(text.len());
+        let snippet: String = text[from..to]
+            .iter()
+            .map(|c| if c.is_whitespace() { ' ' } else { *c })
+            .collect();
+        hits.push(format!(
+            "{who}: {}{}{}",
+            if from > 0 { "…" } else { "" },
+            snippet.trim(),
+            if to < text.len() { "…" } else { "" }
+        ));
+    }
+    if hits.is_empty() {
+        return format!("no match for \"{needle}\" in this conversation");
+    }
+    let total = hits.len();
+    let shown = &hits[total.saturating_sub(SHOWN)..];
+    format!(
+        "{total} line(s) match \"{needle}\"{}\n{}",
+        if total > SHOWN {
+            format!(" · the last {SHOWN}:")
+        } else {
+            ":".to_owned()
+        },
+        shown.join("\n")
+    )
+}
+
+/// The model's most recent reply as the conversation shows it.
+fn last_reply(transcript: &[TranscriptLine]) -> Option<String> {
+    let end = transcript
+        .iter()
+        .rposition(|line| line.kind == LineKind::Model && !line.text.trim().is_empty())?;
+    let start = transcript[..end]
+        .iter()
+        .rposition(|line| line.kind != LineKind::Model)
+        .map_or(0, |at| at + 1);
+    Some(
+        transcript[start..=end]
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The conversation as Markdown: prompts, replies and one line per tool
+/// call. It is what the pane holds, so local notices are left out and a
+/// compacted or resumed session exports only what is still displayed.
+fn transcript_markdown(transcript: &[TranscriptLine]) -> String {
+    let mut out = String::from("# ORBIT transcript\n");
+    let mut previous: Option<LineKind> = None;
+    for line in transcript {
+        if line.local_notice || line.text.trim().is_empty() && line.tool_name.is_empty() {
+            continue;
+        }
+        match line.kind {
+            LineKind::User => {
+                out.push_str("\n## You\n\n");
+                out.push_str(&line.text);
+                out.push('\n');
+            }
+            LineKind::Model => {
+                if previous != Some(LineKind::Model) {
+                    out.push_str("\n## ORBIT\n\n");
+                }
+                out.push_str(&line.text);
+                out.push('\n');
+            }
+            LineKind::Tool => {
+                if previous != Some(LineKind::Tool) {
+                    out.push('\n');
+                }
+                out.push_str(&format!("- `{}` {}\n", line.tool_name, line.text.trim()));
+            }
+            LineKind::Queued | LineKind::System => continue,
+        }
+        previous = Some(line.kind);
+    }
+    out
+}
+
+/// `/review` or `/git:sync` → the name a custom command file could have.
+fn custom_command_name(cmd: &str) -> Option<&str> {
+    let name = cmd.strip_prefix('/')?;
+    (!name.is_empty()
+        && name.len() <= 128
+        && name.split(':').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        }))
+    .then_some(name)
+}
+
+/// The prompt a skill command stands for: `/name args` where `name` is not
+/// a built-in command (or a prefix of one) and a skill of that name is
+/// installed for the user or the project. The worker still decides whether
+/// a project skill may load (folder trust).
+fn skill_command_prompt(home: &std::path::Path, text: &str) -> Option<String> {
+    let rest = text.strip_prefix('/')?;
+    let (name, args) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(name, args)| (name, args.trim()));
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        || !super::chrome::slash_list(&format!("/{name}")).is_empty()
+    {
+        return None;
+    }
+    let installed = [
+        Some(home.join("skills")),
+        Some(std::path::PathBuf::from(".orbit/skills")),
+        Some(std::path::PathBuf::from(".claude/skills")),
+        // The operator's Claude Code skills, when `claude_compat` is on
+        // (the worker applies the same switch before loading one).
+        std::env::var("ORBIT_CLAUDE_COMPAT")
+            .is_ok_and(|value| value == "1" || value == "true")
+            .then(std::env::home_dir)
+            .flatten()
+            .map(|dir| dir.join(".claude/skills")),
+    ]
+    .iter()
+    .flatten()
+    .any(|dir| dir.join(name).join("SKILL.md").is_file());
+    if !installed {
+        return None;
+    }
+    let mut prompt =
+        format!("Run the `{name}` skill: load it with the Skill tool and follow its instructions.");
+    if !args.is_empty() {
+        prompt.push_str("\n\nArguments: ");
+        prompt.push_str(args);
+    }
+    Some(prompt)
+}
+
+/// Commands that only read or arrange the screen, so they run while a turn
+/// is in flight. Every other command waits for the turn to end.
+fn runs_while_busy(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "/help"
+            | "/usage"
+            | "/sessions"
+            | "/models"
+            | "/theme"
+            | "/customize"
+            | "/goal"
+            | "/loop"
+            | "/copy"
+            | "/export"
+            | "/find"
+    )
+}
+
 /// Run a `/command` or bare `quit`/`exit` (§11.6). TUI-local ones
 /// run at once; the rest go to the worker in order.
 #[allow(clippy::too_many_arguments)]
@@ -3417,12 +4453,7 @@ fn run_command(
         Some((c, a)) => (c, a.trim()),
         None => (text, ""),
     };
-    if scenario.is_busy()
-        && !matches!(
-            cmd,
-            "/help" | "/usage" | "/sessions" | "/models" | "/theme" | "/customize"
-        )
-    {
+    if scenario.is_busy() && !runs_while_busy(cmd) {
         *toast = Some(Toast {
             text: "wait for the active work to finish".into(),
             ok: false,
@@ -3436,6 +4467,8 @@ fn run_command(
             TranscriptLine {
                 kind: LineKind::System,
                 text: t,
+                // A command's answer is read, not glanced at: it wraps.
+                wrap: true,
                 ..Default::default()
             },
             EditOrigin::Local,
@@ -3587,7 +4620,14 @@ fn run_command(
             None
         }
         "/mode" => {
-            const MODES: [&str; 5] = ["default", "acceptEdits", "plan", "dontAsk", "bypass"];
+            const MODES: [&str; 6] = [
+                "default",
+                "acceptEdits",
+                "plan",
+                "auto",
+                "dontAsk",
+                "bypass",
+            ];
             if arg.is_empty() {
                 let cur = scenario.permission_mode.as_deref().unwrap_or("default");
                 notice(
@@ -3611,6 +4651,60 @@ fn run_command(
                     scenario,
                     format!("unknown mode {arg} · /mode <{}>", MODES.join("|")),
                 );
+            }
+            None
+        }
+        "/goal" | "/loop" => {
+            let text = match (cmd, arg) {
+                (_, "") => tui
+                    .automation
+                    .as_ref()
+                    .map_or("nothing is running".to_string(), Automation::describe),
+                (_, "clear" | "stop" | "off") => {
+                    tui.automation = None;
+                    format!("{} stopped", cmd.trim_start_matches('/'))
+                }
+                ("/goal", condition) => {
+                    // A check asked for an earlier goal does not judge this one.
+                    tui.goal_asked = false;
+                    scenario.goal_verdict = None;
+                    tui.automation = Some(Automation::Goal {
+                        condition: condition.to_string(),
+                        rounds: 0,
+                    });
+                    "goal set · /goal clear or Esc stops it".to_string()
+                }
+                (_, spec) => match Automation::parse_loop(spec) {
+                    Some(automation) => {
+                        let text =
+                            format!("{} · /loop stop or Esc stops it", automation.describe());
+                        tui.automation = Some(automation);
+                        text
+                    }
+                    None => "usage: /loop [30s|5m|2h] <prompt>".to_string(),
+                },
+            };
+            notice(scenario, text);
+            None
+        }
+        "/hooks" | "/skills" | "/agents" | "/mcp" | "/memory" | "/config" | "/btw" | "/rename"
+        | "/add-dir" | "/tasks" | "/sandbox" | "/status" | "/output-style" | "/fork" | "/cd"
+        | "/plugin" | "/doctor" => {
+            if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                // `/mcp login <server>` and `/mcp logout <server>` ride along.
+                WorkerCommand::Inspect(
+                    format!("{} {}", cmd.trim_start_matches('/'), arg.trim())
+                        .trim_end()
+                        .to_string(),
+                ),
+            ) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
             }
             None
         }
@@ -3671,6 +4765,211 @@ fn run_command(
         }
         "/theme" | "/customize" => {
             *toast = Some(profile_command_toast(tui, scenario, text, now_ms));
+            None
+        }
+        // `/plan` is `/mode plan`.
+        "/plan" => {
+            if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                WorkerCommand::SetMode("plan".to_string()),
+            ) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
+            None
+        }
+        "/vim" => {
+            tui.vim = match tui.vim.take() {
+                Some(_) => None,
+                None => Some(super::vim::VimState::default()),
+            };
+            notice(
+                scenario,
+                if tui.vim.is_some() {
+                    "vim editing on for this session · Esc for NORMAL, i to insert".into()
+                } else {
+                    "vim editing off".into()
+                },
+            );
+            None
+        }
+        "/keybindings" => {
+            let path = tui.app.home.join("keybindings.toml");
+            if arg == "reload" {
+                match super::keybindings::Keybindings::load(&tui.app.home) {
+                    Ok(keys) => {
+                        tui.keybindings = keys;
+                        notice(
+                            scenario,
+                            format!("{} key binding(s) loaded", tui.keybindings.len()),
+                        );
+                    }
+                    Err(error) => notice(scenario, format!("bindings unchanged: {error}")),
+                }
+            } else {
+                notice(
+                    scenario,
+                    format!(
+                        "{} key binding(s) from {} · /keybindings reload rereads it",
+                        tui.keybindings.len(),
+                        path.display()
+                    ),
+                );
+            }
+            None
+        }
+        "/find" => {
+            match arg {
+                "" => notice(
+                    scenario,
+                    "usage: /find <text> lists matches · /find next moves to one, older each time · /find prev goes back".into(),
+                ),
+                "next" | "prev" => match tui.find.clone() {
+                    None => notice(scenario, "nothing searched yet: /find <text>".into()),
+                    Some((query, shown)) => {
+                        let matches = find_matches(&scenario.transcript, &query);
+                        if matches.is_empty() {
+                            tui.find = None;
+                            notice(
+                                scenario,
+                                format!("no match for \"{query}\" in this conversation"),
+                            );
+                        } else {
+                            let total = matches.len();
+                            let at =
+                                find_step(total, shown.map(|at| at.min(total - 1)), arg == "next");
+                            tui.find = Some((query.clone(), Some(at)));
+                            tui.find_jump = Some(matches[total - 1 - at]);
+                            *toast = Some(Toast {
+                                text: format!(
+                                    "\"{query}\" · match {} of {total}, newest first",
+                                    at + 1
+                                ),
+                                ok: true,
+                                shown_ms: now_ms,
+                            });
+                        }
+                    }
+                },
+                text => {
+                    let found = find_in_transcript(&scenario.transcript, text);
+                    let any = !find_matches(&scenario.transcript, text).is_empty();
+                    tui.find = any.then(|| (text.to_string(), None));
+                    notice(
+                        scenario,
+                        if any {
+                            format!(
+                                "{found}\n/find next moves the conversation to the newest match"
+                            )
+                        } else {
+                            found
+                        },
+                    );
+                }
+            }
+            None
+        }
+        "/context" => {
+            match context_summary(scenario) {
+                Some(line) => notice(scenario, line),
+                None => notice(
+                    scenario,
+                    "no context measurement yet; send a prompt first".into(),
+                ),
+            }
+            None
+        }
+        "/copy" => {
+            match last_reply(&scenario.transcript) {
+                Some(text) => {
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stdout(),
+                        crate::selection::osc52_sequence(&text).as_bytes(),
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    crate::selection::set_x_clipboard(&text);
+                    *toast = Some(Toast {
+                        text: format!("copied {} characters", text.chars().count()),
+                        ok: true,
+                        shown_ms: now_ms,
+                    });
+                }
+                None => notice(scenario, "nothing to copy yet".into()),
+            }
+            None
+        }
+        "/export" => {
+            let markdown = transcript_markdown(&scenario.transcript);
+            let path = if arg.is_empty() {
+                std::path::PathBuf::from(format!("orbit-transcript-{}.md", now_ms / 1000))
+            } else {
+                std::path::PathBuf::from(arg)
+            };
+            // Never over an existing file: an export is a new file or nothing.
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, markdown.as_bytes()));
+            match written {
+                Ok(()) => notice(
+                    scenario,
+                    format!("exported {} bytes to {}", markdown.len(), path.display()),
+                ),
+                Err(error) => notice(
+                    scenario,
+                    format!("export to {} failed: {error}", path.display()),
+                ),
+            }
+            None
+        }
+        "/mods" | "/mod" => {
+            let command = match (cmd, arg) {
+                ("/mods", "") => Some(WorkerCommand::ListInstalledMods),
+                ("/mods", "refresh") => Some(WorkerCommand::RefreshMods),
+                ("/mod", name) if !name.is_empty() && !name.contains(char::is_whitespace) => {
+                    Some(WorkerCommand::ToggleMod(name.to_string()))
+                }
+                _ => None,
+            };
+            match command {
+                Some(command) => {
+                    if let Err(message) = submit_foreground(scenario, command_sink, command) {
+                        *toast = Some(Toast {
+                            text: message.into(),
+                            ok: false,
+                            shown_ms: now_ms,
+                        });
+                    }
+                }
+                None => notice(
+                    scenario,
+                    "usage: /mods · /mods refresh · /mod <name>".into(),
+                ),
+            }
+            None
+        }
+        // Not built in: a mod's `/name:cmd` or a custom command file. The
+        // worker owns both lookups and answers an unknown name.
+        _ if custom_command_name(cmd).is_some() => {
+            let name = custom_command_name(cmd).unwrap_or_default();
+            let command = match name.split_once(':') {
+                Some((module, inner)) if arg.is_empty() && !inner.contains(':') => {
+                    WorkerCommand::ModCommand(module.to_string(), inner.to_string())
+                }
+                _ => WorkerCommand::SlashCommand(name.to_string(), arg.to_string()),
+            };
+            if let Err(message) = submit_foreground(scenario, command_sink, command) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
             None
         }
         _ => {
@@ -4110,9 +5409,89 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         }
         return None;
     }
+    if let Msg::ApprovalAnswered {
+        call_id,
+        allowed,
+        source,
+    } = msg
+    {
+        // The worker already has its answer; only the card is behind.
+        if scenario.approval_call_id.as_deref() != Some(call_id.as_str()) {
+            return None;
+        }
+        scenario.motion_until_ms = now_ms + 1000;
+        if allowed {
+            for l in scenario.transcript.iter_mut().rev() {
+                if l.kind == LineKind::Tool
+                    && l.call_id == call_id
+                    && l.tool_state == super::scenario::ToolState::AwaitingYou
+                {
+                    l.tool_state = super::scenario::ToolState::Running;
+                    break;
+                }
+            }
+        }
+        if !scenario.approval_queue.is_empty() {
+            scenario.approval_queue.remove(0);
+        }
+        if scenario.approval_queue.is_empty() {
+            scenario.apply("approval_resolved", 0);
+        } else {
+            scenario.approval_shown_ms = now_ms;
+        }
+        let source: String = clean(source)
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        let said = format!(
+            "{} from the channel {source}",
+            if allowed { "allowed" } else { "denied" }
+        );
+        push_display_line(
+            scenario,
+            TranscriptLine {
+                kind: LineKind::System,
+                text: said.clone(),
+                ..Default::default()
+            },
+            EditOrigin::Local,
+        );
+        // Said as a toast too: the line goes with the turn's notices.
+        return Some(said);
+    }
     // Every message may start a motion: keep redrawing for a second.
     scenario.motion_until_ms = now_ms + 1000;
     match msg {
+        Msg::StatusLine(text) => {
+            let clean = crate::bridge::safe_text(&crate::bridge::terminal_safe(&text));
+            scenario.status_line = Some(clean).filter(|line| !line.trim().is_empty());
+        }
+        Msg::EditFile { path, then } => {
+            scenario.edit_request = Some((path, then));
+        }
+        Msg::GoalVerdict {
+            met,
+            impossible,
+            available,
+            reason,
+        } => {
+            // A model wrote the reason and it is shown and sent on: one
+            // printable line of bounded length.
+            let reason: String = crate::bridge::safe_text(&crate::bridge::terminal_safe(&reason))
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect();
+            scenario.goal_verdict = Some(GoalVerdict {
+                met,
+                impossible,
+                available,
+                reason,
+            });
+        }
         Msg::Routing(lines) => {
             scenario.routing_lines = lines
                 .into_iter()
@@ -4181,6 +5560,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         Msg::TextDelta(text) => {
             scenario.apply("text_delta", 0);
             scenario.last_data_ms = now_ms;
+            scenario.meter_stream(text.chars().count(), now_ms);
             let end = foreground_end(scenario);
             match end
                 .checked_sub(1)
@@ -4276,6 +5656,20 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             outcome,
             fact,
         } => {
+            // A cancelled worker can finish a prompt that was registered
+            // after Escape. Its terminal result closes only its own card;
+            // other queued approvals and their registry entries stay live.
+            if scenario.approval_call_id.as_deref() == Some(call_id.as_str()) {
+                if let Some(index) = scenario
+                    .approval_queue
+                    .iter()
+                    .rposition(|tool| tool == &name)
+                {
+                    scenario.approval_queue.remove(index);
+                }
+                scenario.apply("approval_resolved", 0);
+                scenario.approval_summary = None;
+            }
             let key = if call_id.is_empty() {
                 name.clone()
             } else {
@@ -4326,7 +5720,11 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                         }
                         crate::model::ToolOutcome::Denied => {
                             l.tool_state = super::scenario::ToolState::Denied;
-                            l.meta = String::new();
+                            // Who refused, when the worker says it was a
+                            // channel; otherwise the card's own words.
+                            l.meta = Some(fact.clone())
+                                .filter(|fact| super::scenario::names_who_refused(fact))
+                                .unwrap_or_default();
                         }
                         crate::model::ToolOutcome::Failed => {
                             l.tool_state = super::scenario::ToolState::Failed;
@@ -4453,6 +5851,17 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             ..
         } => {
             let managed = scenario.session_binding().is_some();
+            // The reactor meter: managed workers report the running total,
+            // legacy bridges the turn's own count.
+            scenario.mark_turn_meter();
+            let turn_output = if managed {
+                output_tokens
+                    .max(scenario.output_tokens)
+                    .saturating_sub(scenario.meter_output_base)
+            } else {
+                output_tokens
+            };
+            scenario.settle_turn_rate(turn_output, now_ms);
             // A turn that is over leaves no card "running": a call that
             // never reported (Esc, an error, the round guard) was cut
             // off, and says so.
@@ -4516,6 +5925,8 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     TranscriptLine {
                         kind: LineKind::System,
                         text: line.to_string(),
+                        // A command's answer is read whole: it wraps.
+                        wrap: true,
                         ..Default::default()
                     },
                     EditOrigin::Local,
@@ -4779,6 +6190,19 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.window_tokens = window_tokens;
             scenario.usage_shown_ms = now_ms;
         }
+        Msg::UsageDetail {
+            session_id,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+        } => {
+            scenario.usage_detail = Some((
+                session_id,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+            ));
+        }
         Msg::LedgerAppended { record_count } => {
             scenario.ledger_count = Some(record_count);
             scenario.ledger_ms = Some(now_ms);
@@ -4985,7 +6409,8 @@ fn draw_with_hits_with_read(
         }
         None => None,
     };
-    super::shell::draw_with_reading(
+    let no_overlay = ov.is_none();
+    let painted = super::shell::draw_with_reading(
         f,
         &super::shell::DrawIn {
             app: &tui.app,
@@ -5030,7 +6455,60 @@ fn draw_with_hits_with_read(
         },
         &tui.profile,
         reading,
-    )
+    );
+    // `/find next`: what was searched stands out in the conversation for as
+    // long as the view stays away from the newest rows.
+    if no_overlay
+        && let Some((query, Some(_))) = &tui.find
+        && let Some(frame) = &painted.1
+        && frame.mode != ReadMode::Follow
+    {
+        mark_find_matches(f.buffer_mut(), frame.rows, query);
+    }
+    painted
+}
+
+/// Show every occurrence of `needle` inside `area` in reverse video. The
+/// painted rows are searched, so a match broken across two rows by
+/// wrapping is not marked.
+fn mark_find_matches(buffer: &mut ratatui::buffer::Buffer, area: Rect, needle: &str) {
+    use unicode_width::UnicodeWidthStr;
+    let wanted: Vec<char> = needle.to_lowercase().chars().collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let area = area.intersection(buffer.area);
+    for y in area.top()..area.bottom() {
+        // The row's characters, lowercased, each with the column it is in.
+        let mut row: Vec<(char, u16)> = Vec::new();
+        let mut x = area.left();
+        while x < area.right() {
+            let symbol = buffer[(x, y)].symbol();
+            let width = symbol.width().max(1) as u16;
+            row.extend(symbol.to_lowercase().chars().map(|c| (c, x)));
+            // The cell after a wide character belongs to it.
+            x += width;
+        }
+        let mut at = 0;
+        while at + wanted.len() <= row.len() {
+            if row[at..at + wanted.len()]
+                .iter()
+                .map(|(c, _)| c)
+                .eq(wanted.iter())
+            {
+                for &(_, column) in &row[at..at + wanted.len()] {
+                    let cell = &mut buffer[(column, y)];
+                    cell.set_style(
+                        cell.style()
+                            .add_modifier(ratatui::style::Modifier::REVERSED),
+                    );
+                }
+                at += wanted.len();
+            } else {
+                at += 1;
+            }
+        }
+    }
 }
 
 /// A click on changed file `i`. Returns true when it should open that
@@ -5672,6 +7150,20 @@ fn save_history(path: &Option<std::path::PathBuf>, history: &[String]) {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
     }
+    // Created 0600, so a new file is never readable by others even for
+    // the moment between the write and the permission fix below.
+    #[cfg(unix)]
+    let _ = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(p)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, raw.as_bytes()))
+    };
+    #[cfg(not(unix))]
     let _ = std::fs::write(p, raw);
     // set_permissions AFTER the write: `.mode()` at open only applies to
     // newly created files, but save_history may append to a file created by
@@ -6037,6 +7529,142 @@ mod approval_card_tests {
             9,
         );
         assert_eq!(card(&s), ToolState::Denied);
+    }
+
+    #[test]
+    fn a_finished_call_closes_only_its_matching_approval() {
+        let mut s = Scenario::new();
+        s.approval_queue.push("Read".into());
+        apply_msg(
+            Msg::ToolCallStarted {
+                call_id: "cancelled".into(),
+                name: "Write".into(),
+                summary: "Write(out.txt)".into(),
+            },
+            &mut s,
+            1,
+        );
+        apply_msg(
+            Msg::ApprovalRequested {
+                call_id: "cancelled".into(),
+                tool_name: "Write".into(),
+                summary: "Write(out.txt)".into(),
+                risk: 2,
+                working_dir: "/tmp".into(),
+            },
+            &mut s,
+            2,
+        );
+        let finished = |id: &str| Msg::ToolCallFinished {
+            call_id: id.into(),
+            name: "Write".into(),
+            outcome: crate::model::ToolOutcome::Cancelled,
+            fact: String::new(),
+        };
+        apply_msg(finished("unrelated"), &mut s, 3);
+        assert_eq!(s.approval_call_id.as_deref(), Some("cancelled"));
+        assert_eq!(s.approval_queue, ["Read", "Write"]);
+        apply_msg(finished("cancelled"), &mut s, 4);
+        assert!(s.approval_call_id.is_none());
+        assert!(s.approval_pending.is_none());
+        assert!(s.approval_summary.is_none());
+        assert_eq!(s.approval_queue, ["Read"]);
+        assert_eq!(
+            s.transcript.len(),
+            1,
+            "cancellation invents no channel answer"
+        );
+        assert_eq!(s.transcript[0].tool_state, ToolState::Cancelled);
+    }
+
+    /// A prompt a channel answered closes here too: the card goes, the
+    /// call runs when it was allowed, and the conversation says who
+    /// answered. An answer about another call changes nothing.
+    #[test]
+    fn a_prompt_answered_by_a_channel_closes_its_card() {
+        let asked = |s: &mut Scenario| {
+            apply_msg(
+                Msg::ToolCallStarted {
+                    call_id: "c1".into(),
+                    name: "Bash".into(),
+                    summary: "make".into(),
+                },
+                s,
+                1,
+            );
+            apply_msg(
+                Msg::ApprovalRequested {
+                    call_id: "c1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "Bash(make)".into(),
+                    risk: 2,
+                    working_dir: "/tmp".into(),
+                },
+                s,
+                2,
+            );
+        };
+        let answered = |call: &str, allowed| Msg::ApprovalAnswered {
+            call_id: call.into(),
+            allowed,
+            source: "chat\u{1b}[2J".into(),
+        };
+        let card = |s: &Scenario| {
+            s.transcript
+                .iter()
+                .find(|l| l.kind == LineKind::Tool)
+                .map(|l| l.tool_state)
+                .unwrap()
+        };
+        let mut s = Scenario::new();
+        asked(&mut s);
+        assert_eq!(apply_msg(answered("other", true), &mut s, 3), None);
+        assert_eq!(s.approval_call_id.as_deref(), Some("c1"));
+        assert_eq!(card(&s), ToolState::AwaitingYou);
+
+        assert_eq!(
+            apply_msg(answered("c1", true), &mut s, 4).as_deref(),
+            Some("allowed from the channel chat")
+        );
+        assert_eq!(s.approval_call_id, None);
+        assert!(s.approval_queue.is_empty());
+        assert_eq!(card(&s), ToolState::Running);
+        assert_eq!(
+            s.transcript.last().map(|l| l.text.as_str()),
+            Some("allowed from the channel chat")
+        );
+
+        let mut s = Scenario::new();
+        asked(&mut s);
+        apply_msg(answered("c1", false), &mut s, 4);
+        assert_eq!(s.approval_call_id, None);
+        assert_eq!(card(&s), ToolState::AwaitingYou);
+        assert_eq!(
+            s.transcript.last().map(|l| l.text.as_str()),
+            Some("denied from the channel chat")
+        );
+        // The card names the channel when the worker says it refused, and
+        // takes no other words for a denial.
+        let finished = |fact: &str| Msg::ToolCallFinished {
+            call_id: "c1".into(),
+            name: "Bash".into(),
+            outcome: crate::model::ToolOutcome::Denied,
+            fact: fact.into(),
+        };
+        let meta = |s: &Scenario| {
+            s.transcript
+                .iter()
+                .find(|l| l.kind == LineKind::Tool)
+                .map(|l| l.meta.clone())
+                .unwrap()
+        };
+        apply_msg(finished("denied by the channel chat"), &mut s, 9);
+        assert_eq!(card(&s), ToolState::Denied);
+        assert_eq!(meta(&s), "denied by the channel chat");
+        let mut s = Scenario::new();
+        asked(&mut s);
+        apply_msg(finished("12 lines"), &mut s, 9);
+        assert_eq!(meta(&s), "");
     }
 }
 
@@ -8693,12 +10321,45 @@ fn pane_context(
     controller: bool,
 ) -> orbit_frontend_protocol::customization::PaneContext {
     use orbit_frontend_protocol::customization::{PaneAgent, PaneContext};
+    let usage_detail = s
+        .usage_detail
+        .as_ref()
+        .filter(|detail| detail.0 == s.session_id);
     PaneContext {
         permission_mode: s.permission_mode.clone(),
         routing: s.routing_lines.clone(),
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
         cost_microcents: s.cost_microcents,
+        model: s.model_id.clone(),
+        provider: s.provider.clone(),
+        phase: ["orient", "reason", "act", "verify", "respond"]
+            .get(s.phase)
+            .map(|phase| (*phase).to_string()),
+        used_tokens: (s.window_tokens > 0).then_some(s.used_tokens),
+        window_tokens: (s.window_tokens > 0).then_some(s.window_tokens),
+        turns: Some(s.turns),
+        turn_tools: Some(s.turn_tools),
+        // Observed by the worker since it opened this session; another
+        // session's counts are never shown.
+        cache_read_tokens: usage_detail.map(|detail| detail.1),
+        cache_write_tokens: usage_detail.map(|detail| detail.2),
+        reasoning_tokens: usage_detail.map(|detail| detail.3),
+        cost_uncertain: !s.priced
+            || !matches!(
+                s.cost_qualification(),
+                crate::msg::CostQualification::Known { .. }
+                    | crate::msg::CostQualification::Unavailable
+            ),
+        rate_milli: s.turn_rate_milli,
+        peak_rate_milli: s.peak_rate_milli,
+        live_rate_milli: s.live_rate_milli(),
+        rate_history: s
+            .rate_history
+            .iter()
+            .skip(s.rate_history.len().saturating_sub(40))
+            .copied()
+            .collect(),
         agents: s
             .agents
             .iter()
@@ -8714,6 +10375,7 @@ fn pane_context(
                 .into(),
             })
             .collect(),
+        council: None,
         controller,
     }
 }
@@ -9318,6 +10980,283 @@ fn save_layout(tui: &mut Tui, toast: &mut Option<Toast>, now: u64) {
 #[cfg(test)]
 mod routing_projection_tests {
     use super::*;
+    /// With a separate check, its word decides: a reply that claims the
+    /// goal is met does not end it, and the check's reason goes into the
+    /// next round's prompt.
+    #[test]
+    fn a_judged_goal_follows_the_check_and_not_the_replys_claim() {
+        let mut goal = Automation::Goal {
+            condition: "tests pass".into(),
+            rounds: 0,
+        };
+        // The first round is sent as ever.
+        assert!(matches!(goal.step(None, false, 0), AutomationStep::Send(_)));
+        let not_yet = GoalVerdict {
+            available: true,
+            reason: "two tests still fail".into(),
+            ..Default::default()
+        };
+        match goal.judged_step(&not_yet) {
+            AutomationStep::Send(prompt) => {
+                assert!(prompt.contains("tests pass"), "{prompt}");
+                assert!(
+                    prompt.contains(
+                        "A separate check of your last reply found: two tests still fail"
+                    )
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            goal,
+            Automation::Goal {
+                condition: "tests pass".into(),
+                rounds: 2
+            }
+        );
+        let met = GoalVerdict {
+            met: true,
+            available: true,
+            reason: "all 41 pass".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            goal.judged_step(&met),
+            AutomationStep::Done("goal met after 2 rounds · all 41 pass".into())
+        );
+        let hopeless = GoalVerdict {
+            impossible: true,
+            available: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            goal.judged_step(&hopeless),
+            AutomationStep::Done("goal judged impossible; stopped".into())
+        );
+        let mut tired = Automation::Goal {
+            condition: "x".into(),
+            rounds: Automation::GOAL_MAX_ROUNDS,
+        };
+        assert!(matches!(
+            tired.judged_step(&not_yet),
+            AutomationStep::Done(_)
+        ));
+        let mut looping = Automation::parse_loop("30s check").unwrap();
+        assert_eq!(looping.judged_step(&met), AutomationStep::Wait);
+    }
+
+    #[test]
+    fn a_goal_repeats_until_the_model_reports_it_met() {
+        let mut goal = Automation::Goal {
+            condition: "tests pass".into(),
+            rounds: 0,
+        };
+        // A stale failure or reply from before the goal was set is ignored.
+        let AutomationStep::Send(first) = goal.step(Some("GOAL MET earlier"), true, 0) else {
+            panic!("the first round sends");
+        };
+        assert!(first.starts_with("Work toward this goal until it is met: tests pass"));
+        let AutomationStep::Send(next) = goal.step(Some("still two failures"), false, 10) else {
+            panic!("an unmet goal continues");
+        };
+        assert!(next.starts_with("The goal is not met yet"));
+        assert_eq!(
+            goal.step(Some("  goal met: all green"), false, 20),
+            AutomationStep::Done("goal met after 2 rounds".into())
+        );
+        let mut failing = Automation::Goal {
+            condition: "x".into(),
+            rounds: 1,
+        };
+        assert!(matches!(
+            failing.step(None, true, 0),
+            AutomationStep::Done(_)
+        ));
+        let mut impossible = Automation::Goal {
+            condition: "x".into(),
+            rounds: 3,
+        };
+        assert!(matches!(
+            impossible.step(Some("GOAL IMPOSSIBLE: no network"), false, 0),
+            AutomationStep::Done(_)
+        ));
+        let mut tired = Automation::Goal {
+            condition: "x".into(),
+            rounds: Automation::GOAL_MAX_ROUNDS,
+        };
+        assert!(matches!(
+            tired.step(Some("not yet"), false, 0),
+            AutomationStep::Done(_)
+        ));
+    }
+
+    #[test]
+    fn a_loop_waits_out_its_interval_between_runs() {
+        assert_eq!(Automation::parse_loop(""), None);
+        assert_eq!(Automation::parse_loop("5m"), None);
+        let mut every = Automation::parse_loop("2m  check the deploy").unwrap();
+        assert_eq!(
+            every.describe(),
+            "loop · every 120s · run 0 · check the deploy"
+        );
+        assert_eq!(
+            every.step(None, false, 1_000),
+            AutomationStep::Send("check the deploy".into())
+        );
+        assert_eq!(every.step(None, false, 60_000), AutomationStep::Wait);
+        assert_eq!(
+            every.step(None, false, 121_000),
+            AutomationStep::Send("check the deploy".into())
+        );
+        assert!(matches!(
+            every.step(None, true, 500_000),
+            AutomationStep::Done(_)
+        ));
+        // No interval means ten minutes; intervals never go under ten seconds.
+        assert!(matches!(
+            Automation::parse_loop("check mail"),
+            Some(Automation::Loop {
+                every_ms: 600_000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Automation::parse_loop("1s ping"),
+            Some(Automation::Loop {
+                every_ms: 10_000,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn a_slash_name_runs_an_installed_skill_but_never_shadows_a_command() {
+        let home = std::env::temp_dir().join(format!("orbit-skillcmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("skills/release-notes")).unwrap();
+        std::fs::write(
+            home.join("skills/release-notes/SKILL.md"),
+            "---\nname: release-notes\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("skills/help")).unwrap();
+        std::fs::write(home.join("skills/help/SKILL.md"), "x").unwrap();
+
+        let plain = skill_command_prompt(&home, "/release-notes").unwrap();
+        assert!(plain.contains("`release-notes` skill"));
+        assert!(!plain.contains("Arguments"));
+        let with_args = skill_command_prompt(&home, "/release-notes  since v0.2").unwrap();
+        assert!(with_args.ends_with("Arguments: since v0.2"));
+        // Built-in commands and their prefixes win; unknown names stay commands.
+        assert_eq!(skill_command_prompt(&home, "/help"), None);
+        assert_eq!(skill_command_prompt(&home, "/missing"), None);
+        assert_eq!(skill_command_prompt(&home, "/../etc"), None);
+        assert_eq!(skill_command_prompt(&home, "release-notes"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn custom_command_names_copy_and_export_read_the_conversation() {
+        assert_eq!(custom_command_name("/review"), Some("review"));
+        assert_eq!(custom_command_name("/git:sync"), Some("git:sync"));
+        for bad in ["/", "/a b", "/../x", "/a::b", "/a/b", "review"] {
+            assert_eq!(custom_command_name(bad), None, "{bad}");
+        }
+        let line = |kind, text: &str| TranscriptLine {
+            kind,
+            text: text.into(),
+            ..Default::default()
+        };
+        let mut tool = line(LineKind::Tool, "cargo test");
+        tool.tool_name = "Bash".into();
+        let mut local = line(LineKind::System, "mode: auto");
+        local.local_notice = true;
+        let transcript = vec![
+            line(LineKind::User, "fix the parser"),
+            line(LineKind::Model, "Looking."),
+            tool,
+            line(LineKind::Model, "Fixed it."),
+            line(LineKind::Model, "Tests pass."),
+            local,
+        ];
+        assert_eq!(
+            last_reply(&transcript).as_deref(),
+            Some("Fixed it.\nTests pass.")
+        );
+        assert_eq!(last_reply(&transcript[..1]), None);
+        let found = find_in_transcript(&transcript, "PARSER");
+        assert_eq!(found, "1 line(s) match \"PARSER\":\nyou: fix the parser");
+        assert!(find_in_transcript(&transcript, "cargo").contains("tool: cargo test"));
+        assert!(find_in_transcript(&transcript, "mode: auto").starts_with("no match"));
+        assert!(find_in_transcript(&transcript, "zebra").starts_with("no match"));
+        // Where the matches are, oldest first, and how `/find next` and
+        // `/find prev` walk them from the newest.
+        assert_eq!(find_matches(&transcript, "PARSER"), vec![(0, 8)]);
+        assert_eq!(
+            find_matches(&transcript, "t"),
+            vec![(0, 4), (2, 6), (3, 7), (4, 0)]
+        );
+        assert!(find_matches(&transcript, "mode: auto").is_empty());
+        assert!(find_matches(&transcript, "").is_empty());
+        assert_eq!(find_step(3, None, true), 0, "the newest first");
+        assert_eq!(find_step(3, Some(0), true), 1);
+        assert_eq!(find_step(4, Some(3), true), 0, "round again");
+        assert_eq!(find_step(4, Some(0), false), 3);
+        assert_eq!(find_step(1, Some(0), true), 0);
+        let markdown = transcript_markdown(&transcript);
+        assert_eq!(
+            markdown,
+            "# ORBIT transcript\n\n## You\n\nfix the parser\n\n## ORBIT\n\nLooking.\n\n- `Bash` cargo test\n\n## ORBIT\n\nFixed it.\nTests pass.\n"
+        );
+    }
+    #[test]
+    fn usage_detail_reaches_the_pane_context_only_for_its_own_session() {
+        let mut scenario = Scenario::new();
+        scenario.session_id = "session-a".into();
+        assert_eq!(pane_context(&scenario, false).cache_read_tokens, None);
+        apply_msg(
+            crate::msg::Msg::UsageDetail {
+                session_id: "session-a".into(),
+                cache_read_tokens: 7,
+                cache_write_tokens: 3,
+                reasoning_tokens: 0,
+            },
+            &mut scenario,
+            5000,
+        );
+        let context = pane_context(&scenario, false);
+        assert_eq!(
+            (
+                context.cache_read_tokens,
+                context.cache_write_tokens,
+                context.reasoning_tokens
+            ),
+            (Some(7), Some(3), Some(0))
+        );
+        // Another session never shows these counts.
+        scenario.session_id = "session-b".into();
+        assert_eq!(pane_context(&scenario, false).cache_read_tokens, None);
+    }
+
+    #[test]
+    fn finished_turns_feed_the_reactor_meter_in_the_pane_context() {
+        let mut scenario = Scenario::new();
+        scenario.turn_started_ms = 1_000;
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 10,
+                output_tokens: 100,
+                cost_microcents: 0,
+            },
+            &mut scenario,
+            3_000,
+        );
+        let context = pane_context(&scenario, false);
+        assert_eq!(context.rate_milli, Some(50_000));
+        assert_eq!(context.peak_rate_milli, Some(50_000));
+        assert_eq!(context.rate_history, vec![50_000]);
+        assert_eq!(context.live_rate_milli, None);
+    }
     #[test]
     fn pane_context_tracks_authoritative_mode_changes_without_caching_startup_mode() {
         let mut scenario = Scenario::new();
@@ -12610,17 +14549,18 @@ mod palette_review_tests {
             for _ in 0..50 {
                 keys.press(KeyCode::Down);
             }
-            assert_eq!(keys.selected, 15);
+            // The last command in the list.
+            assert_eq!(keys.selected, 45);
             let rows = keys.frame(width, height);
             let hit = keys
                 .tui
                 .hits
                 .iter()
-                .find(|hit| hit.click == Click::Palette(15))
+                .find(|hit| hit.click == Click::Palette(45))
                 .unwrap();
             assert!(
                 rows[hit.rect.y as usize].contains("▌")
-                    && rows[hit.rect.y as usize].contains("/theme")
+                    && rows[hit.rect.y as usize].contains("/init")
             );
             assert!(
                 keys.tui
@@ -12884,6 +14824,95 @@ mod reading_state_tests {
             })
             .collect()
     }
+    /// The editor is started on the file as one argument, whatever is in
+    /// its name, and the editor setting may carry its own arguments.
+    #[test]
+    fn the_editor_gets_the_file_as_one_argument() {
+        let dir = std::env::temp_dir().join(format!("orbit-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a file; echo \"$(id)\".md");
+        std::fs::write(&path, "before\n").unwrap();
+        let status = editor_command("sh -c 'printf edited > \"$1\"' editor", &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `/find next` moves the conversation: the frame painted after the
+    /// jump shows the matched row, not the newest rows, and a line the view
+    /// does not know moves nothing.
+    #[test]
+    fn a_find_jump_brings_the_match_into_view() {
+        let (mut tui, s, mut reading) = setup();
+        let before = paint(&mut tui, &s, &mut reading, 80, 24).join("\n");
+        assert!(before.contains("ROW_79"), "it starts at the newest rows");
+        assert!(!before.contains("ROW_20"));
+
+        let at = s.transcript[0].text.find("ROW_20").unwrap();
+        assert_eq!(find_matches(&s.transcript, "row_20"), vec![(0, at)]);
+        reading.jump_to(0, at);
+        let after = paint(&mut tui, &s, &mut reading, 80, 24).join("\n");
+        assert!(after.contains("ROW_20"), "{after}");
+        assert!(!after.contains("ROW_79"), "the view left the tail");
+
+        // The match is marked while the view is on it, and only then.
+        let marked = |tui: &mut Tui, reading: &mut ReadState| {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let input = reading.input();
+            let done = terminal
+                .draw(|f| {
+                    draw_with_hits_with_read(
+                        f,
+                        tui,
+                        &s,
+                        "",
+                        None,
+                        "",
+                        0,
+                        None,
+                        false,
+                        0,
+                        input.as_ref(),
+                    );
+                })
+                .unwrap();
+            let buffer = done.buffer.clone();
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+                .map(|cell| cell.symbol().to_owned())
+                .collect::<String>()
+        };
+        assert_eq!(marked(&mut tui, &mut reading), "", "nothing was searched");
+        tui.find = Some(("row_20".into(), Some(0)));
+        assert_eq!(marked(&mut tui, &mut reading), "ROW_20");
+        // Only the conversation's rows: not the panel's title or the
+        // composer's hint, which hold these words too.
+        tui.find = Some(("conversation".into(), Some(0)));
+        assert_eq!(marked(&mut tui, &mut reading), "");
+        tui.find = Some(("send".into(), Some(0)));
+        assert_eq!(marked(&mut tui, &mut reading), "");
+        tui.find = Some(("row_20".into(), None));
+        assert_eq!(marked(&mut tui, &mut reading), "", "listed, not moved to");
+        tui.find = Some(("row_7".into(), Some(0)));
+
+        reading.jump_to(99, 0);
+        let same = paint(&mut tui, &s, &mut reading, 80, 24).join("\n");
+        assert!(same.contains("ROW_20"), "an unknown line moves nothing");
+        reading.follow();
+        let back = paint(&mut tui, &s, &mut reading, 80, 24).join("\n");
+        assert!(back.contains("ROW_79"));
+        assert_eq!(
+            marked(&mut tui, &mut reading),
+            "",
+            "back at the newest rows nothing is marked"
+        );
+    }
+
     fn key(
         tui: &mut Tui,
         s: &mut Scenario,

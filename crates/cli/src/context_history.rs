@@ -1015,6 +1015,59 @@ impl CompactionJournal for Journal {
         self.settle_refusal_record(attempt, &settlement.to_record())
     }
 
+    fn abandon_uncertain(
+        &self,
+        attempt: &AttemptRef,
+    ) -> Result<DetailedAccountingCheckpoint, HistoryError> {
+        validate_reference(attempt)?;
+        let layout = self.layout(false)?;
+        let _lock = Lock::acquire(&layout.owner, LOCK).map_err(storage_error)?;
+        let mut container = self.container(&layout)?;
+        let entry = container
+            .entries
+            .iter_mut()
+            .find(|entry| entry.namespace == self.namespace())
+            .ok_or(HistoryError::Missing)?;
+        let Some(pending) = entry.pending.clone() else {
+            // Already abandoned: the same answer, nothing written.
+            let last = entry.last.as_ref().ok_or(HistoryError::Conflict)?;
+            let abandoned = last.reference.to_public() == *attempt
+                && last.receipt.as_ref().is_some_and(|receipt| {
+                    receipt.to_public().knownness == AccountingKnownness::Uncertain
+                });
+            return if abandoned {
+                layout.check()?;
+                entry.checkpoint_detailed(&self.owner)
+            } else {
+                Err(HistoryError::Conflict)
+            };
+        };
+        if pending.reference.to_public() != *attempt || pending.retry_binding.is_some() {
+            return Err(HistoryError::Conflict);
+        }
+        let receipt = pending.uncertain_receipt.ok_or(HistoryError::Conflict)?;
+        let mut totals = entry.totals.to_public();
+        if totals.knownness != AccountingKnownness::Uncertain {
+            return Err(HistoryError::InvalidRecord);
+        }
+        totals.knownness = match entry.baseline.to_public() {
+            AccountingBaseline::UnknownLegacy => AccountingKnownness::UnknownLegacy,
+            AccountingBaseline::FreshKnownZero => AccountingKnownness::UnknownUsage,
+        };
+        entry.totals = Delta::from_public(&totals);
+        // The revision stays where the uncertain receipt left it: a settled
+        // attempt is always exactly one revision behind its namespace.
+        entry.pending = None;
+        entry.last = Some(Settlement {
+            reference: pending.reference,
+            receipt: Some(receipt),
+            refused: None,
+        });
+        let checkpoint = entry.checkpoint_detailed(&self.owner)?;
+        self.save(&layout, &container)?;
+        Ok(checkpoint)
+    }
+
     fn check_archive_capacity(&self, minimum_record_bytes: u64) -> Result<(), HistoryError> {
         if minimum_record_bytes > MAX_COMPACTION_SOURCE_BYTES as u64 {
             return Err(HistoryError::TooLarge);
@@ -1703,6 +1756,7 @@ enum Purpose {
     Ordinary,
     Chunk,
     Merge,
+    Housekeeping,
 }
 impl Purpose {
     fn from_public(v: AttemptPurpose) -> Self {
@@ -1710,6 +1764,7 @@ impl Purpose {
             AttemptPurpose::Ordinary => Self::Ordinary,
             AttemptPurpose::Chunk => Self::Chunk,
             AttemptPurpose::Merge => Self::Merge,
+            AttemptPurpose::Housekeeping => Self::Housekeeping,
         }
     }
     fn to_public(self) -> AttemptPurpose {
@@ -1717,6 +1772,7 @@ impl Purpose {
             Self::Ordinary => AttemptPurpose::Ordinary,
             Self::Chunk => AttemptPurpose::Chunk,
             Self::Merge => AttemptPurpose::Merge,
+            Self::Housekeeping => AttemptPurpose::Housekeeping,
         }
     }
 }
@@ -2164,7 +2220,11 @@ fn validate_container(container: &Container, owner: &str) -> Result<(), HistoryE
             if let (Some(stored), None) = (&last.receipt, &last.refused) {
                 let receipt = stored.to_public();
                 receipt.validate()?;
-                if receipt.knownness == AccountingKnownness::Uncertain
+                // An uncertain receipt is the last settlement only of an
+                // attempt that was abandoned, and totals that have been
+                // through that are never fully known again.
+                let abandoned = totals.knownness != AccountingKnownness::Known;
+                if (receipt.knownness == AccountingKnownness::Uncertain && !abandoned)
                     || receipt.request_id != reference.request_id
                     || reference
                         .revision
@@ -2770,6 +2830,91 @@ mod tests {
             .policy_revision
             .push_str("-changed");
         assert_eq!(journal.publish_record(&record), Err(HistoryError::Conflict));
+    }
+
+    #[test]
+    fn an_uncertain_attempt_can_be_abandoned_and_the_namespace_takes_requests_again() {
+        let tree = Tree::new();
+        let journal = tree.journal();
+        journal
+            .initialize_accounting(AccountingBaseline::FreshKnownZero)
+            .unwrap();
+        let first = journal
+            .begin_attempt(
+                AccountingRevision(0),
+                &intent("known-first", AttemptPurpose::Ordinary),
+            )
+            .unwrap();
+        let known = journal
+            .settle_attempt(&first, &receipt("known-first", AttemptPurpose::Ordinary))
+            .unwrap();
+        let stopped = journal
+            .begin_attempt(known.revision, &intent("stopped", AttemptPurpose::Ordinary))
+            .unwrap();
+        // Nothing has been received for it yet: there is nothing to abandon.
+        assert_eq!(
+            journal.abandon_uncertain(&stopped).err(),
+            Some(HistoryError::Conflict)
+        );
+        let uncertain = RequestAccountingReceipt {
+            request_id: "stopped".into(),
+            purpose: AttemptPurpose::Ordinary,
+            totals: AccountingTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: None,
+            },
+            usage: None,
+            knownness: AccountingKnownness::Uncertain,
+            completed: false,
+        };
+        let blocked = journal.settle_attempt(&stopped, &uncertain).unwrap();
+        assert!(blocked.pending.as_ref().unwrap().uncertain);
+        // Another attempt's reference abandons nothing.
+        assert_eq!(
+            journal.abandon_uncertain(&first).err(),
+            Some(HistoryError::Conflict)
+        );
+
+        let abandoned = journal.abandon_uncertain(&stopped).unwrap();
+        assert!(abandoned.pending().is_none());
+        assert_eq!(abandoned.revision(), blocked.revision);
+        assert_eq!(
+            abandoned.totals().knownness,
+            AccountingKnownness::UnknownUsage
+        );
+        // What was known stays known; nothing is added for the stopped one.
+        assert_eq!(
+            abandoned.totals().ordinary.input_tokens,
+            known.totals.ordinary.input_tokens
+        );
+        assert_eq!(abandoned.totals().ordinary.cost_microcents, None);
+        assert_eq!(
+            abandoned.known_priced_subtotals(),
+            blocked.known_priced_subtotals
+        );
+        // The stored form is valid, reopens, and repeating changes nothing.
+        let reopened = context_journal(&tree.home, "owner", None).unwrap();
+        assert_eq!(
+            reopened.accounting_checkpoint_detailed().unwrap(),
+            abandoned
+        );
+        assert_eq!(reopened.abandon_uncertain(&stopped).unwrap(), abandoned);
+        let inspected = inspect_accounting_detailed(&tree.home, "owner", None).unwrap();
+        assert_eq!(inspected.pending_receipt, None);
+        assert_eq!(inspected.last_legacy_receipt, Some(uncertain));
+        // The namespace takes requests again.
+        let next = reopened
+            .begin_attempt(
+                abandoned.revision(),
+                &intent("after", AttemptPurpose::Ordinary),
+            )
+            .unwrap();
+        let after = reopened
+            .settle_attempt(&next, &receipt("after", AttemptPurpose::Ordinary))
+            .unwrap();
+        assert!(after.pending.is_none());
+        assert_eq!(after.totals.knownness, AccountingKnownness::UnknownUsage);
     }
 
     #[test]

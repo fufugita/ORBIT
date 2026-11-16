@@ -16,7 +16,7 @@ fn resolve(cx: &ToolContext, raw: &str) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
     } else {
-        cx.working_dir.join(p)
+        cx.cwd().join(p)
     }
 }
 

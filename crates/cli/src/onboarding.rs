@@ -141,8 +141,29 @@ fn selected_answer(
     match value {
         "back" if allow_back => Some(SetupSelection::Back),
         "cancel" => Some(SetupSelection::Canceled),
-        _ => None,
+        _ => named_row(value, choices),
     }
+}
+
+/// The one row of a list to tick whose label, after its check box, is
+/// exactly what was typed: a model there is chosen by its name as it is
+/// shown. Rows without a check box are chosen by number or identity only;
+/// a label is never an alias for them.
+fn named_row(value: &str, choices: &[SetupChoice<'_>]) -> Option<SetupSelection> {
+    let name = |label: &str| -> Option<String> {
+        label
+            .strip_prefix("[ ] ")
+            .or_else(|| label.strip_prefix("[x] "))
+            .map(|name| name.trim().to_owned())
+    };
+    let mut matching = choices.iter().filter(|choice| {
+        name(choice.label).is_some_and(|name| name.eq_ignore_ascii_case(value.trim()))
+    });
+    let first = matching.next()?;
+    matching
+        .next()
+        .is_none()
+        .then(|| SetupSelection::Chosen(first.id.to_owned()))
 }
 
 fn plain_select<T: SetupTerminal + ?Sized>(
@@ -425,8 +446,26 @@ fn stage<T: SetupTerminal>(
     title: &str,
     detail: &str,
 ) -> Result<(), OnboardingError> {
+    // A terminal that takes colour gets the step drawn: where it is among
+    // the six, its name, what it asks. Plain keeps its two lines, byte for
+    // byte, for scripted journeys.
+    if terminal.rich_choices_available() {
+        return terminal.message(&crate::setup_terminal_ui::stage_header(
+            crate::setup_terminal_ui::depth_from_env(),
+            rich_columns(),
+            number,
+            6,
+            title,
+            detail,
+        ));
+    }
     terminal.message(&format!("\nORBIT SETUP  {number}/6  {title}"))?;
     terminal.message(detail)
+}
+
+/// The width a rich terminal's scroll-back is drawn for.
+fn rich_columns() -> usize {
+    terminal_dimensions().map_or(80, |(columns, _)| columns.max(1))
 }
 
 enum FieldRecovery {
@@ -434,10 +473,17 @@ enum FieldRecovery {
     Back,
 }
 
+/// What was wrong with the field being corrected, for the full-screen
+/// choice that follows: the message itself scrolls out of sight behind it.
+static FIELD_PROBLEM: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+
 fn recover_field<T: SetupTerminal>(
     terminal: &mut T,
     message: &'static str,
 ) -> Result<FieldRecovery, OnboardingError> {
+    if let Ok(mut problem) = FIELD_PROBLEM.lock() {
+        *problem = message;
+    }
     terminal.message(message)?;
     match terminal.select(
         "Correct this field",
@@ -874,19 +920,24 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
     let _ = ProviderCredentialStore::new(home)?;
     let baseline = setup::plan_setup(home, &SetupRequest::default())?;
     let existing = config_snapshot(home)?;
-    // Rich terminals get a small ASCII wordmark; plain keeps the bare name so
-    // scripted journeys stay byte-identical (wizard item 7, task T7).
+    // Rich terminals open with ORBIT's mark, as the terminal chat's welcome
+    // draws it; plain keeps the bare name and the same words so scripted
+    // journeys stay byte-identical.
+    const INTRODUCTION: &str = "Connect a provider, choose a model, then review and save.\nNothing is saved until you confirm. Ctrl-C cancels. Manual model entry works offline.";
     if terminal.rich_choices_available() {
-        terminal.message(concat!(
-            " ___  ____  ____  ____  ___\n",
-            "/ __)(  _ \\(  _ \\(  _ \\/ __)\n",
-            "( (__ ) __/ )   / ) __/\\__ \\\n",
-            " \\___)(_)  (__\\_)(_)  (___/\n",
+        let depth = crate::setup_terminal_ui::depth_from_env();
+        let columns = rich_columns();
+        terminal.message(&crate::setup_terminal_ui::banner(depth, columns))?;
+        terminal.message("")?;
+        terminal.message(&crate::setup_terminal_ui::note(
+            depth,
+            columns,
+            INTRODUCTION,
         ))?;
     } else {
         terminal.message("ORBIT")?;
+        terminal.message(INTRODUCTION)?;
     }
-    terminal.message("Connect a provider, choose a model, then review and save.\nNothing is saved until you confirm. Ctrl-C cancels. Manual model entry works offline.")?;
     let offered = crate::presets::presets();
     let mut preset = preset_id
         .map(|id| {
@@ -914,7 +965,7 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
                     "Provider",
                     "Choose a preset or a custom compatible endpoint.",
                 )?;
-                // The easiest path leads when one is offered (task T4): a
+                // The easiest path leads when one is offered: a
                 // browser-capable preset becomes a headline choice above the
                 // plain preset list. The numbered plain grammar keeps the
                 // same order, so scripted journeys see one extra choice.
@@ -2416,7 +2467,7 @@ fn choose_catalog_rich<T: SetupTerminal>(
         }
         match choice.as_str() {
             FILTER => {
-                let query = terminal.line("Filter models (blank shows all)", 128)?;
+                let query = terminal.line("Filter models (blank shows all): ", 128)?;
                 filter = query.trim().to_lowercase();
                 page = 0;
                 focus = filtered
@@ -2604,6 +2655,11 @@ fn fallback_after_error<T: SetupTerminal>(
             Err(OnboardingError::Credential(error))
         }
         _ => {
+            if matches!(error, OnboardingError::Credential(_)) {
+                terminal.message(
+                    "No credential is available for this provider yet: the variable it reads is not set and no key is saved.",
+                )?;
+            }
             terminal.message("Discovery unavailable. Enter raw model IDs manually; no provider configuration was saved.")?;
             manual_selection(terminal, "manual_fallback")
         }
@@ -3017,10 +3073,16 @@ impl StdSetupTerminal {
             choices.len(),
             current.and_then(|id| choices.iter().position(|choice| choice.id == id)),
         );
+        let depth = ui::depth_from_env();
         let mut typed = Vec::new();
         let mut escaped = Vec::new();
         let mut escape_started = None;
-        let mut error = "";
+        // The screen that asks to correct a field opens with what was wrong.
+        let mut error = if prompt == "Correct this field" {
+            FIELD_PROBLEM.lock().map_or("", |problem| *problem)
+        } else {
+            ""
+        };
         let mut redraw = true;
         let mut last_dimensions = None;
         let result = (|| {
@@ -3032,29 +3094,50 @@ impl StdSetupTerminal {
                 if columns < 24 || rows < 8 {
                     return Ok(None);
                 }
-                let mut frame =
-                    ui::frame(prompt, choices, &menu, &typed, columns, rows, allow_back);
-                frame.lines[2] = ui::clip(error, columns.saturating_sub(1));
+                // A terminal with room gets the panel under the mark; a
+                // small one the plain frame, a line per choice.
+                let roomy = columns >= ui::SCREEN_MIN.0 && rows >= ui::SCREEN_MIN.1;
+                let (lines, page): (Vec<Vec<u8>>, usize) = if roomy {
+                    let screen = ui::screen(
+                        prompt, choices, &menu, &typed, error, columns, rows, allow_back, depth,
+                    );
+                    (
+                        screen.lines.into_iter().map(String::into_bytes).collect(),
+                        screen.page,
+                    )
+                } else {
+                    let mut frame =
+                        ui::frame(prompt, choices, &menu, &typed, columns, rows, allow_back);
+                    frame.lines[2] = ui::clip(error, columns.saturating_sub(1));
+                    let selected_line = frame.selected_line;
+                    let styled = frame
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .map(|(index, line)| {
+                            let style: &[u8] = if index == 0 {
+                                b"\x1b[1;35m"
+                            } else if index == selected_line {
+                                b"\x1b[1;36m"
+                            } else if index == 2 && !error.is_empty() {
+                                b"\x1b[33m"
+                            } else {
+                                b"\x1b[0m"
+                            };
+                            [style, line.as_bytes(), b"\x1b[0m"].concat()
+                        })
+                        .collect();
+                    (styled, frame.page)
+                };
                 if redraw || last_dimensions != Some((columns, rows)) {
                     out.write_all(b"\x1b[H\x1b[2J")
                         .map_err(|_| OnboardingError::TerminalIo)?;
-                    for (index, line) in frame.lines.iter().enumerate() {
+                    for (index, line) in lines.iter().enumerate() {
                         if index > 0 {
                             out.write_all(b"\r\n")
                                 .map_err(|_| OnboardingError::TerminalIo)?;
                         }
-                        let style: &[u8] = if index == 0 {
-                            b"\x1b[1;35m"
-                        } else if index == frame.selected_line {
-                            b"\x1b[1;36m"
-                        } else if index == 2 && !error.is_empty() {
-                            b"\x1b[33m"
-                        } else {
-                            b"\x1b[0m"
-                        };
-                        out.write_all(style)
-                            .and_then(|()| out.write_all(line.as_bytes()))
-                            .and_then(|()| out.write_all(b"\x1b[0m"))
+                        out.write_all(line)
                             .map_err(|_| OnboardingError::TerminalIo)?;
                     }
                     out.flush().map_err(|_| OnboardingError::TerminalIo)?;
@@ -3142,7 +3225,7 @@ impl StdSetupTerminal {
                     Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown => {
                         typed.clear();
                         error = "";
-                        menu.navigate(event, frame.page);
+                        menu.navigate(event, page);
                     }
                     Key::Erase => {
                         if !typed.is_empty() {
@@ -3233,6 +3316,19 @@ impl StdSetupTerminal {
         // Enter hidden mode before publishing the prompt: a fast paste must not
         // race terminal echo while the caller is waiting for the key prompt.
         let mut out = std::io::stdout().lock();
+        // A terminal that takes colour gets the question marked the way
+        // the choice screen marks its input line.
+        let styled;
+        let prompt = if self.rich_choices_available() && !prompt.contains('\x1b') {
+            styled = crate::setup_terminal_ui::question(
+                crate::setup_terminal_ui::depth_from_env(),
+                rich_columns(),
+                prompt,
+            );
+            styled.as_str()
+        } else {
+            prompt
+        };
         out.write_all(prompt.as_bytes())
             .and_then(|()| out.flush())
             .map_err(|_| OnboardingError::TerminalIo)?;
@@ -3373,6 +3469,21 @@ impl SetupTerminal for StdSetupTerminal {
         plain_select(self, prompt, choices, current, allow_back)
     }
     fn message(&mut self, message: &str) -> Result<(), OnboardingError> {
+        // In a terminal that takes colour, plain words of the setup sit
+        // under the same margin and in the same quiet colour as the rest.
+        // Nothing is cut: an address to copy stays whole. A message that
+        // brings its own colours is written as it is.
+        let styled;
+        let message = if self.rich_choices_available() && !message.contains('\x1b') {
+            styled = crate::setup_terminal_ui::plain_note(
+                crate::setup_terminal_ui::depth_from_env(),
+                rich_columns(),
+                message,
+            );
+            styled.as_str()
+        } else {
+            message
+        };
         let mut out = std::io::stdout().lock();
         out.write_all(message.as_bytes())
             .and_then(|()| out.write_all(b"\n"))

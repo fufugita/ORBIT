@@ -19,10 +19,141 @@ use orbit_cli::session_accounting::{self, FullCostStatus, NamespaceSpendPolicy, 
 use orbit_cli::tui_worker;
 use orbit_cli::{config, sessions, tool_runtime, tools};
 
+/// Flags ORBIT shares with Claude Code that set up the run and nothing
+/// else: taken out of the arguments here, before any command grammar sees
+/// them, and handed on through the environment. A `-p` prompt is never
+/// read as a flag.
+fn take_setup_flags(args: Vec<String>) -> Result<Vec<String>, String> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let variable = match arg.as_str() {
+            "-p" | "--print" => {
+                kept.push(arg);
+                kept.extend(args.next());
+                continue;
+            }
+            // Everything after a bare `--` belongs to someone else (the
+            // command line of an MCP server given to `orbit mcp add`).
+            "--" => {
+                kept.push(arg);
+                kept.extend(args);
+                break;
+            }
+            // Claude Code's setup triggers: run the `Setup` hooks, then
+            // start (or, with --init-only, stop).
+            "--init" | "--init-only" | "--maintenance" => {
+                let trigger = if arg == "--maintenance" {
+                    "maintenance"
+                } else {
+                    "init"
+                };
+                // SAFETY: the first statement of `main`, before any thread exists.
+                unsafe {
+                    if arg == "--init-only" {
+                        std::env::set_var("ORBIT_SETUP_ONLY", "1");
+                    }
+                    // `--maintenance --init-only` stays a maintenance run.
+                    if arg != "--init-only" || std::env::var_os("ORBIT_SETUP_TRIGGER").is_none() {
+                        std::env::set_var("ORBIT_SETUP_TRIGGER", trigger);
+                    }
+                }
+                continue;
+            }
+            "--append-system-prompt" => "ORBIT_APPEND_SYSTEM_PROMPT",
+            "--append-system-prompt-file" => "ORBIT_APPEND_SYSTEM_PROMPT",
+            "--output-style" => "ORBIT_OUTPUT_STYLE",
+            "--fallback-model" => "ORBIT_FALLBACK_MODEL",
+            "--channels" => "ORBIT_CHANNELS",
+            "--channel-permissions" => "ORBIT_CHANNEL_PERMISSIONS",
+            "--settings" => "ORBIT_SETTINGS_FILE",
+            "--add-dir" => "ORBIT_ADD_DIRS",
+            "--mcp-config" => "ORBIT_MCP_CONFIG",
+            _ => {
+                kept.push(arg);
+                continue;
+            }
+        };
+        let value = args.next().ok_or_else(|| format!("{arg} needs a value"))?;
+        let value = if arg == "--append-system-prompt-file" {
+            std::fs::read_to_string(&value).map_err(|error| format!("{arg} {value}: {error}"))?
+        } else if arg == "--mcp-config" || arg == "--settings" {
+            // Later code may change directory; keep the path absolute.
+            std::path::absolute(&value)
+                .map_err(|error| format!("{arg} {value}: {error}"))?
+                .to_string_lossy()
+                .into_owned()
+        } else if arg == "--add-dir" {
+            // Repeatable: each one joins the list, in PATH form.
+            let dir =
+                std::path::absolute(&value).map_err(|error| format!("{arg} {value}: {error}"))?;
+            if !dir.is_dir() {
+                return Err(format!("{arg} {value}: not a directory"));
+            }
+            let mut dirs: Vec<std::path::PathBuf> = std::env::var_os(variable)
+                .map(|listed| std::env::split_paths(&listed).collect())
+                .unwrap_or_default();
+            dirs.push(dir);
+            std::env::join_paths(dirs)
+                .map_err(|error| format!("{arg} {value}: {error}"))?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            value
+        };
+        // SAFETY: the first statement of `main`, before any thread exists.
+        unsafe { std::env::set_var(variable, value) };
+    }
+    // The prompt a chat hands to its fallback chat is taken out of the
+    // environment here, so nothing this process starts inherits it.
+    if let Ok(prompt) = std::env::var(orbit_cli::fallback::CHAT_FIRST_PROMPT) {
+        // SAFETY: the first statement of `main`, before any thread exists.
+        unsafe { std::env::remove_var(orbit_cli::fallback::CHAT_FIRST_PROMPT) };
+        if !prompt.trim().is_empty() {
+            let _ = CHAT_FIRST_PROMPT.set(prompt);
+        }
+    }
+    Ok(kept)
+}
+
+/// The prompt a plain chat asks first when it was started as another chat's
+/// fallback (see `fallback::chat_rerun`).
+static CHAT_FIRST_PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The fallback chat a plain chat asked for as it ended: the model, the
+/// fork of its conversation, and the prompt that went unanswered.
+static FALLBACK_CHAT: std::sync::Mutex<Option<(String, String, String)>> =
+    std::sync::Mutex::new(None);
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = match take_setup_flags(std::env::args().skip(1).collect()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("ORBIT-E1101: {error}");
+            std::process::exit(1);
+        }
+    };
     if let Some(code) = orbit_cli::recovery_commands::try_run(&args) {
         std::process::exit(code);
+    }
+    // `--init`, `--init-only`, `--maintenance`: the Setup hooks run once,
+    // before anything else starts. They are observational: a failing hook
+    // is reported and the session still starts.
+    if let Ok(trigger) = std::env::var("ORBIT_SETUP_TRIGGER") {
+        let home = config::resolve_home(&args);
+        let hooks =
+            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
+        for outcome in hooks.fire(
+            orbit_engine::hooks::HookEvent::Setup,
+            &serde_json::json!({ "trigger": trigger }),
+        ) {
+            if outcome.exit_code != 0 && !outcome.stderr.trim().is_empty() {
+                eprintln!("setup hook: {}", outcome.stderr.trim());
+            }
+        }
+        if std::env::var_os("ORBIT_SETUP_ONLY").is_some() {
+            std::process::exit(0);
+        }
     }
     // Local compaction has its own complete grammar, including rejection of
     // help/prompt/model overrides before any ownership or discovery effects.
@@ -51,7 +182,7 @@ fn main() {
     // A prompt is arbitrary text. Only a top-level -p selects headless mode;
     // operands of local commands cannot change the execution path.
     if headless_prompt_index(&args).is_some() {
-        let headless = match headless_arguments(&args) {
+        let headless = match headless_arguments_with_input(&args) {
             Ok(arguments) => arguments,
             Err(error) => {
                 eprintln!("ORBIT-E1101: {error}");
@@ -63,6 +194,15 @@ fn main() {
     // C1: `--help`/`-h` print HUMAN help (exit 0); `--version` prints the
     // version line. The machine-readable forms stay on the verbs:
     // `orbit help --json` and `orbit version` (JSON).
+    // `orbit provider --help` (and `orbit provider role --help`): the
+    // provider commands, not the whole program's help.
+    if first_word == Some("provider")
+        && !args.iter().any(|a| a == "--json")
+        && args.iter().any(|a| a == "--help" || a == "-h")
+    {
+        println!("{PROVIDER_USAGE}");
+        std::process::exit(0);
+    }
     if first_word != Some("plugin") && args.iter().any(|a| a == "--help" || a == "-h") {
         if args.iter().any(|a| a == "--json") {
             let value = dispatch(&["help".into(), "--json".into()]).expect("static help command");
@@ -100,7 +240,14 @@ fn main() {
         _ => {}
     }
     if wants_chat {
-        let code = cmd_chat(&args);
+        let mut code = cmd_chat(&args);
+        // A plain chat that fell back hands over here, once everything it
+        // held has been let go of.
+        if let Some((spec, fork, prompt)) =
+            FALLBACK_CHAT.lock().ok().and_then(|mut chat| chat.take())
+        {
+            code = orbit_cli::fallback::chat_rerun(&args, &spec, &fork, &prompt);
+        }
         std::process::exit(code);
     }
 
@@ -112,10 +259,27 @@ fn main() {
                 || (command == "init"
                     && v.get("interactive").and_then(serde_json::Value::as_bool) == Some(true)))
                 && !args.iter().any(|arg| arg == "--json");
-            if command == "config" && !args.iter().any(|arg| arg == "--json") {
+            if command == "config"
+                && v["command"] == "config import-claude"
+                && !args.iter().any(|arg| arg == "--json")
+            {
+                print!("{}", orbit_cli::claude_permissions::human_report(&v));
+            } else if command == "migrate" && !args.iter().any(|arg| arg == "--json") {
+                print!("{}", orbit_cli::migration::human_report(&v));
+            } else if command == "completions" && !args.iter().any(|arg| arg == "--json") {
+                print!("{}", v["script"].as_str().unwrap_or_default());
+            } else if command == "config" && !args.iter().any(|arg| arg == "--json") {
                 print!("{}", orbit_cli::configuration_ui::human_report(&v));
             } else if command == "plugin" && !args.iter().any(|arg| arg == "--json") {
                 print!("{}", orbit_cli::plugin_commands::human_report(&v));
+            } else if command == "mcp"
+                // After `--` the words are the server's command line.
+                && !args
+                    .iter()
+                    .take_while(|arg| *arg != "--")
+                    .any(|arg| arg == "--json")
+            {
+                print!("{}", orbit_cli::mcp_commands::human_report(&v));
             } else if human {
                 print!("{}", orbit_cli::cli_release_commands::human_report(&v));
             } else {
@@ -182,6 +346,14 @@ fn print_human_help() {
             "offline readiness; never starts configured servers",
         ),
         (
+            "migrate --from claude [--json]",
+            "read-only migration checks and next steps",
+        ),
+        (
+            "completions bash|zsh|fish [--json]",
+            "emit shell completion scripts",
+        ),
+        (
             "pentest init/status/templates/readiness",
             "local engagement workspaces and templates",
         ),
@@ -189,7 +361,10 @@ fn print_human_help() {
             "customize show/set/import/export/reset",
             "appearance, layouts and named panes",
         ),
-        ("theme NAME", "select orbit, midnight or paper"),
+        (
+            "theme NAME",
+            "select orbit, midnight, paper, aespa-pastel or kwangya-ice",
+        ),
         ("models", "list models from all configured providers"),
         (
             "provider add/list/remove/role/presets",
@@ -315,12 +490,44 @@ fn print_human_help() {
         ),
         ("--no-tui", "plain REPL instead of the TUI"),
         (
+            "--bare",
+            "start with minimal configuration and integrations",
+        ),
+        (
+            "--worktree <NAME>",
+            "create or enter an isolated Git worktree",
+        ),
+        (
+            "--permission-mode <MODE>",
+            "select the session's permission mode",
+        ),
+        ("--allowedTools <LIST>", "allow tools by permission rule"),
+        ("--disallowedTools <LIST>", "deny tools by permission rule"),
+        (
+            "--fallback-model <MODEL>",
+            "use a fallback before any completed tool rounds",
+        ),
+        ("--settings <FILE>", "load an additional settings file"),
+        (
+            "--add-dir <DIR>",
+            "add a tool working directory (repeatable)",
+        ),
+        (
+            "--mcp-config <FILE>",
+            "select an explicit MCP configuration file",
+        ),
+        ("--channels <LIST>", "enable named MCP event channels"),
+        (
+            "--channel-permissions <LIST>",
+            "allow listed channels to answer approvals",
+        ),
+        (
             "--safe-customization",
             "read-only session defaults; preserve malformed stored files",
         ),
         (
             "--auto-tools",
-            "TUI/chat: run tools without asking (bypass)",
+            "allow uncovered tools; explicit ask/deny rules still apply",
         ),
     ] {
         println!("    {name:<28} {desc}");
@@ -380,6 +587,12 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "setup" => cmd_setup(&home, args, false),
         "config" => cmd_config(&home, args),
         "doctor" => orbit_cli::cli_release_commands::doctor(&home, &command_tail(args)?),
+        "migrate" => orbit_cli::migration::command(
+            &home,
+            &std::env::current_dir().map_err(ioe)?,
+            &command_tail(args)?,
+        )
+        .map_err(|error| ("ORBIT-E1101", error)),
         "pentest" => orbit_cli::cli_release_commands::pentest(&home, &command_tail(args)?),
         "customize" | "theme" => {
             let mut tail = command_tail(args)?;
@@ -415,12 +628,32 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             orbit_cli::CliError::V02Only(message) => ("ORBIT-E110C", message),
             orbit_cli::CliError::ConfirmRequired(message) => ("ORBIT-E1911", message),
         }),
+        "mcp" => orbit_cli::mcp_commands::command(
+            &home,
+            &std::env::current_dir().map_err(ioe)?,
+            &command_tail(args)?,
+        )
+        .map_err(|error| match error {
+            orbit_cli::CliError::Usage(message) => ("ORBIT-E1101", message),
+            orbit_cli::CliError::ConfigInvalid(message) => ("ORBIT-E1106", message),
+            other => ("ORBIT-E1106", other.to_string()),
+        }),
         "folder" => cmd_folder(&home, args),
         "provider" => cmd_provider(&home, args),
         "route" => cmd_route(&home, args),
         "completions" => {
             let tail = command_tail(args)?;
-            let shell = tail.first().map(String::as_str).unwrap_or("bash");
+            let words: Vec<&str> = tail.iter().map(String::as_str).collect();
+            let shell = match words.as_slice() {
+                [] | ["--json"] => "bash",
+                [shell] | [shell, "--json"] | ["--json", shell] => shell,
+                _ => {
+                    return Err((
+                        "ORBIT-E1101",
+                        "usage: completions [bash|zsh|fish] [--json]".into(),
+                    ));
+                }
+            };
             emit_completions(shell)
         }
         "version" => Ok(serde_json::to_value(orbit_cli::version_evidence(
@@ -440,10 +673,12 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "init          terminal setup wizard; --no-provider initializes offline",
                 "config [show] [--json]  interactive defaults, routing and appearance; show is read-only",
                 "doctor [--json] offline readiness without server startup",
-                "pentest init|status|templates|readiness local engagement workflows",
+                "migrate --from claude [--json]  read-only migration checks and next steps",
+                "pentest init|status|templates|readiness|finding|evidence local engagement workflows",
                 "customize show|capabilities|set|theme|reset|validate|import|export portable customization",
                 "theme NAME    select a built-in appearance",
                 "models        list models from all configured providers",
+                "mcp add|list|get|remove  edit the MCP server list (configuration only)",
                 "route status|test|setup|set|reset|auto  configure and preview model routing",
                 "ask PROMPT    send one prompt through a configured gateway",
                 "compact --session ID [--home PATH] [--json]  compact an inactive saved session",
@@ -531,6 +766,27 @@ fn cmd_config(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
                 && std::io::IsTerminal::is_terminal(&std::io::stdout())
         }
         ["show"] | ["--json"] | ["show", "--json"] => false,
+        // The permission rules of a Claude Code settings.json, carried over
+        // on request: listed first, written only with --apply.
+        ["import-claude", flags @ ..]
+            if flags
+                .iter()
+                .all(|flag| matches!(*flag, "--apply" | "--json")) =>
+        {
+            let workspace = std::env::current_dir().map_err(ioe)?;
+            let tools: Vec<String> = tools::tool_definitions()
+                .into_iter()
+                .map(|tool| tool.name)
+                .chain(["Skill", "Task", "Agent"].map(String::from))
+                .collect();
+            return orbit_cli::claude_permissions::import(
+                home,
+                &workspace,
+                &tools,
+                flags.contains(&"--apply"),
+            )
+            .map_err(|error| ("ORBIT-E1106", error));
+        }
         _ => return Err(("ORBIT-E1101", "usage: config [show] [--json]".into())),
     };
     let workspace = std::env::current_dir().map_err(ioe)?;
@@ -1236,8 +1492,8 @@ fn cmd_export(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
         .map_err(|e| ("ORBIT-E0508", e.to_string()))?;
     std::fs::write(&to, &sealed).map_err(ioe)?;
     // Persist local identity next to bundle (0600) for restore; v0.1 local-only.
-    std::fs::write(
-        format!("{to}.key"),
+    write_private_file(
+        Path::new(&format!("{to}.key")),
         identity.to_string().expose_secret().as_bytes(),
     )
     .map_err(ioe)?;
@@ -1246,13 +1502,34 @@ fn cmd_export(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
     )
 }
 
+/// Write a file only its owner can read: created 0600, and set to 0600
+/// when it was already there with wider permissions. The key that opens an
+/// export was written with the default mode (readable by everyone on most
+/// systems) under a comment that said 0600.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
+}
+
 /// `orbit restore <archive> --into <fresh-home>`: decrypt + immutable namespace.
 fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
-    let archive = args
-        .get(1)
-        .ok_or(("ORBIT-E1101", "restore requires archive".into()))?;
     let into =
         value_after(args, "--into").ok_or(("ORBIT-E1101", "restore requires --into".into()))?;
+    // The archive is the word after `restore` that is not an option's
+    // value: `orbit --home H restore A --into D` used to read `H` as it.
+    let archive = positionals(args)
+        .into_iter()
+        .skip(1)
+        .find(|word| *word != into)
+        .ok_or(("ORBIT-E1101", "restore requires archive".into()))?;
     let into_path = PathBuf::from(&into);
     if into_path.exists() {
         return Err(("ORBIT-E0509", "restore target exists; must be fresh".into()));
@@ -1294,9 +1571,15 @@ fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
 /// - `ORBIT_GATE_TOKEN` — optional bearer token (never printed/persisted)
 fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     ensure_initialized(home)?;
-    let prompt = args
-        .get(1)
-        .ok_or(("ORBIT-E1101", "ask requires a prompt".into()))?;
+    // The prompt is the word after `ask`. With options before the command
+    // (`orbit --home H ask "…"`) the second argument is an option's value,
+    // which used to be sent as the prompt.
+    let prompt = if args.first().map(String::as_str) == Some("ask") {
+        args.get(1).map(String::as_str)
+    } else {
+        positionals(args).get(1).copied()
+    }
+    .ok_or(("ORBIT-E1101", "ask requires a prompt".into()))?;
     let model = value_after(args, "--model")
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
         .ok_or(("ORBIT-E1101", "ask requires --model or ORBIT_MODEL".into()))?;
@@ -1653,7 +1936,7 @@ fn print_compact_output(value: &serde_json::Value, json: bool) {
         println!("{value}");
     } else {
         println!(
-            "compaction: {} ({}); applied={}, snapshot_saved={}; known cost {} microcents; full cost {}",
+            "compaction: {} ({}); applied={}, snapshot_saved={}; known cost {} micro-dollars; full cost {}",
             value["status"].as_str().unwrap_or("unknown"),
             value["reason"].as_str().unwrap_or("unavailable"),
             value["applied"],
@@ -1976,7 +2259,62 @@ fn owned_startup_session_with_origin(
             .map_err(|error| error.to_string())?
     };
     if !forking {
-        return Ok((source_lease, Some(saved), RootOrigin::RestoredOrLegacy));
+        // A request that was stopped or timed out before its outcome was
+        // known leaves a session that admits nothing more. For a person at
+        // a terminal the chat goes on in the same session: the stopped
+        // request is closed as abandoned and the cost before now is
+        // unknown. Anything scripted (piped input, a server, a headless
+        // run) keeps the plain refusal and changes nothing.
+        let blocked = kind == "chat"
+            && adopting == 0
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && orbit_cli::session_accounting::admission_blocked_for(
+                home,
+                source_lease.session_id(),
+            );
+        if !blocked {
+            // A session whose stopped request was abandoned, but whose file
+            // was last written while that request was still pending (the
+            // process ended in between): the file is brought up to date.
+            if let Some(watermark) = saved.accounting_watermark.as_mut()
+                && watermark.full_cost_status
+                    == orbit_cli::session_accounting::FullCostStatus::Uncertain
+                && let Some(status) = orbit_cli::session_accounting::abandoned_status_for(
+                    home,
+                    source_lease.session_id(),
+                )
+            {
+                watermark.full_cost_status = status;
+                source_lease
+                    .save(&saved)
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok((source_lease, Some(saved), RootOrigin::RestoredOrLegacy));
+        }
+        if let Ok(Some(status)) =
+            orbit_cli::session_accounting::abandon_stopped_for(home, source_lease.session_id())
+        {
+            // The saved session still says the request is pending.
+            if let Some(watermark) = saved.accounting_watermark.as_mut() {
+                watermark.full_cost_status = status;
+                source_lease
+                    .save(&saved)
+                    .map_err(|error| error.to_string())?;
+            }
+            eprintln!(
+                "Session {} ended with a request whose outcome is unknown (stopped or timed out). It may still have been billed; the session goes on, and its cost is shown as a lower bound from here.",
+                source_lease.session_id()
+            );
+            return Ok((source_lease, Some(saved), RootOrigin::RestoredOrLegacy));
+        }
+        // It could not be closed that way (nothing was received for it at
+        // all): go on in a copy with the same conversation instead.
+        eprintln!(
+            "Session {} ended with a request whose outcome is unknown, so it takes no more requests.\nContinuing in a copy with the same conversation: {fresh_id}\nTo look at the original: orbit recovery status --session {}",
+            source_lease.session_id(),
+            source_lease.session_id()
+        );
     }
     let lease =
         sessions::SessionLease::acquire(home, fresh_id, kind).map_err(|error| error.to_string())?;
@@ -2346,6 +2684,10 @@ fn cmd_headless(args: &[String]) -> i32 {
         eprintln!("{code}: {msg}");
         return 1;
     }
+    // Before any MCP server starts: a server is told at its handshake
+    // whether it may ask the operator questions. Nobody is here to answer
+    // one; hooks may, and otherwise it is dismissed.
+    orbit_cli::elicitation::install(&home);
     let requested_gate =
         value_after(args, "--gate").or_else(|| std::env::var("ORBIT_GATE_URL").ok());
     let requested_model =
@@ -2376,7 +2718,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         && orbit_tools::permissions::PermissionMode::from_config(&mode).is_none()
     {
         eprintln!(
-            "ORBIT-E1101: unknown --permission-mode {mode} (default, acceptEdits, plan, dontAsk, bypass)"
+            "ORBIT-E1101: unknown --permission-mode {mode} (default, acceptEdits, auto, plan, dontAsk, bypass)"
         );
         return 1;
     }
@@ -2464,15 +2806,6 @@ fn cmd_headless(args: &[String]) -> i32 {
     // --resume load the prior transcript; after the turn the session
     // is saved so the next --continue finds it. Without this, a
     // killed session's work is lost (gate 4).
-    // A busy session refuses before any session-start hook can run.
-    {
-        let hooks =
-            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
-        let _ = hooks.fire(
-            orbit_engine::hooks::HookEvent::SessionStart,
-            &serde_json::json!({ "frontend": "headless" }),
-        );
-    }
     let selected_effort = match startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok()) {
         Ok(s) => sessions::startup_effort(s, resumed_file.as_ref(), &model, &provider_id),
         Err(e) => {
@@ -2497,6 +2830,15 @@ fn cmd_headless(args: &[String]) -> i32 {
         out_tokens = sf.output_tokens;
         cost_microcents = sf.cost_microcents;
         transcript = sf.to_transcript();
+        // A fallback run forks the conversation the failed run saved, which
+        // ends with this very prompt, unanswered. It is asked once.
+        if std::env::var_os(orbit_cli::fallback::RETRY_MARK).is_some()
+            && transcript.last().is_some_and(|message| {
+                message.role == orbit_adapter::types::ChatRole::User && message.content == prompt
+            })
+        {
+            transcript.pop();
+        }
     }
     let mut initial = sessions::SessionFile::from_chat(
         &session_id,
@@ -2594,11 +2936,49 @@ fn cmd_headless(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let tool_cx = orbit_tools::ToolContext::new(
+    let tool_cx = orbit_cli::tools::with_extra_dirs(orbit_tools::ToolContext::new(
         home.clone(),
         session_id.clone(),
         std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+    ));
+    // One headless prompt: the classifier bills to this session's
+    // housekeeping and sees the prompt itself as the operator context.
+    tool_cx.set_ext(orbit_cli::auto_mode::ClassifierAccounting {
+        owner_session_id: session_id.clone(),
+        spend_policy,
+    });
+    tool_cx.set_ext(orbit_cli::auto_mode::OperatorContext::from_messages([
+        prompt,
+    ]));
+    orbit_cli::hook_handlers::install(&home, &tool_cx);
+    // Session-start hooks, once the session is known (a busy session has
+    // already refused): every hook payload of this run names the session,
+    // its saved file and the permission mode, as an interactive session's
+    // does, and what a session-start hook prints is context for the model.
+    orbit_engine::hooks::set_permission_mode(scope.mode.config_name());
+    orbit_engine::hooks::set_session_context(
+        &session_id,
+        Some(&sessions::sessions_dir(&home).join(format!("{session_id}.json"))),
     );
+    let session_hook_context = {
+        let hooks =
+            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
+        let outcomes = hooks.fire(
+            orbit_engine::hooks::HookEvent::SessionStart,
+            &serde_json::json!({
+                "frontend": "headless",
+                "source": if resumed_file.is_some() { "resume" } else { "startup" },
+            }),
+        );
+        orbit_engine::hooks::prompt_context(&outcomes)
+            .map(|context| format!("\n\n## Session start hook output\n{context}"))
+            .unwrap_or_default()
+    };
+    // `--channels`: messages from the named servers reach this run's turn
+    // with its tool rounds.
+    for line in orbit_cli::channels::start(&home, &tool_cx) {
+        eprintln!("{line}");
+    }
     tool_runtime::remember_effort_setting(
         &tool_cx,
         if turn_config.provider_id == base_turn_config.provider_id
@@ -2673,7 +3053,12 @@ fn cmd_headless(args: &[String]) -> i32 {
         // directory, the platform, ORBIT.md and the tools (review
         // blocker 5).
         memory_bytes: session_prompt.memory_bytes,
-        system_directive: Some(session_prompt.text),
+        // With what the MCP servers in use say about themselves.
+        system_directive: Some(format!(
+            "{}{session_hook_context}{}",
+            session_prompt.text,
+            orbit_cli::tools::mcp_instructions_note_reporting(&home, &executor.tool_cx)
+        )),
         request_stem: "orbit-p".into(),
         session_id: session_id.clone(),
         compaction_config: Some(
@@ -2757,6 +3142,8 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     };
     signal_guard.sync_signal();
+    // The turn's trace begins here (when spans are exported).
+    orbit_cli::telemetry::turn_started(&home);
     let first = match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options)
         .map_err(|error| error.to_string())
         .and_then(|notices| {
@@ -2796,10 +3183,32 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
         Err(error) => Some(error),
     };
+    // --fallback-model: the selected model could not be reached at all and
+    // produced nothing. This session keeps the failed request for
+    // inspection, as it always does; once it is saved, the prompt runs
+    // again on the fallback model as a session of its own (below).
+    let fallback_spec = (signal_guard.sync_signal() == 0
+        && !signal_guard.token().is_cancelled()
+        && local_error.is_none())
+    .then(|| {
+        let failed = completions.first()?;
+        let orbit_engine::TurnEnd::Failed(failure) = &failed.end else {
+            return None;
+        };
+        orbit_cli::fallback::applies(
+            &failure.message,
+            &failed.report.final_text,
+            failed.report.output_tokens,
+            failed.report.rounds,
+        )
+        .then(orbit_cli::fallback::requested)
+        .flatten()
+    })
+    .flatten();
     if signal_guard.sync_signal() == 0
         && !signal_guard.token().is_cancelled()
         && let Some(schema) = &json_schema
-        && let Some(first) = completions.first()
+        && let Some(first) = completions.last()
         && first.end == orbit_engine::TurnEnd::Completed
         && !first.report.final_text.trim().is_empty()
         && let Err(problems) = validate_json_against_schema(&first.report.final_text, schema)
@@ -2813,8 +3222,27 @@ fn cmd_headless(args: &[String]) -> i32 {
         let mut repair_options = options.clone();
         repair_options.tools.clear();
         repair_options.max_rounds = 1;
-        struct RepairExecutor;
+        struct RepairExecutor {
+            tool_cx: orbit_tools::ToolContext,
+        }
         impl orbit_engine::ToolExecutor for RepairExecutor {
+            fn hook_handler_runner(
+                &self,
+            ) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+                Some(orbit_cli::hook_handlers::runner(
+                    &self.tool_cx.home,
+                    &self.tool_cx,
+                ))
+            }
+
+            fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+                tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+            }
+
+            fn end_cancel_scope(&mut self) {
+                self.tool_cx.pop_cancel_check();
+            }
+
             fn execute(
                 &mut self,
                 calls: &[orbit_engine::PendingToolCall],
@@ -2850,7 +3278,9 @@ fn cmd_headless(args: &[String]) -> i32 {
                         &repair_options,
                         &repair_prompt,
                         &mut transcript,
-                        &mut RepairExecutor,
+                        &mut RepairExecutor {
+                            tool_cx: executor.tool_cx.clone(),
+                        },
                         signal_guard.token(),
                         &mut events,
                         retry_policy.as_ref(),
@@ -2967,6 +3397,21 @@ fn cmd_headless(args: &[String]) -> i32 {
     if let Some(error) = &storage_error {
         eprintln!("session not saved: {error}");
     }
+    if let Some(spec) = &fallback_spec
+        && storage_error.is_none()
+    {
+        eprintln!("{model} is unavailable; running the prompt on fallback model {spec}");
+        fire_session_end(&home, "error");
+        if let Err(error) = signal_guard.close() {
+            eprintln!("process signal cleanup failed: {error}");
+        }
+        // The fallback run continues a resumed conversation as a fork of
+        // it; this session's lease is released first so it can be read.
+        let resumed = resumed_file.as_ref().map(|_| session_id.clone());
+        drop(accounting);
+        drop(live_lease);
+        return orbit_cli::fallback::rerun(prompt, args, spec, resumed.as_deref());
+    }
     let full_status = saved
         .accounting_watermark
         .as_ref()
@@ -2978,6 +3423,21 @@ fn cmd_headless(args: &[String]) -> i32 {
             "full session cost is unknown ({full_status:?}); displayed cost is the known priced subtotal"
         );
     }
+    // Telemetry, when the operator turned it on: what each turn of this
+    // run used, sent before the process ends.
+    orbit_cli::telemetry::session_started(&home, &session_id);
+    for completion in &completions {
+        orbit_cli::telemetry::turn_recorded(
+            &home,
+            &orbit_cli::telemetry::Turn::from_report(
+                &session_id,
+                &turn_config.model,
+                &turn_config.provider_id,
+                &completion.report,
+            ),
+        );
+    }
+    orbit_cli::telemetry::finish(&home);
     let totals = completions
         .iter()
         .try_fold((0u64, 0u64, 0u64, 0u32), |sum, completion| {
@@ -3041,6 +3501,8 @@ fn cmd_headless(args: &[String]) -> i32 {
         value["context_notices"] = serde_json::json!(context_notices);
         value["context_usage"] = serde_json::json!(context_usage);
         value["full_cost_status"] = serde_json::json!(full_status);
+        // What `--resume` takes, so a script can go on in this session.
+        value["session_id"] = serde_json::json!(session_id);
         println!("{value}");
     } else if !stream_json && final_report.is_some() {
         println!("{final_text}");
@@ -3104,6 +3566,10 @@ fn fire_session_end(home: &Path, reason: &str) {
         orbit_engine::hooks::HookEvent::SessionEnd,
         &serde_json::json!({ "reason": reason }),
     );
+    // A run without a screen names hook trouble on standard error.
+    for problem in orbit_engine::hooks::take_hook_problems() {
+        eprintln!("{problem}");
+    }
 }
 
 /// The headless tool executor: `dontAsk` — every call that no allow
@@ -3121,6 +3587,10 @@ struct HeadlessToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
+    fn hook_handler_runner(&self) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+        Some(orbit_cli::hook_handlers::runner(&self.home, &self.tool_cx))
+    }
+
     fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
         tool_runtime::remember_turn_config(&self.tool_cx, config);
     }
@@ -3269,38 +3739,8 @@ fn find_web_bin() -> Option<PathBuf> {
 /// Create or enter a git worktree at .orbit/worktrees/<name> on a new
 /// branch (phase 4). Parallel sessions never touch each other's files.
 fn enter_worktree(name: &str) -> Result<PathBuf, String> {
-    // Validate the name: it becomes a branch name and a directory.
-    if name.is_empty()
-        || name.starts_with('.')
-        || name.contains("..")
-        || name.contains('/')
-        || name.contains('\\')
-        || name.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err("invalid worktree name".into());
-    }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let dot_orbit = cwd.join(".orbit");
-    let wt_root = dot_orbit.join("worktrees");
-    let wt_path = wt_root.join(name);
-    if wt_path.exists() {
-        return Ok(wt_path); // idempotent: enter the existing one
-    }
-    std::fs::create_dir_all(&wt_root).map_err(|e| e.to_string())?;
-    let branch = format!("orbit/{name}");
-    let out = std::process::Command::new("git")
-        .arg("worktree")
-        .arg("add")
-        .arg("-b")
-        .arg(&branch)
-        .arg(&wt_path)
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(wt_path)
+    orbit_cli::worktree::create_git_worktree(&cwd, name)
 }
 /// Validate chat's complete grammar before worktree, identity or session changes.
 fn validate_chat_arguments(args: &[String]) -> Result<(), String> {
@@ -3409,6 +3849,9 @@ fn cmd_chat(args: &[String]) -> i32 {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".orbit"))
     });
+    // Before any MCP server starts: a server is told at its handshake
+    // whether it may ask the operator questions.
+    orbit_cli::elicitation::install(&home);
     // Guide only a fresh interactive conversation. Automation, explicit resume
     // and the existing environment-only provider contract keep their grammar.
     if std::io::IsTerminal::is_terminal(&std::io::stdin())
@@ -3481,7 +3924,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                         "Saved. Describe a task to begin; your first message will test the provider connection."
                     );
                     println!("Run `orbit doctor` any time to verify the local setup.");
-                    // Doctor auto-suggest (wizard item 9, task T8): arm a
+                    // Doctor auto-suggest: arm a
                     // one-time inline offer on the NEXT fresh interactive
                     // launch within an hour. The marker lives in the private
                     // home; scripted and nonTTY launches never consult it.
@@ -3507,7 +3950,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         eprintln!("{code}: {msg}");
         return 2;
     }
-    // One-time doctor offer (task T8): only a fresh interactive launch after
+    // One-time doctor offer: only a fresh interactive launch after
     // a recent successful save, never in scripted or nonTTY contexts.
     if std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -3717,13 +4160,26 @@ fn cmd_chat(args: &[String]) -> i32 {
                 tui_config.scope.clone(),
                 args.iter().any(|arg| arg == "--safe-customization"),
             );
-            return orbit_hud_tui::run_proto_with_startup(
+            // The `/` list and the palette also offer this session's own
+            // command files and skills.
+            orbit_hud_tui::proto::chrome::set_session_commands(
+                orbit_cli::custom_commands::session_commands(
+                    &home,
+                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    orbit_engine::hooks::project_trusted(&home),
+                ),
+            );
+            let code = orbit_hud_tui::run_proto_with_startup(
                 args,
                 tui_worker::make_spawner_owned(tui_config, live_lease),
                 home.clone(),
                 identity,
                 host,
             );
+            // The screen has closed and the process is about to end: the
+            // session-end hooks run now, while there is still a process.
+            tui_worker::fire_session_end(&home);
+            return code;
         }
     }
 
@@ -3736,6 +4192,10 @@ fn cmd_chat(args: &[String]) -> i32 {
     };
     let mut exit_error = false;
     let mut last_operation_failed = false;
+    // The prompt a chat that fell back to this one left unanswered, and the
+    // fallback chat this one hands over to (model, fork, prompt).
+    let mut first_prompt = CHAT_FIRST_PROMPT.get().cloned();
+    let mut fallback_chat: Option<(String, String, String)> = None;
 
     // Plain front-end (REPL / non-TTY): the shared plain grammar owns
     // stdout lines (§11.4). The TUI never enables this — its worker threads
@@ -3791,13 +4251,56 @@ fn cmd_chat(args: &[String]) -> i32 {
         },
     );
 
+    // Session hooks run for a plain chat as they do on the screen: what a
+    // session-start hook prints is context for the model, every payload
+    // names the session, and the session-end hooks run when the chat ends.
+    orbit_engine::hooks::set_permission_mode(
+        value_after(args, "--permission-mode")
+            .as_deref()
+            .unwrap_or("default"),
+    );
+    orbit_engine::hooks::set_session_context(
+        &session,
+        Some(&sessions::sessions_dir(&home).join(format!("{session}.json"))),
+    );
+    let plain_session_hook_context = {
+        let hooks =
+            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
+        let outcomes = hooks.fire(
+            orbit_engine::hooks::HookEvent::SessionStart,
+            &serde_json::json!({
+                "frontend": "plain",
+                "source": if resumed_file.is_some() { "resume" } else { "startup" },
+            }),
+        );
+        orbit_engine::hooks::prompt_context(&outcomes)
+            .map(|context| format!("\n\n## Session start hook output\n{context}"))
+            .unwrap_or_default()
+    };
+
     loop {
         if signal_guard.sync_signal() != 0 {
             exit_error |= last_operation_failed;
             break;
         }
         last_operation_failed = false;
-        let line = match orbit_cli::plain_input::read_stdin_line(signal_guard.token()) {
+        // A chat started as another chat's fallback asks the prompt that
+        // went unanswered there before it reads its own input.
+        let carried = first_prompt.take();
+        // It is a prompt, whatever it starts with: never a chat command.
+        let asked_again = carried.is_some();
+        if let Some(prompt) = &carried {
+            let shown: String = prompt
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(400)
+                .collect();
+            println!("(asking again) {shown}");
+        }
+        let line = match carried.map_or_else(
+            || orbit_cli::plain_input::read_stdin_line(signal_guard.token()),
+            |prompt| Ok(orbit_cli::plain_input::PlainInput::Line(prompt)),
+        ) {
             Ok(orbit_cli::plain_input::PlainInput::Line(line)) => line,
             Ok(
                 orbit_cli::plain_input::PlainInput::Eof
@@ -3819,12 +4322,19 @@ fn cmd_chat(args: &[String]) -> i32 {
         }
 
         // Slash commands / control.
-        if trimmed == "exit" || trimmed == "quit" {
+        if !asked_again && (trimmed == "exit" || trimmed == "quit") {
             last_operation_failed = false;
             break;
         }
         last_operation_failed = true;
-        if trimmed.starts_with('/') {
+        let mut custom_prompt: Option<String> = None;
+        // The `allowed-tools` of the command file that prompt came from.
+        let mut command_grants = orbit_cli::custom_commands::TurnGrants::default();
+        // The skill a `/skill` line named, for the turn it starts.
+        let mut user_skill: Option<String> = None;
+        // The `model` it named for its turn.
+        let mut command_model: Option<String> = None;
+        if !asked_again && trimmed.starts_with('/') {
             if trimmed.split_whitespace().next() == Some("/compact") {
                 if trimmed != "/compact" {
                     eprintln!("usage: /compact");
@@ -4035,6 +4545,18 @@ fn cmd_chat(args: &[String]) -> i32 {
                 }
                 continue;
             }
+            // `/memory …`, `/config …`: the terminal chat's editing
+            // commands; an editor is run in place, at a terminal.
+            if let Some(reply) = orbit_cli::config_edit::plain_command(
+                &home,
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                &trimmed,
+                std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            ) {
+                println!("{reply}");
+                last_operation_failed = false;
+                continue;
+            }
             if let Some(command) = trimmed.strip_prefix("/route") {
                 if !command.is_empty() && !command.starts_with(char::is_whitespace) {
                     eprintln!("unknown command: {trimmed}");
@@ -4150,7 +4672,72 @@ fn cmd_chat(args: &[String]) -> i32 {
                 }
             }
             if !handled {
-                eprintln!("unknown command: {trimmed}; try /help");
+                // Not a chat command: a custom command file (or a built-in
+                // prompt such as /init) runs as the prompt it stands for.
+                let command_shell = orbit_cli::custom_commands::Shell::for_scope(
+                    &tool_runtime::PermissionScope::from_flags(
+                        value_after(args, "--permission-mode").as_deref(),
+                        value_after(args, "--allowedTools").as_deref(),
+                        value_after(args, "--disallowedTools").as_deref(),
+                    ),
+                );
+                let expansion = orbit_cli::custom_commands::parse_invocation(&trimmed).and_then(
+                    |(name, args)| {
+                        let working_dir = std::env::current_dir().ok()?;
+                        orbit_cli::custom_commands::expand_command(
+                            &home,
+                            &working_dir,
+                            orbit_engine::hooks::project_trusted(&home),
+                            name,
+                            args,
+                            command_shell,
+                        )
+                    },
+                );
+                match expansion {
+                    Some(Ok(prompt)) => {
+                        if let Some((name, _)) =
+                            orbit_cli::custom_commands::parse_invocation(&trimmed)
+                            && let Ok(working_dir) = std::env::current_dir()
+                        {
+                            command_grants = orbit_cli::custom_commands::turn_grants(
+                                &home,
+                                &working_dir,
+                                orbit_engine::hooks::project_trusted(&home),
+                                name,
+                            );
+                            command_model = orbit_cli::custom_commands::turn_model(
+                                &home,
+                                &working_dir,
+                                orbit_engine::hooks::project_trusted(&home),
+                                name,
+                            );
+                        }
+                        custom_prompt = Some(prompt);
+                        last_operation_failed = false;
+                    }
+                    Some(Err(reason)) => eprintln!("{trimmed} was blocked by a hook: {reason}"),
+                    // Or a skill, `/skill` or `/plugin:skill`: the model
+                    // loads it with the Skill tool, as in the terminal chat.
+                    None => match orbit_cli::custom_commands::parse_invocation(&trimmed).and_then(
+                        |(name, args)| {
+                            let cx = orbit_tools::ToolContext::new(
+                                home.clone(),
+                                session.clone(),
+                                std::env::current_dir().ok()?,
+                            );
+                            orbit_cli::custom_commands::skill_prompt(&cx, name, args)
+                                .map(|prompt| (name.to_owned(), prompt))
+                        },
+                    ) {
+                        Some((name, prompt)) => {
+                            user_skill = Some(name);
+                            custom_prompt = Some(prompt);
+                            last_operation_failed = false;
+                        }
+                        None => eprintln!("unknown command: {trimmed}; try /help"),
+                    },
+                }
             } else if prior_selection
                 != (
                     model.clone(),
@@ -4228,8 +4815,12 @@ fn cmd_chat(args: &[String]) -> i32 {
                     ),
                 }
             }
-            continue;
+            if custom_prompt.is_none() {
+                continue;
+            }
         }
+        // A custom command continues below as the prompt it expanded to.
+        let trimmed = custom_prompt.unwrap_or(trimmed);
 
         // Plain grammar (§11.4): the turn boundary is stamped — one event
         // per line, words not glyphs. Same grammar as copy mode and non-TTY.
@@ -4332,6 +4923,38 @@ fn cmd_chat(args: &[String]) -> i32 {
                 continue;
             }
         };
+        // A command file may name the model for the one turn it starts.
+        // It runs on it the way a routed turn runs on its routed model; a
+        // name that cannot be used here leaves the turn where it was.
+        let (turn_config, routing_decision) = match command_model.take() {
+            None => (turn_config, routing_decision),
+            Some(spec) => {
+                let chosen =
+                    orbit_cli::config::ProvidersConfig::load(&home).and_then(|providers| {
+                        let chosen =
+                            orbit_cli::phase_routing::resolve_model(&providers, &spec, None)?
+                                .turn_config(Some(&base_turn_config))?;
+                        // The session's effort must be one this model takes.
+                        chosen.validate_effort()?;
+                        Ok(chosen)
+                    });
+                match chosen {
+                    Ok(chosen) => {
+                        println!(
+                            "this command runs on {}/{}",
+                            chosen.provider_id, chosen.model
+                        );
+                        (chosen, None)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "the command names model {spec}, which cannot be used here ({error}); using the session's"
+                        );
+                        (turn_config, routing_decision)
+                    }
+                }
+            }
+        };
         if let Some(decision) = &routing_decision {
             println!(
                 "route {}/{} → {}/{}",
@@ -4361,12 +4984,15 @@ fn cmd_chat(args: &[String]) -> i32 {
                 value_after(args, "--allowedTools").as_deref(),
                 value_after(args, "--disallowedTools").as_deref(),
             ),
-            tool_cx: orbit_tools::ToolContext::new(
+            tool_cx: orbit_cli::tools::with_extra_dirs(orbit_tools::ToolContext::new(
                 home.clone(),
                 session.clone(),
                 std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
-            ),
+            )),
         };
+        // A command file's `allowed-tools` cover the turn it started.
+        orbit_cli::custom_commands::set_turn_grants(&executor.tool_cx, command_grants);
+        orbit_cli::custom_commands::set_user_skill(&executor.tool_cx, user_skill.take());
         tool_runtime::remember_effort_setting(
             &executor.tool_cx,
             if turn_config.provider_id == base_turn_config.provider_id
@@ -4428,10 +5054,41 @@ fn cmd_chat(args: &[String]) -> i32 {
             }
         };
         let session_prompt = build_session_prompt(&home, &model);
+        // The auto-mode classifier sees what was asked and bills here, as in
+        // the TUI. Only the operator's typed prompts are shared.
+        {
+            let operator: Vec<&str> = transcript
+                .iter()
+                .filter(|message| message.role == orbit_adapter::types::ChatRole::User)
+                .map(|message| message.content.as_str())
+                .collect();
+            executor
+                .tool_cx
+                .set_ext(orbit_cli::auto_mode::OperatorContext::from_messages(
+                    operator,
+                ));
+            executor
+                .tool_cx
+                .set_ext(orbit_cli::auto_mode::ClassifierAccounting {
+                    owner_session_id: session.clone(),
+                    spend_policy: None,
+                });
+            orbit_cli::hook_handlers::install(&home, &executor.tool_cx);
+            if interactive {
+                orbit_cli::channels::prompts_are_asked();
+            }
+            for line in orbit_cli::channels::start(&home, &executor.tool_cx) {
+                eprintln!("{line}");
+            }
+        }
         let mut options = orbit_engine::TurnOptions {
             tools: tools::session_tool_definitions(&home),
             memory_bytes: session_prompt.memory_bytes,
-            system_directive: Some(session_prompt.text),
+            system_directive: Some(format!(
+                "{}{plain_session_hook_context}{}",
+                session_prompt.text,
+                orbit_cli::tools::mcp_instructions_note_reporting(&home, &executor.tool_cx)
+            )),
             request_stem: "orbit-repl".into(),
             session_id: session.clone(),
             compaction_config: Some(
@@ -4492,6 +5149,22 @@ fn cmd_chat(args: &[String]) -> i32 {
                     || (completion.end == orbit_engine::TurnEnd::Completed && !completion.report.ok)
             }
         };
+        // `--fallback-model`: the model could not be reached and nothing
+        // came back. This session keeps the unsettled request, so the chat
+        // goes on in a fork of it, on the fallback model (below, once the
+        // session is saved).
+        let unreachable = completion.as_ref().is_ok_and(|completion| {
+            matches!(
+                &completion.end,
+                orbit_engine::TurnEnd::Failed(failure)
+                    if orbit_cli::fallback::applies(
+                        &failure.message,
+                        &completion.report.final_text,
+                        completion.report.output_tokens,
+                        completion.report.rounds,
+                    )
+            )
+        });
         exit_error |= executor.approval_channel.input_failed();
         if let Ok(completion) = &completion {
             println!();
@@ -4551,6 +5224,23 @@ fn cmd_chat(args: &[String]) -> i32 {
             }
             exit_error = true;
         }
+        if unreachable
+            && !persist_failed
+            && signal_guard.sync_signal() == 0
+            && let Some(spec) = orbit_cli::fallback::requested()
+        {
+            match sessions::fork_held_session(&home, &live_lease, Some(&trimmed)) {
+                Ok(fork) => {
+                    eprintln!(
+                        "{model} is unavailable; continuing on fallback model {spec} in a fork of this conversation ({})",
+                        fork.session_id
+                    );
+                    fallback_chat = Some((spec, fork.session_id, trimmed.clone()));
+                    break;
+                }
+                Err(error) => eprintln!("the fallback model could not be started: {error}"),
+            }
+        }
         if exit_error || signal_guard.sync_signal() != 0 {
             exit_error |= last_operation_failed;
             break;
@@ -4559,6 +5249,20 @@ fn cmd_chat(args: &[String]) -> i32 {
 
     let signal = signal_guard.sync_signal();
     exit_error |= signal != 0 && last_operation_failed;
+    orbit_engine::hooks::set_session_context(
+        &session,
+        Some(&sessions::sessions_dir(&home).join(format!("{session}.json"))),
+    );
+    fire_session_end(
+        &home,
+        if exit_error {
+            "error"
+        } else if signal != 0 {
+            "cancelled"
+        } else {
+            "exit"
+        },
+    );
     // Exit summary (JSON envelope, consistent with other commands).
     println!(
         "{}",
@@ -4576,9 +5280,17 @@ fn cmd_chat(args: &[String]) -> i32 {
             "full_cost_status": full_cost_status,
         })
     );
-    close_plain_signals(&mut signal_guard, 0, |signal| {
+    let code = close_plain_signals(&mut signal_guard, 0, |signal| {
         exit_error || (signal != 0 && last_operation_failed)
-    })
+    });
+    // The fallback chat takes over this terminal from `main`, once this
+    // session has let go of its lease and everything else it holds.
+    if let Some(chat) = fallback_chat
+        && let Ok(mut slot) = FALLBACK_CHAT.lock()
+    {
+        *slot = Some(chat);
+    }
+    code
 }
 
 /// The REPL's tool executor: bridges the engine's `ToolExecutor` trait
@@ -4603,6 +5315,10 @@ struct ReplToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for ReplToolExecutor {
+    fn hook_handler_runner(&self) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+        Some(orbit_cli::hook_handlers::runner(&self.home, &self.tool_cx))
+    }
+
     fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
         tool_runtime::remember_turn_config(&self.tool_cx, config);
     }
@@ -5306,10 +6022,31 @@ fn validate_provider_arguments(args: &[String]) -> Result<(), (&'static str, Str
         _ => false,
     };
     if !valid {
-        return Err(("ORBIT-E1101", "invalid provider command arguments".into()));
+        return Err((
+            "ORBIT-E1101",
+            format!("invalid provider command arguments\n\n{PROVIDER_USAGE}"),
+        ));
     }
     Ok(())
 }
+
+/// What `orbit provider --help` prints, and what a malformed provider
+/// command is answered with.
+const PROVIDER_USAGE: &str = "\
+orbit provider: the model providers ORBIT can use
+
+    orbit provider list [--json]                     the configured providers
+    orbit provider presets [--json]                  the built-in presets
+    orbit provider add [NAME] [--kind K] [--url URL] [--model ID] [--credential-env ENV] [--name N]
+                                                     add a provider (the wizard, when bare)
+    orbit provider remove NAME                       remove a provider
+    orbit provider role ROLE [MODEL|PROVIDER/MODEL]  show or set the model for a role:
+                                                     main, subagent, explore or compaction
+    orbit provider refresh NAME [--schema generic|openrouter|anthropic|ollama]
+                                                     read the provider's model list again
+    orbit provider login NAME [--method browser|key|env] [--headless] [--no-browser]
+    orbit provider logout NAME [--yes]";
+
 fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     validate_provider_arguments(args)?;
     if provider_credential_subcommand(&command_tail(args)?).is_some() {
@@ -5650,12 +6387,12 @@ fn handle_chat_command(
     gate: &str,
     provider: &mut String,
     transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
-    usage: (&u64, &u64, &u64, &u64), // (turns, input, output, cost µ¢)
+    usage: (&u64, &u64, &u64, &u64), // (turns, input, output, cost in micro-dollars)
 ) -> bool {
     match cmd {
         "/help" => {
             println!(
-                "commands: exit, /help, /compact, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>"
+                "commands: exit, /help, /compact, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>, /memory add|remove|edit, /config set|unset|edit"
             );
             true
         }
@@ -5893,6 +6630,169 @@ fn headless_arguments(args: &[String]) -> Result<Vec<String>, String> {
     Ok(remaining)
 }
 
+/// [`headless_arguments`], with what was piped or redirected into the run:
+/// `git diff | orbit -p "review this"` puts the diff in front of the prompt,
+/// and `echo "question" | orbit -p` (no prompt word) makes the piped text
+/// the prompt.
+fn headless_arguments_with_input(args: &[String]) -> Result<Vec<String>, String> {
+    let index = headless_prompt_index(args).ok_or("-p must be a top-level option")?;
+    let with_prompt = |prompt: String| {
+        let mut all = args.to_vec();
+        all.insert(index + 1, prompt);
+        headless_arguments(&all)
+    };
+    let next_is_option = args
+        .get(index + 1)
+        .is_none_or(|next| next.starts_with("--"));
+    match headless_arguments(args) {
+        // `-p --output-format json` with input piped in: the piped text is
+        // the prompt and the option keeps its meaning.
+        Ok(arguments) if next_is_option => match piped_input(whole_prompt_wait())? {
+            Some(input) => with_prompt(input).or(Ok(arguments)),
+            None => Ok(arguments),
+        },
+        Ok(mut arguments) => {
+            // A pipeline's producer may take its time: `slow | orbit -p x`
+            // waits for it (half a minute for its first byte). A pipe that
+            // a program which started this run still holds for writing is
+            // another matter: it may never be written to, and must not
+            // stall the run, so it gets a moment and no more.
+            let held = stdin_pipe_held_by_ancestor();
+            let wait = std::time::Duration::from_millis(if held { 250 } else { 30_000 });
+            let started = std::time::Instant::now();
+            let input = piped_input(Some(wait))?;
+            if input.is_none() && !held && started.elapsed() >= wait {
+                eprintln!(
+                    "no piped input arrived in {} s; continuing without it",
+                    wait.as_secs()
+                );
+            }
+            if let Some(input) = input {
+                arguments[0] =
+                    format!("<piped-input>\n{input}\n</piped-input>\n\n{}", arguments[0]);
+            }
+            Ok(arguments)
+        }
+        Err(error) if next_is_option => match piped_input(whole_prompt_wait())? {
+            Some(input) => with_prompt(input),
+            None => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+/// How long to wait for a prompt that is to come from standard input: to
+/// its end when a pipeline feeds it, a moment when the pipe is one that a
+/// program which started this run holds and may never write to.
+fn whole_prompt_wait() -> Option<std::time::Duration> {
+    stdin_pipe_held_by_ancestor().then(|| std::time::Duration::from_millis(250))
+}
+
+/// Does a process this one descends from hold the writing end of the pipe
+/// on standard input? A program that spawned this one (directly or through
+/// a wrapper such as `timeout`) with a pipe it may never write to does; a
+/// shell that built a pipeline does not, because the producer is a sibling
+/// and the shell has let go of the pipe. Ancestors that cannot be looked at
+/// are passed over.
+fn stdin_pipe_held_by_ancestor() -> bool {
+    let Ok(ours) = std::fs::read_link("/proc/self/fd/0") else {
+        return false;
+    };
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..32 {
+        if pid <= 1 {
+            break;
+        }
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            for entry in entries.flatten() {
+                if !std::fs::read_link(entry.path()).is_ok_and(|link| link == ours) {
+                    continue;
+                }
+                // `flags:` in fdinfo is the open mode in octal: 1 is
+                // write-only, 2 read-write.
+                let writes = std::fs::read_to_string(format!(
+                    "/proc/{pid}/fdinfo/{}",
+                    entry.file_name().to_string_lossy()
+                ))
+                .ok()
+                .and_then(|info| {
+                    info.lines()
+                        .find_map(|line| line.strip_prefix("flags:"))
+                        .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok())
+                })
+                .is_some_and(|flags| matches!(flags & 3, 1 | 2));
+                if writes {
+                    return true;
+                }
+            }
+        }
+        // The parent of `pid`: the fourth field of its stat line, after the
+        // bracketed command name (which may itself hold spaces).
+        let Some(parent) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse::<u32>()
+                    .ok()
+            })
+        else {
+            break;
+        };
+        pid = parent;
+    }
+    false
+}
+
+/// The text on standard input when it is a pipe or a file (never a
+/// terminal, `/dev/null` or a socket), without trailing blank space; `None`
+/// when there is none. A pipe is waited on for `first_byte` before it is
+/// taken to be unused, or without limit when `first_byte` is `None`; once
+/// it has spoken it is read to its end. More than 1 MiB is refused, not cut.
+fn piped_input(first_byte: Option<std::time::Duration>) -> Result<Option<String>, String> {
+    use std::io::Read;
+    const LIMIT: u64 = 1024 * 1024;
+    let Ok(stat) = rustix::fs::fstat(std::io::stdin()) else {
+        return Ok(None);
+    };
+    let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    match kind {
+        rustix::fs::FileType::RegularFile => {}
+        rustix::fs::FileType::Fifo => {
+            if let Some(wait) = first_byte {
+                let mut fds = [libc::pollfd {
+                    fd: 0,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }];
+                let millis = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+                // SAFETY: one valid pollfd for this process's standard input.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
+                if ready <= 0 {
+                    return Ok(None);
+                }
+            }
+        }
+        _ => return Ok(None),
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read piped input: {error}"))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(
+            "piped input is larger than 1 MiB; pass a file path in the prompt instead".into(),
+        );
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_end();
+    Ok((!text.trim().is_empty()).then(|| text.to_owned()))
+}
+
 fn validate_headless_arguments(args: &[String]) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     let mut index = 0;
@@ -5950,9 +6850,9 @@ fn headless_execution_options(args: &[String]) -> Result<HeadlessExecutionOption
         .unwrap_or(orbit_engine::DEFAULT_MAX_ROUNDS);
     let max_cost = value_after(args, "--max-cost")
         .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|_| "--max-cost must be an unsigned integer in microcents")
+            value.parse::<u64>().map_err(
+                |_| "--max-cost must be an unsigned integer of micro-dollars (1000000 is $1)",
+            )
         })
         .transpose()?;
     let schema = value_after(args, "--json-schema")
@@ -8131,7 +9031,7 @@ mod schema_dialect_tests {
     }
 }
 
-/// Shell completion scripts (task T6). Hand-rolled emission from the verb
+/// Shell completion scripts. Hand-rolled emission from the verb
 /// table — no completion framework dependency. Only the known command list is
 /// advertised; flags stay uncompleted because the grammar is positional.
 fn emit_completions(shell: &str) -> Result<serde_json::Value, (&'static str, String)> {
@@ -8146,6 +9046,12 @@ fn emit_completions(shell: &str) -> Result<serde_json::Value, (&'static str, Str
         "theme",
         "models",
         "list-models",
+        "mcp",
+        "migrate",
+        "compact",
+        "recovery",
+        "serve",
+        "attach",
         "route",
         "ask",
         "run",
@@ -8179,7 +9085,7 @@ fn emit_completions(shell: &str) -> Result<serde_json::Value, (&'static str, Str
             for verb in VERBS {
                 out.push_str(&format!("    '{verb}'\n"));
             }
-            out.push_str("  )\n  _describe 'command' verbs\n}\n_orbit \"$@\"\n");
+            out.push_str("  )\n  _describe 'command' verbs\n}\ncompdef _orbit orbit\n");
             out
         }
         "fish" => {
@@ -8214,21 +9120,21 @@ mod completions_tests {
 
     #[test]
     fn completions_cover_every_documented_verb_per_shell() {
-        // The help command table is the contract; every documented leading
-        // verb must be completable, in all three shells.
+        let help = dispatch(&["help".into(), "--json".into()]).unwrap();
+        let commands = help["commands"].as_array().unwrap();
         for shell in ["bash", "zsh", "fish"] {
             let value = emit_completions(shell).expect("known shell");
             let script = value["script"].as_str().unwrap();
-            for verb in [
-                "setup",
-                "init",
-                "doctor",
-                "provider",
-                "route",
-                "theme",
-                "completions",
-            ] {
-                assert!(script.contains(verb), "{shell}: missing {verb}");
+            let words: Vec<&str> = script
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .filter(|word| !word.is_empty())
+                .collect();
+            for entry in commands {
+                let verb = entry.as_str().unwrap().split_whitespace().next().unwrap();
+                if verb.starts_with('(') || verb.starts_with('-') {
+                    continue;
+                }
+                assert!(words.contains(&verb), "{shell}: missing {verb}");
             }
         }
         assert!(emit_completions("powershell").is_err());

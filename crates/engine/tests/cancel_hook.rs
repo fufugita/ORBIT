@@ -1,5 +1,5 @@
-//! The engine hands each round's executor the turn's cancel token and
-//! takes the previous one back afterwards (stack discipline), so a
+//! The engine scopes the turn's cancel token through lifecycle hooks and
+//! each round's tools, restoring the previous token afterwards, so a
 //! nested turn — a subagent — cannot clear its parent's Esc.
 
 #![deny(unsafe_code)]
@@ -150,9 +150,8 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
 
     assert_eq!(
         executor.log,
-        ["turn", "begin", "execute", "end"],
-        "the executor is told the turn's configuration first, then the \
-         turn's token is current for the round's tools, then it is not"
+        ["begin", "turn", "begin", "execute", "end", "end"],
+        "the turn token covers the whole operation and the nested tools"
     );
     assert_eq!(executor.model, "test-model", "the turn's own model");
     assert!(
@@ -176,4 +175,127 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
         "the cancel inside execute ends the turn"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prompt_and_failure_hooks_share_the_turn_scope_and_restore_the_parent_without_a_provider() {
+    use orbit_engine::hooks::{HandlerRunner, HookEvent, HookOutcome, Hooks};
+    use std::sync::{Arc, Mutex};
+
+    struct LifecycleExecutor {
+        stack: Arc<Mutex<Vec<CancelToken>>>,
+        cancel: CancelToken,
+        observed: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+    impl ToolExecutor for LifecycleExecutor {
+        fn execute(&mut self, _: &[PendingToolCall], _: u32) -> Vec<ToolRoundResult> {
+            panic!("a blocked prompt must never execute tools");
+        }
+
+        fn begin_cancel_scope(&mut self, token: &CancelToken) {
+            self.stack.lock().unwrap().push(token.clone());
+        }
+
+        fn end_cancel_scope(&mut self) {
+            self.stack.lock().unwrap().pop();
+        }
+
+        fn hook_handler_runner(&self) -> Option<Arc<HandlerRunner>> {
+            let stack = self.stack.clone();
+            let cancel = self.cancel.clone();
+            let observed = self.observed.clone();
+            Some(Arc::new(move |_, payload| {
+                let event = payload["hook_event_name"].as_str().unwrap();
+                let current = stack.lock().unwrap().last().unwrap().is_cancelled();
+                observed.lock().unwrap().push((event.into(), current));
+                if event == "UserPromptSubmit" {
+                    assert!(!current, "the turn must override the cancelled parent");
+                    cancel.cancel();
+                    HookOutcome {
+                        exit_code: 2,
+                        stderr: "blocked before provider dispatch".into(),
+                        ..HookOutcome::default()
+                    }
+                } else {
+                    assert!(current, "StopFailure must retain the turn's cancellation");
+                    HookOutcome::default()
+                }
+            }))
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "orbit-cancel-lifecycle-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.toml"),
+        "[[hooks]]\nevent = \"UserPromptSubmit\"\nprompt = \"check\"\n\
+         [[hooks]]\nevent = \"StopFailure\"\nprompt = \"check\"\n",
+    )
+    .unwrap();
+    let parent = CancelToken::new();
+    parent.cancel();
+    let stack = Arc::new(Mutex::new(vec![parent]));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let cancel = CancelToken::new();
+    let mut executor = LifecycleExecutor {
+        stack: stack.clone(),
+        cancel: cancel.clone(),
+        observed: observed.clone(),
+    };
+    let _parent_runner = orbit_engine::hooks::handler_runner_scope(Arc::new(|_, _| HookOutcome {
+        stdout: "parent runner".into(),
+        ..HookOutcome::default()
+    }));
+    let config = orbit_engine::TurnConfig {
+        billing: None,
+        sampling: None,
+        effort: None,
+        supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
+        provider_id: "never-dispatched".into(),
+        gate: "invalid://no-provider".into(),
+        model: "test-model".into(),
+        kind: orbit_engine::ProviderKind::OpenAiCompatible,
+        credential_env: None,
+        pricing: None,
+        max_output_tokens: 1_024,
+    };
+    let mut transcript = Vec::new();
+    let result = orbit_engine::run_turn(
+        &dir,
+        &config,
+        &orbit_engine::TurnOptions::default(),
+        "blocked",
+        &mut transcript,
+        &mut executor,
+        &cancel,
+        &mut |_| {},
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .contains("blocked before provider dispatch")
+    );
+    assert!(transcript.is_empty());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            ("UserPromptSubmit".into(), false),
+            ("StopFailure".into(), true)
+        ]
+    );
+    assert_eq!(stack.lock().unwrap().len(), 1);
+    assert!(stack.lock().unwrap().last().unwrap().is_cancelled());
+    let after = Hooks::load(&dir, false).fire(HookEvent::StopFailure, &serde_json::json!({}));
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].stdout, "parent runner");
+    std::fs::remove_dir_all(dir).unwrap();
 }

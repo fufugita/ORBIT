@@ -199,12 +199,16 @@ pub fn build_system_prompt(
     // 4. Memory files, lowest scope first.
     let memory_from = s.len();
     s.push_str("## Project instructions\n\n");
-    for rel in MEMORY_FILES {
-        let path: PathBuf = if rel.starts_with('/') {
-            PathBuf::from(rel)
-        } else {
-            working_dir.join(rel)
-        };
+    // Managed, then the operator's own file, then the project's.
+    let mut files: Vec<PathBuf> = vec![PathBuf::from(MEMORY_FILES[0]), home.join("ORBIT.md")];
+    files.extend(MEMORY_FILES[1..].iter().map(|rel| working_dir.join(rel)));
+    files.extend(
+        [".claude/CLAUDE.md", "CLAUDE.local.md"]
+            .iter()
+            .map(|rel| working_dir.join(rel)),
+    );
+    let mut imports = ImportBudget::default();
+    for path in files {
         if let Ok(text) = std::fs::read_to_string(&path) {
             let capped = cap_auto_memory(&text);
             s.push_str(&format!(
@@ -213,9 +217,18 @@ pub fn build_system_prompt(
                 text.len(),
                 capped
             ));
+            let scope = path.parent().unwrap_or(working_dir).to_path_buf();
+            push_imports(
+                &mut s,
+                &text,
+                &path,
+                &[working_dir, &scope],
+                1,
+                &mut imports,
+            );
         }
     }
-    let _ = home; // managed scope /etc/orbit/ORBIT.md is in MEMORY_FILES
+    push_rules(&mut s, working_dir);
     let memory_bytes = s.len() - memory_from;
 
     // 5. Enabled mods' instructions (frozen here, not re-inserted).
@@ -225,10 +238,391 @@ pub fn build_system_prompt(
         s.push_str("\n\n");
     }
 
+    // 6. The output style, then anything appended for this run.
+    if let Some(style) = output_style(home, working_dir) {
+        s.push_str("## Output style\n\n");
+        s.push_str(&style);
+        s.push_str("\n\n");
+    }
+    if let Some(extra) = std::env::var("ORBIT_APPEND_SYSTEM_PROMPT")
+        .ok()
+        .filter(|extra| !extra.trim().is_empty())
+    {
+        s.push_str("## Additional instructions\n\n");
+        s.push_str(&cap_auto_memory(&extra));
+        s.push_str("\n\n");
+    }
+
     SystemPrompt {
         text: s,
         memory_bytes,
     }
+}
+
+static OUTPUT_STYLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Choose the output style for prompts built from here on (`/output-style`),
+/// ahead of the environment and settings; `None` returns to those. Reports
+/// whether the name resolves: `default`, a built-in, or a style file. An
+/// unknown name leaves the previous choice in place.
+pub fn set_output_style(home: &Path, working_dir: &Path, name: Option<&str>) -> bool {
+    let Ok(mut slot) = OUTPUT_STYLE.lock() else {
+        return false;
+    };
+    let previous = slot.clone();
+    *slot = name.map(str::to_owned);
+    drop(slot);
+    let known = match name.map(|name| name.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(name) if name == "default" => true,
+        Some(_) => output_style(home, working_dir).is_some(),
+    };
+    if !known && let Ok(mut slot) = OUTPUT_STYLE.lock() {
+        *slot = previous;
+    }
+    known
+}
+
+/// The selected output style's instructions. The name comes from
+/// `ORBIT_OUTPUT_STYLE` (`--output-style`), else a top-level
+/// `output_style = "name"` in `$ORBIT_HOME/settings.toml`. `explanatory`
+/// and `learning` are built in; any other name is a Markdown file in
+/// `.orbit/output-styles/`, `.claude/output-styles/` or
+/// `$ORBIT_HOME/output-styles/`, used without its front matter. `default`,
+/// no name, or a name with no file adds nothing.
+fn output_style(home: &Path, working_dir: &Path) -> Option<String> {
+    let chosen = OUTPUT_STYLE.lock().ok().and_then(|slot| slot.clone());
+    let name = chosen
+        .or_else(|| std::env::var("ORBIT_OUTPUT_STYLE").ok())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            // `--settings <file>` is read first: it is this run's choice.
+            let named = |text: String| {
+                text.lines()
+                    .map(str::trim)
+                    .take_while(|line| !line.starts_with('['))
+                    .filter_map(|line| line.split('#').next()?.split_once('='))
+                    .find(|(key, _)| key.trim() == "output_style")
+                    .map(|(_, value)| value.trim().trim_matches('"').to_owned())
+            };
+            orbit_tools::executor::extra_settings_file()
+                .filter(|file| !orbit_tools::executor::is_json(file))
+                .and_then(|file| std::fs::read_to_string(file).ok())
+                .and_then(named)
+                .or_else(|| {
+                    std::fs::read_to_string(home.join("settings.toml"))
+                        .ok()
+                        .and_then(named)
+                })
+        })?;
+    let name = name.trim();
+    match name.to_ascii_lowercase().as_str() {
+        "" | "default" => return None,
+        "explanatory" => {
+            return Some(
+                "Explain as you work. Before and after a piece of work, add a short \
+                 note on why the code is shaped the way it is and what trade-off the \
+                 change makes, so the operator learns the codebase along the way."
+                    .into(),
+            );
+        }
+        "learning" => {
+            return Some(
+                "Work as a teacher. Explain your reasoning, and when a small, \
+                 self-contained piece of the change would be instructive, leave it \
+                 for the operator: mark the spot with TODO(human), say what is needed \
+                 there, and wait for them before continuing."
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+    [
+        working_dir.join(".orbit/output-styles"),
+        working_dir.join(".claude/output-styles"),
+        home.join("output-styles"),
+    ]
+    .iter()
+    .find_map(|dir| std::fs::read_to_string(dir.join(format!("{name}.md"))).ok())
+    .map(|text| cap_auto_memory(rule_front_matter(&text).1))
+    .filter(|body| !body.trim().is_empty())
+}
+
+/// The instruction files that exist for this home and project, in the
+/// order the prompt reads them, with their sizes: what `/memory` lists.
+pub fn instruction_files(home: &Path, working_dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files: Vec<PathBuf> = vec![PathBuf::from(MEMORY_FILES[0]), home.join("ORBIT.md")];
+    files.extend(MEMORY_FILES[1..].iter().map(|rel| working_dir.join(rel)));
+    files.extend(
+        [".claude/CLAUDE.md", "CLAUDE.local.md"]
+            .iter()
+            .map(|rel| working_dir.join(rel)),
+    );
+    for dir in [".orbit/rules", ".claude/rules"] {
+        let mut rules: Vec<PathBuf> = std::fs::read_dir(working_dir.join(dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        rules.sort();
+        files.extend(rules);
+    }
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok()?;
+            meta.is_file().then_some((path, meta.len()))
+        })
+        .collect()
+}
+
+/// `@path` imports: how deep they nest and how many files they may add.
+const IMPORT_MAX_DEPTH: usize = 5;
+const IMPORT_MAX_FILES: usize = 24;
+
+#[derive(Default)]
+struct ImportBudget {
+    seen: Vec<PathBuf>,
+}
+
+/// The `@path` tokens of an instruction file: at the start of a line or
+/// after whitespace, outside fenced code blocks and inline code. Relative
+/// paths are relative to the file that names them; `~/` is the home folder.
+fn import_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let mut in_code = false;
+        let mut previous = ' ';
+        for (at, c) in line.char_indices() {
+            if c == '`' {
+                in_code = !in_code;
+            } else if c == '@' && !in_code && previous.is_whitespace() {
+                let rest = &line[at + 1..];
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || c == '`')
+                    .unwrap_or(rest.len());
+                let token = rest[..end].trim_end_matches(['.', ',', ';', ':', ')', '!', '?']);
+                if !token.is_empty() && !out.iter().any(|seen| seen == token) {
+                    out.push(token.to_owned());
+                }
+            }
+            previous = c;
+        }
+    }
+    out
+}
+
+/// Append the files an instruction file imports. An import is honoured only
+/// when it resolves to a regular file inside one of `roots` (the project, or
+/// the importing scope's own folder) that is not on the deny-read list: a
+/// repository's instructions cannot pull a key or another project's files
+/// into the prompt. Anything else `@name` might mean is left as text.
+fn push_imports(
+    out: &mut String,
+    text: &str,
+    from: &Path,
+    roots: &[&Path],
+    depth: usize,
+    budget: &mut ImportBudget,
+) {
+    if depth > IMPORT_MAX_DEPTH {
+        return;
+    }
+    let base = from.parent().unwrap_or(Path::new("."));
+    for token in import_tokens(text) {
+        if budget.seen.len() >= IMPORT_MAX_FILES {
+            return;
+        }
+        let candidate = match token.strip_prefix("~/") {
+            Some(rest) => match std::env::home_dir() {
+                Some(home) => home.join(rest),
+                None => continue,
+            },
+            None => base.join(&token),
+        };
+        let Ok(resolved) = candidate.canonicalize() else {
+            continue;
+        };
+        let inside = roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| resolved.starts_with(root));
+        if !inside
+            || !resolved.is_file()
+            || orbit_tools::is_deny_read(&resolved)
+            || budget.seen.contains(&resolved)
+            || from.canonicalize().is_ok_and(|own| own == resolved)
+        {
+            continue;
+        }
+        let Ok(imported) = std::fs::read_to_string(&resolved) else {
+            continue;
+        };
+        budget.seen.push(resolved.clone());
+        out.push_str(&format!(
+            "#### Imported by {}: {} ({} bytes)\n\n{}\n\n",
+            from.display(),
+            resolved.display(),
+            imported.len(),
+            cap_auto_memory(&imported)
+        ));
+        push_imports(out, &imported, &resolved, roots, depth + 1, budget);
+    }
+}
+
+/// Rule files: `.orbit/rules/*.md` and `.claude/rules/*.md`. A rule with no
+/// `paths:` front matter is always in the prompt. A path-scoped rule is
+/// listed with its patterns here; its text arrives with the result of the
+/// first Read, Edit or Write of a matching file (see [`scoped_rules_for`]).
+fn push_rules(out: &mut String, working_dir: &Path) {
+    const MAX_RULES: usize = 32;
+    let mut files: Vec<PathBuf> = [".orbit/rules", ".claude/rules"]
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(working_dir.join(dir)).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md") && path.is_file())
+        .collect();
+    files.sort();
+    files.truncate(MAX_RULES);
+    let mut scoped = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let (paths, body) = rule_front_matter(&text);
+        if paths.is_empty() {
+            out.push_str(&format!(
+                "### {} ({} bytes)\n\n{}\n\n",
+                path.display(),
+                text.len(),
+                cap_auto_memory(body)
+            ));
+        } else {
+            scoped.push(format!("- `{}` — for {}", path.display(), paths.join(", ")));
+        }
+    }
+    if !scoped.is_empty() {
+        out.push_str(
+            "### Path-scoped rules\n\nEach rule's text is added to the result the first time you read or edit a matching file.\n\n",
+        );
+        out.push_str(&scoped.join("\n"));
+        out.push_str("\n\n");
+    }
+}
+
+/// `a/{b,c}/*.{ts,tsx}` → every alternative, at most 64.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let mut done = Vec::new();
+    let mut work = vec![pattern.to_owned()];
+    while let Some(next) = work.pop() {
+        let alternatives = next.find('{').and_then(|open| {
+            let close = open + next[open..].find('}')?;
+            Some((open, close))
+        });
+        match alternatives {
+            Some((open, close)) if done.len() + work.len() < 64 => {
+                for option in next[open + 1..close].split(',') {
+                    work.push(format!("{}{option}{}", &next[..open], &next[close + 1..]));
+                }
+            }
+            _ => done.push(next),
+        }
+    }
+    done
+}
+
+/// The path-scoped rules that apply to `file`: every rule in
+/// `.orbit/rules/` or `.claude/rules/` whose `paths:` has a pattern
+/// matching the file's path relative to the working directory. Returned as
+/// (rule file, body), bodies capped like any instruction file.
+pub fn scoped_rules_for(working_dir: &Path, file: &Path) -> Vec<(String, String)> {
+    const MAX_RULES: usize = 32;
+    let (Ok(root), Ok(file)) = (working_dir.canonicalize(), file.canonicalize()) else {
+        return Vec::new();
+    };
+    let Ok(relative) = file.strip_prefix(&root) else {
+        return Vec::new();
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let mut files: Vec<PathBuf> = [".orbit/rules", ".claude/rules"]
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(root.join(dir)).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md") && path.is_file())
+        .collect();
+    files.sort();
+    files.truncate(MAX_RULES);
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let (patterns, body) = rule_front_matter(&text);
+            patterns
+                .iter()
+                .flat_map(|pattern| expand_braces(pattern.trim_start_matches("./")))
+                .any(|pattern| {
+                    orbit_tools::fs_tools::glob_path_match(&pattern, &relative)
+                        // A bare `*.rs` means "anywhere", as in a gitignore.
+                        || (!pattern.contains('/')
+                            && orbit_tools::fs_tools::glob_path_match(
+                                &format!("**/{pattern}"),
+                                &relative,
+                            ))
+                })
+                .then(|| (path.display().to_string(), cap_auto_memory(body)))
+        })
+        .collect()
+}
+
+/// The `paths:` patterns of a rule's YAML front matter (inline list, block
+/// list or a single value) and the body after it.
+fn rule_front_matter(text: &str) -> (Vec<String>, &str) {
+    let Some(rest) = text.strip_prefix("---") else {
+        return (Vec::new(), text);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (Vec::new(), text);
+    };
+    let (front, body) = (&rest[..end], &rest[end + 4..]);
+    let clean = |value: &str| -> Option<String> {
+        let value = value.trim().trim_matches(['"', '\'']).trim();
+        (!value.is_empty() && value.len() <= 256).then(|| value.to_owned())
+    };
+    let mut paths = Vec::new();
+    let mut in_paths = false;
+    for line in front.lines() {
+        if let Some(value) = line.strip_prefix("paths:") {
+            in_paths = true;
+            let value = value.trim();
+            let value = value
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap_or(value);
+            paths.extend(value.split(',').filter_map(clean));
+        } else if in_paths && line.trim_start().starts_with("- ") {
+            paths.extend(clean(line.trim_start().trim_start_matches("- ")));
+        } else if !line.starts_with(char::is_whitespace) {
+            in_paths = false;
+        }
+    }
+    paths.truncate(16);
+    (paths, body.trim_start_matches(['\r', '\n']))
 }
 
 /// Cap auto-memory at 200 lines / 25 KB (the spec's bound).
@@ -252,6 +646,7 @@ fn tool_description(name: &str) -> Option<&'static str> {
         "Grep" => "Searches file contents",
         "Bash" => "Runs a command in the working directory",
         "TaskStop" => "Stops a background command",
+        "TaskOutput" => "Reads a background command's latest output",
         "calculator" => "Evaluates a math expression",
         "current_session" => "Reports session identity and usage",
         "list_models" => "Lists configured models",
@@ -385,5 +780,167 @@ mod tests {
         // And the boundary the off-by-algorithm would break: 2000-02-29.
         let (y, m, d) = civil_from_days(11_016);
         assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    #[test]
+    fn import_tokens_skip_code_and_ordinary_at_signs() {
+        let text = "See @docs/style.md and @~/notes.md.\nmail me@example.com, use `@not/this`\n```\n@fenced/file.md\n```\n@docs/style.md again\n";
+        assert_eq!(import_tokens(text), ["docs/style.md", "~/notes.md"]);
+    }
+
+    #[test]
+    fn imports_stay_inside_the_project_and_nest() {
+        let root = std::env::temp_dir().join(format!("orbit-ctx-imp-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("docs")).unwrap();
+        std::fs::write(root.join("outside.md"), "OUTSIDE SECRET").unwrap();
+        std::fs::write(
+            project.join("CLAUDE.md"),
+            "Rules: @docs/style.md @../outside.md @types/node @CLAUDE.md\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("docs/style.md"),
+            "STYLE BODY, see @deeper.md\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("docs/deeper.md"), "DEEPER BODY @style.md\n").unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("ORBIT.md"), "OPERATOR RULES\n").unwrap();
+        let prompt = build_system_prompt(&home, &project, "m", &[], "").text;
+        assert!(
+            prompt.contains("OPERATOR RULES"),
+            "the operator's own file is read"
+        );
+        assert!(prompt.contains("STYLE BODY"));
+        assert!(
+            prompt.contains("DEEPER BODY"),
+            "imports nest, relative to the importer"
+        );
+        assert!(
+            !prompt.contains("OUTSIDE SECRET"),
+            "nothing from outside the project"
+        );
+        assert_eq!(
+            prompt.matches("STYLE BODY").count(),
+            1,
+            "a cycle imports once"
+        );
+    }
+
+    #[test]
+    fn rules_load_whole_or_as_a_pointer_when_path_scoped() {
+        let project = std::env::temp_dir().join(format!("orbit-ctx-rules-{}", std::process::id()));
+        std::fs::create_dir_all(project.join(".claude/rules")).unwrap();
+        std::fs::write(project.join(".claude/rules/always.md"), "ALWAYS RULE\n").unwrap();
+        std::fs::write(
+            project.join(".claude/rules/api.md"),
+            "---\npaths:\n  - \"src/api/**/*.ts\"\n  - src/routes/**\n---\nSCOPED RULE BODY\n",
+        )
+        .unwrap();
+        let home = project.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prompt = build_system_prompt(&home, &project, "m", &[], "").text;
+        assert!(prompt.contains("ALWAYS RULE"));
+        assert!(!prompt.contains("SCOPED RULE BODY"));
+        assert!(
+            prompt.contains("for src/api/**/*.ts, src/routes/**"),
+            "{prompt}"
+        );
+        assert_eq!(
+            rule_front_matter("---\npaths: [\"a/**\", b.rs]\n---\nbody").0,
+            ["a/**", "b.rs"]
+        );
+        assert_eq!(rule_front_matter("no front matter").0, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_custom_output_style_file_is_added_without_its_front_matter() {
+        let root = std::env::temp_dir().join(format!("orbit-ctx-style-{}", std::process::id()));
+        let (home, project) = (root.join("home"), root.join("project"));
+        std::fs::create_dir_all(home.join("output-styles")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home.join("output-styles/terse.md"),
+            "---\nname: terse\ndescription: short\n---\nANSWER IN ONE LINE\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "output_style = \"terse\"\n[permissions]\n",
+        )
+        .unwrap();
+        if std::env::var_os("ORBIT_OUTPUT_STYLE").is_none() {
+            let prompt = build_system_prompt(&home, &project, "m", &[], "").text;
+            assert!(
+                prompt.contains("## Output style\n\nANSWER IN ONE LINE"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("description: short"));
+            std::fs::write(home.join("settings.toml"), "output_style = \"default\"\n").unwrap();
+            assert!(
+                !build_system_prompt(&home, &project, "m", &[], "")
+                    .text
+                    .contains("## Output style")
+            );
+            std::fs::write(home.join("settings.toml"), "output_style = \"../etc\"\n").unwrap();
+            assert!(output_style(&home, &project).is_none());
+            std::fs::write(home.join("settings.toml"), "output_style = \"learning\"\n").unwrap();
+            assert!(
+                output_style(&home, &project)
+                    .unwrap()
+                    .contains("TODO(human)")
+            );
+        }
+    }
+
+    #[test]
+    fn a_scoped_rule_applies_to_files_matching_its_patterns() {
+        let project = std::env::temp_dir().join(format!(
+            "orbit-ctx-scoped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(project.join(".claude/rules")).unwrap();
+        std::fs::create_dir_all(project.join("src/api/v1")).unwrap();
+        std::fs::create_dir_all(project.join("docs")).unwrap();
+        std::fs::write(
+            project.join(".claude/rules/api.md"),
+            "---\npaths:\n  - \"src/api/**/*.{ts,tsx}\"\n---\nAPI RULE\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".claude/rules/md.md"),
+            "---\npaths: \"*.md\"\n---\nMARKDOWN RULE\n",
+        )
+        .unwrap();
+        std::fs::write(project.join(".claude/rules/always.md"), "ALWAYS\n").unwrap();
+        for file in [
+            "src/api/v1/users.ts",
+            "src/api/index.tsx",
+            "src/api/v1/users.rs",
+            "docs/guide.md",
+        ] {
+            std::fs::write(project.join(file), "x").unwrap();
+        }
+        let bodies = |file: &str| -> Vec<String> {
+            scoped_rules_for(&project, &project.join(file))
+                .into_iter()
+                .map(|(_, body)| body.trim().to_owned())
+                .collect()
+        };
+        assert_eq!(bodies("src/api/v1/users.ts"), ["API RULE"]);
+        assert_eq!(bodies("src/api/index.tsx"), ["API RULE"]);
+        assert!(bodies("src/api/v1/users.rs").is_empty());
+        assert_eq!(bodies("docs/guide.md"), ["MARKDOWN RULE"]);
+        assert!(scoped_rules_for(&project, Path::new("/etc/hostname")).is_empty());
+        assert_eq!(
+            expand_braces("a/{b,c}/*.{ts,tsx}").len(),
+            4,
+            "every combination"
+        );
     }
 }

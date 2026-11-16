@@ -109,15 +109,9 @@ fn gate3_deny_read_list_blocks_credentials() {
     std::fs::create_dir_all(&dir).unwrap();
     let cx = cx_for(&dir);
 
-    // A fake credential file under a deny-read path shape.
+    // Check the real deny-read path shape without creating or touching anything
+    // in the operator's home. Read must refuse it before any file access.
     let home = std::env::var("HOME").unwrap();
-    let ssh_dir = std::path::Path::new(&home).join(".orbit-gate3-ssh");
-    std::fs::create_dir_all(&ssh_dir).unwrap();
-    let key = ssh_dir.join("id_rsa");
-    std::fs::write(&key, "FAKE KEY MATERIAL").unwrap();
-
-    // The deny-read list matches ~/.ssh/** — our stand-in dir does not
-    // match, so test the real matcher on the real path shape.
     assert!(orbit_tools::is_deny_read(
         &std::path::Path::new(&home).join(".ssh/id_rsa")
     ));
@@ -135,7 +129,6 @@ fn gate3_deny_read_list_blocks_credentials() {
     assert!(result.is_error, "reading a credential must be refused");
     assert!(result.payload.contains("deny-read"));
 
-    let _ = std::fs::remove_dir_all(&ssh_dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

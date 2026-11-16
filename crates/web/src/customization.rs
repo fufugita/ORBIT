@@ -1,7 +1,8 @@
 //! Bounded browser presentation over the same checked profile host as the terminal.
 use orbit_frontend_protocol::customization::{
-    CustomizationError, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES, PaneAction, PaneContext, PaneOutput,
-    PaneState, ProfileCommand, ProfileHost, ResolvedProfile, Surface,
+    BUILTIN_PANE_IDS, CustomizationError, LayoutNode, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES,
+    PaneAction, PaneContext, PaneOutput, PaneState, ProfileCommand, ProfileHost, ResolvedProfile,
+    Surface,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -78,7 +79,7 @@ impl BrowserSession {
         }
     }
     pub fn refresh_all(&mut self, context: &PaneContext) {
-        let ids: Vec<_> = self
+        let mut ids: Vec<_> = self
             .resolved
             .profile
             .panes
@@ -86,6 +87,27 @@ impl BrowserSession {
             .filter(|p| p.surfaces.contains(&Surface::Browser))
             .map(|p| p.id.clone())
             .collect();
+        // Built-in panes (council, reactor) load only when the layout shows
+        // them and the profile does not redefine them.
+        fn builtin(node: &LayoutNode, out: &mut Vec<String>) {
+            match node {
+                LayoutNode::Custom { pane_id } => {
+                    if BUILTIN_PANE_IDS.contains(&pane_id.as_str()) && !out.contains(pane_id) {
+                        out.push(pane_id.clone());
+                    }
+                }
+                LayoutNode::Split { children, .. } => {
+                    for child in children {
+                        builtin(child, out);
+                    }
+                }
+                LayoutNode::Panel { .. } => {}
+            }
+        }
+        let mut shown = Vec::new();
+        builtin(&self.resolved.profile.layout.tree, &mut shown);
+        shown.retain(|id| !self.resolved.profile.panes.iter().any(|p| p.id == *id));
+        ids.extend(shown);
         for id in ids {
             let _ = self.refresh(&id, context);
         }
@@ -103,9 +125,7 @@ impl BrowserSession {
         let def = self
             .resolved
             .profile
-            .panes
-            .iter()
-            .find(|p| p.id == id)
+            .pane_def(id)
             .ok_or("unknown custom pane")?;
         if !def.surfaces.contains(&Surface::Browser) {
             return Err("pane does not support browser".into());
@@ -206,9 +226,7 @@ impl BrowserSession {
                 let def = self
                     .resolved
                     .profile
-                    .panes
-                    .iter()
-                    .find(|p| p.id == pane_id)
+                    .pane_def(&pane_id)
                     .ok_or("unknown custom pane")?;
                 let action = self
                     .outputs

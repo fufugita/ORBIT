@@ -19,32 +19,49 @@ pub enum PlainInput {
 /// Unix waits observe cancellation without changing descriptor or terminal
 /// flags. The non-Unix fallback retains ordinary blocking stdin behavior.
 pub fn read_stdin_line(cancel: &CancelToken) -> io::Result<PlainInput> {
+    read_stdin_line_unless(cancel, &|| false).map(|line| line.unwrap_or(PlainInput::Cancelled))
+}
+
+/// Like [`read_stdin_line`], and gives up with `None` as soon as `stop`
+/// says the line is no longer wanted (the question was answered somewhere
+/// else). What was typed and not yet entered stays with the terminal. The
+/// non-Unix fallback cannot be interrupted.
+pub fn read_stdin_line_unless(
+    cancel: &CancelToken,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Option<PlainInput>> {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
         let stdin = io::stdin();
-        read_fd_line(stdin.as_fd(), cancel)
+        read_fd_line_unless(stdin.as_fd(), cancel, stop)
     }
     #[cfg(not(unix))]
     {
-        if cancel.is_cancelled() {
-            return Ok(PlainInput::Cancelled);
-        }
-        let mut line = String::new();
-        let count = io::stdin().read_line(&mut line)?;
-        if cancel.is_cancelled() {
-            return Ok(PlainInput::Cancelled);
-        }
-        if count == 0 {
-            return Ok(PlainInput::Eof);
-        }
-        let mut bytes = line.into_bytes();
-        let newline = bytes.last() == Some(&b'\n');
-        if newline {
-            bytes.pop();
-        }
-        finish_line(bytes, newline)
+        let _ = stop;
+        fallback_line(cancel).map(Some)
     }
+}
+
+#[cfg(not(unix))]
+fn fallback_line(cancel: &CancelToken) -> io::Result<PlainInput> {
+    if cancel.is_cancelled() {
+        return Ok(PlainInput::Cancelled);
+    }
+    let mut line = String::new();
+    let count = io::stdin().read_line(&mut line)?;
+    if cancel.is_cancelled() {
+        return Ok(PlainInput::Cancelled);
+    }
+    if count == 0 {
+        return Ok(PlainInput::Eof);
+    }
+    let mut bytes = line.into_bytes();
+    let newline = bytes.last() == Some(&b'\n');
+    if newline {
+        bytes.pop();
+    }
+    finish_line(bytes, newline)
 }
 
 fn finish_line(mut bytes: Vec<u8>, newline: bool) -> io::Result<PlainInput> {
@@ -57,8 +74,17 @@ fn finish_line(mut bytes: Vec<u8>, newline: bool) -> io::Result<PlainInput> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "input is not valid UTF-8"))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn read_fd_line(fd: std::os::fd::BorrowedFd<'_>, cancel: &CancelToken) -> io::Result<PlainInput> {
+    read_fd_line_unless(fd, cancel, &|| false).map(|line| line.unwrap_or(PlainInput::Cancelled))
+}
+
+#[cfg(unix)]
+fn read_fd_line_unless(
+    fd: std::os::fd::BorrowedFd<'_>,
+    cancel: &CancelToken,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Option<PlainInput>> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use rustix::io::{Errno, read};
 
@@ -69,7 +95,10 @@ fn read_fd_line(fd: std::os::fd::BorrowedFd<'_>, cancel: &CancelToken) -> io::Re
     let mut bytes = Vec::new();
     loop {
         if cancel.is_cancelled() {
-            return Ok(PlainInput::Cancelled);
+            return Ok(Some(PlainInput::Cancelled));
+        }
+        if stop() {
+            return Ok(None);
         }
         let mut descriptors = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
         match poll(&mut descriptors, Some(&timeout)) {
@@ -79,7 +108,7 @@ fn read_fd_line(fd: std::os::fd::BorrowedFd<'_>, cancel: &CancelToken) -> io::Re
             Err(error) => return Err(error.into()),
         }
         if cancel.is_cancelled() {
-            return Ok(PlainInput::Cancelled);
+            return Ok(Some(PlainInput::Cancelled));
         }
         let ready = descriptors[0].revents();
         if ready.contains(PollFlags::NVAL) {
@@ -101,17 +130,17 @@ fn read_fd_line(fd: std::os::fd::BorrowedFd<'_>, cancel: &CancelToken) -> io::Re
             Err(error) => return Err(error.into()),
         };
         if cancel.is_cancelled() {
-            return Ok(PlainInput::Cancelled);
+            return Ok(Some(PlainInput::Cancelled));
         }
         if count == 0 {
             return if bytes.is_empty() {
-                Ok(PlainInput::Eof)
+                Ok(Some(PlainInput::Eof))
             } else {
-                finish_line(bytes, false)
+                finish_line(bytes, false).map(Some)
             };
         }
         if byte[0] == b'\n' {
-            return finish_line(bytes, true);
+            return finish_line(bytes, true).map(Some);
         }
         bytes.try_reserve(1).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate input line")
@@ -148,6 +177,35 @@ mod tests {
             read_fd_line(reader.as_fd(), &CancelToken::new()).unwrap(),
             PlainInput::Line("keep".into())
         );
+    }
+
+    /// A wait that is no longer wanted ends without taking what is there,
+    /// and one that is stopped while it waits ends soon after.
+    #[test]
+    fn a_stopped_wait_ends_and_consumes_nothing() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        writer.write_all(b"later\n").unwrap();
+        let cancel = CancelToken::new();
+        assert_eq!(
+            read_fd_line_unless(reader.as_fd(), &cancel, &|| true).unwrap(),
+            None
+        );
+        assert_eq!(ioctl_fionread(&reader).unwrap(), 6);
+        assert_eq!(
+            read_fd_line_unless(reader.as_fd(), &cancel, &|| false).unwrap(),
+            Some(PlainInput::Line("later".into()))
+        );
+        let started = Instant::now();
+        let polls = AtomicUsize::new(0);
+        assert_eq!(
+            read_fd_line_unless(reader.as_fd(), &cancel, &|| {
+                polls.fetch_add(1, Ordering::SeqCst) >= 3
+            })
+            .unwrap(),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(writer);
     }
 
     #[test]

@@ -27,9 +27,24 @@ pub enum PermissionMode {
     DontAsk,
     /// Everything runs (containers/VMs only; refused as root).
     Bypass,
+    /// As `AcceptEdits`, but a call no rule covers is put to a classifier
+    /// model before the operator: it may allow it, block it, or ask.
+    Auto,
 }
 
 impl PermissionMode {
+    /// The name `from_config` reads back, as settings and hooks spell it.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Plan => "plan",
+            PermissionMode::DontAsk => "dontAsk",
+            PermissionMode::Bypass => "bypass",
+            PermissionMode::Auto => "auto",
+        }
+    }
+
     pub fn from_config(s: &str) -> Option<Self> {
         match s {
             "default" => Some(PermissionMode::Default),
@@ -37,6 +52,7 @@ impl PermissionMode {
             "plan" => Some(PermissionMode::Plan),
             "dontAsk" | "dont-ask" => Some(PermissionMode::DontAsk),
             "bypass" | "bypassPermissions" => Some(PermissionMode::Bypass),
+            "auto" => Some(PermissionMode::Auto),
             _ => None,
         }
     }
@@ -140,9 +156,15 @@ impl RuleSet {
     }
 }
 
-/// Exact tools remain exact. The only tool-name wildcard is an MCP server selector.
+/// Task and Agent name the same subagent operation. Other tools remain exact;
+/// the only tool-name wildcard is an MCP server selector.
 pub fn rule_tool_matches(rule: &PermissionRule, tool: &str, server: Option<&str>) -> bool {
-    if rule.tool == tool {
+    if rule.tool == tool
+        || matches!(
+            (rule.tool.as_str(), tool),
+            ("Task", "Agent") | ("Agent", "Task")
+        )
+    {
         return true;
     }
     rule.tool
@@ -201,8 +223,16 @@ pub fn rule_matches(rule: &PermissionRule, argument: &str) -> bool {
     if let Some(prefix) = p.strip_suffix(" *") {
         argument.starts_with(prefix)
     } else if let Some(prefix) = p.strip_suffix("**") {
-        let prefix = prefix.trim_end_matches('/');
-        argument.starts_with(prefix)
+        if prefix.ends_with('/') {
+            let directory = prefix.trim_end_matches('/');
+            directory.is_empty()
+                || argument == directory
+                || argument
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        } else {
+            argument.starts_with(prefix)
+        }
     } else if p.contains('*') {
         crate::glob_match(p, argument)
     } else {
@@ -341,13 +371,10 @@ pub fn evaluate_with_server(
     is_readonly_command: bool,
     server: Option<&str>,
 ) -> Verdict {
-    // Bypass: everything runs (refused at startup as root — the CLI
-    // checks that separately).
-    if mode == PermissionMode::Bypass {
-        return Verdict::Allow;
-    }
-
-    // Explicit rules first — they override the mode.
+    // Explicit rules first — they override the mode, bypass included: a
+    // deny rule denies and a rule that asks still asks, as in Claude Code.
+    // Bypass skips the prompts the mode itself would raise, not the rules
+    // the operator wrote.
     if let Some(effect) = rules.evaluate_with_server(tool, argument, server) {
         return match effect {
             RuleEffect::Allow => Verdict::Allow,
@@ -364,22 +391,26 @@ pub fn evaluate_with_server(
 
     // No rule: the mode decides.
     match mode {
-        PermissionMode::Default | PermissionMode::AcceptEdits => {
+        PermissionMode::Default | PermissionMode::AcceptEdits | PermissionMode::Auto => {
             let edit_tools = matches!(tool, "Write" | "Edit" | "NotebookEdit");
             let freely = is_read_only_tool
                 || (tool == "Bash" && is_readonly_command)
-                || (mode == PermissionMode::AcceptEdits && edit_tools);
+                || (mode != PermissionMode::Default && edit_tools);
             if freely { Verdict::Allow } else { Verdict::Ask }
         }
         PermissionMode::Plan => {
-            if is_read_only_tool {
+            // ExitPlanMode only asks the operator to approve the plan; it
+            // is the way out of plan mode, so plan mode cannot refuse it.
+            if is_read_only_tool || tool == "ExitPlanMode" {
                 Verdict::Allow
             } else {
                 Verdict::Deny("plan mode: read-only until the plan is approved".into())
             }
         }
         PermissionMode::DontAsk => Verdict::Deny("no allow rule covers this call (dontAsk)".into()),
-        PermissionMode::Bypass => unreachable!(),
+        // Bypass: whatever no rule spoke about runs (refused at startup as
+        // root — the CLI checks that separately).
+        PermissionMode::Bypass => Verdict::Allow,
     }
 }
 
@@ -421,6 +452,26 @@ pub fn evaluate_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_mode_lets_the_plan_be_put_to_the_operator() {
+        let none = RuleSet { rules: Vec::new() };
+        assert_eq!(
+            evaluate(
+                PermissionMode::Plan,
+                &none,
+                "ExitPlanMode",
+                "",
+                false,
+                false
+            ),
+            Verdict::Allow
+        );
+        assert!(matches!(
+            evaluate(PermissionMode::Plan, &none, "Edit", "/p/a.rs", false, false),
+            Verdict::Deny(_)
+        ));
+    }
 
     fn rules(pairs: &[(&str, RuleEffectSerde)]) -> RuleSet {
         RuleSet {
@@ -601,5 +652,219 @@ mod tests {
         assert!(!rule_matches(&r, "/tests/a.rs"));
         let r = parse_rule("Read", RuleEffectSerde::Deny).unwrap();
         assert!(rule_matches(&r, "anything"));
+    }
+
+    #[test]
+    fn bare_task_and_agent_rules_keep_coverage_for_every_effect() {
+        for configured in ["Task", "Agent"] {
+            for effect in [
+                RuleEffectSerde::Allow,
+                RuleEffectSerde::Ask,
+                RuleEffectSerde::Deny,
+            ] {
+                let rules = RuleSet {
+                    rules: vec![parse_rule(configured, effect).unwrap()],
+                };
+                for called in ["Task", "Agent"] {
+                    for agent_type in ["general", "Explore", "Plan"] {
+                        assert_eq!(
+                            rules.evaluate(called, agent_type),
+                            Some(RuleEffect::from(effect)),
+                            "{configured}: {called}({agent_type})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_aliases_do_not_cross_tool_or_agent_type_boundaries() {
+        for configured in ["Task", "Agent"] {
+            let rules = RuleSet {
+                rules: vec![
+                    parse_rule(&format!("{configured}(Explore)"), RuleEffectSerde::Deny).unwrap(),
+                ],
+            };
+            for called in ["Task", "Agent"] {
+                assert_eq!(rules.evaluate(called, "Explore"), Some(RuleEffect::Deny));
+                for other_type in ["ExploreDangerous", "general", "Plan", ""] {
+                    assert_eq!(rules.evaluate(called, other_type), None);
+                }
+            }
+            for other_tool in [
+                "TaskCreate",
+                "TaskStop",
+                "TaskOutput",
+                "TaskList",
+                "AgentOutput",
+                "AgentStop",
+                "AgentSendMessage",
+                "ListAgents",
+            ] {
+                assert_eq!(rules.evaluate(other_tool, "Explore"), None);
+            }
+        }
+        for (configured, other_tool) in [("Read", "Grep"), ("Edit", "Write")] {
+            let rules = RuleSet {
+                rules: vec![parse_rule(configured, RuleEffectSerde::Deny).unwrap()],
+            };
+            assert_eq!(rules.evaluate(other_tool, "Explore"), None);
+        }
+    }
+
+    #[test]
+    fn subtree_patterns_keep_the_directory_boundary() {
+        for tool in ["Read", "Write", "Edit"] {
+            for effect in [
+                RuleEffectSerde::Allow,
+                RuleEffectSerde::Ask,
+                RuleEffectSerde::Deny,
+            ] {
+                let rule = parse_rule(&format!("{tool}(/project/src/**)"), effect).unwrap();
+                for inside in [
+                    "/project/src",
+                    "/project/src/",
+                    "/project/src/main.rs",
+                    "/project/src/nested/lib.rs",
+                ] {
+                    assert!(rule_matches(&rule, inside), "{tool}: {inside}");
+                }
+                for outside in [
+                    "/project/src-backup/private.rs",
+                    "/project/src2/main.rs",
+                    "/project/src.rs",
+                    "/project/other/main.rs",
+                ] {
+                    assert!(!rule_matches(&rule, outside), "{tool}: {outside}");
+                }
+            }
+        }
+        let root = parse_rule("Read(/**)", RuleEffectSerde::Allow).unwrap();
+        assert!(rule_matches(&root, "/project/file"));
+        // A root-wide rule retains its existing coverage of relative spellings.
+        assert!(rule_matches(&root, "project/file"));
+        assert!(rule_matches(&root, ""));
+        let prefix = parse_rule("Read(report**)", RuleEffectSerde::Allow).unwrap();
+        assert!(rule_matches(&prefix, "report-final.txt"));
+    }
+
+    #[test]
+    fn a_subtree_allow_does_not_admit_a_sibling_edit_in_dont_ask_mode() {
+        let rules = RuleSet {
+            rules: vec![parse_rule("Edit(/project/src/**)", RuleEffectSerde::Allow).unwrap()],
+        };
+        assert_eq!(
+            evaluate(
+                PermissionMode::DontAsk,
+                &rules,
+                "Edit",
+                "/project/src/main.rs",
+                false,
+                false
+            ),
+            Verdict::Allow
+        );
+        assert!(matches!(
+            evaluate(
+                PermissionMode::DontAsk,
+                &rules,
+                "Edit",
+                "/project/src-backup/private.rs",
+                false,
+                false
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    /// Bypass skips the mode's own prompts, never the operator's rules: a
+    /// deny rule denies, a rule that asks still asks, the rest runs.
+    #[test]
+    fn rules_hold_in_bypass_mode() {
+        let rules = RuleSet {
+            rules: vec![
+                parse_rule("Bash(rm *)", RuleEffectSerde::Deny).unwrap(),
+                parse_rule("Bash(git push *)", RuleEffectSerde::Ask).unwrap(),
+                parse_rule("Write", RuleEffectSerde::Ask).unwrap(),
+            ],
+        };
+        let bypass = |tool: &str, argument: &str| {
+            evaluate(PermissionMode::Bypass, &rules, tool, argument, false, false)
+        };
+        assert!(matches!(bypass("Bash", "rm -rf build"), Verdict::Deny(_)));
+        assert!(matches!(
+            bypass("Bash", "ls; rm -rf build"),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(bypass("Bash", "git push origin main"), Verdict::Ask);
+        assert_eq!(bypass("Write", "/src/main.rs"), Verdict::Ask);
+        assert_eq!(bypass("Bash", "cargo build"), Verdict::Allow);
+        assert_eq!(bypass("Edit", "/src/main.rs"), Verdict::Allow);
+        assert_eq!(
+            evaluate(
+                PermissionMode::Bypass,
+                &RuleSet::default(),
+                "Bash",
+                "rm -rf build",
+                false,
+                false
+            ),
+            Verdict::Allow,
+            "with no rules bypass allows everything, as before"
+        );
+    }
+
+    #[test]
+    fn auto_mode_frees_edits_and_leaves_the_rest_to_be_asked() {
+        assert_eq!(
+            PermissionMode::from_config("auto"),
+            Some(PermissionMode::Auto)
+        );
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::DontAsk,
+            PermissionMode::Bypass,
+            PermissionMode::Auto,
+        ] {
+            assert_eq!(PermissionMode::from_config(mode.config_name()), Some(mode));
+        }
+        let none = RuleSet::default();
+        assert_eq!(
+            evaluate(
+                PermissionMode::Auto,
+                &none,
+                "Edit",
+                "/src/main.rs",
+                false,
+                false
+            ),
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                PermissionMode::Auto,
+                &none,
+                "Read",
+                "/src/main.rs",
+                true,
+                false
+            ),
+            Verdict::Allow
+        );
+        // An uncovered command asks: the caller puts it to the classifier.
+        assert_eq!(
+            evaluate(
+                PermissionMode::Auto,
+                &none,
+                "Bash",
+                "make deploy",
+                false,
+                false
+            ),
+            Verdict::Ask
+        );
     }
 }

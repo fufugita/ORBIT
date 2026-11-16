@@ -99,6 +99,13 @@ pub struct ApprovalRequest {
     /// What `s` and `a` would remember, when there is something narrower
     /// than the whole tool to offer.
     pub grant: Option<GrantOffer>,
+    /// The call's arguments, for a channel that relays the prompt
+    /// (`--channel-permissions`).
+    pub input: serde_json::Value,
+    /// Whether a channel may answer this prompt. A confirmation that a
+    /// hook asked for is the person's alone: it has no verdict of its own
+    /// in the ledger to say who gave it.
+    pub relay: bool,
 }
 
 /// Approval channel — how the operator is asked to approve a tool call.
@@ -116,6 +123,13 @@ pub trait ApprovalChannel: Send {
     fn take_note(&mut self) -> Option<String> {
         None
     }
+
+    /// The channel that answered the last `ask` in the person's place
+    /// (`--channel-permissions`), taken once. `None` when the person
+    /// answered. The ledger records it.
+    fn take_answering_channel(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// The standard stdin-based approval channel, optionally sharing cancellation
@@ -125,6 +139,8 @@ pub struct StdApprovalChannel {
     note: Option<String>,
     cancel: Option<orbit_provider_http::CancelToken>,
     input_failed: bool,
+    /// The channel that answered the last prompt, when one did.
+    answered_by: Option<String>,
 }
 
 impl StdApprovalChannel {
@@ -134,6 +150,7 @@ impl StdApprovalChannel {
             note: None,
             cancel: None,
             input_failed: false,
+            answered_by: None,
         }
     }
 
@@ -192,8 +209,13 @@ impl ApprovalChannel for StdApprovalChannel {
         self.note.take()
     }
 
+    fn take_answering_channel(&mut self) -> Option<String> {
+        self.answered_by.take()
+    }
+
     fn ask(&mut self, req: &ApprovalRequest, auto_tools: bool) -> ApprovalVerdict {
         self.note = None;
+        self.answered_by = None;
         if self.cancelled() {
             return ApprovalVerdict::Deny;
         }
@@ -223,11 +245,49 @@ impl ApprovalChannel for StdApprovalChannel {
         );
         let _ = std::io::stdout().flush();
         let line = if let Some(cancel) = &self.cancel {
-            match crate::plain_input::read_stdin_line(cancel) {
-                Ok(crate::plain_input::PlainInput::Line(line)) => line,
-                Ok(
+            // A channel that relays prompts is asked as well; its answer
+            // ends the wait for a line here.
+            let remote = std::sync::Arc::new(std::sync::Mutex::new(None::<(bool, String)>));
+            let slot = remote.clone();
+            let _relay = req
+                .relay
+                .then(|| {
+                    crate::channels::relay_permission(
+                        &req.tool_name,
+                        &req.summary,
+                        &req.input,
+                        Box::new(move |allowed, source| {
+                            if let Ok(mut slot) = slot.lock() {
+                                *slot = Some((allowed, source.to_owned()));
+                            }
+                        }),
+                    )
+                })
+                .flatten();
+            let answered = || remote.lock().is_ok_and(|answer| answer.is_some());
+            match crate::plain_input::read_stdin_line_unless(cancel, &answered) {
+                Ok(None) => {
+                    let (allowed, source) = remote
+                        .lock()
+                        .ok()
+                        .and_then(|mut answer| answer.take())
+                        .unwrap_or((false, String::new()));
+                    let source: String = source.chars().filter(|c| !c.is_control()).collect();
+                    println!(
+                        "\n{} from the channel {source}",
+                        if allowed { "allowed" } else { "denied" }
+                    );
+                    self.answered_by = Some(source);
+                    return if allowed {
+                        ApprovalVerdict::AllowOnce
+                    } else {
+                        ApprovalVerdict::Deny
+                    };
+                }
+                Ok(Some(crate::plain_input::PlainInput::Line(line))) => line,
+                Ok(Some(
                     crate::plain_input::PlainInput::Eof | crate::plain_input::PlainInput::Cancelled,
-                ) => return ApprovalVerdict::Deny,
+                )) => return ApprovalVerdict::Deny,
                 Err(error) => {
                     self.fail_input();
                     eprintln!("approval input failed: {error}");
@@ -387,6 +447,50 @@ pub fn execute_call(
     interactive: bool,
     approval: &mut dyn ApprovalChannel,
     grants: &mut AutoGrants,
+    scope: &PermissionScope,
+    tool_cx: &orbit_tools::ToolContext,
+) -> Result<(String, Option<FileChange>), String> {
+    let started = std::time::Instant::now();
+    let outcome = execute_call_decided(
+        home,
+        session_id,
+        decision_id,
+        call,
+        auto_tools,
+        interactive,
+        approval,
+        grants,
+        scope,
+        tool_cx,
+    );
+    // Telemetry, when the operator turned it on: the tool's name, whether
+    // it succeeded and how long it took. Never its arguments or result.
+    // The wrapper for a searched MCP tool is not a call of its own: the
+    // tool it names is recorded when it runs.
+    if call.name != "McpToolCall" {
+        crate::telemetry::tool_result(
+            home,
+            session_id,
+            &call.name,
+            outcome
+                .as_ref()
+                .is_ok_and(|(payload, _)| !orbit_tools::result_is_error(payload)),
+            started.elapsed(),
+        );
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_call_decided(
+    home: &Path,
+    session_id: &str,
+    decision_id: &str,
+    call: &crate::PendingToolCall,
+    auto_tools: bool,
+    interactive: bool,
+    approval: &mut dyn ApprovalChannel,
+    grants: &mut AutoGrants,
     // The SESSION's permission scope (S5): mode + operator lists,
     // owned by the caller and passed explicitly — env vars are gone.
     scope: &PermissionScope,
@@ -395,8 +499,49 @@ pub fn execute_call(
     // Edit. Callers build this once per session.
     tool_cx: &orbit_tools::ToolContext,
 ) -> Result<(String, Option<FileChange>), String> {
+    if tool_cx.is_cancelled() {
+        return Ok((tool_error("cancelled by user"), None));
+    }
     if call.arguments.len() > MAX_ARGUMENT_BYTES {
         return Ok((tool_error("tool arguments exceed 64 KiB"), None));
+    }
+    // Tool search: McpToolCall stands for the MCP tool it names. It is
+    // unwrapped before anything is recorded or decided, so the ledger,
+    // hooks, permission rules and approvals all see the real tool.
+    if call.name == "McpToolCall" {
+        return match crate::tools::unwrap_mcp_tool_call(call) {
+            Ok(inner) => execute_call(
+                home,
+                session_id,
+                decision_id,
+                &inner,
+                auto_tools,
+                interactive,
+                approval,
+                grants,
+                scope,
+                tool_cx,
+            ),
+            Err(error) => Ok((tool_error(&error), None)),
+        };
+    }
+    // MCP resources are authorised as a pseudo tool of their server.
+    if matches!(call.name.as_str(), "ListMcpResources" | "ReadMcpResource") {
+        return match crate::tools::unwrap_mcp_resource_call(call) {
+            Ok(inner) => execute_call(
+                home,
+                session_id,
+                decision_id,
+                &inner,
+                auto_tools,
+                interactive,
+                approval,
+                grants,
+                scope,
+                tool_cx,
+            ),
+            Err(error) => Ok((tool_error(&error), None)),
+        };
     }
     let arguments_sha256 = hex::encode(Sha256::digest(&call.arguments));
     // The retry here (not just in record_result) is what makes a
@@ -422,6 +567,36 @@ pub fn execute_call(
     });
     // LedgerWriter::append is the durability boundary (append+fsync), so no
     // execution may happen before the call returns successfully.
+    //
+    // The lock is not held while the call is decided. Deciding can take as
+    // long as the operator takes to answer, and it can make requests of its
+    // own (auto mode's classifier, tool search's result record), each of
+    // which appends to this same ledger: holding the single-writer lock
+    // across it failed those appends, and every other session on this home,
+    // with E0719. The verdict reopens the writer below.
+    drop(writer);
+    if tool_cx.is_cancelled() {
+        return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, false);
+    }
+
+    // Tool search itself only reads the tool catalog: no approval is needed.
+    if call.name == "McpToolSearch" {
+        let args =
+            crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
+        let response = crate::tools::mcp_tool_search(home, tool_cx, &args);
+        let ok = response.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
+        let (output, _) = scan_mcp_text(&response.to_string());
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            if ok { "ok" } else { "error" },
+            &output,
+            tool_cx,
+        )?;
+        return Ok((output, None));
+    }
 
     let known = crate::tools::is_known_tool(&call.name);
 
@@ -562,7 +737,26 @@ pub fn execute_call(
     let rule_granted = call_key
         .as_ref()
         .is_some_and(|k| grants.rule_granted(&k.tool, &k.pattern));
+    // The command file that started this turn may allow the call
+    // (`allowed-tools`). Like a session grant, it answers only the mode's
+    // own question: a deny, plan mode and an explicit ask come first.
+    let turn_granted = match &call_key {
+        Some(key) => crate::custom_commands::turn_granted(tool_cx, &key.tool, &key.pattern),
+        None => crate::custom_commands::turn_granted(tool_cx, &call.name, ""),
+    }
+    // The operator typed `/this-skill`: loading it is what they asked for,
+    // not something to ask them about again.
+    || (call.name == "Skill"
+        && args_preview
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| crate::custom_commands::user_invoked(tool_cx, name)));
     let mut offer: Option<GrantOffer> = None;
+    // Auto mode's answer for this call, when the classifier was consulted.
+    let mut auto_decision: Option<crate::auto_mode::AutoDecision> = None;
+    // Whether the operator was shown this call (a hook's `ask` is then
+    // already answered).
+    let mut operator_asked = false;
     let mut verdict = if !known || rule_verdict == crate::permissions::RuleVerdict::Deny {
         ApprovalVerdict::Deny
     } else if matches!(
@@ -576,13 +770,41 @@ pub fn execute_call(
         || auto_tools
         || grants.is_granted(&call.name)
         || rule_granted
+        || turn_granted
         // B4: the mode/pattern layer allows it outright (read-only in
         // default mode, edits in acceptEdits, an allow rule from
         // --allowedTools or settings.toml).
         || pattern_verdict == PatternOutcome::Allow)
     {
         ApprovalVerdict::AllowOnce
+    } else if scope.mode == orbit_tools::permissions::PermissionMode::Auto
+        && pattern_verdict != PatternOutcome::ExplicitAsk
+        && {
+            // Auto mode: the classifier sees the uncovered call first. An
+            // explicit ask rule never reaches it; ASK falls through to the
+            // operator below.
+            let decision = crate::auto_mode::judge(
+                home,
+                tool_cx,
+                &call.name,
+                &args_preview,
+                crate::tools::call_risk(&call.name, &args_preview),
+            );
+            let decided = decision != crate::auto_mode::AutoDecision::Ask;
+            auto_decision = Some(decision);
+            decided
+        }
+    {
+        match &auto_decision {
+            Some(crate::auto_mode::AutoDecision::Allow) => ApprovalVerdict::AllowOnce,
+            _ => ApprovalVerdict::Deny,
+        }
     } else {
+        // A cancelled classifier falls back to Ask. Escape must not open a
+        // fresh approval after the front end already closed the turn's cards.
+        if tool_cx.is_cancelled() {
+            return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, false);
+        }
         // E9: PermissionRequest fires when the operator is asked to
         // decide (hooks can observe, not replace, the ask).
         let hooks_pr = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
@@ -594,15 +816,22 @@ pub fn execute_call(
             }),
         );
         offer = grant_offer(home, scope, &tool_cx.working_dir, &call.name, &args_preview);
+        let request = ApprovalRequest {
+            call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            summary: safe_call_summary(call),
+            risk: crate::tools::call_risk(&call.name, &args_preview),
+            preview: crate::tools::approval_preview(&call.name, &args_preview),
+            grant: offer.clone(),
+            input: args_preview.clone(),
+            relay: true,
+        };
+        if tool_cx.is_cancelled() {
+            return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, false);
+        }
+        operator_asked = true;
         approval.ask(
-            &ApprovalRequest {
-                call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                summary: safe_call_summary(call),
-                risk: crate::tools::call_risk(&call.name, &args_preview),
-                preview: crate::tools::approval_preview(&call.name, &args_preview),
-                grant: offer.clone(),
-            },
+            &request,
             auto_tools && pattern_verdict != PatternOutcome::ExplicitAsk,
         )
     };
@@ -615,6 +844,11 @@ pub fn execute_call(
             .is_some_and(|plan| !mcp_plan_is_current(home, &call.name, tool_cx, plan));
     if mcp_changed {
         verdict = ApprovalVerdict::Deny;
+    }
+    // Neither an automatic answer nor a late manual answer may grant
+    // permissions or run a call after its owning turn was cancelled.
+    if tool_cx.is_cancelled() {
+        return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, false);
     }
 
     // Apply the grant's side effects. `s` and `a` remember the rule the
@@ -645,12 +879,35 @@ pub fn execute_call(
         }
     };
     // The note typed with a denial: the model's reason, not the ledger's.
+    let auto_block = match &auto_decision {
+        Some(crate::auto_mode::AutoDecision::Block(reason)) => {
+            Some(format!("auto mode blocked this call: {reason}"))
+        }
+        _ => None,
+    };
     let note = if allowed {
         None
+    } else if auto_block.is_some() {
+        // The classifier's reason goes to the model the way a typed
+        // denial note does; the operator was not asked.
+        auto_block.clone()
     } else {
         approval.take_note().filter(|n| !n.trim().is_empty())
     };
 
+    // A channel answered the prompt in the person's place: the record
+    // names it.
+    let answering_channel = if operator_asked {
+        approval.take_answering_channel()
+    } else {
+        None
+    };
+    let channel_reason = answering_channel.as_ref().map(|channel| {
+        format!(
+            "{} through the channel {channel} (--channel-permissions)",
+            if allowed { "approved" } else { "denied" }
+        )
+    });
     let reason = if mcp_changed {
         "MCP configuration or policy changed after approval; request confirmation again"
     } else if !known {
@@ -663,6 +920,9 @@ pub fn execute_call(
         r
     } else if let PatternOutcome::McpError(error, _) = &pattern_verdict {
         error
+    } else if let Some(reason) = &channel_reason {
+        // Also for a rule that asks: the answer came through the channel.
+        reason
     } else if pattern_verdict == PatternOutcome::ExplicitAsk {
         if allowed {
             "operator approved configured explicit confirmation"
@@ -671,6 +931,10 @@ pub fn execute_call(
         } else {
             "operator declined configured explicit confirmation"
         }
+    } else if auto_block.is_some() {
+        "blocked by the auto mode classifier"
+    } else if auto_decision == Some(crate::auto_mode::AutoDecision::Allow) {
+        "allowed by the auto mode classifier"
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow {
         "allowed by persistent rule (permissions.toml)"
     } else if auto_tools {
@@ -698,6 +962,11 @@ pub fn execute_call(
     } else {
         "operator denied"
     };
+    let mut writer = reopen_writer(home)?;
+    if tool_cx.is_cancelled() {
+        drop(writer);
+        return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, false);
+    }
     let verdict_digest = writer
         .append(LedgerEvent::ToolVerdict(ToolVerdict {
             session_id: session_id.into(),
@@ -721,15 +990,15 @@ pub fn execute_call(
     // would scribble on the alternate screen.
     if plain_output_enabled() {
         println!(
-            "{} tool {} {}: {}",
+            "{} tool {} {}: {} by {}",
             hhmm_now(),
             call.name,
             safe_call_summary(call),
-            if allowed {
-                "allowed by you"
-            } else {
-                "denied by you"
-            }
+            if allowed { "allowed" } else { "denied" },
+            answering_channel.as_ref().map_or_else(
+                || "you".to_owned(),
+                |channel| format!("the channel {channel}")
+            ),
         );
     }
 
@@ -739,9 +1008,22 @@ pub fn execute_call(
     // across the dispatch deadlocked the subagent at boot (E0719). The
     // verdict is durably recorded above; the result reopens below.
     drop(writer);
+    if tool_cx.is_cancelled() {
+        return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, true);
+    }
 
     if !allowed {
+        let _ = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home)).fire(
+            orbit_engine::hooks::HookEvent::PermissionDenied,
+            &serde_json::json!({
+                "tool": call.name,
+                "summary": safe_call_summary(call),
+                "reason": reason,
+            }),
+        );
         let mut output = match &note {
+            // The classifier's words, not the operator's.
+            Some(n) if auto_block.is_some() => tool_denial(n),
             Some(n) => tool_denial(&format!("denied by the operator: {n}")),
             None => tool_denial(reason),
         };
@@ -789,7 +1071,12 @@ pub fn execute_call(
                 session_id,
                 name,
                 &args,
-                crate::plugin_content::InvocationOrigin::Model,
+                // The operator typed `/this-skill`: the load is theirs.
+                if crate::custom_commands::user_invoked(tool_cx, name) {
+                    crate::plugin_content::InvocationOrigin::User
+                } else {
+                    crate::plugin_content::InvocationOrigin::Model
+                },
                 scope,
                 approval,
             ) {
@@ -819,10 +1106,64 @@ pub fn execute_call(
         return Ok((output, None));
     }
 
+    // The worktree tools move the session's working directory.
+    if crate::worktree::is_worktree_tool(&call.name) {
+        let output = match crate::worktree::tool(home, tool_cx, &call.name, &args) {
+            Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
+            Err(e) => tool_error(&e),
+        };
+        let status = if orbit_tools::result_is_error(&output) {
+            "error"
+        } else {
+            "ok"
+        };
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
+        return Ok((output, None));
+    }
+
+    // Scheduled prompts: edits to the schedule file an open session fires.
+    if crate::tools::is_schedule_tool(&call.name) {
+        let output =
+            match crate::tools::schedule_tool(home, &tool_cx.working_dir, &call.name, &args) {
+                Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
+                Err(e) => tool_error(&e),
+            };
+        let status = if orbit_tools::result_is_error(&output) {
+            "error"
+        } else {
+            "ok"
+        };
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
+        return Ok((output, None));
+    }
+
     // Agent controls share the normal ledger and permission path above.
-    if call.name == "ListAgents" || call.name == "AgentSendMessage" {
+    if matches!(
+        call.name.as_str(),
+        "ListAgents" | "AgentSendMessage" | "AgentOutput" | "AgentStop"
+    ) {
         let result = agent_store_for_context(home, session_id, tool_cx).and_then(|store| {
-            if call.name == "ListAgents" {
+            if call.name == "AgentOutput" {
+                crate::tools::agent_output(&store, &args)
+            } else if call.name == "AgentStop" {
+                crate::tools::agent_stop(&args)
+            } else if call.name == "ListAgents" {
                 let offset = args
                     .get("offset")
                     .map(|value| {
@@ -910,6 +1251,32 @@ pub fn execute_call(
     // match the parent. `Agent` is the current Claude Code name; both
     // shapes route to the one runner.
     if call.name == "Task" || call.name == "Agent" {
+        // A background run returns at once; its report is read later with
+        // AgentOutput.
+        if args.get("run_in_background") == Some(&serde_json::Value::Bool(true)) {
+            let response = match crate::tools::start_background_task(
+                home, session_id, &args, tool_cx, scope,
+            ) {
+                Ok(v) => serde_json::json!({ "ok": true, "result": v }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e }),
+            };
+            let output = bounded_task_output(response);
+            let status = if orbit_tools::result_is_error(&output) {
+                "error"
+            } else {
+                "ok"
+            };
+            record_result(
+                home,
+                session_id,
+                decision_id,
+                call,
+                status,
+                &output,
+                tool_cx,
+            )?;
+            return Ok((output, None));
+        }
         let observer = tool_cx.ext::<SubagentObserver>();
         let response = match crate::tools::execute_task_in_session(
             home,
@@ -977,9 +1344,9 @@ pub fn execute_call(
     }
 
     if call.name == "LspDiagnostics" {
-        let result = serde_json::from_value::<crate::lsp::LspDiagnosticsArgs>(args.clone())
-            .map_err(|error| crate::lsp::LspError::Configuration(error.to_string()))
-            .and_then(|arguments| crate::lsp::diagnostics(home, tool_cx, scope, &arguments));
+        // Diagnostics, or with an `operation` a navigation request: the
+        // same tool, so the same permission rules cover both.
+        let result = crate::lsp::run(home, tool_cx, scope, &args);
         let (output, status) = lsp_result_output(result);
         record_result(
             home,
@@ -998,7 +1365,42 @@ pub fn execute_call(
     // permission layer (modes + pattern rules), the deny-read list and
     // the secret scanner on every result (review blocker 1).
     if orbit_tools::is_wave1(&call.name) {
-        let (output, file_change) = execute_wave1(home, scope, call, &args, tool_cx);
+        // A PreToolUse hook may answer `ask`: the operator confirms, unless
+        // they already approved this very call.
+        let mut confirm = |reason: &str| -> bool {
+            if tool_cx.is_cancelled() {
+                return false;
+            }
+            if operator_asked {
+                return true;
+            }
+            let reason: String = reason
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect();
+            let request = ApprovalRequest {
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                summary: format!("{} — hook asks: {reason}", safe_call_summary(call)),
+                risk: crate::tools::call_risk(&call.name, &args),
+                // The summary is one clipped line: the hook's reason is
+                // also given whole, above what the call would do.
+                preview: std::iter::once(" a hook asks:".to_owned())
+                    .chain(crate::tools::wrap_for_card(&reason))
+                    .chain(crate::tools::approval_preview(&call.name, &args))
+                    .collect(),
+                grant: None,
+                input: args.clone(),
+                relay: false,
+            };
+            if tool_cx.is_cancelled() {
+                return false;
+            }
+            let verdict = approval.ask(&request, false);
+            !tool_cx.is_cancelled() && verdict != ApprovalVerdict::Deny
+        };
+        let (output, file_change) = execute_wave1(home, scope, call, &args, tool_cx, &mut confirm);
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -1010,11 +1412,16 @@ pub fn execute_call(
         // PostToolUse fires inside execute_wave1 with ok=true/false).
         // A denial (status "denied") is not a failure — the tool never
         // ran (D9), and PermissionRequest already covered the moment.
-        if status == "error" {
+        if status == "error" && !tool_cx.is_cancelled() {
             let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
             let _ = hooks.fire(
                 orbit_engine::hooks::HookEvent::PostToolUseFailure,
-                &serde_json::json!({ "tool": call.name, "ok": false }),
+                &serde_json::json!({
+                    "tool": call.name,
+                    "arguments": args,
+                    "ok": false,
+                    "error": output.chars().take(4_000).collect::<String>(),
+                }),
             );
         }
         record_result(
@@ -1098,8 +1505,8 @@ fn skill_result_output(mut response: serde_json::Value) -> String {
     serde_json::json!({"ok":false,"result_error":true,"error":"Skill result exceeds the 64 KiB encoded output limit","truncated":true}).to_string()
 }
 
-fn lsp_result_output(
-    result: Result<crate::lsp::DiagnosticReport, crate::lsp::LspError>,
+fn lsp_result_output<T: serde::Serialize>(
+    result: Result<T, crate::lsp::LspError>,
 ) -> (String, &'static str) {
     let (output, status) = match result {
         Ok(report) => (
@@ -1291,7 +1698,7 @@ fn grant_offer(
     use orbit_tools::permissions::{PermissionMode, PermissionRule, RuleEffectSerde, rule_matches};
     if !matches!(
         scope.mode,
-        PermissionMode::Default | PermissionMode::AcceptEdits
+        PermissionMode::Default | PermissionMode::AcceptEdits | PermissionMode::Auto
     ) {
         return None;
     }
@@ -1505,22 +1912,21 @@ fn pattern_layer_verdict_with_plan(
                     return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
                 }
             }
-            if scope.mode != orbit_tools::permissions::PermissionMode::Bypass {
-                match rules.evaluate(tool_name, "") {
-                    Some(orbit_tools::permissions::RuleEffect::Deny) => {
-                        return PatternOutcome::Deny("denied by rule".into());
-                    }
-                    Some(orbit_tools::permissions::RuleEffect::Ask) => {
-                        return if scope.mode == orbit_tools::permissions::PermissionMode::DontAsk {
-                            PatternOutcome::Deny(
-                                "configured confirmation is unavailable (dontAsk)".into(),
-                            )
-                        } else {
-                            PatternOutcome::ExplicitAsk
-                        };
-                    }
-                    Some(orbit_tools::permissions::RuleEffect::Allow) | None => {}
+            // Rules hold in every mode, bypass included.
+            match rules.evaluate(tool_name, "") {
+                Some(orbit_tools::permissions::RuleEffect::Deny) => {
+                    return PatternOutcome::Deny("denied by rule".into());
                 }
+                Some(orbit_tools::permissions::RuleEffect::Ask) => {
+                    return if scope.mode == orbit_tools::permissions::PermissionMode::DontAsk {
+                        PatternOutcome::Deny(
+                            "configured confirmation is unavailable (dontAsk)".into(),
+                        )
+                    } else {
+                        PatternOutcome::ExplicitAsk
+                    };
+                }
+                Some(orbit_tools::permissions::RuleEffect::Allow) | None => {}
             }
             return PatternOutcome::Allow;
         }
@@ -1531,18 +1937,56 @@ fn pattern_layer_verdict_with_plan(
         // own calls decide their permissions).
         if tool_name == "Task" || tool_name == "Agent" {
             let key = orbit_tools::agent_permission_key(args);
+            if let Some(allowlist) = &scope.allowlist {
+                let covered = allowlist.iter().any(|entry| {
+                    parse_rule(entry, RuleEffectSerde::Allow).is_some_and(|rule| {
+                        orbit_tools::permissions::rule_tool_matches(&rule, &key.tool, None)
+                            && orbit_tools::permissions::rule_matches(&rule, &key.pattern)
+                    })
+                });
+                if !covered {
+                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+                }
+            }
             return match evaluate(scope.mode, &rules, &key.tool, &key.pattern, false, false) {
                 Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask
+                    if rules.evaluate(&key.tool, &key.pattern)
+                        == Some(orbit_tools::permissions::RuleEffect::Ask) =>
+                {
+                    PatternOutcome::ExplicitAsk
+                }
                 Verdict::Ask => PatternOutcome::Ask,
                 Verdict::Deny(reason) => PatternOutcome::Deny(reason),
             };
         }
-        if tool_name == "ListAgents" || tool_name == "AgentSendMessage" {
-            let pattern = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(
+            tool_name,
+            "ListAgents" | "AgentSendMessage" | "AgentOutput" | "AgentStop"
+        ) || crate::tools::is_schedule_tool(tool_name)
+        {
+            let pattern = args
+                .get("agent_id")
+                .or_else(|| args.get("agent"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if tool_name == "AgentSendMessage"
                 && scope.mode == orbit_tools::permissions::PermissionMode::Plan
             {
                 return PatternOutcome::Deny("plan mode: agent messages are queue writes".into());
+            }
+            if crate::tools::is_schedule_tool(tool_name)
+                && tool_name != "CronList"
+                && scope.mode == orbit_tools::permissions::PermissionMode::Plan
+            {
+                return PatternOutcome::Deny(
+                    if crate::worktree::is_worktree_tool(tool_name) {
+                        "plan mode: a worktree changes the repository"
+                    } else {
+                        "plan mode: schedules are writes"
+                    }
+                    .into(),
+                );
             }
             if let Some(allowlist) = &scope.allowlist {
                 let covered = allowlist.iter().any(|entry| {
@@ -1560,7 +2004,12 @@ fn pattern_layer_verdict_with_plan(
                 &rules,
                 tool_name,
                 pattern,
-                tool_name == "ListAgents",
+                // Stopping one's own background agent is never a prompt.
+                // Deleting a schedule only ever reduces what will run.
+                matches!(
+                    tool_name,
+                    "ListAgents" | "AgentOutput" | "AgentStop" | "CronList" | "CronDelete"
+                ),
                 false,
             ) {
                 Verdict::Allow => PatternOutcome::Allow,
@@ -1840,17 +2289,17 @@ pub fn effective_permission_policy(
                     PermissionMode::Plan => "plan-mode",
                     PermissionMode::DontAsk => "dont-ask-mode",
                     PermissionMode::Bypass => "bypass-mode",
+                    PermissionMode::Auto => "auto-mode",
                 }
             }
             .into(),
         );
     }
+    // Bypass allows what no rule denies or asks about; a deny or ask rule
+    // from any source holds in it.
     if scope.mode == orbit_tools::permissions::PermissionMode::Bypass
         && !matches.iter().any(|entry| {
-            entry.effect == RuleEffectSerde::Deny
-                && !entry.shadowed
-                && (selector == "LspDiagnostics"
-                    || matches!(entry.source.as_str(), "legacy" | "operator-scope-exclusion"))
+            !entry.shadowed && matches!(entry.effect, RuleEffectSerde::Deny | RuleEffectSerde::Ask)
         })
     {
         effect = RuleEffectSerde::Allow;
@@ -2161,6 +2610,49 @@ fn reopen_writer(home: &Path) -> Result<LedgerWriter, String> {
     Err(format!("open ledger: {last_err}"))
 }
 
+/// Settle a durable intent without executing the call. If approval was already
+/// recorded, keep that single verdict: cancellation changes the result, not the
+/// historical approval decision.
+fn settle_cancelled_call(
+    home: &Path,
+    session_id: &str,
+    decision_id: &str,
+    call: &crate::PendingToolCall,
+    tool_cx: &orbit_tools::ToolContext,
+    verdict_recorded: bool,
+) -> Result<(String, Option<FileChange>), String> {
+    if !verdict_recorded {
+        let mut writer = reopen_writer(home)?;
+        let digest = writer
+            .append(LedgerEvent::ToolVerdict(ToolVerdict {
+                session_id: session_id.into(),
+                decision_id: decision_id.into(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                allowed: false,
+                reason: "cancelled by user".into(),
+            }))
+            .map_err(|e| format!("record tool verdict: {e}"))?;
+        tool_cx.note_ledger(orbit_tools::LedgerNote {
+            kind: "verdict",
+            target: safe_call_summary(call),
+            fact: "cancelled by user".into(),
+            digest,
+        });
+    }
+    let output = tool_error("cancelled by user");
+    record_result(
+        home,
+        session_id,
+        decision_id,
+        call,
+        "error",
+        &output,
+        tool_cx,
+    )?;
+    Ok((output, None))
+}
+
 fn record_result(
     home: &Path,
     session_id: &str,
@@ -2416,8 +2908,73 @@ fn execute_wave1(
     call: &crate::PendingToolCall,
     args: &serde_json::Value,
     tool_cx: &orbit_tools::ToolContext,
+    confirm: &mut dyn FnMut(&str) -> bool,
 ) -> (String, Option<FileChange>) {
     use orbit_tools::permissions::{RuleEffectSerde, evaluate, parse_rule};
+
+    if tool_cx.is_cancelled() {
+        return (tool_error("cancelled by user"), None);
+    }
+    // Hooks (phase 5): PreToolUse fires BEFORE every other gate —
+    // hooks are the operator's policy layer and must see (and be able
+    // to block) every call, whatever the machine's sandbox state. It
+    // fires once per call. A hook may also rewrite the input; every gate
+    // below, and the tool itself, then sees the rewritten input.
+    // PostToolUse sees the result.
+    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+    let pre = hooks.fire(
+        orbit_engine::hooks::HookEvent::PreToolUse,
+        &serde_json::json!({
+            "tool": call.name,
+            "arguments": args,
+        }),
+    );
+    if tool_cx.is_cancelled() {
+        return (tool_error("cancelled by user"), None);
+    }
+    if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
+        return (tool_denial(&format!("blocked by hook: {reason}")), None);
+    }
+    // TaskCreated / TaskCompleted: a hook may refuse a new task, or refuse to
+    // let one be marked done (a gate on "finished").
+    let task_event = match call.name.as_str() {
+        "TaskCreate" => Some(orbit_engine::hooks::HookEvent::TaskCreated),
+        "TaskUpdate"
+            if matches!(
+                args.get("status").and_then(serde_json::Value::as_str),
+                Some("done" | "completed")
+            ) =>
+        {
+            Some(orbit_engine::hooks::HookEvent::TaskCompleted)
+        }
+        _ => None,
+    };
+    if let Some(event) = task_event {
+        // No `tool` key: these events have no matcher subject.
+        let outcomes = hooks.fire(event, &serde_json::json!({ "task": args }));
+        if tool_cx.is_cancelled() {
+            return (tool_error("cancelled by user"), None);
+        }
+        if let Some(reason) = orbit_engine::hooks::blocked(&outcomes) {
+            return (tool_denial(&format!("blocked by hook: {reason}")), None);
+        }
+    }
+    if let Some(reason) = orbit_engine::hooks::asks(&pre) {
+        let confirmed = confirm(&reason);
+        if tool_cx.is_cancelled() {
+            return (tool_error("cancelled by user"), None);
+        }
+        if !confirmed {
+            return (
+                tool_denial(&format!(
+                    "a hook asked for confirmation and it was declined: {reason}"
+                )),
+                None,
+            );
+        }
+    }
+    let rewritten = orbit_engine::hooks::rewritten_input(&pre);
+    let args = rewritten.as_ref().unwrap_or(args);
 
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
     let mut rules = orbit_tools::executor::load_rules_in(home, &tool_cx.working_dir);
@@ -2472,21 +3029,11 @@ fn execute_wave1(
             args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
         );
 
-    // Hooks (phase 5): PreToolUse fires BEFORE every other gate —
-    // hooks are the operator's policy layer and must see (and be able
-    // to block) every call, whatever the machine's sandbox state.
-    // PostToolUse sees the result.
-    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
-    let pre = hooks.fire(
-        orbit_engine::hooks::HookEvent::PreToolUse,
-        &serde_json::json!({
-            "tool": call.name,
-            "arguments": args,
-        }),
-    );
-    if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
-        return (tool_denial(&format!("blocked by hook: {reason}")), None);
-    }
+    // Advisory scope review (engagement workspaces): a tool call naming a
+    // target outside the recorded scope.toml is surfaced as a visible
+    // warning and logged — never a block. ORBIT informs the operator; the
+    // operator decides. Pure file parsing, no network.
+    crate::pentest::record_scope_advisories(home, &tool_cx.working_dir, &call.name, args);
 
     // S3: when the shell sandbox cannot run on this machine, a Bash
     // command must not execute unsandboxed on an allow verdict. The
@@ -2534,17 +3081,8 @@ fn execute_wave1(
     // satisfies Edit's precondition. A fresh context per call is what
     // made Edit always refuse.
     let cx = tool_cx.clone();
-
-    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
-    let pre = hooks.fire(
-        orbit_engine::hooks::HookEvent::PreToolUse,
-        &serde_json::json!({
-            "tool": call.name,
-            "arguments": args,
-        }),
-    );
-    if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
-        return (tool_denial(&format!("blocked by hook: {reason}")), None);
+    if cx.is_cancelled() {
+        return (tool_error("cancelled by user"), None);
     }
 
     // Checkpoint (phase 4): before the first WRITE of a turn, snapshot
@@ -2578,6 +3116,9 @@ fn execute_wave1(
 
     // B1: a tool bug must become a tool error, never a dead worker
     // (a panic here used to take the whole process or the TUI thread).
+    if cx.is_cancelled() {
+        return (tool_error("cancelled by user"), None);
+    }
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if call.name == "Read"
             && let Some(path) = args.get("file_path").and_then(|value| value.as_str())
@@ -2597,14 +3138,43 @@ fn execute_wave1(
     };
     let result = orbit_tools::finish(result, &cx, &call.id);
 
-    // PostToolUse: the hook sees the (scanned) result.
-    let _ = hooks.fire(
+    // PostToolUse: the hook sees the (scanned) result, as `tool_response`
+    // (Claude Code's name for it). A very large result is not copied to
+    // every hook: it is summarised by its size.
+    const MAX_HOOK_RESPONSE: usize = 256 * 1024;
+    let tool_response = if result.payload.len() <= MAX_HOOK_RESPONSE {
+        serde_json::from_str::<serde_json::Value>(&result.payload)
+            .unwrap_or_else(|_| serde_json::Value::String(result.payload.clone()))
+    } else {
+        serde_json::json!({ "truncated": true, "bytes": result.payload.len() })
+    };
+    let post = hooks.fire(
         orbit_engine::hooks::HookEvent::PostToolUse,
         &serde_json::json!({
             "tool": call.name,
+            "arguments": args,
             "ok": !result.is_error,
+            "tool_response": tool_response,
         }),
     );
+    // What the hooks around this call want the model to know rides on the
+    // result: context a PreToolUse or PostToolUse hook added, and what a
+    // PostToolUse hook reported when it blocked (exit code 2, or
+    // `decision: "block"`) - a failed lint or test run after an edit, say.
+    // The call has already run; the report is for the model to act on.
+    let mut hook_feedback: Vec<String> = Vec::new();
+    if let Some(context) = orbit_engine::hooks::added_context(&pre) {
+        hook_feedback.push(context);
+    }
+    if let Some(reason) = orbit_engine::hooks::blocked(&post) {
+        hook_feedback.push(format!(
+            "A PostToolUse hook reported a problem after this call: {}",
+            reason.trim()
+        ));
+    }
+    if let Some(context) = orbit_engine::hooks::added_context(&post) {
+        hook_feedback.push(context);
+    }
 
     // M11: a successful checkpointed write carries a real diff — the
     // "before" bytes were captured above, the "after" bytes are read
@@ -2630,7 +3200,66 @@ fn execute_wave1(
         _ => None,
     };
 
-    (result.payload, file_change)
+    // A path-scoped rule arrives with the first successful Read, Edit or
+    // Write of a file it covers, once per session.
+    let mut payload = result.payload;
+    if !hook_feedback.is_empty()
+        && let Ok(serde_json::Value::Object(mut body)) = serde_json::from_str(&payload)
+    {
+        let mut text = hook_feedback.join("\n");
+        if text.len() > 8 * 1024 {
+            let mut cut = 8 * 1024;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
+        body.insert("hook_feedback".into(), text.into());
+        payload = serde_json::Value::Object(body).to_string();
+    }
+    if !result.is_error
+        && matches!(call.name.as_str(), "Read" | "Edit" | "Write")
+        && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+        && let Some(rules) = new_scoped_rules(&cx, &orbit_tools::resolve_path(&cx, path))
+        && let Ok(serde_json::Value::Object(mut body)) = serde_json::from_str(&payload)
+    {
+        body.insert("project_rules".into(), rules);
+        payload = serde_json::Value::Object(body).to_string();
+    }
+
+    (payload, file_change)
+}
+
+/// The rule files this session has already delivered with a tool result.
+#[derive(Default)]
+struct DeliveredRules(std::sync::Mutex<std::collections::HashSet<String>>);
+
+/// The scoped rules that apply to `file` and have not been delivered yet,
+/// as a JSON array of `{rule, text}`; `None` when there are none. At most
+/// 16 KiB of rule text rides on one result; a rule that does not fit waits
+/// for the next matching call.
+fn new_scoped_rules(cx: &orbit_tools::ToolContext, file: &Path) -> Option<serde_json::Value> {
+    const MAX_BYTES: usize = 16 * 1024;
+    let rules = orbit_engine::context::scoped_rules_for(&cx.working_dir, file);
+    if rules.is_empty() {
+        return None;
+    }
+    if cx.ext::<DeliveredRules>().is_none() {
+        cx.set_ext(DeliveredRules::default());
+    }
+    let delivered = cx.ext::<DeliveredRules>()?;
+    let mut seen = delivered.0.lock().ok()?;
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    for (rule, text) in rules {
+        if seen.contains(&rule) || bytes + text.len() > MAX_BYTES {
+            continue;
+        }
+        bytes += text.len();
+        seen.insert(rule.clone());
+        out.push(serde_json::json!({ "rule": rule, "text": text }));
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Array(out))
 }
 
 /// Is the current folder trusted (project-scope rules/hooks/skills
@@ -2678,13 +3307,39 @@ fn execute_mcp(
         orbit_mcp::McpCallOptions::new(std::time::Duration::from_millis(server_cfg.timeout_ms));
     options.cancel = cx.cancel_check();
     options.working_dir = Some(cx.working_dir.clone());
-    match orbit_mcp::POOL.call_tool_with_options(
-        &plan.server,
-        server_cfg,
-        &plan.tool,
-        args.clone(),
-        &options,
-    ) {
+    // A resource request, when the call was unwrapped from ListMcpResources
+    // or ReadMcpResource; otherwise an ordinary tool call.
+    let resource = args
+        .get(crate::tools::MCP_RESOURCE_MARK)
+        .and_then(serde_json::Value::as_str);
+    let outcome = match (plan.tool.as_str(), resource) {
+        (crate::tools::MCP_RESOURCE_LIST, Some("list")) => orbit_mcp::POOL
+            .request_with_options(
+                &plan.server,
+                server_cfg,
+                "resources/list",
+                serde_json::json!({}),
+                &options,
+            )
+            .map(|result| serde_json::json!({ "structuredContent": result })),
+        (crate::tools::MCP_RESOURCE_READ, Some("read")) => orbit_mcp::POOL
+            .request_with_options(
+                &plan.server,
+                server_cfg,
+                "resources/read",
+                serde_json::json!({ "uri": args.get("uri") }),
+                &options,
+            )
+            .map(|result| serde_json::json!({ "structuredContent": result })),
+        _ => orbit_mcp::POOL.call_tool_with_options(
+            &plan.server,
+            server_cfg,
+            &plan.tool,
+            args.clone(),
+            &options,
+        ),
+    };
+    match outcome {
         Ok(result) => {
             let ok = !result
                 .get("isError")
@@ -2797,7 +3452,7 @@ fn scan_mcp_text(text: &str) -> (String, usize) {
     (safe, count)
 }
 
-fn scan_mcp_value(value: &mut serde_json::Value, redactions: &mut usize) {
+pub(crate) fn scan_mcp_value(value: &mut serde_json::Value, redactions: &mut usize) {
     scan_mcp_value_with_key(value, redactions, false);
 }
 
@@ -3467,6 +4122,12 @@ struct AgentSessionContext {
     depth: usize,
 }
 
+/// Is this the context of a subagent, not of the session itself?
+pub(crate) fn is_agent_context(cx: &orbit_tools::ToolContext) -> bool {
+    cx.ext::<AgentSessionContext>()
+        .is_some_and(|context| context.current_agent_id.is_some())
+}
+
 fn agent_session_context(cx: &orbit_tools::ToolContext, session_id: &str) -> AgentSessionContext {
     cx.ext::<AgentSessionContext>()
         .map(|context| (*context).clone())
@@ -3511,6 +4172,8 @@ pub(crate) fn child_agent_context(
     let mut child =
         orbit_tools::ToolContext::new(home.into(), agent_id.into(), parent.working_dir.clone());
     child.working_dirs = parent.working_dirs.clone();
+    // A subagent starts where its parent is; a move of its own stays its own.
+    child.set_cwd(Some(parent.cwd()));
     child.set_ext(AgentSessionContext {
         owner_session_id: identity.owner_session_id,
         current_agent_id: Some(agent_id.into()),
@@ -3533,6 +4196,8 @@ pub(crate) fn invocation_context(
         parent.working_dir.clone(),
     );
     invocation.working_dirs = parent.working_dirs.clone();
+    // A skill runs where the session is, not back in the project.
+    invocation.set_cwd(Some(parent.cwd()));
     invocation.set_ext(agent_session_context(parent, session_id));
     crate::plugin_content::inherit_context(parent, &invocation);
     if let Some(cancel) = parent.cancel_check() {
@@ -3545,6 +4210,10 @@ pub(crate) fn invocation_context(
 }
 
 impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
+    fn hook_handler_runner(&self) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+        Some(crate::hook_handlers::runner(&self.home, &self.tool_cx))
+    }
+
     fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
         remember_turn_config(&self.tool_cx, config);
     }
@@ -5311,6 +5980,36 @@ mod grant_tests {
 mod agent_key_tests {
     use super::*;
 
+    #[test]
+    fn agent_allowlist_scope_matches_both_tool_aliases_and_the_agent_type() {
+        let home = std::env::temp_dir().join(format!("orbit-agent-scope-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let args = serde_json::json!({"agent": "Explore", "prompt": "find it"});
+        for selector in ["Agent", "Task", "Agent(Explore)", "Task(Explore)"] {
+            let scope = PermissionScope::from_flags(Some("bypass"), Some(selector), None);
+            for tool in ["Task", "Agent"] {
+                assert_eq!(
+                    pattern_layer_verdict_in(&home, &scope, tool, &args, &home),
+                    PatternOutcome::Allow,
+                    "{selector} must cover the {tool} alias"
+                );
+            }
+        }
+        for selector in ["Read", "Agent(Plan)", "Task(Plan)", ""] {
+            let scope = PermissionScope::from_flags(Some("bypass"), Some(selector), None);
+            for tool in ["Task", "Agent"] {
+                assert!(
+                    matches!(
+                        pattern_layer_verdict_in(&home, &scope, tool, &args, &home),
+                        PatternOutcome::Deny(_)
+                    ),
+                    "{selector:?} must not cover {tool}(Explore)"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The registry AgentTool is deleted (Task/Agent are intercepted in
     /// execute_call before the registry), but Agent(<agent-type>)
     /// pattern rules and session grants must keep working. This is the
@@ -5475,6 +6174,17 @@ mod agent_lifecycle_tests {
         }
     }
 
+    #[derive(Default)]
+    struct Refuse {
+        asked: Vec<(String, bool)>,
+    }
+    impl ApprovalChannel for Refuse {
+        fn ask(&mut self, request: &ApprovalRequest, auto_tools: bool) -> ApprovalVerdict {
+            self.asked.push((request.tool_name.clone(), auto_tools));
+            ApprovalVerdict::Deny
+        }
+    }
+
     struct Fixture {
         home: std::path::PathBuf,
         cx: orbit_tools::ToolContext,
@@ -5541,6 +6251,111 @@ mod agent_lifecycle_tests {
     }
     fn id(result: &Value) -> &str {
         result["result"]["agent_id"].as_str().unwrap()
+    }
+
+    #[test]
+    fn configured_agent_ask_rules_require_confirmation_before_launch() {
+        for rule_tool in ["Agent", "Task"] {
+            let fixture = Fixture::new();
+            std::fs::write(
+                fixture.home.join("settings.toml"),
+                format!("[permissions]\nask = [\"{rule_tool}(Explore)\"]\n"),
+            )
+            .unwrap();
+            for mode in ["default", "bypass", "auto"] {
+                let scope = PermissionScope::from_flags(Some(mode), None, None);
+                for tool in ["Task", "Agent"] {
+                    for consent in ["auto-tools", "tool-grant", "rule-grant"] {
+                        let call = crate::PendingToolCall {
+                            index: 0,
+                            id: ulid::Ulid::new().to_string(),
+                            name: tool.into(),
+                            arguments: serde_json::to_vec(&json!({
+                                "agent":"Explore", "prompt":"requires confirmation"
+                            }))
+                            .unwrap(),
+                        };
+                        let mut grants = AutoGrants::new();
+                        if consent == "tool-grant" {
+                            grants.grant(tool);
+                        } else if consent == "rule-grant" {
+                            grants.grant_rule("Agent", "Explore");
+                        }
+                        let mut approval = Refuse::default();
+                        let (result, _) = execute_call(
+                            &fixture.home,
+                            "owner",
+                            "decision",
+                            &call,
+                            consent == "auto-tools",
+                            false,
+                            &mut approval,
+                            &mut grants,
+                            &scope,
+                            &fixture.cx,
+                        )
+                        .unwrap();
+                        assert!(
+                            orbit_tools::result_is_denial(&result),
+                            "{rule_tool} ask, {mode}, {tool}, {consent}: {result}"
+                        );
+                        assert!(
+                            result.contains(
+                                "configured explicit confirmation requires an interactive approval"
+                            ),
+                            "{result}"
+                        );
+                        assert_eq!(approval.asked, [(tool.into(), false)]);
+                        assert!(fixture.store().list().unwrap().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_calls_outside_pinned_scope_are_denied_before_launch() {
+        let fixture = Fixture::new();
+        for mode in ["default", "bypass", "auto"] {
+            for selector in ["Read", "Agent(Plan)", "Task(Plan)", ""] {
+                let scope = PermissionScope::from_flags(Some(mode), Some(selector), None);
+                for tool in ["Task", "Agent"] {
+                    let call = crate::PendingToolCall {
+                        index: 0,
+                        id: ulid::Ulid::new().to_string(),
+                        name: tool.into(),
+                        arguments: serde_json::to_vec(&json!({
+                            "agent":"Explore", "prompt":"outside pinned scope"
+                        }))
+                        .unwrap(),
+                    };
+                    let mut grants = AutoGrants::new();
+                    grants.grant(tool);
+                    grants.grant_rule("Agent", "Explore");
+                    let mut approval = Refuse::default();
+                    let (result, _) = execute_call(
+                        &fixture.home,
+                        "owner",
+                        "decision",
+                        &call,
+                        true,
+                        false,
+                        &mut approval,
+                        &mut grants,
+                        &scope,
+                        &fixture.cx,
+                    )
+                    .unwrap();
+                    assert!(orbit_tools::result_is_denial(&result), "{result}");
+                    assert!(
+                        result.contains("outside the operator's allowlist"),
+                        "{result}"
+                    );
+                    assert!(approval.asked.is_empty());
+                    assert!(fixture.store().list().unwrap().is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -6016,19 +6831,124 @@ mod agent_lifecycle_tests {
     }
 
     #[test]
+    fn cancelled_agents_preserve_the_admission_boundary_without_a_provider() {
+        let fixture = Fixture::new();
+        // No server is started. The admitted turn must cancel before transport.
+        let config = orbit_engine::TurnConfig {
+            provider_id: "mock".into(),
+            gate: "http://127.0.0.1:1".into(),
+            model: "mock-notools".into(),
+            kind: orbit_engine::ProviderKind::OpenAiCompatible,
+            credential_env: None,
+            billing: None,
+            pricing: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
+            max_output_tokens: 32_000,
+            sampling: None,
+            effort: None,
+            supported_efforts: None,
+        };
+        remember_turn_config(&fixture.cx, &config);
+        fixture.cx.push_cancel_check(std::sync::Arc::new(|| true));
+        let skipped = fixture.task(json!({"agent":"Explore","prompt":"not admitted"}));
+        fixture.cx.pop_cancel_check();
+        assert_eq!(skipped["error"], "cancelled by user", "{skipped}");
+        assert!(skipped.get("agent_id").is_none());
+        assert!(fixture.store().list().unwrap().is_empty());
+
+        let store = fixture.store();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        fixture.cx.push_cancel_check(std::sync::Arc::new(move || {
+            stopped.load(Ordering::SeqCst)
+                || if store
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|agent| agent.status == AgentStatus::Running)
+                {
+                    stopped.store(true, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+        }));
+        let cancelled = fixture.task(json!({"agent":"Explore","prompt":"cancel after admission"}));
+        fixture.cx.pop_cancel_check();
+        assert_eq!(cancelled["ok"], false, "{cancelled}");
+        let agent_id = cancelled["agent_id"]
+            .as_str()
+            .expect("admitted child identity");
+        let saved = fixture.store().load(agent_id).unwrap();
+        assert_eq!(saved.status, AgentStatus::Cancelled);
+        assert_eq!(saved.turns, 1);
+        assert!(saved.active_run_id.is_none());
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|message| {
+                    message.role == orbit_adapter::types::ChatRole::User
+                        && message.content == "cancel after admission"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn cancelled_and_stale_runs_resume_from_saved_transcript() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let mock = Mock::new();
         let fixture = Fixture::new();
         remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
         fixture.cx.push_cancel_check(std::sync::Arc::new(|| true));
+        let skipped = fixture.task(json!({"agent":"Explore","prompt":"not admitted"}));
+        fixture.cx.pop_cancel_check();
+        assert_eq!(skipped["ok"], false, "{skipped}");
+        assert_eq!(skipped["error"], "cancelled by user", "{skipped}");
+        assert!(skipped.get("agent_id").is_none(), "{skipped}");
+        assert!(fixture.store().list().unwrap().is_empty());
+        assert_eq!(mock.requests(), 0);
+
+        // Cancel only after the child has a durable run. An already-cancelled
+        // parent is refused by execute_call before admitting any child.
+        let store = fixture.store();
+        let admitted_cancel = AtomicBool::new(false);
+        fixture.cx.push_cancel_check(std::sync::Arc::new(move || {
+            if !admitted_cancel.load(Ordering::SeqCst)
+                && store
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|agent| agent.status == AgentStatus::Running)
+            {
+                admitted_cancel.store(true, Ordering::SeqCst);
+            }
+            admitted_cancel.load(Ordering::SeqCst)
+        }));
         let cancelled = fixture.task(json!({"agent":"Explore","prompt":"cancelled task"}));
+        fixture.cx.pop_cancel_check();
         assert_eq!(cancelled["ok"], false, "{cancelled}");
         let agent_id = cancelled["agent_id"].as_str().unwrap();
         let saved = fixture.store().load(agent_id).unwrap();
         assert_eq!(saved.status, AgentStatus::Cancelled);
         assert_eq!(saved.turns, 1);
+        assert!(saved.active_run_id.is_none());
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|message| {
+                    message.role == orbit_adapter::types::ChatRole::User
+                        && message.content == "cancelled task"
+                })
+                .count(),
+            1,
+            "the admitted task is preserved exactly once"
+        );
         assert_eq!(mock.requests(), 0);
-        fixture.cx.pop_cancel_check();
         drop(fixture.store().begin(agent_id, None).unwrap());
         assert_eq!(
             fixture.store().load(agent_id).unwrap().status,
@@ -6318,6 +7238,8 @@ mod cancellable_approval_tests {
                 pattern: "check *".into(),
                 can_save: true,
             }),
+            input: serde_json::Value::Null,
+            relay: false,
         }
     }
 
@@ -6384,5 +7306,351 @@ mod cancellable_approval_tests {
             ApprovalVerdict::Deny
         );
         assert!(channel.input_failed());
+    }
+}
+
+#[cfg(test)]
+mod cancelled_dispatch_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fixture {
+        base: PathBuf,
+        home: PathBuf,
+        project: PathBuf,
+        cx: orbit_tools::ToolContext,
+        cancel: orbit_provider_http::CancelToken,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let base =
+                std::env::temp_dir().join(format!("orbit-cancel-dispatch-{}", ulid::Ulid::new()));
+            let home = base.join("home");
+            let project = base.join("project");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let cx =
+                orbit_tools::ToolContext::new(home.clone(), "cancel-owner".into(), project.clone());
+            let cancel = orbit_provider_http::CancelToken::new();
+            begin_cancel_scope(&cx, &cancel);
+            Self {
+                base,
+                home,
+                project,
+                cx,
+                cancel,
+            }
+        }
+
+        fn call(&self, name: &str, args: serde_json::Value) -> crate::PendingToolCall {
+            crate::PendingToolCall {
+                index: 0,
+                id: "cancelled-call".into(),
+                name: name.into(),
+                arguments: serde_json::to_vec(&args).unwrap(),
+            }
+        }
+
+        fn write_call(&self) -> crate::PendingToolCall {
+            self.call(
+                "Write",
+                serde_json::json!({"file_path":"never-written.txt","content":"must not run"}),
+            )
+        }
+
+        fn run(
+            &self,
+            call: &crate::PendingToolCall,
+            approval: &mut dyn ApprovalChannel,
+            grants: &mut AutoGrants,
+            scope: &PermissionScope,
+        ) -> String {
+            let (output, change) = execute_call(
+                &self.home,
+                "cancel-owner",
+                "cancel-decision",
+                call,
+                false,
+                true,
+                approval,
+                grants,
+                scope,
+                &self.cx,
+            )
+            .unwrap();
+            assert!(change.is_none());
+            assert_eq!(output, cancelled_result(call).content);
+            assert!(!orbit_tools::result_is_denial(&output));
+            assert!(!self.project.join("never-written.txt").exists());
+            assert!(!self.project.join("never-ran.txt").exists());
+            output
+        }
+
+        fn assert_settled(&self, call: &crate::PendingToolCall, allowed: bool) {
+            let (records, _) =
+                orbit_ledger::reader::verify_ledger(&self.home.join("ledger")).unwrap();
+            let events: Vec<_> = records
+                .iter()
+                .filter_map(|record| match &record.record.event {
+                    LedgerEvent::ToolIntent(event) if event.call_id == call.id => Some("intent"),
+                    LedgerEvent::ToolVerdict(event) if event.call_id == call.id => {
+                        assert_eq!(event.allowed, allowed);
+                        if !allowed {
+                            assert_eq!(event.reason, "cancelled by user");
+                        }
+                        Some("verdict")
+                    }
+                    LedgerEvent::ToolResult(event) if event.call_id == call.id => {
+                        let output = cancelled_result(call).content;
+                        assert_eq!(event.status, "error");
+                        assert_eq!(
+                            event.output_sha256,
+                            hex::encode(Sha256::digest(output.as_bytes()))
+                        );
+                        assert_eq!(event.output_bytes, output.len() as u64);
+                        Some("result")
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(events, ["intent", "verdict", "result"]);
+        }
+
+        #[cfg(unix)]
+        fn marker_hook(&self, event: &str) -> PathBuf {
+            let marker = self.home.join("hook-finished");
+            let quoted = marker.to_string_lossy().replace('\'', "'\\''");
+            std::fs::write(
+                self.home.join("settings.toml"),
+                format!("[[hooks]]\nevent = \"{event}\"\ncommand = \": > '{quoted}'\"\n"),
+            )
+            .unwrap();
+            marker
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    struct Approval {
+        asked: usize,
+        verdict: ApprovalVerdict,
+        cancel: Option<orbit_provider_http::CancelToken>,
+    }
+
+    impl Approval {
+        fn unexpected() -> Self {
+            Self {
+                asked: 0,
+                verdict: ApprovalVerdict::AllowOnce,
+                cancel: None,
+            }
+        }
+    }
+
+    impl ApprovalChannel for Approval {
+        fn ask(&mut self, _: &ApprovalRequest, _: bool) -> ApprovalVerdict {
+            self.asked += 1;
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            self.verdict
+        }
+    }
+
+    #[test]
+    fn cancellation_during_auto_judgement_never_opens_a_manual_prompt_or_runs_the_command() {
+        for answer in ["ASK", "ALLOW", "BLOCK: needs review"] {
+            let fixture = Fixture::new();
+            let cancel = fixture.cancel.clone();
+            let judged = Arc::new(AtomicUsize::new(0));
+            let seen = judged.clone();
+            fixture
+                .cx
+                .set_ext(crate::auto_mode::AutoJudge(Arc::new(move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    cancel.cancel();
+                    Ok(answer.into())
+                })));
+            let call = fixture.call(
+                "Bash",
+                serde_json::json!({"command":"printf ran > never-ran.txt"}),
+            );
+            let mut approval = Approval::unexpected();
+            let mut grants = AutoGrants::new();
+            fixture.run(
+                &call,
+                &mut approval,
+                &mut grants,
+                &PermissionScope::from_flags(Some("auto"), None, None),
+            );
+            assert_eq!(judged.load(Ordering::SeqCst), 1);
+            assert_eq!(approval.asked, 0);
+            assert!(grants.granted_tools().is_empty());
+            fixture.assert_settled(&call, false);
+        }
+    }
+
+    #[test]
+    fn cancellation_after_approval_never_applies_grants_or_writes_files() {
+        for verdict in [
+            ApprovalVerdict::AllowOnce,
+            ApprovalVerdict::AllowSession,
+            ApprovalVerdict::AllowRuleSession,
+            ApprovalVerdict::AllowRuleAlways,
+            ApprovalVerdict::Deny,
+        ] {
+            let fixture = Fixture::new();
+            orbit_tools::permissions::FolderTrust::new(fixture.home.clone())
+                .trust(&fixture.project)
+                .unwrap();
+            let call = fixture.write_call();
+            let mut approval = Approval {
+                asked: 0,
+                verdict,
+                cancel: Some(fixture.cancel.clone()),
+            };
+            let mut grants = AutoGrants::new();
+            fixture.run(
+                &call,
+                &mut approval,
+                &mut grants,
+                &PermissionScope::default(),
+            );
+            assert_eq!(approval.asked, 1);
+            assert!(grants.granted_tools().is_empty());
+            assert!(!grants.rule_granted("Write", "never-written.txt"));
+            assert!(!fixture.project.join(".orbit/settings.local.toml").exists());
+            fixture.assert_settled(&call, false);
+        }
+    }
+
+    #[test]
+    fn cancellation_at_ledger_boundaries_keeps_one_verdict_and_one_result() {
+        for boundary in ["intent", "verdict"] {
+            let fixture = Fixture::new();
+            let cancel = fixture.cancel.clone();
+            fixture.cx.set_ledger_sink(Some(Arc::new(move |note| {
+                if note.kind == boundary {
+                    cancel.cancel();
+                }
+            })));
+            let call = fixture.write_call();
+            let mut approval = Approval::unexpected();
+            fixture.run(
+                &call,
+                &mut approval,
+                &mut AutoGrants::new(),
+                &PermissionScope::from_flags(Some("acceptEdits"), None, None),
+            );
+            assert_eq!(approval.asked, 0);
+            fixture.assert_settled(&call, boundary == "verdict");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_during_permission_request_hook_never_registers_an_approval() {
+        let fixture = Fixture::new();
+        let marker = fixture.marker_hook("PermissionRequest");
+        let watched = marker.clone();
+        fixture
+            .cx
+            .push_cancel_check(Arc::new(move || watched.exists()));
+        let call = fixture.write_call();
+        let mut approval = Approval::unexpected();
+        fixture.run(
+            &call,
+            &mut approval,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+        );
+        assert!(
+            marker.exists(),
+            "the permission hook completed before cancellation"
+        );
+        assert_eq!(approval.asked, 0);
+        fixture.assert_settled(&call, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_during_pre_tool_hook_keeps_the_existing_approval_without_running_the_tool() {
+        let fixture = Fixture::new();
+        let marker = fixture.marker_hook("PreToolUse");
+        let watched = marker.clone();
+        fixture
+            .cx
+            .push_cancel_check(Arc::new(move || watched.exists()));
+        let call = fixture.write_call();
+        let mut approval = Approval::unexpected();
+        fixture.run(
+            &call,
+            &mut approval,
+            &mut AutoGrants::new(),
+            &PermissionScope::from_flags(Some("acceptEdits"), None, None),
+        );
+        assert!(marker.exists());
+        assert_eq!(approval.asked, 0);
+        fixture.assert_settled(&call, true);
+    }
+
+    #[test]
+    fn cancellation_before_intent_never_records_or_prompts() {
+        let fixture = Fixture::new();
+        fixture.cancel.cancel();
+        let mut approval = Approval::unexpected();
+        fixture.run(
+            &fixture.write_call(),
+            &mut approval,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+        );
+        assert_eq!(approval.asked, 0);
+        assert!(!fixture.home.join("ledger").exists());
+    }
+}
+
+#[cfg(test)]
+mod scoped_rule_tests {
+    use super::*;
+
+    #[test]
+    fn a_scoped_rule_is_delivered_once_per_session() {
+        let project = std::env::temp_dir().join(format!(
+            "orbit-rules-once-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(project.join(".orbit/rules")).unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join(".orbit/rules/rust.md"),
+            "---\npaths: \"src/**/*.rs\"\n---\nNo unwrap in library code.\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/a.rs"), "").unwrap();
+        std::fs::write(project.join("src/b.rs"), "").unwrap();
+        std::fs::write(project.join("README.md"), "").unwrap();
+        let cx =
+            orbit_tools::ToolContext::new(project.clone(), "rules-test".into(), project.clone());
+
+        assert!(new_scoped_rules(&cx, &project.join("README.md")).is_none());
+        let first = new_scoped_rules(&cx, &project.join("src/a.rs")).unwrap();
+        assert_eq!(first.as_array().unwrap().len(), 1);
+        assert!(first[0]["text"].as_str().unwrap().contains("No unwrap"));
+        assert!(first[0]["rule"].as_str().unwrap().ends_with("rust.md"));
+        // Same rule, another matching file, the same session: not again.
+        assert!(new_scoped_rules(&cx, &project.join("src/b.rs")).is_none());
+        // A clone shares the session's state, as each tool call's does.
+        assert!(new_scoped_rules(&cx.clone(), &project.join("src/a.rs")).is_none());
     }
 }

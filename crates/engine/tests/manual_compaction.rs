@@ -923,11 +923,34 @@ fn manual_malformed_nonempty_is_refused_without_turn_or_network() {
 }
 
 #[test]
-fn manual_fitting_complete_history_keeps_exact_source_and_counters() {
-    isolated!("manual_fitting_complete_history_keeps_exact_source_and_counters");
+fn manual_fitting_short_history_rejects_nonshrinking_summary_and_preserves_source() {
+    isolated!("manual_fitting_short_history_rejects_nonshrinking_summary_and_preserves_source");
     let (home, mut fixture, journal, selected, options) =
         setup(vec![Response::complete(SUMMARY)], 10_000, 12_000);
     let mut source = history(0, 0);
+    let original = source.clone();
+    let (result, events) = invoke(&home, &selected, &options, &mut source, &CancelToken::new());
+    fixture.finish();
+    // Manual compaction attempts the older of two exchanges even when both
+    // fit. An ineffective summary preserves the source but still costs a call.
+    assert_eq!(result.status, CompactionStatus::SummaryUnusable);
+    assert!(!result.applied);
+    assert_eq!(source, original);
+    assert!(journal.archives().is_empty());
+    assert_paid(&result, &journal, 1);
+    assert_eq!(journal.accounting_checkpoint().unwrap().revision.0, 2);
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    assert_ids(&home, &journal, 1);
+    assert_summary_requests(&fixture, 12_000, 1);
+    assert_private_manual_events(&events, false);
+}
+
+#[test]
+fn manual_single_complete_exchange_keeps_exact_source_and_counters() {
+    isolated!("manual_single_complete_exchange_keeps_exact_source_and_counters");
+    let (home, mut fixture, journal, selected, options) = setup(vec![], 10_000, 12_000);
+    let mut source = Vec::new();
+    pair(&mut source, INTENT, 0);
     let original = source.clone();
     let (result, events) = invoke(&home, &selected, &options, &mut source, &CancelToken::new());
     fixture.finish();
@@ -938,6 +961,31 @@ fn manual_fitting_complete_history_keeps_exact_source_and_counters() {
     assert!(fixture.requests.lock().unwrap().is_empty());
     assert_eq!(journal.accounting_checkpoint().unwrap().revision.0, 0);
     assert_private_manual_events(&events, false);
+}
+
+#[test]
+fn manual_fitting_history_applies_smaller_summary_and_retains_latest_exchange() {
+    isolated!("manual_fitting_history_applies_smaller_summary_and_retains_latest_exchange");
+    let (home, mut fixture, journal, selected, options) =
+        setup(vec![Response::complete(SUMMARY)], 10_000, 12_000);
+    let mut source = Vec::new();
+    pair(&mut source, "OLDER", 800);
+    pair(&mut source, INTENT, 0);
+    let original = source.clone();
+    let (result, events) = invoke(&home, &selected, &options, &mut source, &CancelToken::new());
+    fixture.finish();
+    assert_eq!(result.status, CompactionStatus::PublishedReady);
+    assert!(result.applied);
+    assert_eq!(source[1], orbit_engine::assistant_message(SUMMARY));
+    assert_eq!(&source[2..], &original[2..]);
+    let archives = journal.archives();
+    assert_eq!(archives.len(), 1);
+    assert_eq!(archives[0].source, original);
+    assert_eq!(archives[0].candidate, source);
+    assert_paid(&result, &journal, 1);
+    assert_ids(&home, &journal, 1);
+    assert_summary_requests(&fixture, 12_000, 1);
+    assert_private_manual_events(&events, true);
 }
 
 #[test]

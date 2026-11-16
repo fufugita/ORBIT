@@ -7,6 +7,16 @@ use orbit_adapter::types::{ChatMessage, EffortValue};
 use sha2::Digest;
 use std::path::Path;
 
+/// How long a model may take to send the first byte of its answer when its
+/// entry in providers.toml sets no `first_byte_timeout_ms`. Gateways that
+/// route, queue or think before answering routinely take over half a
+/// minute; a request cut off by this wait leaves its cost unknown, so the
+/// default errs on the side of waiting.
+pub const DEFAULT_FIRST_BYTE_TIMEOUT_MS: u64 = 120_000;
+/// How long a started answer may go silent when the model's entry sets no
+/// `idle_timeout_ms`.
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 180_000;
+
 /// One assembled tool call from the provider stream.
 #[derive(Debug, Clone)]
 pub struct PendingToolCall {
@@ -589,7 +599,7 @@ fn build_prepared_request(
                 std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(30_000)
+                    .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT_MS)
             }),
         idle_timeout_ms: measurement_timeouts
             .map(|t| t.1)
@@ -598,7 +608,7 @@ fn build_prepared_request(
                 std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(90_000)
+                    .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS)
             }),
     };
 
@@ -1178,7 +1188,7 @@ mod preparation_tests {
     #[test]
     fn per_model_deadlines_raise_the_harness_defaults() {
         // A slow upstream declares its own budget in providers.toml; the
-        // request must carry it instead of the 30 s/90 s defaults, or every
+        // request must carry it instead of the harness defaults, or every
         // turn dies as E0409 before the provider answers.
         let mut slow = config();
         slow.first_byte_timeout_ms = Some(180_000);
@@ -1194,8 +1204,16 @@ mod preparation_tests {
         let context = request_preparation_context(&defaults, None, &[]).unwrap();
         let prepared =
             prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
-        assert_eq!(prepared.request.first_byte_timeout_ms, 30_000);
-        assert_eq!(prepared.request.idle_timeout_ms, 90_000);
+        assert_eq!(
+            prepared.request.first_byte_timeout_ms,
+            DEFAULT_FIRST_BYTE_TIMEOUT_MS
+        );
+        assert_eq!(prepared.request.idle_timeout_ms, DEFAULT_IDLE_TIMEOUT_MS);
+        // Long enough for a model that thinks before its first byte.
+        assert_eq!(
+            (DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS),
+            (120_000, 180_000)
+        );
     }
 
     #[test]

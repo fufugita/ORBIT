@@ -6,7 +6,8 @@
 //! - H-4/H-5/H-15: brand off by default; three-tier downgrade-only fallback.
 //! - H-7: hard downgrade conditions (NO_COLOR/CI/TERM=dumb) are non-overridable.
 //! - H-9: stdout = data, stderr = diagnostics.
-//! - H-17: cost is integer µ¢.
+//! - H-17: cost is an integer of micro-dollars (µ$; 1,000,000 is $1). The
+//!   field is named for micro-cents for historical reasons.
 //! - H-21/H-22: phase-router orchestrator-only; no provider fields in HUD.
 //! - H-24: stdout writes serialized.
 
@@ -50,7 +51,7 @@ pub enum BrandTier {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HudEvent {
     PhaseChanged { phase: String },
-    CostBar { cost_microcents: u64 }, // H-17 integer µ¢
+    CostBar { cost_microcents: u64 }, // H-17 integer µ$ (historical name)
     Indicator { kind: String },       // REPLAY | DRIFT | RESTRICTED (H-16)
     Message { text: String },         // DisplaySafeString-only
 }
@@ -65,21 +66,42 @@ pub fn display_safe(text: &str) -> Result<String, HudError> {
     // CoT markers remain hard rejects (H-3): these are prompt-confusion
     // payloads, not secrets.
     let lowered = text.to_lowercase();
-    for pat in ["prompt:", "user_message", "chain_of_thought"] {
+    for pat in ROLE_MARKERS {
         if lowered.contains(pat) {
             return Err(HudError::DisplayGateRejected(format!(
                 "payload contains disallowed pattern {pat:?} (H-3)"
             )));
         }
     }
+    Ok(display_safe_content(text))
+}
+
+/// The role markers [`display_safe`] rejects a whole payload for.
+const ROLE_MARKERS: [&str; 3] = ["prompt:", "user_message", "chain_of_thought"];
+
+/// How many role markers `text` holds, by the same case-blind match as
+/// [`display_safe`]. A conversation message may spell one out in plain
+/// sight (people do write "the system prompt: ..."); a caller that shows
+/// conversation text compares this count for what is seen with the count
+/// for everything the text carries, to find a marker that is hidden.
+pub fn role_marker_count(text: &str) -> usize {
+    let lowered = text.to_lowercase();
+    ROLE_MARKERS
+        .iter()
+        .map(|marker| lowered.matches(marker).count())
+        .sum()
+}
+
+/// [`display_safe`] without the role-marker rejection, for text that is a
+/// conversation message rather than a status line: secret values are
+/// redacted and control sequences stripped, exactly as there.
+pub fn display_safe_content(text: &str) -> String {
     // Secret VALUES: redact, keep the line.
     let text = redact_secret_values(text);
     // Strip ANSI/control sequences (H-3).
-    let stripped: String = text
-        .chars()
+    text.chars()
         .filter(|c| !c.is_control() || *c == '\n')
-        .collect();
-    Ok(stripped)
+        .collect()
 }
 
 /// Environment negotiation (H-7 hard downgrades, non-overridable).
@@ -135,7 +157,7 @@ impl Hud {
                 match event {
                     HudEvent::PhaseChanged { phase } => (Some(format!("[PHASE:{phase}]")), None),
                     HudEvent::CostBar { cost_microcents } => {
-                        (Some(format!("[COST:{cost_microcents}µ¢]")), None) // H-17 integer
+                        (Some(format!("[COST:{cost_microcents}µ$]")), None) // H-17 integer
                     }
                     HudEvent::Indicator { kind } => (Some(format!("[IND:{kind}]")), None),
                     HudEvent::Message { text } => (Some(text.clone()), None),

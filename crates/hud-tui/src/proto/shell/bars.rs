@@ -44,10 +44,10 @@ pub fn cwd_label() -> String {
 }
 
 /// The current git branch, read from `.git/HEAD` (cached).
-/// The branch label with status depth (REA G2): branch name, ahead/behind
+/// The branch label with status depth: branch name, ahead/behind
 /// vs upstream, and an in-progress operation marker. Read from the .git
 /// files themselves — no process spawn, memoized per launch.
-/// The branch label with status depth (REA G2): branch name, ahead/behind
+/// The branch label with status depth: branch name, ahead/behind
 /// vs upstream, and an in-progress operation marker — one bounded
 /// `git status -sb` per launch, memoized; any failure degrades to the
 /// plain name read from .git/HEAD.
@@ -145,9 +145,9 @@ pub struct TopBar<'a> {
     pub focus_idx: usize,
     pub cwd: String,
     pub branch: Option<String>,
-    /// Per-chip visibility (REA G1): absent = visible.
+    /// Per-chip visibility: absent = visible.
     pub chip_visibility: &'a std::collections::BTreeMap<String, bool>,
-    /// Per-chip terminal-width window (REA G3): a chip outside its
+    /// Per-chip terminal-width window: a chip outside its
     /// declared range hides.
     pub chip_width_bounds: &'a std::collections::BTreeMap<String, ChipWidthBounds>,
     /// The terminal width the bar draws into.
@@ -563,6 +563,7 @@ pub fn mode_pill_spec_themed(colors: Palette, mode: Option<&str>) -> (&'static s
             ("ACCEPT EDITS", colors.on_accent, colors.violet)
         }
         "plan" => ("PLAN", colors.on_accent, colors.cyan),
+        "auto" => ("AUTO", colors.on_accent, colors.violet),
         "bypass" | "bypassPermissions" | "dontAsk" => ("BYPASS", colors.white, colors.red),
         _ => ("DEFAULT", colors.ink, colors.mode_default_bg),
     }
@@ -806,7 +807,23 @@ pub fn status_line(
     };
     let hw = super::frame::hints_width(&hints);
     let used = x + 2 + segs_width(&parts);
-    if used + hw + 2 < w {
+    let hints_fit = used + hw + 2 < w;
+    // The operator's status-line command: beside the activity, cut to the
+    // room left before the key hints. Too little room and it is not drawn.
+    if let Some(line) = s.status_line.as_deref() {
+        let start = x + 2;
+        let end = if hints_fit { w - 1 - hw - 2 } else { w - 1 };
+        if end - start >= 6 {
+            cv.text(
+                start,
+                y,
+                &clip_text(line, end - start),
+                colors.muted,
+                Some(colors.app),
+            );
+        }
+    }
+    if hints_fit {
         keyhints(cv, w - 1 - hw, y, &hints, Some(colors.app));
     }
 }
@@ -1075,7 +1092,7 @@ mod tests {
     }
 
     /// The ctx meter names the absolute free tokens beside the percentage:
-    /// the number the reader actually budgets with (task T1, REA pass 2 #6).
+    /// the number the reader actually budgets with.
     #[test]
     fn context_meter_shows_tokens_left_beside_the_percentage() {
         let mut scenario = Scenario::new();
@@ -1110,7 +1127,7 @@ mod tests {
         let row = cells(&buffer, 0, 120);
         assert!(row.contains("40% · 120k left"), "meter line: {row}");
     }
-    /// REA G1: a chip the user turned off does not render; the others do.
+    /// a chip the user turned off does not render; the others do.
     #[test]
     fn hidden_chips_leave_the_bar_and_the_rest_show() {
         let mut scenario = Scenario::new();
@@ -1152,7 +1169,7 @@ mod tests {
         assert!(row.contains("/tmp/work"), "cwd chip still shows: {row}");
         assert!(row.contains("$"), "cost chip still shows: {row}");
     }
-    /// REA G2: the chip decoration parses ahead/behind headers and adds
+    /// the chip decoration parses ahead/behind headers and adds
     /// the in-progress marker from sentinel files only.
     #[test]
     fn branch_decoration_carries_ahead_behind_and_operations() {
@@ -1179,7 +1196,7 @@ mod tests {
         assert_eq!(decorate_branch("## main", &dir), "main ⚙merge");
         let _ = std::fs::remove_dir_all(&dir);
     }
-    /// REA G3: a chip inside its width window shows; outside it hides.
+    /// a chip inside its width window shows; outside it hides.
     #[test]
     fn width_bounds_gate_the_chip_by_the_bar_width() {
         let mut scenario = Scenario::new();
@@ -1218,5 +1235,53 @@ mod tests {
         };
         assert!(!draw(100).contains("ctx "), "below min: hidden");
         assert!(draw(130).contains("ctx "), "at min: shown");
+    }
+    fn status_row(width: u16, line: Option<&str>) -> String {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+        let mut scenario = Scenario::new();
+        scenario.status_line = line.map(str::to_owned);
+        let mut cv = Cv::new(&mut buffer);
+        status_line(
+            &mut cv,
+            i32::from(width),
+            0,
+            &scenario,
+            0,
+            true,
+            false,
+            true,
+            false,
+            false,
+        );
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_operators_status_line_sits_between_the_activity_and_the_hints() {
+        let plain = status_row(140, None);
+        assert!(
+            plain.contains("ready") && plain.contains("commands"),
+            "{plain}"
+        );
+        let shown = status_row(140, Some("main · 3 files changed"));
+        assert!(shown.contains("ready"), "{shown}");
+        assert!(shown.contains("main · 3 files changed"), "{shown}");
+        assert!(
+            shown.contains("commands"),
+            "the hints keep their place: {shown}"
+        );
+        assert!(
+            shown.find("ready").unwrap() < shown.find("main ·").unwrap()
+                && shown.find("main ·").unwrap() < shown.find("commands").unwrap()
+        );
+        // Less room: the line is cut with an ellipsis, never over the hints.
+        let long = "x".repeat(300);
+        let cut = status_row(140, Some(&long));
+        assert!(cut.contains("x…") && cut.contains("commands"), "{cut}");
+        // No room at all: nothing is drawn rather than a stub.
+        let narrow = status_row(30, Some("main · 3 files changed"));
+        assert!(!narrow.contains("main"), "{narrow}");
     }
 }

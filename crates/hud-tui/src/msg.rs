@@ -139,6 +139,35 @@ pub enum Msg {
     /// A one-line status message (model changed, session loaded, etc.).
     /// Rendered in the status bar / toast, NOT in the transcript.
     Status(String),
+    /// What the operator's status-line command printed: shown in the bottom
+    /// bar beside the activity. Empty clears it.
+    StatusLine(String),
+    /// What a separate check of `/goal` found after a round: whether the
+    /// condition is met, whether it cannot be, and why. `available` is
+    /// false when no check could be made, and the reply's own first words
+    /// decide instead.
+    GoalVerdict {
+        met: bool,
+        impossible: bool,
+        available: bool,
+        reason: String,
+    },
+    /// The open approval prompt for `call_id` was answered somewhere else
+    /// (a channel that relays prompts): the card closes and the
+    /// conversation says who answered.
+    ApprovalAnswered {
+        call_id: String,
+        allowed: bool,
+        source: String,
+    },
+    /// `/memory edit` or `/config edit`: open this file in the person's
+    /// editor, with the terminal handed over for the duration. `then` is
+    /// the inspection asked of the worker once the editor closes, which
+    /// reports what was saved.
+    EditFile {
+        path: std::path::PathBuf,
+        then: String,
+    },
     /// Display-safe decision facts from the shared routing engine; no raw prompt/config.
     Routing(Vec<String>),
     /// Configured request effort and choices, wrapped in the transcript on resize.
@@ -307,6 +336,15 @@ pub enum Msg {
         used_tokens: u64,
         window_tokens: u64,
         breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
+    },
+    /// Cache and reasoning tokens the worker has observed for this session
+    /// since it opened it in this process. These totals are not persisted:
+    /// they restart when the session is resumed.
+    UsageDetail {
+        session_id: String,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
     },
     /// The ledger grew: the record count after the append.
     LedgerAppended {

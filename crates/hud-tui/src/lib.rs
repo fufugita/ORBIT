@@ -16,6 +16,7 @@ pub mod customization;
 pub mod model;
 pub mod msg;
 pub mod proto;
+pub mod schedule;
 pub mod selection;
 mod terminal;
 pub mod tokens;

@@ -347,7 +347,7 @@ mod tests {
         let messages = [user];
         let expected = [
             json!([{"role":"user","content":[{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWxz"}},{"type":"text","text":"second"}]}]),
-            json!([{"role":"user","content":[{"type":"text","text":"first"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"cGl4ZWxz"}},{"type":"text","text":"second"}]}]),
+            json!([{"role":"user","content":[{"type":"text","text":"first"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"cGl4ZWxz"}},{"type":"text","text":"second","cache_control":{"type":"ephemeral"}}]}]),
             json!([{"role":"user","content":"firstsecond","images":["cGl4ZWxz"]}]),
         ];
         for (dialect, expected) in DIALECTS.into_iter().zip(expected) {
@@ -371,7 +371,7 @@ mod tests {
         let messages = [user];
         let expected = [
             json!([]),
-            json!([{"type":"text","text":"flattened fallback"}]),
+            json!([{"type":"text","text":"flattened fallback","cache_control":{"type":"ephemeral"}}]),
             json!(""),
         ];
         for (dialect, expected) in DIALECTS.into_iter().zip(expected) {
@@ -448,7 +448,7 @@ mod tests {
                 "model":"fixture-model", "stream":true, "max_tokens":73, "thinking":{"type":"adaptive"},
                 "output_config":{"effort":"max"},
                 "system":[{"type":"text","text":"first directive\n\nsecond directive","cache_control":{"type":"ephemeral"}}],
-                "messages":[{"role":"user","content":[{"type":"text","text":"question"}]}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"question","cache_control":{"type":"ephemeral"}}]}],
                 "tools":[{"name":"inspect","description":"Inspect one path","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],
                 "tool_choice":{"type":"auto"}
             })
@@ -538,8 +538,8 @@ mod tests {
                 {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","is_error":true,"content":[
                     {"type":"text","text":"{\"ok\":false,\"error\":\"synthetic failure\"}"},
                     {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"cGl4ZWxz"}}
-                ]}]},
-                {"role":"user","content":[{"type":"tool_result","tool_use_id":"","is_error":false,"content":"legacy plain result"}]}
+                ],"cache_control":{"type":"ephemeral"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"","is_error":false,"content":"legacy plain result","cache_control":{"type":"ephemeral"}}]}
             ])
         );
     }
@@ -561,7 +561,7 @@ mod tests {
                 }
             )["messages"],
             json!([
-                {"role":"user","content":[{"type":"text","text":"fallback text"}]}
+                {"role":"user","content":[{"type":"text","text":"fallback text","cache_control":{"type":"ephemeral"}}]}
             ])
         );
     }

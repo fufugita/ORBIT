@@ -138,7 +138,7 @@ impl Tool for BashTool {
                 "command": { "type": "string", "description": "The command to run" },
                 "timeout": { "type": "integer", "description": "Seconds before moving to background (default 120, max 600)" },
                 "description": { "type": "string", "description": "What this command does (for the operator)" },
-                "run_in_background": { "type": "boolean", "description": "Start the command detached and return a task_id at once; stop it with TaskStop (C7 — the flag was advertised by TaskStop but missing from this schema, so a call with it ran in the foreground)" }
+                "run_in_background": { "type": "boolean", "description": "Start the command detached and return a task_id at once; stop it with TaskStop" }
             },
             "required": ["command"]
         })
@@ -211,14 +211,16 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
     // working dirs + session temp, no network. When it is not, the
     // result SAYS the command ran unsandboxed so the operator and the
     // permission layer can see it (the executor forces an ask).
-    let sandbox = crate::sandbox::ShellSandbox::standard(&cx.working_dirs, &cx.session_id);
+    let mut sandbox = crate::sandbox::ShellSandbox::standard(&cx.writable_dirs(), &cx.session_id)
+        .with_additions(&crate::sandbox::SandboxAdditions::load(&cx.home), &cx.home);
+    sandbox.read_dirs.extend(cx.readable_dirs());
     let sandboxed = matches!(
         crate::sandbox::ShellSandbox::probe(),
         crate::sandbox::SandboxStatus::Confined
     );
 
     let mut child = if sandboxed {
-        let mut cmd = sandbox.wrap(command, &cx.working_dir);
+        let mut cmd = sandbox.wrap(command, &cx.cwd());
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Own process group (same as the unsandboxed arm below): the
         // Esc interrupt and TaskStop kill the whole tree, never
@@ -232,7 +234,7 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
         match Command::new("bash")
             .arg("-c")
             .arg(command)
-            .current_dir(&cx.working_dir)
+            .current_dir(cx.cwd())
             // Safety (review blocker 3): a child never inherits ORBIT's
             // environment (provider keys included) — an explicit allowlist
             // only. Null stdin: a command that reads stdin cannot take the
@@ -283,6 +285,16 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                 });
                 if !scanned.redactions.is_empty() {
                     payload["redacted"] = json!(scanned.redactions);
+                }
+                if sandboxed
+                    && !status.success()
+                    && let Some(note) = sandbox_failure_note(
+                        status.code(),
+                        payload["output"].as_str().unwrap_or(""),
+                        sandbox.network,
+                    )
+                {
+                    payload["sandbox_note"] = json!(note);
                 }
                 let mut r = ToolResult {
                     payload: payload.to_string(),
@@ -379,7 +391,9 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
             std::env::temp_dir().join(format!("orbit-bash-{}.log", ulid::Ulid::new()))
         });
 
-    let sandbox = crate::sandbox::ShellSandbox::standard(&cx.working_dirs, &cx.session_id);
+    let mut sandbox = crate::sandbox::ShellSandbox::standard(&cx.writable_dirs(), &cx.session_id)
+        .with_additions(&crate::sandbox::SandboxAdditions::load(&cx.home), &cx.home);
+    sandbox.read_dirs.extend(cx.readable_dirs());
     let sandboxed = matches!(
         crate::sandbox::ShellSandbox::probe(),
         crate::sandbox::SandboxStatus::Confined
@@ -393,7 +407,7 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
         cmd.spawn()
     };
     let mut child = if sandboxed {
-        let mut wrapped = sandbox.wrap(command, &cx.working_dir);
+        let mut wrapped = sandbox.wrap(command, &cx.cwd());
         match spawn(&mut wrapped) {
             Ok(c) => c,
             Err(e) => return ToolResult::err(&format!("cannot spawn sandboxed bash: {e}")),
@@ -403,7 +417,7 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
         plain
             .arg("-c")
             .arg(command)
-            .current_dir(&cx.working_dir)
+            .current_dir(cx.cwd())
             .env_clear()
             .envs(env_allowlist());
         match spawn(&mut plain) {
@@ -436,6 +450,46 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
         "note": format!("running detached; output will land in {}", output_path.display()),
         "sandboxed": sandboxed,
     }))
+}
+
+/// What to tell the model when a confined command fails the way the
+/// sandbox makes commands fail: a program that is not among the system's,
+/// a name that does not resolve, a write outside the writable directories.
+/// Said on the failing result only, so it costs nothing until it is needed;
+/// without it the model retries, or blames the project.
+fn sandbox_failure_note(exit: Option<i32>, output: &str, network: bool) -> Option<&'static str> {
+    // The end of the output is where the failure is reported.
+    let mut from = output.len().saturating_sub(4096);
+    while !output.is_char_boundary(from) {
+        from += 1;
+    }
+    let tail = output[from..].to_ascii_lowercase();
+    if exit == Some(127) || tail.contains("command not found") {
+        return Some(
+            "This command ran in ORBIT's shell sandbox, which sees the system's programs and the working directories only: a program installed under the home directory is not found there. Retrying will not help. Tell the operator what is missing; a [sandbox] table in their settings.toml (read, path) can make it available.",
+        );
+    }
+    if !network
+        && [
+            "could not resolve host",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "network is unreachable",
+            "failed to lookup address",
+        ]
+        .iter()
+        .any(|sign| tail.contains(sign))
+    {
+        return Some(
+            "This command ran in ORBIT's shell sandbox, which has no network. Retrying will not help. Tell the operator the command needs the network; `network = true` in a [sandbox] table of their settings.toml allows it.",
+        );
+    }
+    if tail.contains("read-only file system") {
+        return Some(
+            "This command ran in ORBIT's shell sandbox, which can write only in the working directories and a temporary directory. Retrying will not help. Tell the operator where the command needs to write; /add-dir, or `write` in a [sandbox] table of their settings.toml, allows it.",
+        );
+    }
+    None
 }
 
 /// Output kept in memory per command. More goes only to the output
@@ -633,6 +687,85 @@ impl Tool for TaskStopTool {
             }));
         }
         ToolResult::err("no such background task")
+    }
+}
+
+/// TaskOutput: the latest output of a background command, by id.
+pub struct TaskOutputTool;
+
+impl Tool for TaskOutputTool {
+    fn name(&self) -> &'static str {
+        "TaskOutput"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The id Bash returned" },
+                "tail_lines": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Default 60" }
+            },
+            "required": ["task_id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn permission_key(&self, _input: &serde_json::Value) -> crate::PermissionKey {
+        crate::PermissionKey {
+            tool: "TaskOutput".into(),
+            pattern: String::new(),
+        }
+    }
+    fn run(&self, input: &serde_json::Value, _cx: &ToolContext) -> ToolResult {
+        /// Only the end of the log is read: a long-running command can
+        /// have written far more than fits in a result.
+        const TAIL_BYTES: u64 = 64 * 1024;
+        let Some(task_id) = input.get("task_id").and_then(|v| v.as_str()) else {
+            return ToolResult::err("task_id is required");
+        };
+        let lines = input
+            .get("tail_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60)
+            .clamp(1, 400) as usize;
+        let found = BACKGROUND.lock().ok().and_then(|bg| {
+            bg.iter()
+                .find(|b| b.id == task_id)
+                .map(|b| (b.output_path.clone(), b.pid, b.command.clone()))
+        });
+        let Some((path, pid, command)) = found else {
+            return ToolResult::err(
+                "no such background task (it was stopped, or belongs to another session)",
+            );
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        let mut text = String::new();
+        let mut truncated = false;
+        if let Ok(mut file) = std::fs::File::open(&path) {
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if size > TAIL_BYTES {
+                truncated = file.seek(SeekFrom::Start(size - TAIL_BYTES)).is_ok();
+            }
+            let mut bytes = Vec::new();
+            let _ = file.take(TAIL_BYTES).read_to_end(&mut bytes);
+            text = String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let all: Vec<&str> = text.lines().collect();
+        let from = all.len().saturating_sub(lines);
+        truncated |= from > 0;
+        // Linux only; elsewhere the state is not reported.
+        let running = std::path::Path::new("/proc/self")
+            .exists()
+            .then(|| std::path::Path::new(&format!("/proc/{pid}")).exists());
+        ToolResult::ok(json!({
+            "ok": true,
+            "task_id": task_id,
+            "command": command,
+            "running": running,
+            "earlier_output_omitted": truncated,
+            "output": all[from..].join("\n"),
+            "log": path.display().to_string(),
+        }))
     }
 }
 
@@ -892,6 +1025,23 @@ fn live_pgrp(pid: i32) -> Option<i32> {
     let _state = fields.next();
     let _ppid = fields.next();
     fields.next().and_then(|f: &str| f.parse::<i32>().ok())
+}
+
+/// A registered background command's log file, process id and command
+/// line, by task id. `None` once TaskStop removed it.
+pub fn background_task(task_id: &str) -> Option<(PathBuf, i32, String)> {
+    BACKGROUND.lock().ok().and_then(|bg| {
+        bg.iter()
+            .find(|b| b.id == task_id)
+            .map(|b| (b.output_path.clone(), b.pid, b.command.clone()))
+    })
+}
+
+/// Whether a process is still there. Linux only (`/proc`); `None` elsewhere.
+pub fn pid_alive(pid: i32) -> Option<bool> {
+    std::path::Path::new("/proc/self")
+        .exists()
+        .then(|| std::path::Path::new(&format!("/proc/{pid}")).exists())
 }
 
 /// List live background commands (for the status line / TaskList).
@@ -1168,6 +1318,16 @@ mod output_tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let seen = TaskOutputTool.run(&json!({ "task_id": task, "tail_lines": 1 }), &cx);
+        let seen: serde_json::Value = serde_json::from_str(&seen.payload).unwrap();
+        assert_eq!(seen["ok"], true, "{seen}");
+        assert!(seen["log"].as_str().is_some());
+        assert!(
+            TaskOutputTool
+                .run(&json!({ "task_id": "bg-missing" }), &cx)
+                .payload
+                .contains("no such background task")
+        );
         let stop = TaskStopTool.run(&json!({ "task_id": task }), &cx);
         assert!(
             seen_first,
@@ -1480,5 +1640,33 @@ mod cancel_tests {
             .and_then(|value| value.parse().ok())
             .ok_or_else(invalid)?;
         Ok(Some((start_ticks, state)))
+    }
+}
+
+#[cfg(test)]
+mod sandbox_note_tests {
+    use super::sandbox_failure_note;
+
+    #[test]
+    fn a_failure_the_sandbox_causes_is_explained_and_others_are_not() {
+        let missing =
+            sandbox_failure_note(Some(127), "bash: line 1: cargo: command not found", false);
+        assert!(missing.unwrap().contains("not found there"));
+        let offline = sandbox_failure_note(
+            Some(6),
+            "curl: (6) Could not resolve host: example.com",
+            false,
+        );
+        assert!(offline.unwrap().contains("no network"));
+        // With the network allowed, a lookup failure is the network's own.
+        assert!(sandbox_failure_note(Some(6), "Could not resolve host: x", true).is_none());
+        let read_only = sandbox_failure_note(
+            Some(1),
+            "touch: cannot touch '/opt/x': Read-only file system",
+            true,
+        );
+        assert!(read_only.unwrap().contains("can write only"));
+        assert!(sandbox_failure_note(Some(1), "error[E0308]: mismatched types", false).is_none());
+        assert!(sandbox_failure_note(Some(2), "", false).is_none());
     }
 }

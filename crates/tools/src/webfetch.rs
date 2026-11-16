@@ -73,17 +73,7 @@ impl Tool for WebFetchTool {
             return ToolResult::err("WebFetch is HTTPS only");
         }
         if let Some(host) = url.host_str() {
-            let h = host.trim_matches(['[', ']']);
-            if h == "localhost"
-                || h.starts_with("127.")
-                || h == "::1"
-                || h.starts_with("10.")
-                || h.starts_with("192.168.")
-                || h.strip_prefix("172.")
-                    .and_then(|r| r.split('.').next())
-                    .and_then(|n| n.parse::<u8>().ok())
-                    .is_some_and(|n| (16..=31).contains(&n))
-            {
+            if refused_host(host) {
                 return ToolResult::err("WebFetch refuses localhost and private addresses");
             }
         } else {
@@ -213,6 +203,41 @@ impl Tool for WebFetchTool {
     }
 }
 
+/// Hosts WebFetch never contacts: localhost names and any literal address
+/// that is loopback, private, link-local (cloud metadata lives there),
+/// carrier-grade NAT, unspecified, or an IPv6 form of one of those. A name
+/// that only resolves to such an address is not caught here; HTTPS
+/// certificate validation is what stands in its way.
+fn refused_host(host: &str) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    let host = host.trim_matches(['[', ']']).trim_end_matches('.');
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    let refused_v4 = |ip: Ipv4Addr| {
+        let octets = ip.octets();
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || (octets[0] == 100 && octets[1] & 0xC0 == 64)
+    };
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => refused_v4(ip),
+        Ok(IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || first & 0xFE00 == 0xFC00
+                || first & 0xFFC0 == 0xFE80
+                || ip.to_ipv4_mapped().is_some_and(refused_v4)
+        }
+        Err(_) => false,
+    }
+}
+
 fn cap(b: impl IntoIterator<Item = u8>) -> Vec<u8> {
     b.into_iter().take(MAX_BYTES).collect()
 }
@@ -314,4 +339,51 @@ pub fn html_to_markdown(bytes: &[u8]) -> String {
         }
     }
     collapsed.trim().to_string()
+}
+
+#[cfg(test)]
+mod refused_host_tests {
+    use super::refused_host;
+
+    #[test]
+    fn local_private_and_metadata_addresses_are_refused_in_every_form() {
+        for host in [
+            "localhost",
+            "LOCALHOST.",
+            "api.localhost",
+            "127.0.0.1",
+            "127.9.9.9",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "255.255.255.255",
+            "[::1]",
+            "::",
+            "[fd00::1]",
+            "[fe80::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:169.254.169.254]",
+        ] {
+            assert!(refused_host(host), "{host} must be refused");
+        }
+    }
+
+    #[test]
+    fn public_hosts_are_allowed() {
+        for host in [
+            "example.com",
+            "localhost.example.com",
+            "8.8.8.8",
+            "172.15.0.1",
+            "172.32.0.1",
+            "100.128.0.1",
+            "[2606:4700:4700::1111]",
+        ] {
+            assert!(!refused_host(host), "{host} must be allowed");
+        }
+    }
 }

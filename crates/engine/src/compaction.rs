@@ -188,6 +188,8 @@ pub enum AttemptPurpose {
     Ordinary,
     Chunk,
     Merge,
+    /// A session-owned classifier or hook request, separate from compaction.
+    Housekeeping,
 }
 
 /// Root owner and stable child are distinct; a Task's session ID is its child.
@@ -299,6 +301,7 @@ fn purpose_tag(purpose: AttemptPurpose) -> &'static str {
         AttemptPurpose::Ordinary => "ordinary",
         AttemptPurpose::Chunk => "chunk",
         AttemptPurpose::Merge => "merge",
+        AttemptPurpose::Housekeeping => "housekeeping",
     }
 }
 fn metadata_digest(domain: &[u8], value: &serde_json::Value) -> Result<String, HistoryError> {
@@ -553,6 +556,26 @@ pub trait CompactionJournal: std::fmt::Debug + Send + Sync {
         _attempt: &AttemptRef,
         _settlement: &crate::retry::RefusedOrdinarySettlement,
     ) -> Result<crate::retry::RefusedSettlementAck, HistoryError> {
+        Err(HistoryError::InvalidRecord)
+    }
+
+    /// Close a pending attempt whose outcome is not known (the request was
+    /// stopped, or timed out, after it was sent) as abandoned, so the
+    /// namespace can take requests again. Its uncertain receipt becomes the
+    /// last settlement, nothing is added to the totals, the revision stays
+    /// as it is, and the totals' knownness goes from uncertain to unknown
+    /// usage (unknown legacy, on that baseline): what was spent before this
+    /// point is not known, and is never claimed to be. Only an attempt that holds an uncertain receipt
+    /// and no retry binding can be abandoned. Repeating the call for the
+    /// same attempt returns the same checkpoint.
+    ///
+    /// This is for a person who stopped the request and wants to go on. A
+    /// caller that needs exact accounting does not call it. The default
+    /// refuses without calling or mutating an old store.
+    fn abandon_uncertain(
+        &self,
+        _attempt: &AttemptRef,
+    ) -> Result<crate::retry::DetailedAccountingCheckpoint, HistoryError> {
         Err(HistoryError::InvalidRecord)
     }
 }
@@ -923,12 +946,35 @@ impl Partition<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn plan_compaction(
     source: &[ChatMessage],
     conversation_context: &RequestPreparationContext,
     summary_context: &RequestPreparationContext,
     conversation: &SelectedBudget,
     summary: &SelectedBudget,
+) -> Result<CompactionPlan, CompactionError> {
+    plan_compaction_for(
+        source,
+        conversation_context,
+        summary_context,
+        conversation,
+        summary,
+        false,
+    )
+}
+
+/// `requested` is true when the operator asked for the summary: what has to
+/// stay whole stays, and everything before it is summarized whether or not
+/// it would still have fitted. Otherwise the plan keeps as much recent
+/// history as fits.
+pub(crate) fn plan_compaction_for(
+    source: &[ChatMessage],
+    conversation_context: &RequestPreparationContext,
+    summary_context: &RequestPreparationContext,
+    conversation: &SelectedBudget,
+    summary: &SelectedBudget,
+    requested: bool,
 ) -> Result<CompactionPlan, CompactionError> {
     let digest = source_digest(source)?;
     let (prefix, groups) = groups(source)?;
@@ -948,25 +994,52 @@ pub(crate) fn plan_compaction(
         return Err(CompactionError::InvalidSummaryContext);
     }
     let before = conversation_probe.estimate_messages(source, conversation)?;
-    let mut retained = groups[..last]
-        .iter()
-        .rposition(|g| g.complete)
-        .unwrap_or(last);
+    let mut retained = if requested {
+        last.saturating_sub(1)
+    } else {
+        groups[..last]
+            .iter()
+            .rposition(|g| g.complete)
+            .unwrap_or(last)
+    };
     for (index, group) in groups.iter().enumerate() {
-        if group.protected || !group.complete {
+        if group.protected || (!requested && !group.complete) {
             retained = retained.min(index);
         }
     }
     // Only immutable material and the actual required suffix form the hard
     // floor. A hypothetical pending summary is an optional-selection hint.
-    let mut required = source[..prefix].to_vec();
-    required.extend_from_slice(&source[groups[retained].span.start..]);
-    let required_estimate = conversation_probe.estimate_messages(&required, conversation)?;
+    let floor = |retained: usize| {
+        let mut required = source[..prefix].to_vec();
+        required.extend_from_slice(&source[groups[retained].span.start..]);
+        conversation_probe.estimate_messages(&required, conversation)
+    };
+    let mut required_estimate = floor(retained)?;
+    // The last finished exchange and every exchange that ended without an
+    // answer stay whole while they fit. When they do not, they are settled
+    // history like any other and only the current intent (and what is
+    // protected) is required: one long earlier turn must not leave the
+    // session unable to take another request.
+    let current_only = groups[..last]
+        .iter()
+        .position(|group| group.protected)
+        .unwrap_or(last);
+    if !fits(&required_estimate, conversation) && current_only > retained {
+        retained = current_only;
+        required_estimate = floor(retained)?;
+    }
+    // A summary the operator asked for keeps the same two exchanges whole.
+    // When those two are the whole conversation nothing would be left to
+    // summarize, so then only the latest one stays.
+    if requested && retained == 0 && current_only > 0 {
+        retained = current_only;
+        required_estimate = floor(retained)?;
+    }
     if !fits(&required_estimate, conversation) {
         return Err(CompactionError::ProtectedTooLarge);
     }
     let mut optional_probes = 0;
-    while retained > 0 && optional_probes < MAX_OPTIONAL_TAIL_PROBES {
+    while !requested && retained > 0 && optional_probes < MAX_OPTIONAL_TAIL_PROBES {
         optional_probes += 1;
         let estimate = conversation_probe.estimate_messages(
             &skeleton(source, prefix, groups[retained - 1].span.start),
@@ -1136,6 +1209,7 @@ pub fn compact_context(
             conversation: &conversation,
             summary: &summary,
             remaining_attempts: crate::turn::MAX_TURN_ACCOUNTING_ATTEMPTS,
+            requested: false,
         },
         cancel,
         &mut |_| {},
@@ -1206,6 +1280,17 @@ pub fn compact_context_detailed(
         Err(status) => return without_attempt(status),
     };
     let hooks = crate::hooks::Hooks::load(home, crate::hooks::project_trusted(home));
+    // A PreCompact hook can refuse a requested compaction: nothing is
+    // summarised and the conversation is left as it was.
+    if let Some(reason) = crate::hooks::blocked(&hooks.fire(
+        crate::hooks::HookEvent::PreCompact,
+        &serde_json::json!({ "trigger": "manual" }),
+    )) {
+        events(orbit_frontend_protocol::FrontendEvent::Status {
+            text: format!("a PreCompact hook blocked compaction: {reason}"),
+        });
+        return without_attempt(CompactionStatus::Cancelled);
+    }
     let attempt = compact_with_contexts(
         home,
         config,
@@ -1215,13 +1300,10 @@ pub fn compact_context_detailed(
             conversation: &conversation,
             summary: &summary,
             remaining_attempts: crate::turn::MAX_TURN_ACCOUNTING_ATTEMPTS,
+            requested: true,
         },
         cancel,
         &mut |estimate| {
-            let _ = hooks.fire(
-                crate::hooks::HookEvent::PreCompact,
-                &serde_json::json!({ "estimated_tokens": estimate.estimated_input_tokens }),
-            );
             events(orbit_frontend_protocol::FrontendEvent::Compacting {
                 used_tokens: estimate.estimated_input_tokens,
                 window_tokens: budget
@@ -1286,6 +1368,8 @@ pub(crate) struct CompactionContexts<'a> {
     pub(crate) conversation: &'a RequestPreparationContext,
     pub(crate) summary: &'a RequestPreparationContext,
     pub(crate) remaining_attempts: usize,
+    /// The operator asked for this summary (`/compact`, `orbit compact`).
+    pub(crate) requested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1926,14 +2010,22 @@ impl SummaryRunner<'_> {
                 sum.checked_add(receipt.totals.cost_microcents.unwrap_or(0))
             })
             .ok_or(CompactionStatus::SpendRefused)?;
-        admit_spend(
-            self.options.spend_allowance,
-            self.config,
-            &estimate,
-            spent,
-            true,
-        )
-        .map_err(|_| CompactionStatus::SpendRefused)?;
+        let allowance = self
+            .options
+            .spend_allowance
+            .map(|mut allowance| {
+                allowance.remaining_microcents = allowance
+                    .remaining_microcents
+                    .checked_sub(spent)
+                    .ok_or(CompactionStatus::SpendRefused)?;
+                Ok::<_, CompactionStatus>(allowance)
+            })
+            .transpose()?;
+        let allowance =
+            crate::turn::namespace_allowance(self.options, Some(&self.checkpoint), allowance)
+                .map_err(|_| CompactionStatus::SpendRefused)?;
+        admit_spend(allowance, self.config, &estimate, 0, true)
+            .map_err(|_| CompactionStatus::SpendRefused)?;
         let intent = AttemptIntent {
             owner_session_id: self.checkpoint.owner_session_id().to_owned(),
             child_id: self.checkpoint.child_id().map(str::to_owned),
@@ -2027,12 +2119,13 @@ pub(crate) fn compact_with_contexts(
         Ok(value) => value,
         Err(status) => return failed(status),
     };
-    let plan = match plan_compaction(
+    let plan = match plan_compaction_for(
         source,
         contexts.conversation,
         contexts.summary,
         &conversation,
         &summary,
+        contexts.requested,
     ) {
         Ok(value) => value,
         Err(error) => return failed(planner_status(error)),
@@ -2680,6 +2773,156 @@ mod tests {
                 CompactionError::ProtectedTooLarge,
             );
         }
+    }
+
+    /// The last finished exchange stays whole while it fits (the test
+    /// above). One too long to keep used to refuse every later request in
+    /// the session; it is now summarized like the history before it.
+    #[test]
+    fn a_last_exchange_too_long_to_keep_is_summarized_and_not_a_refusal() {
+        let mut source = Vec::new();
+        pair(&mut source, "old", 400);
+        let long = source.len();
+        pair(&mut source, "long", 4000);
+        source.push(crate::user_message("current exact"));
+        let p = plan(&source, 1500, 64_000).unwrap();
+        assert_eq!(p.coverage.retained_suffix.start, source.len() - 1);
+        assert_eq!(p.coverage.summarized_prefix.end, source.len() - 1);
+        assert!(p.coverage.summarized_prefix.start <= long);
+        assert!(
+            p.chunks
+                .iter()
+                .any(|chunk| chunk.prompt.contains("long user"))
+        );
+        assert!(p.required_estimate.estimated_input_tokens <= 1500);
+    }
+
+    /// A summary the operator asked for keeps the last two exchanges and
+    /// summarizes the rest, even when all of it would still have fitted;
+    /// with only two exchanges it keeps the latest. The automatic plan for
+    /// the same history keeps what fits.
+    #[test]
+    fn a_requested_summary_does_not_wait_for_the_context_to_fill() {
+        let mut source = Vec::new();
+        for i in 0..3 {
+            pair(&mut source, &format!("older-{i}"), 40);
+        }
+        let latest = source.len();
+        pair(&mut source, "latest", 40);
+        let requested = |source: &[ChatMessage]| {
+            let c = config(ProviderKind::OpenAiCompatible);
+            plan_compaction_for(
+                source,
+                &request_preparation_context(&c, Some("frozen directive"), &[]).unwrap(),
+                &request_preparation_context(&c, None, &[]).unwrap(),
+                &SelectedBudget::legacy_input(&c, 64_000).unwrap(),
+                &SelectedBudget::legacy_input(&c, 64_000).unwrap(),
+                true,
+            )
+        };
+        let mentions = |p: &CompactionPlan, text: &str| {
+            p.chunks.iter().any(|chunk| chunk.prompt.contains(text))
+        };
+        error(
+            plan(&source, 64_000, 64_000),
+            CompactionError::NothingToCompact,
+        );
+        let p = requested(&source).unwrap();
+        assert_eq!(p.coverage.retained_suffix.start, latest - 2);
+        assert_eq!(p.coverage.summarized_prefix.start, 0);
+        assert!(mentions(&p, "older-0 user") && mentions(&p, "older-1 user"));
+        assert!(!mentions(&p, "older-2 user") && !mentions(&p, "latest user"));
+        // Two exchanges: the earlier one is summarized, the latest stays.
+        let p = requested(&source[latest - 2..]).unwrap();
+        assert_eq!(p.coverage.retained_suffix.start, 2);
+        assert!(mentions(&p, "older-2 user") && !mentions(&p, "latest user"));
+        // One exchange alone has nothing before it to summarize.
+        error(
+            requested(&source[latest..]),
+            CompactionError::NothingToCompact,
+        );
+    }
+
+    #[test]
+    fn requested_compaction_keeps_two_recent_exchanges_after_an_older_cancelled_turn() {
+        let mut source = vec![
+            crate::user_message("cancelled old request"),
+            calls(&["old-read".to_owned()]),
+            result(
+                "old-read",
+                "the old tool finished but the turn had no final answer",
+            ),
+        ];
+        let recent = source.len();
+        pair(&mut source, "recent", 40);
+        pair(&mut source, "latest", 40);
+        let config = config(ProviderKind::OpenAiCompatible);
+        let conversation =
+            request_preparation_context(&config, Some("frozen directive"), &[]).unwrap();
+        let summary = request_preparation_context(&config, None, &[]).unwrap();
+        let budget = SelectedBudget::legacy_input(&config, 64_000).unwrap();
+        let planned =
+            plan_compaction_for(&source, &conversation, &summary, &budget, &budget, true).unwrap();
+        assert_eq!(planned.coverage.retained_suffix.start, recent);
+        assert_eq!(planned.coverage.summarized_prefix.end, recent);
+        assert!(
+            planned
+                .chunks
+                .iter()
+                .any(|chunk| chunk.prompt.contains("cancelled old request"))
+        );
+        assert!(
+            planned
+                .chunks
+                .iter()
+                .all(|chunk| !chunk.prompt.contains("recent user")
+                    && !chunk.prompt.contains("latest user"))
+        );
+        // The automatic policy still keeps unfinished earlier turns while they fit.
+        error(
+            plan_compaction_for(&source, &conversation, &summary, &budget, &budget, false),
+            CompactionError::NothingToCompact,
+        );
+    }
+
+    /// A turn that stopped after its tools ran has no closing answer. It
+    /// stays whole while it fits; when it does not, it is settled history
+    /// and is summarized, so the session goes on taking requests.
+    #[test]
+    fn a_turn_that_ended_without_an_answer_is_summarized_once_it_no_longer_fits() {
+        let unanswered = |bytes: usize| {
+            let mut source = Vec::new();
+            pair(&mut source, "old", 300);
+            source.push(crate::user_message("stopped turn"));
+            source.push(calls(&["call-0".to_string()]));
+            source.push(result("call-0", &"r".repeat(bytes)));
+            source.push(crate::user_message("current exact"));
+            source
+        };
+        // It fits: it is kept whole, as before.
+        let small = unanswered(200);
+        let p = plan(&small, 1500, 64_000);
+        match p {
+            Ok(p) => assert!(p.coverage.retained_suffix.start <= 2),
+            Err(e) => assert_eq!(e, CompactionError::NothingToCompact),
+        }
+        // It does not fit: it is summarized and only the current intent stays.
+        let large = unanswered(8000);
+        let p = plan(&large, 1500, 64_000).unwrap();
+        assert_eq!(p.coverage.retained_suffix.start, large.len() - 1);
+        assert!(
+            p.chunks
+                .iter()
+                .any(|chunk| chunk.prompt.contains("stopped turn"))
+        );
+        // The current intent alone still has to fit.
+        let mut too_long = unanswered(200);
+        too_long.pop();
+        too_long.push(crate::user_message("c".repeat(9000)));
+        error(
+            plan(&too_long, 1500, 64_000),
+            CompactionError::ProtectedTooLarge,
+        );
     }
 
     #[test]

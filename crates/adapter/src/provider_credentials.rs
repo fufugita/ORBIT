@@ -1004,10 +1004,17 @@ impl<'a> StoreLock<'a> {
 
     fn open(directory: &'a Directory, create: bool) -> Result<Self, ProviderCredentialError> {
         directory.check()?;
-        let mut flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        if create {
-            flags |= OFlags::CREATE;
-        }
+        // Readiness inspection must work on a read-only mount. A reader
+        // neither creates nor writes the lock, but still excludes writers.
+        let (access, operation) = if create {
+            (
+                OFlags::RDWR | OFlags::CREATE,
+                FlockOperation::NonBlockingLockExclusive,
+            )
+        } else {
+            (OFlags::RDONLY, FlockOperation::NonBlockingLockShared)
+        };
+        let flags = access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let fd = openat(&*directory.fd, LOCK_NAME, flags, Mode::from_raw_mode(0o600))
             .map_err(|_| ProviderCredentialError::UnsafeFile)?;
         let file = File::from(fd);
@@ -1016,7 +1023,7 @@ impl<'a> StoreLock<'a> {
         result.check()?;
         let started = Instant::now();
         loop {
-            match flock(&result.file, FlockOperation::NonBlockingLockExclusive) {
+            match flock(&result.file, operation) {
                 Ok(()) => break,
                 Err(rustix::io::Errno::WOULDBLOCK) | Err(rustix::io::Errno::INTR) => {
                     if started.elapsed() >= LOCK_WAIT {
@@ -2352,6 +2359,78 @@ mod tests {
                 .unwrap()
                 .revision(),
             Some(saved.revision)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_storage_read_only_lock_never_requires_a_write_descriptor() {
+        let home = Home::new();
+        let store = home.store();
+        let identity = identity();
+        let saved = store
+            .save(&identity, secret(), ExpectedRevision::Absent)
+            .unwrap();
+        let directory = Directory::open(&home.0, false).unwrap().unwrap();
+        let reader = StoreLock::acquire_existing(&directory).unwrap();
+        assert_eq!(
+            rustix::fs::fcntl_getfl(&reader.file).unwrap() & OFlags::ACCMODE,
+            OFlags::RDONLY,
+            "a readiness read must not request write access on a read-only filesystem"
+        );
+        assert!(reader.file.set_len(1).is_err());
+        assert_eq!(fstat(&reader.file).unwrap().st_size, 0);
+        assert_eq!(
+            store.status_read_only_with(&identity, |_| Ok(None)),
+            ProviderCredentialStatus::Available {
+                source: ProviderCredentialSource::Saved,
+                revision: Some(saved.revision),
+            },
+            "another read-only status query may share the checked lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_storage_read_only_readers_share_but_never_bypass_a_writer() {
+        let home = Home::new();
+        let store = home.store();
+        let identity = identity();
+        let saved = store
+            .save(&identity, secret(), ExpectedRevision::Absent)
+            .unwrap();
+        let record = home.0.join("auth/providers").join(identity.file_name());
+        let before = Zeroizing::new(fs::read(&record).unwrap());
+        let directory = Directory::open(&home.0, false).unwrap().unwrap();
+        let first = StoreLock::acquire_existing(&directory).unwrap();
+        let second = StoreLock::acquire_existing(&directory).unwrap();
+        assert_eq!(
+            store
+                .save(&identity, secret(), ExpectedRevision::Exact(saved.revision))
+                .unwrap_err(),
+            ProviderCredentialError::Busy,
+            "writers remain excluded while readers inspect the records"
+        );
+        drop(first);
+        drop(second);
+        let writer = StoreLock::acquire(&directory).unwrap();
+        assert_eq!(
+            rustix::fs::fcntl_getfl(&writer.file).unwrap() & OFlags::ACCMODE,
+            OFlags::RDWR
+        );
+        assert_eq!(
+            store.status_read_only_with(&identity, |_| Ok(None)),
+            ProviderCredentialStatus::Invalid(ProviderCredentialError::Busy),
+            "a read-only query must not see records during publication"
+        );
+        drop(writer);
+        assert_eq!(*Zeroizing::new(fs::read(&record).unwrap()), *before);
+        assert_eq!(
+            store.status_read_only_with(&identity, |_| Ok(None)),
+            ProviderCredentialStatus::Available {
+                source: ProviderCredentialSource::Saved,
+                revision: Some(saved.revision),
+            }
         );
     }
 }

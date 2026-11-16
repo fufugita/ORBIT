@@ -225,6 +225,10 @@ fn tool_line(l: &TranscriptLine, cl: u16, cw: u16, class: WidthClass) -> Vec<Lin
             },
             Token::Red,
         ),
+        // A channel that answers approval prompts refused it.
+        ToolState::Denied if super::scenario::names_who_refused(&l.meta) => {
+            (l.meta.clone(), Token::Muted)
+        }
         ToolState::Denied => ("denied by you".into(), Token::Muted),
         ToolState::Blocked => ("blocked · unknown tool".into(), Token::Amber),
         ToolState::Cancelled => ("cancelled".into(), Token::Muted),
