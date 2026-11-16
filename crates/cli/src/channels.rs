@@ -398,6 +398,9 @@ pub fn frame(event: &orbit_mcp::ChannelEvent) -> String {
 /// line about each for the session's start (what is listening, what could
 /// not be).
 pub fn start(home: &Path, cx: &orbit_tools::ToolContext) -> Vec<String> {
+    if crate::tools::bare_mode() {
+        return Vec::new();
+    }
     static STARTED: std::sync::Once = std::sync::Once::new();
     let mut report = Vec::new();
     let mut first = false;

@@ -39,6 +39,20 @@ pub mod skills;
 pub mod transcript;
 pub mod turn;
 
+static BARE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Select minimal configuration for this process before starting workers.
+/// Once selected, bare mode remains enabled for the process's lifetime.
+pub fn enable_bare_mode() {
+    BARE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shared by configuration discovery and hook execution across worker threads.
+pub fn bare_mode() -> bool {
+    BARE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ORBIT_BARE").is_ok_and(|value| value == "1")
+}
+
 pub use compaction::{
     AccountingBaseline, AccountingCheckpoint, AccountingDelta, AccountingKnownness,
     AccountingRevision, AccountingTotals, AttemptIntent, AttemptPurpose, AttemptRef,

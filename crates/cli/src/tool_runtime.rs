@@ -579,25 +579,6 @@ fn execute_call_decided(
         return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, false);
     }
 
-    // Tool search itself only reads the tool catalog: no approval is needed.
-    if call.name == "McpToolSearch" {
-        let args =
-            crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-        let response = crate::tools::mcp_tool_search(home, tool_cx, &args);
-        let ok = response.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
-        let (output, _) = scan_mcp_text(&response.to_string());
-        record_result(
-            home,
-            session_id,
-            decision_id,
-            call,
-            if ok { "ok" } else { "error" },
-            &output,
-            tool_cx,
-        )?;
-        return Ok((output, None));
-    }
-
     let known = crate::tools::is_known_tool(&call.name);
 
     // B4: layer 2's pattern verdict, computed once here so headless
@@ -697,6 +678,10 @@ fn execute_call_decided(
     if crate::tools::bare_mode() && matches!(call.name.as_str(), "Skill" | "Task" | "Agent") {
         pattern_verdict =
             PatternOutcome::Deny("content invocation is unavailable in bare mode".into());
+    }
+    if crate::tools::bare_mode() && (call.name == "McpToolSearch" || call.name.starts_with("mcp__"))
+    {
+        pattern_verdict = PatternOutcome::Deny("MCP is unavailable in bare mode".into());
     }
 
     // Determine the verdict:
@@ -1062,6 +1047,27 @@ fn execute_call_decided(
             return Ok((output, None));
         }
     };
+
+    // Discovery may start configured servers or contact their endpoints. It
+    // shares the normal scope, approval and durable verdict boundary.
+    if call.name == "McpToolSearch" {
+        let response = crate::tools::mcp_tool_search(home, tool_cx, &args);
+        if tool_cx.is_cancelled() {
+            return settle_cancelled_call(home, session_id, decision_id, call, tool_cx, true);
+        }
+        let ok = response.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
+        let (output, _) = scan_mcp_text(&response.to_string());
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            if ok { "ok" } else { "error" },
+            &output,
+            tool_cx,
+        )?;
+        return Ok((output, None));
+    }
 
     // The Skill tool (phase 5): load a body on demand.
     if call.name == "Skill" {
@@ -1818,6 +1824,23 @@ fn pattern_layer_verdict_in(
     pattern_layer_verdict_with_plan(home, scope, tool_name, args, working_dir, None)
 }
 
+/// A pinned operator list is an invocation ceiling, independently of any
+/// native rules, permission mode or grants that can authorize a covered call.
+fn scope_covers_key(scope: &PermissionScope, tool: &str, pattern: &str) -> bool {
+    scope.allowlist.as_ref().is_none_or(|selectors| {
+        selectors.iter().any(|selector| {
+            orbit_tools::permissions::parse_rule(
+                selector,
+                orbit_tools::permissions::RuleEffectSerde::Allow,
+            )
+            .is_some_and(|rule| {
+                orbit_tools::permissions::rule_tool_matches(&rule, tool, None)
+                    && orbit_tools::permissions::rule_matches(&rule, pattern)
+            })
+        })
+    })
+}
+
 fn pattern_layer_verdict_with_plan(
     home: &Path,
     scope: &PermissionScope,
@@ -1869,6 +1892,19 @@ fn pattern_layer_verdict_with_plan(
         .into_iter()
         .find(|t| t.name() == tool_name)
     else {
+        if tool_name == "McpToolSearch" {
+            if scope.mode == orbit_tools::permissions::PermissionMode::Plan {
+                return PatternOutcome::Deny("plan mode: MCP discovery effects are unknown".into());
+            }
+            if !scope_covers_key(scope, tool_name, "") {
+                return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+            }
+            return match evaluate(scope.mode, &rules, tool_name, "", true, false) {
+                Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask => PatternOutcome::ExplicitAsk,
+                Verdict::Deny(reason) => PatternOutcome::Deny(reason),
+            };
+        }
         if tool_name == "LspDiagnostics" {
             let pattern = args
                 .get("file_path")
@@ -2067,6 +2103,9 @@ fn pattern_layer_verdict_with_plan(
         return PatternOutcome::Ask;
     };
     let key = tool.permission_key(args);
+    if !scope_covers_key(scope, &key.tool, &key.pattern) {
+        return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+    }
     let is_ro_cmd = tool_name == "Bash"
         && orbit_tools::bash::is_readonly_command(
             args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
@@ -2910,7 +2949,7 @@ fn execute_wave1(
     tool_cx: &orbit_tools::ToolContext,
     confirm: &mut dyn FnMut(&str) -> bool,
 ) -> (String, Option<FileChange>) {
-    use orbit_tools::permissions::{RuleEffectSerde, evaluate, parse_rule};
+    use orbit_tools::permissions::{RuleEffect, RuleEffectSerde, Verdict, evaluate, parse_rule};
 
     if tool_cx.is_cancelled() {
         return (tool_error("cancelled by user"), None);
@@ -2973,12 +3012,14 @@ fn execute_wave1(
             );
         }
     }
+    let original_args = args;
     let rewritten = orbit_engine::hooks::rewritten_input(&pre);
     let args = rewritten.as_ref().unwrap_or(args);
 
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
     let mut rules = orbit_tools::executor::load_rules_in(home, &tool_cx.working_dir);
     let mut read_scope = scope.clone();
+    let mut asset_args = None;
     if call.name == "Read"
         && let Some(path) = args.get("file_path").and_then(serde_json::Value::as_str)
     {
@@ -2990,6 +3031,7 @@ fn execute_wave1(
                     Ok(scope) => read_scope = scope,
                     Err(error) => return (tool_denial(&error), None),
                 }
+                asset_args = Some(alias);
             }
             Err(error) => return (tool_denial(&error), None),
             Ok(None) => {}
@@ -3024,6 +3066,20 @@ fn execute_wave1(
         return (tool_denial("unknown tool (deny-by-default)"), None);
     };
     let key = tool.permission_key(args);
+    // A hook may have rewritten the input since the outer verdict. Its
+    // replacement must stay inside both operator and inherited ceilings.
+    if !scope_covers_key(scope, &key.tool, &key.pattern) {
+        return (
+            tool_denial("tool is outside the operator's allowlist"),
+            None,
+        );
+    }
+    if !crate::plugin_content::permits_alias(tool_cx, &call.name, args, asset_args.as_ref(), None) {
+        return (
+            tool_denial("tool is outside the invocation's inherited tool ceiling"),
+            None,
+        );
+    }
     let is_ro_cmd = call.name == "Bash"
         && orbit_tools::bash::is_readonly_command(
             args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
@@ -3050,14 +3106,54 @@ fn execute_wave1(
             .map(|v| v == "1")
             .unwrap_or(false);
 
-    match evaluate(
+    let mut verdict = evaluate(
         scope.mode,
         &rules,
         &key.tool,
         &key.pattern,
         tool.read_only(),
         is_ro_cmd,
-    ) {
+    );
+    let mut explicit_confirmation =
+        rules.evaluate(&key.tool, &key.pattern) == Some(RuleEffect::Ask);
+    if let Some(alias) = &asset_args {
+        let alias_key = tool.permission_key(alias);
+        explicit_confirmation |=
+            rules.evaluate(&alias_key.tool, &alias_key.pattern) == Some(RuleEffect::Ask);
+        let alias_verdict = evaluate(
+            scope.mode,
+            &rules,
+            &alias_key.tool,
+            &alias_key.pattern,
+            tool.read_only(),
+            is_ro_cmd,
+        );
+        verdict = match (verdict, alias_verdict) {
+            (Verdict::Deny(reason), _) | (_, Verdict::Deny(reason)) => Verdict::Deny(reason),
+            (Verdict::Ask, _) | (_, Verdict::Ask) => Verdict::Ask,
+            _ => Verdict::Allow,
+        };
+    }
+    if sandbox_up && matches!(verdict, Verdict::Ask) && explicit_confirmation {
+        let original_key = tool.permission_key(original_args);
+        if original_key.tool != key.tool || original_key.pattern != key.pattern {
+            // The existing card described the original input. Do not reuse
+            // that answer for a new target requiring explicit confirmation.
+            return (
+                tool_denial("rewritten input requires fresh confirmation"),
+                None,
+            );
+        }
+        let confirmed = confirm("a configured rule requires confirmation of this input");
+        if tool_cx.is_cancelled() {
+            return (tool_error("cancelled by user"), None);
+        }
+        if !confirmed {
+            return (tool_denial("configured confirmation was declined"), None);
+        }
+    }
+
+    match verdict {
         // S3 binds on every path that would RUN the command: a plain
         // allow, and the ask-collapse (the operator approved the call
         // — but not running it bare on a sandbox-less machine).
@@ -5543,8 +5639,8 @@ mod bash_rule_tests {
             "cargo build",
         ] {
             assert!(
-                verdict(chained) == PatternOutcome::Ask,
-                "{chained:?} was allowed by a rule that names `cargo test`"
+                matches!(verdict(chained), PatternOutcome::Deny(_)),
+                "{chained:?} escaped a pinned rule that names `cargo test`"
             );
         }
         // A deny anywhere in the line wins over an allow.
@@ -5690,11 +5786,711 @@ mod grant_tests {
         grants: &mut AutoGrants,
         scope: &PermissionScope,
     ) -> String {
+        run_with_auto(home, project, c, ch, grants, scope, false)
+    }
+
+    fn run_with_auto(
+        home: &std::path::Path,
+        project: &std::path::Path,
+        c: &crate::PendingToolCall,
+        ch: &mut Scripted,
+        grants: &mut AutoGrants,
+        scope: &PermissionScope,
+        auto_tools: bool,
+    ) -> String {
         let cx =
             orbit_tools::ToolContext::new(home.to_path_buf(), "s1".into(), project.to_path_buf());
-        execute_call(home, "s1", "d1", c, false, true, ch, grants, scope, &cx)
+        execute_call(
+            home, "s1", "d1", c, auto_tools, true, ch, grants, scope, &cx,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn assert_call_ledger(
+        home: &Path,
+        call: &crate::PendingToolCall,
+        output: &str,
+        allowed: bool,
+        status: &str,
+    ) {
+        let (records, _) = orbit_ledger::verify_ledger(&home.join("ledger")).unwrap();
+        let events: Vec<_> = records
+            .iter()
+            .filter_map(|record| match &record.record.event {
+                LedgerEvent::ToolIntent(event) if event.call_id == call.id => Some("intent"),
+                LedgerEvent::ToolVerdict(event) if event.call_id == call.id => {
+                    assert_eq!(event.allowed, allowed);
+                    Some("verdict")
+                }
+                LedgerEvent::ToolResult(event) if event.call_id == call.id => {
+                    assert_eq!(event.status, status);
+                    assert_eq!(event.output_bytes, output.len() as u64);
+                    assert_eq!(
+                        event.output_sha256,
+                        hex::encode(Sha256::digest(output.as_bytes()))
+                    );
+                    Some("result")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, ["intent", "verdict", "result"]);
+    }
+
+    #[test]
+    fn pinned_registry_scope_beats_native_rules_and_convenience_grants() {
+        for tool in ["Write", "Bash"] {
+            for authority in ["native", "legacy", "auto", "session", "rule", "bypass"] {
+                for selector in ["Read", ""] {
+                    let (home, project) = dirs(&format!("pinned-{tool}-{authority}-{selector}"));
+                    if authority == "native" {
+                        std::fs::write(
+                            home.join("settings.toml"),
+                            "[permissions]\nallow = [\"Write\", \"Bash\"]\n",
+                        )
+                        .unwrap();
+                    } else if authority == "legacy" {
+                        std::fs::write(
+                            home.join("permissions.toml"),
+                            "[allow]\ntools = [\"Write\", \"Bash\"]\n",
+                        )
+                        .unwrap();
+                    }
+                    let mut grants = AutoGrants::new();
+                    if authority == "session" {
+                        grants.grant(tool);
+                    } else if authority == "rule" {
+                        grants.grant_rule(
+                            tool,
+                            if tool == "Write" {
+                                "outside.txt"
+                            } else {
+                                "pwd"
+                            },
+                        );
+                    }
+                    let scope = PermissionScope::from_flags(
+                        (authority == "bypass").then_some("bypass"),
+                        Some(selector),
+                        None,
+                    );
+                    let call = if tool == "Write" {
+                        call(
+                            "Write",
+                            br#"{"file_path":"outside.txt","content":"outside scope"}"#,
+                        )
+                    } else {
+                        // A read-only command keeps the regression independent
+                        // of whether the local shell sandbox is available.
+                        call("Bash", br#"{"command":"pwd"}"#)
+                    };
+                    let mut channel = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+                    let output = run_with_auto(
+                        &home,
+                        &project,
+                        &call,
+                        &mut channel,
+                        &mut grants,
+                        &scope,
+                        authority == "auto",
+                    );
+                    assert!(
+                        !project.join("outside.txt").exists(),
+                        "{tool} wrote outside {selector:?} using {authority}: {output}"
+                    );
+                    assert!(
+                        orbit_tools::result_is_denial(&output),
+                        "{authority}: {output}"
+                    );
+                    assert!(
+                        output.contains("outside the operator's allowlist"),
+                        "{output}"
+                    );
+                    assert!(
+                        channel.asked.is_empty(),
+                        "a pinned ceiling must not offer expansion"
+                    );
+                    assert_call_ledger(&home, &call, &output, false, "denied");
+                    std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_registry_read_scope_keeps_native_rules_from_widening_paths() {
+        let (home, project) = dirs("pinned-read-path");
+        std::fs::write(
+            home.join("settings.toml"),
+            "[permissions]\nallow = [\"Read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("public.txt"), "public fixture content\n").unwrap();
+        std::fs::write(project.join("private.txt"), "private fixture content\n").unwrap();
+        let scope = PermissionScope::from_flags(None, Some("Read(public.txt)"), None);
+        for (name, allowed) in [("public", true), ("private", false)] {
+            let mut call = call(
+                "Read",
+                format!(r#"{{"file_path":"{name}.txt"}}"#).as_bytes(),
+            );
+            call.id = name.into();
+            let mut channel = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+            let output = run_with_auto(
+                &home,
+                &project,
+                &call,
+                &mut channel,
+                &mut AutoGrants::new(),
+                &scope,
+                true,
+            );
+            assert!(channel.asked.is_empty());
+            if allowed {
+                assert!(output.contains("public fixture content"), "{output}");
+                assert_call_ledger(&home, &call, &output, true, "ok");
+            } else {
+                assert!(orbit_tools::result_is_denial(&output), "{output}");
+                assert!(!output.contains("private fixture content"), "{output}");
+                assert_call_ledger(&home, &call, &output, false, "denied");
+            }
+        }
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn covered_registry_scope_keeps_configured_confirmation_and_denial() {
+        for effect in ["ask", "deny"] {
+            let (home, project) = dirs(&format!("pinned-read-{effect}"));
+            std::fs::write(
+                home.join("settings.toml"),
+                format!("[permissions]\n{effect} = [\"Read(public.txt)\"]\n"),
+            )
+            .unwrap();
+            std::fs::write(project.join("public.txt"), "unread fixture content\n").unwrap();
+            let scope = PermissionScope::from_flags(None, Some("Read(public.txt)"), None);
+            let call = call("Read", br#"{"file_path":"public.txt"}"#);
+            let mut grants = AutoGrants::new();
+            grants.grant("Read");
+            let mut channel = Scripted::new(&[ApprovalVerdict::Deny]);
+            let output = run_with_auto(
+                &home,
+                &project,
+                &call,
+                &mut channel,
+                &mut grants,
+                &scope,
+                true,
+            );
+            assert!(orbit_tools::result_is_denial(&output), "{effect}: {output}");
+            assert!(!output.contains("unread fixture content"));
+            assert_eq!(channel.asked.len(), usize::from(effect == "ask"));
+            assert_call_ledger(&home, &call, &output, false, "denied");
+            if effect == "ask" {
+                let mut approved_call = call;
+                approved_call.id = "approved".into();
+                let mut channel = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+                let output = run_with_auto(
+                    &home,
+                    &project,
+                    &approved_call,
+                    &mut channel,
+                    &mut grants,
+                    &scope,
+                    true,
+                );
+                assert!(output.contains("unread fixture content"), "{output}");
+                assert_eq!(
+                    channel.asked.len(),
+                    1,
+                    "the original input is confirmed once"
+                );
+                assert_call_ledger(&home, &approved_call, &output, true, "ok");
+            }
+            std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_rewrite_is_refused(barrier: &str) {
+        let inherited = barrier == "inherited";
+        let (home, project) = dirs(&format!("{barrier}-read-rewrite"));
+        std::fs::write(project.join("public.txt"), "public fixture content\n").unwrap();
+        std::fs::write(project.join("private.txt"), "private fixture content\n").unwrap();
+        let response = serde_json::json!({
+            "hookSpecificOutput": {"updatedInput": {"file_path": "private.txt"}}
+        });
+        let marker = home.join("hook-ran");
+        let script = home.join("rewrite.sh");
+        let quote = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!(
+                "printf ran > '{}'; printf '%s\\n' '{response}'\n",
+                quote(&marker)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[permissions]\nallow = [\"Read\"]\n{}[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"/bin/sh '{}'\"\n",
+                if barrier == "ask" { "ask = [\"Read(private.txt)\"]\n" } else { "" },
+                quote(&script)
+            ),
+        )
+        .unwrap();
+        let hooks = orbit_engine::hooks::Hooks::load(&home, false);
+        let outcomes = hooks.fire(
+            orbit_engine::hooks::HookEvent::PreToolUse,
+            &serde_json::json!({"tool": "Read", "arguments": {"file_path": "public.txt"}}),
+        );
+        assert_eq!(
+            orbit_engine::hooks::rewritten_input(&outcomes),
+            Some(serde_json::json!({"file_path": "private.txt"})),
+            "the supported script fixture must actually rewrite the input"
+        );
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let scope = if inherited {
+            PermissionScope::default()
+        } else if barrier == "ask" {
+            PermissionScope::from_flags(None, Some("Read"), None)
+        } else {
+            PermissionScope::from_flags(None, Some("Read(public.txt)"), None)
+        };
+        let call = call("Read", br#"{"file_path":"public.txt"}"#);
+        let mut channel = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+        let cx = orbit_tools::ToolContext::new(home.clone(), "s1".into(), project.clone());
+        if inherited {
+            crate::plugin_content::restrict_context(&cx, Some(&["Read(public.txt)".into()]))
+                .unwrap();
+        }
+        let output = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            true,
+            true,
+            &mut channel,
+            &mut AutoGrants::new(),
+            &scope,
+            &cx,
+        )
+        .unwrap()
+        .0;
+        assert!(
+            marker.exists(),
+            "the actual dispatcher must run the rewriting hook"
+        );
+        assert!(orbit_tools::result_is_denial(&output), "{output}");
+        assert!(
+            output.contains(if inherited {
+                "outside the invocation's inherited tool ceiling"
+            } else if barrier == "ask" {
+                "rewritten input requires fresh confirmation"
+            } else {
+                "outside the operator's allowlist"
+            }),
+            "{output}"
+        );
+        assert!(!output.contains("private fixture content"));
+        assert!(channel.asked.is_empty());
+        // The initial call was in scope; its backend refused the hook's
+        // rewritten target before it read the private fixture.
+        assert_call_ledger(&home, &call, &output, true, "denied");
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_registry_scope_is_rechecked_after_a_hook_rewrites_the_path() {
+        assert_rewrite_is_refused("operator");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_registry_scope_is_rechecked_after_a_hook_rewrites_the_path() {
+        assert_rewrite_is_refused("inherited");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_rewrite_cannot_reuse_confirmation_for_a_new_registry_target() {
+        assert_rewrite_is_refused("ask");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewritten_plugin_assets_preserve_physical_alias_policy_and_grants() {
+        use orbit_plugin_compat::{InspectOptions, PluginFormat, PluginStore, StoreScope};
+        use std::os::unix::fs::PermissionsExt;
+
+        for effect in ["allow", "ask", "deny"] {
+            let (home, project) = dirs(&format!("asset-rewrite-{effect}"));
+            std::fs::set_permissions(
+                home.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let source = home.parent().unwrap().join("plugin-source");
+            for directory in [".claude-plugin", "skills/reader", "references"] {
+                std::fs::create_dir_all(source.join(directory)).unwrap();
+            }
+            std::fs::write(
+                source.join(".claude-plugin/plugin.json"),
+                r#"{"name":"scope-fixture","version":"1.0.0","description":"Read fixture assets"}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("skills/reader/SKILL.md"),
+                "---\nname: reader\ndescription: Read the fixture reference\n---\nUse the packaged reference.\n",
+            ).unwrap();
+            std::fs::write(
+                source.join("references/private.txt"),
+                "bound private fixture content\n",
+            )
+            .unwrap();
+            let receipt = PluginStore::open(&home, &project, true)
+                .unwrap()
+                .import(
+                    &source,
+                    &InspectOptions {
+                        format: Some(PluginFormat::Claude),
+                        ..Default::default()
+                    },
+                    StoreScope::User,
+                    true,
+                )
+                .unwrap();
+            assert!(receipt.plugin.enabled);
+            let catalog = orbit_engine::skills::load_catalog(&home, &project, true).unwrap();
+            let binding = catalog
+                .skills
+                .iter()
+                .find_map(|entry| entry.binding.as_ref())
+                .unwrap();
+            let asset = format!("{}/references/private.txt", binding.asset_prefix());
+            let physical = binding.root.join("references/private.txt");
+            std::fs::write(project.join("public.txt"), "public fixture content\n").unwrap();
+            let marker = home.join("hook-ran");
+            let script = home.join("rewrite.sh");
+            let quote = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+            let response =
+                serde_json::json!({"hookSpecificOutput": {"updatedInput": {"file_path": asset}}});
+            std::fs::write(
+                &script,
+                format!(
+                    "printf ran > '{}'; printf '%s\\n' '{response}'\n",
+                    quote(&marker)
+                ),
+            )
+            .unwrap();
+            let policy = if effect == "allow" {
+                String::new()
+            } else {
+                format!(
+                    "{effect} = [{}]\n",
+                    serde_json::to_string(&format!("Read({})", physical.display())).unwrap()
+                )
+            };
+            std::fs::write(
+                home.join("settings.toml"),
+                format!(
+                    "[permissions]\nallow = [\"Read\"]\n{policy}[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"/bin/sh '{}'\"\n",
+                    quote(&script)
+                ),
+            ).unwrap();
+            let cx = orbit_tools::ToolContext::new(home.clone(), "s1".into(), project.clone());
+            assert_eq!(
+                crate::plugin_content::asset_policy_path(&cx, &asset).unwrap(),
+                Some(physical.clone())
+            );
+            let selectors = [
+                "Read(public.txt)".into(),
+                format!("Read({})", physical.display()),
+            ];
+            crate::plugin_content::restrict_context(&cx, Some(&selectors)).unwrap();
+            let scope = PermissionScope::from_flags(None, Some("Read"), None);
+            let call = call("Read", br#"{"file_path":"public.txt"}"#);
+            let mut channel = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+            let output = execute_call(
+                &home,
+                "s1",
+                "d1",
+                &call,
+                true,
+                true,
+                &mut channel,
+                &mut AutoGrants::new(),
+                &scope,
+                &cx,
+            )
             .unwrap()
-            .0
+            .0;
+            assert!(marker.exists());
+            assert!(channel.asked.is_empty());
+            if effect == "allow" {
+                assert!(output.contains("bound private fixture content"), "{output}");
+                assert_call_ledger(&home, &call, &output, true, "ok");
+                for (label, selector, covered) in [
+                    ("uri", format!("Read({asset})"), true),
+                    ("physical", format!("Read({})", physical.display()), true),
+                    (
+                        "outside",
+                        format!("Read({})", project.join("other.txt").display()),
+                        false,
+                    ),
+                ] {
+                    std::fs::remove_file(&marker).unwrap();
+                    let scope = PermissionScope::from_flags(None, Some(&selector), None);
+                    let mut direct = self::call(
+                        "Read",
+                        &serde_json::to_vec(&serde_json::json!({"file_path": asset})).unwrap(),
+                    );
+                    direct.id = format!("direct-{label}");
+                    let mut channel = Scripted::new(&[ApprovalVerdict::Deny]);
+                    let output = execute_call(
+                        &home,
+                        "s1",
+                        "d1",
+                        &direct,
+                        false,
+                        true,
+                        &mut channel,
+                        &mut AutoGrants::new(),
+                        &scope,
+                        &cx,
+                    )
+                    .unwrap()
+                    .0;
+                    assert!(channel.asked.is_empty());
+                    if covered {
+                        assert!(marker.exists(), "{label} must reach the configured hook");
+                        assert!(
+                            output.contains("bound private fixture content"),
+                            "{label}: {output}"
+                        );
+                        assert_call_ledger(&home, &direct, &output, true, "ok");
+                    } else {
+                        assert!(
+                            !marker.exists(),
+                            "an unrelated physical selector must deny before hooks"
+                        );
+                        assert!(orbit_tools::result_is_denial(&output), "{output}");
+                        assert!(!output.contains("bound private fixture content"));
+                        assert_call_ledger(&home, &direct, &output, false, "denied");
+                    }
+                }
+            } else {
+                assert!(orbit_tools::result_is_denial(&output), "{effect}: {output}");
+                assert!(!output.contains("bound private fixture content"));
+                assert_call_ledger(&home, &call, &output, true, "denied");
+            }
+            std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn discovery_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let (home, project) = dirs(tag);
+        let marker = home.join("server-started");
+        let server = format!("scope-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let quoted = marker.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            home.join("mcp.json"),
+            serde_json::json!({"servers": {(server): {
+                "command": "/bin/sh",
+                "args": ["-c", format!("printf started > '{quoted}'; exit 3")],
+                "timeout_ms": 500,
+                "initialize_timeout_ms": 250
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        (home, project, marker)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_discovery_obeys_scope_rules_and_plan_before_starting_a_server() {
+        for barrier in ["scope", "empty-scope", "invocation", "deny", "ask", "plan"] {
+            let (home, project, marker) = discovery_fixture(&format!("discovery-{barrier}"));
+            if matches!(barrier, "deny" | "ask") {
+                std::fs::write(
+                    home.join("settings.toml"),
+                    format!("[permissions]\n{barrier} = [\"McpToolSearch\"]\n"),
+                )
+                .unwrap();
+            }
+            let scope = PermissionScope::from_flags(
+                (barrier == "plan").then_some("plan"),
+                match barrier {
+                    "scope" => Some("Read"),
+                    "empty-scope" => Some(""),
+                    _ => None,
+                },
+                None,
+            );
+            let call = call("McpToolSearch", br#"{"query":"anything"}"#);
+            let mut channel = Scripted::new(&[ApprovalVerdict::Deny]);
+            let cx = orbit_tools::ToolContext::new(home.clone(), "s1".into(), project.clone());
+            if barrier == "invocation" {
+                crate::plugin_content::restrict_context(&cx, Some(&["Read".into()])).unwrap();
+            }
+            let output = execute_call(
+                &home,
+                "s1",
+                "d1",
+                &call,
+                true,
+                true,
+                &mut channel,
+                &mut AutoGrants::new(),
+                &scope,
+                &cx,
+            )
+            .unwrap()
+            .0;
+            assert!(
+                !marker.exists(),
+                "{barrier} allowed discovery to start a server: {output}"
+            );
+            assert!(
+                orbit_tools::result_is_denial(&output),
+                "{barrier}: {output}"
+            );
+            assert_eq!(channel.asked.len(), usize::from(barrier == "ask"));
+            assert_call_ledger(&home, &call, &output, false, "denied");
+            std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicitly_allowed_mcp_discovery_keeps_a_complete_execution_record() {
+        let (home, project, marker) = discovery_fixture("discovery-allowed");
+        let scope = PermissionScope::from_flags(None, Some("McpToolSearch"), None);
+        let call = call("McpToolSearch", br#"{"query":"anything"}"#);
+        let mut channel = Scripted::new(&[ApprovalVerdict::Deny]);
+        let output = run_with_auto(
+            &home,
+            &project,
+            &call,
+            &mut channel,
+            &mut AutoGrants::new(),
+            &scope,
+            false,
+        );
+        assert!(
+            marker.exists(),
+            "explicitly allowed discovery did not start its server"
+        );
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["ok"], true);
+        assert!(channel.asked.is_empty());
+        assert_call_ledger(&home, &call, &output, true, "ok");
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_mode_rejects_mcp_calls_even_when_they_are_not_advertised() {
+        const CHILD: &str = "ORBIT_BARE_RUNTIME_SCOPE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            orbit_engine::enable_bare_mode();
+            let (home, project, marker) = discovery_fixture("bare-mcp-runtime");
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(home.join("mcp.json")).unwrap()).unwrap();
+            let server = config["servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap();
+            let wire = orbit_mcp::wire_name(server, "read");
+            let calls = [
+                (
+                    "McpToolSearch".to_owned(),
+                    serde_json::json!({"query": "anything"}),
+                ),
+                (wire.clone(), serde_json::json!({})),
+                (
+                    "McpToolCall".into(),
+                    serde_json::json!({"name": wire, "arguments": {}}),
+                ),
+                (
+                    "ListMcpResources".into(),
+                    serde_json::json!({"server": server}),
+                ),
+                (
+                    "ReadMcpResource".into(),
+                    serde_json::json!({"server": server, "uri": "fixture://item"}),
+                ),
+            ];
+            let scope = PermissionScope::from_flags(Some("bypass"), None, None);
+            for (index, (name, args)) in calls.into_iter().enumerate() {
+                let mut call = call(&name, &serde_json::to_vec(&args).unwrap());
+                call.id = format!("bare-call-{index}");
+                let mut channel = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+                let output = run_with_auto(
+                    &home,
+                    &project,
+                    &call,
+                    &mut channel,
+                    &mut AutoGrants::new(),
+                    &scope,
+                    true,
+                );
+                assert!(
+                    !marker.exists(),
+                    "{name} started a server in bare mode: {output}"
+                );
+                assert!(orbit_tools::result_is_denial(&output), "{name}: {output}");
+                assert!(output.contains("unavailable in bare mode"), "{output}");
+                assert!(channel.asked.is_empty());
+                assert_call_ledger(&home, &call, &output, false, "denied");
+            }
+            std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+            println!("BARE_RUNTIME_SCOPE_CHECKED");
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tool_runtime::grant_tests::bare_mode_rejects_mcp_calls_even_when_they_are_not_advertised",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("ORBIT_CLAUDE_COMPAT", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated bare runtime scope check timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("BARE_RUNTIME_SCOPE_CHECKED"));
     }
 
     fn ledger_text(home: &std::path::Path) -> String {

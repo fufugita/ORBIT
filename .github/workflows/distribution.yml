@@ -71,6 +71,12 @@ jobs:
           # interpreter for this 22.04 container on both native architectures.
           AGENT_TOOLSDIRECTORY: /opt/orbit-python-ubuntu22.04
           RUNNER_TOOL_CACHE: /opt/orbit-python-ubuntu22.04
+      - name: Make container Python usable in clean environments
+        run: |
+          test -f "$pythonLocation/lib/libpython3.12.so.1.0"
+          printf '%s\n' "$pythonLocation/lib" > /etc/ld.so.conf.d/orbit-python.conf
+          ldconfig
+          env -i PATH="$PATH" python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)'
       - name: release test environment
         run: python3 -B scripts/release_preflight.py
       - uses: Swatinem/rust-cache@v2

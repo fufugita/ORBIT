@@ -727,6 +727,12 @@ pub fn project_trusted(home: &Path) -> bool {
 impl Hooks {
     /// Load hooks from the settings scopes.
     pub fn load(home: &Path, project_trusted: bool) -> Self {
+        if crate::bare_mode() {
+            return Self {
+                project_trusted,
+                ..Self::default()
+            };
+        }
         let mut hooks = Vec::new();
         // User scope: $ORBIT_HOME/settings.toml [[hooks]] entries.
         if let Ok(text) = std::fs::read_to_string(home.join("settings.toml")) {
@@ -781,7 +787,7 @@ impl Hooks {
     /// empty vec when no hook matches. Blocking semantics are applied
     /// by the caller (the first block wins).
     pub fn fire(&self, event: HookEvent, payload: &serde_json::Value) -> Vec<HookOutcome> {
-        if SUPPRESSED.with(std::cell::Cell::get) {
+        if crate::bare_mode() || SUPPRESSED.with(std::cell::Cell::get) {
             return Vec::new();
         }
         // The payload carries the event name (E9): a hook listening to
@@ -1531,6 +1537,155 @@ fn test_dir(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_mode_does_not_load_or_fire_hooks_across_threads() {
+        const FIXTURE_DIR: &str = "ORBIT_BARE_HOOK_FIXTURE_DIR";
+        if let Some(root) = std::env::var_os(FIXTURE_DIR) {
+            let root = PathBuf::from(root);
+            let latched = std::env::var("ORBIT_BARE_HOOK_FIXTURE_LATCH").as_deref() == Ok("1");
+            let suppressed = std::env::var("ORBIT_BARE").as_deref() == Ok("1") || latched;
+            // Construct hooks directly, as if they were loaded before the
+            // process selected bare mode. Neither commands nor model/MCP
+            // handlers may run, including on another worker thread.
+            let command = format!(
+                "printf ran > '{}'",
+                root.join("preloaded.marker")
+                    .display()
+                    .to_string()
+                    .replace('\'', "'\\''")
+            );
+            let preloaded = Hooks {
+                hooks: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "event":"Stop", "command":command,
+                    }))
+                    .unwrap(),
+                    serde_json::from_value(serde_json::json!({
+                        "event":"Stop", "command":"",
+                        "handler":{"type":"prompt", "prompt":"fixture runner"},
+                    }))
+                    .unwrap(),
+                ],
+                project_trusted: true,
+            };
+            let runner_marker = root.join("handler.marker");
+            set_handler_runner(Some(std::sync::Arc::new(move |_, _| {
+                std::fs::write(&runner_marker, "ran").unwrap();
+                HookOutcome::default()
+            })));
+            if latched {
+                assert!(!crate::bare_mode());
+                crate::enable_bare_mode();
+                crate::enable_bare_mode();
+            }
+            assert_eq!(crate::bare_mode(), suppressed);
+            let loaded = Hooks::load(&root.join("home"), true);
+            assert_eq!(loaded.hooks.len(), if suppressed { 0 } else { 4 });
+            let (loaded_outcomes, preloaded_outcomes) = std::thread::spawn(move || {
+                (
+                    loaded.fire(HookEvent::Stop, &serde_json::json!({})),
+                    preloaded.fire(HookEvent::Stop, &serde_json::json!({})),
+                )
+            })
+            .join()
+            .unwrap();
+            assert_eq!(loaded_outcomes.len(), if suppressed { 0 } else { 4 });
+            assert_eq!(preloaded_outcomes.len(), if suppressed { 0 } else { 2 });
+            for outcome in loaded_outcomes.iter().chain(&preloaded_outcomes) {
+                assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+            }
+            for marker in [
+                "native",
+                "project",
+                "extra",
+                "claude",
+                "preloaded",
+                "handler",
+            ] {
+                assert_eq!(
+                    root.join(format!("{marker}.marker")).exists(),
+                    !suppressed,
+                    "{marker}"
+                );
+            }
+            return;
+        }
+
+        struct FixtureDir(PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = FixtureDir(test_dir(&format!("bare-{nonce}")));
+        for mode in ["full", "env", "latched"] {
+            let root = fixture.0.join(mode);
+            let project = root.join("project");
+            for directory in [
+                root.join("home"),
+                root.join("claude"),
+                project.join(".orbit"),
+            ] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let command = |marker: &str| {
+                format!(
+                    "printf ran > '{}'",
+                    root.join(format!("{marker}.marker"))
+                        .display()
+                        .to_string()
+                        .replace('\'', "'\\''")
+                )
+            };
+            let settings = |marker: &str| {
+                format!(
+                    "[[hooks]]\nevent = \"Stop\"\ncommand = {}\n",
+                    serde_json::to_string(&command(marker)).unwrap()
+                )
+            };
+            std::fs::write(root.join("home/settings.toml"), settings("native")).unwrap();
+            std::fs::write(project.join(".orbit/settings.toml"), settings("project")).unwrap();
+            std::fs::write(root.join("extra.toml"), settings("extra")).unwrap();
+            std::fs::write(
+                root.join("claude/settings.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "hooks":{"Stop":[{"hooks":[{"type":"command", "command":command("claude")}]}]},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hooks::tests::bare_mode_does_not_load_or_fire_hooks_across_threads",
+                    "--nocapture",
+                ])
+                .current_dir(&project)
+                .env(FIXTURE_DIR, &root)
+                .env("ORBIT_BARE", if mode == "env" { "1" } else { "0" })
+                .env(
+                    "ORBIT_BARE_HOOK_FIXTURE_LATCH",
+                    if mode == "latched" { "1" } else { "0" },
+                )
+                .env("ORBIT_CLAUDE_COMPAT", "1")
+                .env("CLAUDE_CONFIG_DIR", root.join("claude"))
+                .env("ORBIT_SETTINGS_FILE", root.join("extra.toml"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "mode={mode}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn a_hook_that_ignores_stdin_and_floods_stdout_still_finishes() {

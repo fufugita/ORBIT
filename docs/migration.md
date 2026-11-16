@@ -104,6 +104,16 @@ Start new ORBIT sessions with reviewed context from the old project. Existing
 Claude conversations are not imported as ORBIT durable sessions. Keep historical
 exports available separately.
 
+For an initial provider smoke test, `--bare` suppresses automatic hooks, skills,
+instruction bundles, MCP servers, channels, status commands and memory-file
+discovery across headless, interactive and owned sessions. Provider credentials,
+permission rules and explicitly appended system instructions still apply.
+Test your integrations separately in a normal session after reviewing them.
+An `--allowedTools` selection limits tool execution; native
+allow rules and convenience grants cannot widen it, and hook-rewritten inputs
+must remain inside that scope. `McpToolSearch` can start servers and therefore
+uses the same permission and accounting checks as other tool calls.
+
 If you roll back ORBIT after using model hooks or automatic permissions, keep
 the home with the binary version that understands its housekeeping receipts.
 Older builds may refuse those newer records. Preserve the original home and

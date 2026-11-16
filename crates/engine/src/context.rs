@@ -140,9 +140,10 @@ pub fn build_system_prompt(
 
     // 2b. Skills (phase 5): the index — names + one-line purposes.
     // Bodies load on demand via the Skill tool.
-    if tool_names
-        .iter()
-        .any(|name| matches!(*name, "Skill" | "Task" | "Agent"))
+    if !crate::bare_mode()
+        && tool_names
+            .iter()
+            .any(|name| matches!(*name, "Skill" | "Task" | "Agent"))
     {
         match crate::skills::load_catalog(home, working_dir, true) {
             Ok(catalog) => {
@@ -197,42 +198,46 @@ pub fn build_system_prompt(
     s.push('\n');
 
     // 4. Memory files, lowest scope first.
-    let memory_from = s.len();
-    s.push_str("## Project instructions\n\n");
-    // Managed, then the operator's own file, then the project's.
-    let mut files: Vec<PathBuf> = vec![PathBuf::from(MEMORY_FILES[0]), home.join("ORBIT.md")];
-    files.extend(MEMORY_FILES[1..].iter().map(|rel| working_dir.join(rel)));
-    files.extend(
-        [".claude/CLAUDE.md", "CLAUDE.local.md"]
-            .iter()
-            .map(|rel| working_dir.join(rel)),
-    );
-    let mut imports = ImportBudget::default();
-    for path in files {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let capped = cap_auto_memory(&text);
-            s.push_str(&format!(
-                "### {} ({} bytes)\n\n{}\n\n",
-                path.display(),
-                text.len(),
-                capped
-            ));
-            let scope = path.parent().unwrap_or(working_dir).to_path_buf();
-            push_imports(
-                &mut s,
-                &text,
-                &path,
-                &[working_dir, &scope],
-                1,
-                &mut imports,
-            );
+    let memory_bytes = if crate::bare_mode() {
+        0
+    } else {
+        let memory_from = s.len();
+        s.push_str("## Project instructions\n\n");
+        // Managed, then the operator's own file, then the project's.
+        let mut files: Vec<PathBuf> = vec![PathBuf::from(MEMORY_FILES[0]), home.join("ORBIT.md")];
+        files.extend(MEMORY_FILES[1..].iter().map(|rel| working_dir.join(rel)));
+        files.extend(
+            [".claude/CLAUDE.md", "CLAUDE.local.md"]
+                .iter()
+                .map(|rel| working_dir.join(rel)),
+        );
+        let mut imports = ImportBudget::default();
+        for path in files {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let capped = cap_auto_memory(&text);
+                s.push_str(&format!(
+                    "### {} ({} bytes)\n\n{}\n\n",
+                    path.display(),
+                    text.len(),
+                    capped
+                ));
+                let scope = path.parent().unwrap_or(working_dir).to_path_buf();
+                push_imports(
+                    &mut s,
+                    &text,
+                    &path,
+                    &[working_dir, &scope],
+                    1,
+                    &mut imports,
+                );
+            }
         }
-    }
-    push_rules(&mut s, working_dir);
-    let memory_bytes = s.len() - memory_from;
+        push_rules(&mut s, working_dir);
+        s.len() - memory_from
+    };
 
     // 5. Enabled mods' instructions (frozen here, not re-inserted).
-    if !mods_directive.is_empty() {
+    if !crate::bare_mode() && !mods_directive.is_empty() {
         s.push_str("## Enabled mods\n\n");
         s.push_str(mods_directive);
         s.push_str("\n\n");
@@ -296,6 +301,9 @@ fn output_style(home: &Path, working_dir: &Path) -> Option<String> {
         .or_else(|| std::env::var("ORBIT_OUTPUT_STYLE").ok())
         .filter(|name| !name.trim().is_empty())
         .or_else(|| {
+            if crate::bare_mode() {
+                return None;
+            }
             // `--settings <file>` is read first: it is this run's choice.
             let named = |text: String| {
                 text.lines()
@@ -754,6 +762,100 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn bare_prompt_skips_discovered_content_and_keeps_explicit_instructions() {
+        const CHILD: &str = "ORBIT_BARE_CONTEXT_TEST_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let root = std::env::temp_dir().join(format!(
+                "orbit-bare-context-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let home = root.join("home");
+            let project = root.join("project");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(home.join("skills/fixture")).unwrap();
+            std::fs::create_dir_all(project.join(".claude/rules")).unwrap();
+            std::fs::write(home.join("ORBIT.md"), "AUTO_HOME_MEMORY_SENTINEL").unwrap();
+            std::fs::write(home.join("settings.toml"), "output_style = \"learning\"\n").unwrap();
+            std::fs::write(project.join("AGENTS.md"), "AUTO_PROJECT_MEMORY_SENTINEL").unwrap();
+            std::fs::write(
+                project.join(".claude/rules/fixture.md"),
+                "AUTO_RULE_SENTINEL",
+            )
+            .unwrap();
+            std::fs::write(
+                home.join("skills/fixture/SKILL.md"),
+                "---\nname: fixture\ndescription: AUTO_SKILL_SENTINEL\n---\nSkill body.\n",
+            )
+            .unwrap();
+            let prompt = build_system_prompt(
+                &home,
+                &project,
+                "fixture-model",
+                &["Read", "Skill", "Agent"],
+                "AUTO_MOD_SENTINEL",
+            );
+            assert!(prompt.text.contains("## Tools"));
+            assert!(prompt.text.contains("fixture-model"));
+            assert!(prompt.text.contains("EXPLICIT_APPEND_SENTINEL"));
+            for content in [
+                "AUTO_HOME_MEMORY_SENTINEL",
+                "AUTO_PROJECT_MEMORY_SENTINEL",
+                "AUTO_RULE_SENTINEL",
+                "AUTO_SKILL_SENTINEL",
+                "AUTO_MOD_SENTINEL",
+                "Work as a teacher.",
+            ] {
+                assert_eq!(
+                    prompt.text.contains(content),
+                    mode == "full",
+                    "{mode}: {content}"
+                );
+            }
+            assert_eq!(prompt.memory_bytes == 0, mode == "bare");
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        for (mode, bare) in [("full", "0"), ("bare", "1")] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "context::tests::bare_prompt_skips_discovered_content_and_keeps_explicit_instructions",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, mode)
+                .env("ORBIT_BARE", bare)
+                .env("ORBIT_CLAUDE_COMPAT", "0")
+                .env("ORBIT_OUTPUT_STYLE", "")
+                .env("ORBIT_APPEND_SYSTEM_PROMPT", "EXPLICIT_APPEND_SENTINEL")
+                .env_remove("ORBIT_SETTINGS_FILE")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated bare-context check timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn snapshot_rendes_git_facts() {
