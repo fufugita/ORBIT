@@ -103,10 +103,19 @@ fn optional_tools(
 /// project (.orbit/skills, trusted folders only).
 pub fn load_skills(home: &Path, project_trusted: bool) -> Vec<Skill> {
     let mut out = Vec::new();
-    for (dir, needs_trust) in [
+    // ORBIT's own folders first, then Claude Code's, so a skill installed
+    // for both is listed once under ORBIT's copy.
+    let mut dirs = vec![
         (home.join("skills"), false),
         (Path::new(".orbit/skills").to_path_buf(), true),
-    ] {
+        (Path::new(".claude/skills").to_path_buf(), true),
+    ];
+    if crate::hooks::claude_compat(home)
+        && let Some(claude) = crate::hooks::claude_config_dir()
+    {
+        dirs.push((claude.join("skills"), false));
+    }
+    for (dir, needs_trust) in dirs {
         if needs_trust && !project_trusted {
             continue;
         }
@@ -117,6 +126,10 @@ pub fn load_skills(home: &Path, project_trusted: bool) -> Vec<Skill> {
             let skill_md = entry.path().join("SKILL.md");
             if let Ok(text) = std::fs::read_to_string(&skill_md)
                 && let Some(skill) = parse_skill_md(&text)
+                && !out.iter().any(|seen: &Skill| seen.name == skill.name)
+                // A skill only a person may start is not offered to the
+                // model.
+                && !local_skill_policy(&text, &skill).0.disable_model_invocation
             {
                 out.push(skill);
             }
@@ -308,6 +321,84 @@ pub struct CatalogSkill {
     pub skill: Skill,
     pub policy: Option<orbit_plugin_compat::SkillSpec>,
     pub binding: Option<ContentBinding>,
+    /// A skill folder of the operator's own (`$ORBIT_HOME/skills`,
+    /// `.orbit/skills`, Claude Code's): where its `SKILL.md` lives, so the
+    /// files it refers to can be found. `None` for a plugin's skill, whose
+    /// files are reached through its binding.
+    pub dir: Option<std::path::PathBuf>,
+    /// That skill's `allowed-tools`, as written: what its use may do
+    /// without asking, for the turn that loads it.
+    pub grants: Vec<String>,
+}
+
+/// What a skill folder's front matter says about who may start it and what
+/// it may use: `disable-model-invocation`, `user-invocable` (default true)
+/// and `allowed-tools` (a comma-separated line or a list).
+fn local_skill_policy(text: &str, skill: &Skill) -> (orbit_plugin_compat::SkillSpec, Vec<String>) {
+    let front = orbit_plugin_compat::parse_frontmatter(text)
+        .map(|document| document.frontmatter)
+        .unwrap_or(serde_json::Value::Null);
+    let flag =
+        |key: &str, default: bool| front.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+    let grants: Vec<String> = match front.get("allowed-tools") {
+        Some(serde_json::Value::String(line)) => split_tool_list(line),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(|item| item.trim().to_owned())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    (
+        orbit_plugin_compat::SkillSpec {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            body: skill.body.clone(),
+            entry: "SKILL.md".into(),
+            // Loaded into the conversation, not run in a child: the
+            // ceiling a plugin's skill gets is not what a local one means
+            // by `allowed-tools` (see `grants`).
+            allowed_tools: None,
+            model: None,
+            effort: None,
+            disable_model_invocation: flag("disable-model-invocation", false),
+            user_invocable: flag("user-invocable", true),
+            context: None,
+            agent: None,
+        },
+        grants,
+    )
+}
+
+/// `Read, Bash(git status:*), Edit` → its items; a comma inside brackets
+/// belongs to the item.
+fn split_tool_list(line: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in line.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                items.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    items.push(current);
+    items
+        .into_iter()
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -318,10 +409,23 @@ pub struct CatalogAgent {
     pub binding: Option<ContentBinding>,
 }
 
+/// A plugin's command file: a prompt a person starts with
+/// `/plugin:command`. Only its text is used; a command that needs the
+/// plugin's own code is not offered.
+#[derive(Debug, Clone)]
+pub struct CatalogCommand {
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    pub argument_hint: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ContentCatalog {
     pub skills: Vec<CatalogSkill>,
     pub agents: Vec<CatalogAgent>,
+    /// The prompt commands of installed plugins, as `plugin:command`.
+    pub commands: Vec<CatalogCommand>,
     pub diagnostics: Vec<String>,
 }
 
@@ -343,7 +447,20 @@ pub fn load_catalog(
             binding: None,
         });
     }
-    for (base, needs_trust) in [(home.to_path_buf(), false), (project.join(".orbit"), true)] {
+    // ORBIT's own folders first, then Claude Code's: the project's
+    // `.claude/` when the folder is trusted, the operator's `~/.claude/`
+    // when they turned on `claude_compat`. A name already taken is kept.
+    let mut bases = vec![
+        (home.to_path_buf(), false, false),
+        (project.join(".orbit"), true, false),
+        (project.join(".claude"), true, true),
+    ];
+    if crate::hooks::claude_compat(home)
+        && let Some(claude) = crate::hooks::claude_config_dir()
+    {
+        bases.push((claude, false, true));
+    }
+    for (base, needs_trust, borrowed) in bases {
         if needs_trust && !trusted {
             continue;
         }
@@ -351,11 +468,19 @@ pub fn load_catalog(
             for entry in entries.flatten() {
                 if let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md"))
                     && let Some(skill) = parse_skill_md(&text)
+                    && !(borrowed
+                        && catalog
+                            .skills
+                            .iter()
+                            .any(|known| known.skill.name == skill.name))
                 {
+                    let (policy, grants) = local_skill_policy(&text, &skill);
                     catalog.skills.push(CatalogSkill {
                         skill,
-                        policy: None,
+                        policy: Some(policy),
                         binding: None,
+                        dir: entry.path().canonicalize().ok(),
+                        grants,
                     });
                 }
             }
@@ -365,6 +490,11 @@ pub fn load_catalog(
                 if entry.path().extension().and_then(|value| value.to_str()) == Some("md")
                     && let Ok(text) = std::fs::read_to_string(entry.path())
                     && let Some(agent) = parse_agent_md(&text)
+                    && !(borrowed
+                        && catalog
+                            .agents
+                            .iter()
+                            .any(|known| known.agent.name == agent.name))
                 {
                     let allowed_tools = (!agent.tools.is_empty()).then(|| agent.tools.clone());
                     catalog.agents.push(CatalogAgent {
@@ -431,7 +561,9 @@ pub fn load_catalog(
                 for component in &active.plugin.components {
                     if !matches!(
                         component.kind,
-                        ComponentKind::Skill(_) | ComponentKind::Agent(_)
+                        ComponentKind::Skill(_)
+                            | ComponentKind::Agent(_)
+                            | ComponentKind::Command(_)
                     ) {
                         continue;
                     }
@@ -478,6 +610,8 @@ pub fn load_catalog(
                             },
                             policy: Some(spec.clone()),
                             binding,
+                            dir: None,
+                            grants: Vec::new(),
                         }),
                         ComponentKind::Agent(spec) => {
                             let effort = match spec.effort.as_ref() {
@@ -523,6 +657,23 @@ pub fn load_catalog(
                                 allowed_tools: spec.tools.clone(),
                                 binding,
                             });
+                        }
+                        ComponentKind::Command(spec) => {
+                            // A command that is a prompt runs as one; a
+                            // command backed by the plugin's code does not.
+                            if let Some(prompt) = spec.prompt.clone() {
+                                catalog.commands.push(CatalogCommand {
+                                    name: spec.name.clone(),
+                                    description: spec.description.clone(),
+                                    prompt,
+                                    argument_hint: spec.argument_hint.clone(),
+                                });
+                            } else {
+                                catalog.diagnostics.push(format!(
+                                    "{} runs plugin code and is not offered",
+                                    component.id
+                                ));
+                            }
                         }
                         _ => unreachable!(),
                     }
@@ -777,5 +928,60 @@ Body text.
         if let Some(skill) = parse_skill_md(&md) {
             assert!(!skill.name.is_empty());
         }
+    }
+
+    #[test]
+    fn a_trusted_projects_claude_skills_and_agents_join_the_catalog() {
+        let root = std::env::temp_dir().join(format!("orbit-claude-catalog-{}", ulid::Ulid::new()));
+        let (home, project) = (root.join("home"), root.join("project"));
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            project.join(".claude/skills/release/SKILL.md"),
+            "---\nname: release\ndescription: cut a release\n---\nCLAUDE RELEASE\n",
+        );
+        write(
+            project.join(".orbit/skills/release/SKILL.md"),
+            "---\nname: release\ndescription: cut a release\n---\nORBIT RELEASE\n",
+        );
+        write(
+            project.join(".claude/skills/notes/SKILL.md"),
+            "---\nname: notes\ndescription: write notes\n---\nNOTES BODY\n",
+        );
+        write(
+            project.join(".claude/agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: reviews diffs\n---\nReview carefully.\n",
+        );
+        std::fs::create_dir_all(&home).unwrap();
+        // Only this fixture's names: the machine's own Claude Code skills
+        // join too when `ORBIT_CLAUDE_COMPAT` is set where the test runs.
+        let names = |catalog: &ContentCatalog| -> Vec<String> {
+            catalog
+                .skills
+                .iter()
+                .map(|s| s.skill.name.clone())
+                .filter(|name| name == "release" || name == "notes")
+                .collect()
+        };
+        // Untrusted: nothing from the project.
+        let untrusted = load_catalog(&home, &project, false).unwrap();
+        assert!(names(&untrusted).is_empty());
+        orbit_tools::permissions::FolderTrust::new(home.clone())
+            .trust(&project)
+            .unwrap();
+        let trusted = load_catalog(&home, &project, false).unwrap();
+        assert_eq!(names(&trusted), ["notes", "release"]);
+        let release = trusted
+            .skills
+            .iter()
+            .find(|entry| entry.skill.name == "release")
+            .unwrap();
+        assert!(
+            release.skill.body.contains("ORBIT RELEASE"),
+            "ORBIT's copy wins"
+        );
+        assert!(trusted.agents.iter().any(|a| a.agent.name == "reviewer"));
     }
 }

@@ -928,15 +928,16 @@ fn whole_entry_reservation_preserves_prior_receipt_and_maximum_pending_settlemen
     let reference = root.begin_attempt(first.revision, &pending).unwrap();
     let pending_before = root.accounting_checkpoint().unwrap();
     let mut children = Vec::new();
-    let mut leases = Vec::new();
     loop {
         let child = ulid::Ulid::new().to_string();
-        let lease = home.lease(&child);
+        // Only the root's pending attempt must stay live. Keep each child
+        // leased while writing it, then release its descriptors: this tests
+        // the on-disk capacity, not the process's open-file limit.
+        let _child_lease = home.lease(&child);
         let journal = context_journal(&home.0, OWNER, Some(&child)).unwrap();
         match journal.initialize_accounting(AccountingBaseline::FreshKnownZero) {
             Ok(checkpoint) => {
                 children.push((child, checkpoint));
-                leases.push(lease);
             }
             Err(HistoryError::Full) => break,
             Err(error) => panic!("unexpected reservation refusal: {error}"),
@@ -974,6 +975,7 @@ fn whole_entry_reservation_preserves_prior_receipt_and_maximum_pending_settlemen
     );
     assert!(settled.pending.is_none());
     for (child, checkpoint) in &children {
+        let _child_lease = home.lease(child);
         assert_eq!(
             context_journal(&home.0, OWNER, Some(child))
                 .unwrap()
@@ -988,7 +990,6 @@ fn whole_entry_reservation_preserves_prior_receipt_and_maximum_pending_settlemen
         children.len() + 1
     );
     assert!(fs::metadata(home.accounting()).unwrap().len() <= 128 * 1024);
-    drop(leases);
 }
 
 #[test]

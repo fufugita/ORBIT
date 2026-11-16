@@ -85,7 +85,7 @@ pub fn hint_row_themed(
 }
 
 /// The completion list's stable built-in order, extended with customization and routing.
-pub const COMMANDS: [(&str, &str); 16] = [
+pub const COMMANDS: [(&str, &str); 46] = [
     (
         "/clear",
         "forget earlier turns (the model stops seeing them)",
@@ -101,7 +101,7 @@ pub const COMMANDS: [(&str, &str); 16] = [
     ("/help", "keys and commands"),
     (
         "/mode",
-        "set the permission mode (default, acceptEdits, plan, dontAsk, bypass)",
+        "set the permission mode (default, acceptEdits, auto, plan, dontAsk, bypass)",
     ),
     ("/model", "switch the model for this session"),
     ("/models", "list models from configured providers"),
@@ -125,16 +125,131 @@ pub const COMMANDS: [(&str, &str); 16] = [
         "/route",
         "show routing; auto restores automatic model selection",
     ),
-    ("/theme", "show or choose orbit, midnight or paper"),
+    (
+        "/theme",
+        "show or choose orbit, midnight, paper, aespa-pastel or kwangya-ice",
+    ),
+    ("/hooks", "list configured hooks"),
+    ("/skills", "list installed skills; run one with /name"),
+    ("/agents", "list available agents"),
+    ("/mcp", "list configured MCP servers"),
+    (
+        "/goal",
+        "keep working until a condition is met; /goal clear stops",
+    ),
+    (
+        "/loop",
+        "repeat a prompt on an interval: /loop 5m <prompt>; /loop stop",
+    ),
+    ("/copy", "copy the last reply to the clipboard"),
+    (
+        "/export",
+        "write the conversation to a new Markdown file: /export [file]",
+    ),
+    ("/context", "what is using the context window"),
+    ("/memory", "list the instruction and rule files in use"),
+    (
+        "/config",
+        "show the model, effort, permission mode and home",
+    ),
+    (
+        "/btw",
+        "ask a side question without adding it to the conversation",
+    ),
+    ("/rename", "name this session; no name clears it"),
+    (
+        "/add-dir",
+        "add a working directory for this session: /add-dir <path>",
+    ),
+    (
+        "/cd",
+        "move the working directory inside this session's directories: /cd <path>",
+    ),
+    (
+        "/fork",
+        "how to branch this conversation into a new session",
+    ),
+    (
+        "/plugin",
+        "plugins and marketplaces: /plugin install NAME@MARKETPLACE",
+    ),
+    ("/doctor", "offline readiness report for this home"),
+    ("/mods", "list installed mods; /mods refresh rescans"),
+    ("/mod", "turn a mod on or off: /mod <name>"),
+    ("/find", "search this conversation: /find <text>"),
+    ("/status", "session, model, mode, directory and sandbox"),
+    (
+        "/sandbox",
+        "whether commands are confined, and where they may write",
+    ),
+    (
+        "/output-style",
+        "choose how replies are written: default, explanatory, learning or a file",
+    ),
+    ("/plan", "switch to plan mode (the same as /mode plan)"),
+    ("/vim", "turn vim-style editing in the composer on or off"),
+    (
+        "/keybindings",
+        "show the key bindings file; /keybindings reload rereads it",
+    ),
+    ("/recap", "summarize where this session stands"),
+    (
+        "/tasks",
+        "background commands, agents, monitors and scheduled prompts",
+    ),
+    ("/init", "write an ORBIT.md for this repository"),
 ];
+
+/// Commands the session brings besides the built-in ones: its own command
+/// files and skills. Set once, before the interface starts.
+static SESSION_COMMANDS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+    std::sync::OnceLock::new();
+
+/// Offer these `/name` commands in the `/` list and the palette, after the
+/// built-in ones. A name a built-in command already has is left out. The
+/// first call decides; the strings live as long as the process.
+pub fn set_session_commands(commands: Vec<(String, String)>) {
+    let _ = SESSION_COMMANDS.set(session_listing(commands));
+}
+
+/// The session's commands as the lists hold them: `/name` shaped, not a
+/// built-in name, each once, at most 256.
+fn session_listing(commands: Vec<(String, String)>) -> Vec<(&'static str, &'static str)> {
+    let mut seen = std::collections::BTreeSet::new();
+    commands
+        .into_iter()
+        .filter(|(name, _)| {
+            name.len() > 1
+                && name.starts_with('/')
+                && !name.contains(char::is_whitespace)
+                && !COMMANDS.iter().any(|(built_in, _)| built_in == name)
+                && seen.insert(name.clone())
+        })
+        .take(256)
+        .map(|(name, description)| {
+            let name: &'static str = Box::leak(name.into_boxed_str());
+            let description: &'static str = Box::leak(description.into_boxed_str());
+            (name, description)
+        })
+        .collect()
+}
+
+/// Every command on offer: the built-in ones, then the session's own.
+pub fn all_commands() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    COMMANDS.iter().chain(
+        SESSION_COMMANDS
+            .get()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    )
+}
 
 /// The commands the inline list offers for what is typed: every one
 /// whose name starts with it (§9.13). The list shows a window of them
 /// that follows the selection, so none is out of reach.
 pub fn completion_matches(typed: &str) -> Vec<(&'static str, &'static str)> {
     let prefix = typed.trim_start_matches('/');
-    COMMANDS
-        .iter()
+    all_commands()
         .filter(|(c, _)| c.trim_start_matches('/').starts_with(prefix))
         .copied()
         .collect()
@@ -160,8 +275,7 @@ pub fn completion_list_themed(
     selected: usize,
 ) -> (Rect, Vec<Line<'static>>) {
     let prefix = typed.trim_start_matches('/');
-    let matches: Vec<&(&str, &str)> = COMMANDS
-        .iter()
+    let matches: Vec<&(&str, &str)> = all_commands()
         .filter(|(c, _)| c.trim_start_matches('/').starts_with(prefix))
         .take(6)
         .collect();
@@ -254,8 +368,7 @@ pub fn palette_lines_themed(
             Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )),
     ];
-    let matched: Vec<&(&str, &str)> = COMMANDS
-        .iter()
+    let matched: Vec<&(&str, &str)> = all_commands()
         .filter(|(c, _)| subsequence(query, c))
         .collect();
     if matched.is_empty() {
@@ -606,6 +719,27 @@ pub fn overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's own commands join the lists only when they are `/name`
+    /// shaped, new, and not a built-in command's name.
+    #[test]
+    fn session_commands_never_replace_or_repeat_a_built_in() {
+        let listed = session_listing(vec![
+            ("/ship".into(), "Cut a release".into()),
+            ("/help".into(), "not the real one".into()),
+            ("/ship".into(), "again".into()),
+            ("ship".into(), "no slash".into()),
+            ("/two words".into(), "spaces".into()),
+            ("/team:lint".into(), "a plugin's skill".into()),
+        ]);
+        assert_eq!(
+            listed,
+            vec![
+                ("/ship", "Cut a release"),
+                ("/team:lint", "a plugin's skill")
+            ]
+        );
+    }
 
     #[test]
     fn subsequence_matches_case_insensitive() {

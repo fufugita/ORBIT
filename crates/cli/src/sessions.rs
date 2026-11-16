@@ -30,6 +30,7 @@ pub struct SessionFile {
     pub turns: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Micro-dollars (1,000,000 is $1), under its historical name.
     #[serde(default)]
     pub cost_microcents: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1710,6 +1711,16 @@ pub fn save_session(home: &Path, session: &SessionFile) -> Result<(), String> {
 /// Load a session by id (without the `.json` suffix, or with).
 pub fn load_session(home: &Path, session_id: &str) -> Result<SessionFile, String> {
     let id = session_id.trim_end_matches(".json");
+    // The id becomes a file name: the same shape a lease accepts, so no id
+    // can name a file outside the sessions directory.
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid session id: use 1–128 ASCII letters, digits, '-' or '_'".into());
+    }
     let path = sessions_dir(home).join(format!("{id}.json"));
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
     serde_json::from_str(&raw).map_err(|e| format!("parse {path:?}: {e}"))
@@ -1720,9 +1731,36 @@ pub fn load_session(home: &Path, session_id: &str) -> Result<SessionFile, String
 /// untouched; the fork carries its own identity and a fresh updated_at.
 pub fn fork_session(home: &Path, session_id: &str) -> Result<SessionFile, String> {
     let workspace = current_workspace().map_err(|error| error.to_string())?;
-    let (source_lease, mut src) =
+    let (source_lease, src) =
         SessionLease::acquire_for_workspace(home, session_id, "session-fork", &workspace)
             .map_err(|error| error.to_string())?;
+    save_fork(home, source_lease.session_id(), src)
+}
+
+/// Fork the session a running front end already holds, from its last saved
+/// state, without giving up its lease: the caller switches to the fork (or
+/// not) afterwards. `unanswered` is a prompt whose turn failed and is about
+/// to be asked again in the fork: when the saved history ends with it, the
+/// fork starts without it, so it is not there twice.
+pub fn fork_held_session(
+    home: &Path,
+    lease: &SessionLease,
+    unanswered: Option<&str>,
+) -> Result<SessionFile, String> {
+    let mut src = lease.load().map_err(|error| error.to_string())?;
+    if let Some(prompt) = unanswered
+        && src.transcript.last().is_some_and(|message| {
+            message.role == orbit_adapter::types::ChatRole::User && message.content == prompt
+        })
+    {
+        src.transcript.pop();
+    }
+    save_fork(home, lease.session_id(), src)
+}
+
+/// Save `src` under a new session id, with the source's JSONL transcript
+/// copied beside it.
+fn save_fork(home: &Path, source_id: &str, mut src: SessionFile) -> Result<SessionFile, String> {
     let new_id = orbit_gateway::new_session_id();
     src.session_id = new_id.clone();
     src.accounting_watermark = None;
@@ -1730,9 +1768,7 @@ pub fn fork_session(home: &Path, session_id: &str) -> Result<SessionFile, String
     // The fork's JSONL transcript (if one exists) is copied too, so
     // `--resume <fork>` and the TUI's event-sourced view agree with the
     // JSON file.
-    let jsonl_src = home
-        .join("projects")
-        .join(format!("{}.jsonl", source_lease.session_id()));
+    let jsonl_src = home.join("projects").join(format!("{source_id}.jsonl"));
     if jsonl_src.exists() {
         let jsonl_dst = home.join("projects").join(format!("{new_id}.jsonl"));
         std::fs::copy(&jsonl_src, &jsonl_dst).map_err(|e| format!("copy transcript: {e}"))?;
@@ -1942,11 +1978,58 @@ mod tests {
             src.workspace
         );
 
+        // An id that is not a plain name never becomes a path.
+        for bad in ["../session-src", "a/b", "", "x.y"] {
+            assert!(load_session(&home, bad).is_err(), "{bad}");
+        }
         // The original is untouched and both load independently.
         let back = load_session(&home, "session-src").unwrap();
         assert_eq!(back.transcript.len(), src.transcript.len());
         let fork_loaded = load_session(&home, &fork.session_id).unwrap();
         assert_eq!(fork_loaded.transcript.len(), src.transcript.len());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A front end forks the session it holds without letting go of it, and
+    /// a prompt that failed and will be asked again is not copied twice.
+    #[test]
+    fn a_held_session_forks_without_releasing_its_lease() {
+        let home = test_home("fork-held");
+        let mut src = sample("session-held");
+        src.transcript.push(ChatMessage {
+            role: ChatRole::User,
+            content: "the prompt that failed".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
+            blocks: None,
+            origin_model: None,
+            origin_provider: None,
+        });
+        save_session(&home, &src).unwrap();
+        let lease = SessionLease::acquire(&home, "session-held", "tui").unwrap();
+
+        let plain = fork_held_session(&home, &lease, None).unwrap();
+        assert_ne!(plain.session_id, "session-held");
+        assert_eq!(plain.transcript.len(), src.transcript.len());
+        assert!(plain.accounting_watermark.is_none());
+
+        let retry = fork_held_session(&home, &lease, Some("the prompt that failed")).unwrap();
+        assert_eq!(retry.transcript.len(), src.transcript.len() - 1);
+        let other = fork_held_session(&home, &lease, Some("some other prompt")).unwrap();
+        assert_eq!(other.transcript.len(), src.transcript.len());
+
+        // The source is still held and unchanged; the forks load on their own.
+        assert_eq!(lease.load().unwrap().transcript.len(), src.transcript.len());
+        assert!(SessionLease::acquire(&home, "session-held", "other").is_err());
+        assert_eq!(
+            load_session(&home, &retry.session_id)
+                .unwrap()
+                .transcript
+                .len(),
+            src.transcript.len() - 1
+        );
+        drop(lease);
         let _ = std::fs::remove_dir_all(&home);
     }
 

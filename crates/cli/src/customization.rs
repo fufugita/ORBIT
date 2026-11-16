@@ -3,7 +3,7 @@ use crate::tool_runtime::PermissionScope;
 use orbit_frontend_protocol::customization::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -574,7 +574,7 @@ pub fn replace_checked(
     if load(home, workspace)?.revision != expected_revision {
         return Err(Error::Busy);
     }
-    // Backup-on-write (REA G6): the previous profile survives a bad write
+    // Backup-on-write: the previous profile survives a bad write
     // as customization.json.bak. Only the profile path does this — the
     // history journals reject unexpected directory entries, so their
     // shared publish stays untouched. A failed backup does not block
@@ -897,9 +897,7 @@ pub fn read_pane_scoped(
     let resolved = load(home, workspace)?;
     let pane = resolved
         .profile
-        .panes
-        .iter()
-        .find(|p| p.id == id)
+        .pane_def(id)
         .ok_or_else(|| Error::Invalid("unknown pane id".into()))?;
     let (mut state, mut text, mut truncated) = (PaneState::Ready, String::new(), false);
     match &pane.source {
@@ -978,6 +976,23 @@ pub fn read_pane_scoped(
                 );
                 truncated = counts.truncated;
             }
+            SnapshotKind::Council => {
+                // One cached read feeds both the structured state (seat
+                // cards, riding on the context) and the text fallback.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+                let snapshot_state = council_from_state_file(now);
+                (state, text) = match &snapshot_state {
+                    Some(snapshot) => {
+                        council_text_snapshot(snapshot, resolved.profile.glyphs == Glyphs::Ascii)
+                    }
+                    None => (PaneState::Missing, "No council has run".into()),
+                };
+            }
+            SnapshotKind::Reactor => {
+                text = reactor_snapshot(context, resolved.profile.glyphs == Glyphs::Ascii);
+            }
         },
     }
     if text.is_empty() {
@@ -1000,6 +1015,533 @@ pub fn read_pane_scoped(
             .collect(),
     })
 }
+/// Largest MAGI state file the built-in `council` pane reads.
+const COUNCIL_STATE_MAX_BYTES: u64 = 64 * 1024;
+/// A state older than this means the council engine is idle. The engine may
+/// pause up to seven minutes between the phases of a trial council, so this
+/// must outlast the longest quiet stretch, not just one model call.
+const COUNCIL_STALE_SECS: f64 = 420.0;
+const COUNCIL_SEATS: [&str; 4] = ["KARINA", "GISELLE", "WINTER", "NINGNING"];
+
+/// Where the MAGI engine publishes its state. The location comes from the
+/// process environment or this default only; profile data cannot move it.
+///
+/// The engine scopes every file to one session: when the pane knows its
+/// session (ORBIT_SESSION_ID, same id the engine's hook writes under), the
+/// state lives at `sessions/<id>/state.json`. The legacy root file is only
+/// the fallback for runs without a session, and is never preferred.
+fn council_state_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ORBIT_COUNCIL_STATE").filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        return path.is_absolute().then_some(path);
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").filter(|home| !home.is_empty())?);
+    let root = home.join(".local/share/magi");
+    if let Some(session) = std::env::var("ORBIT_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let session = session
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(64)
+            .collect::<String>();
+        if !session.is_empty() {
+            return Some(root.join("sessions").join(session).join("state.json"));
+        }
+    }
+    Some(root.join("state.json"))
+}
+
+/// One bounded, read-only, no-follow read of the council state file.
+pub fn council_snapshot_at(path: &Path, now: f64, ascii: bool) -> (PaneState, String) {
+    let error = |text: &str| (PaneState::Error, text.to_string());
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (PaneState::Missing, "No council has run".into());
+        }
+        Err(_) => return error("Council state cannot be opened"),
+    };
+    match file.metadata() {
+        Ok(meta) if !meta.is_file() => return error("Council state is not a regular file"),
+        Ok(meta) if meta.len() > COUNCIL_STATE_MAX_BYTES => {
+            return error("Council state exceeds 64 KiB");
+        }
+        Ok(_) => {}
+        Err(_) => return error("Council state cannot be inspected"),
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(COUNCIL_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return error("Council state cannot be read");
+    }
+    if bytes.len() as u64 > COUNCIL_STATE_MAX_BYTES {
+        return error("Council state exceeds 64 KiB");
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return error("Council state is not valid JSON");
+    };
+    let stale = value
+        .get("ts")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ts| now - ts > COUNCIL_STALE_SECS);
+    let Some(mut text) = council_text(&value, stale, ascii) else {
+        return error("Council state has no phase");
+    };
+    // Like the MAGI pane, a quiet council shows its last conclusion.
+    let phase = value.get("phase").and_then(serde_json::Value::as_str);
+    if (stale || matches!(phase, Some("IDLE" | "TRIAGE" | "TRIAGED" | "FAIL")))
+        && let Some(last) = council_last_final(&path.with_file_name("history.jsonl"))
+    {
+        text.push_str(&format!(
+            "{}  {last}\n",
+            if ascii { "last" } else { "최근" }
+        ));
+    }
+    // An idle council is its normal resting state, not a failed read.
+    (PaneState::Ready, text)
+}
+
+/// The council as text. Labels, phase names and the narration line follow
+/// the MAGI pane (`magi-pane.py`); `ascii` swaps them for English.
+fn council_text(state: &serde_json::Value, stale: bool, ascii: bool) -> Option<String> {
+    // State text is foreign input: printable characters only, bounded.
+    let clean = |value: Option<&serde_json::Value>, max: usize| -> String {
+        value
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(max)
+            .collect()
+    };
+    let phase = clean(state.get("phase"), 16);
+    if phase.is_empty() {
+        return None;
+    }
+    // The pane treats a state older than two minutes as an idle council.
+    let phase = if stale { "IDLE".to_string() } else { phase };
+    let seats: &[serde_json::Value] = state
+        .get("seats")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[], Vec::as_slice);
+    let phase_en = match phase.as_str() {
+        "SYNC" => "SYNK",
+        "DELIBERATING" => "DELIBERATE",
+        "JUDGING" => "JUDGE",
+        other => other,
+    };
+    let mut text = if ascii {
+        format!("MAGI - {phase_en}\n")
+    } else {
+        let phase_kr = match phase.as_str() {
+            "TRIAGE" => "분석중",
+            "TRIAGED" => "선별",
+            "SYNC" => "기동",
+            "DELIBERATING" => "심의",
+            "VOTING" => "표결",
+            "VOTED" => "투표완료",
+            "JUDGING" => "판정",
+            "VERDICT" => "결론도달",
+            "IDLE" => "대기",
+            "FAIL" => "고장",
+            _ => "",
+        };
+        format!("MAGI · {phase_kr} {phase_en}\n")
+    };
+    const ROLES: [&str; 4] = ["LEAD", "EDGE", "EXACT", "BOLD"];
+    let mut votes: Vec<String> = Vec::new();
+    let mut answered = 0usize;
+    for (index, seat) in seats.iter().take(16).enumerate() {
+        let name = COUNCIL_SEATS
+            .get(index)
+            .map_or_else(|| "AE".to_string(), |name| (*name).to_string());
+        let role = ROLES.get(index).copied().unwrap_or("");
+        let model = clean(seat.get("model"), 40);
+        // Same order as the MAGI pane's `lab()`: gateway aliases such as
+        // `claude-glm-5.3-flash` name the lab after the prefix.
+        let lower = model.to_lowercase();
+        let provider = [
+            ("opus", "ANTHROPIC"),
+            ("haiku", "ANTHROPIC"),
+            ("sonnet", "ANTHROPIC"),
+            ("deepseek", "DEEPSEEK"),
+            ("glm", "ZHIPU"),
+            ("minimax", "MINIMAX"),
+            ("qwen", "ALIBABA"),
+            ("gemini", "GOOGLE"),
+            ("gpt", "OPENAI"),
+            ("kimi", "MOONSHOT"),
+            ("mistral", "MISTRAL"),
+            ("claude", "ANTHROPIC"),
+        ]
+        .into_iter()
+        .find(|(key, _)| lower.contains(key))
+        .map_or("ae", |(_, lab)| lab);
+        let short = model
+            .strip_prefix("claude-")
+            .or_else(|| model.strip_prefix("or-"))
+            .unwrap_or(&model);
+        let verdict = clean(seat.get("verdict"), 16);
+        let status = clean(seat.get("status"), 16);
+        if status == "online" {
+            answered += 1;
+        }
+        let (done, label) = match (verdict.as_str(), status.as_str(), ascii) {
+            ("APPROVE", _, false) => (true, "승인 YES"),
+            ("APPROVE", _, true) => (true, "APPROVE"),
+            ("REJECT", _, false) => (true, "거부 NO"),
+            ("REJECT", _, true) => (true, "REJECT"),
+            ("CONDITIONAL", _, false) => (true, "보류 HOLD"),
+            ("CONDITIONAL", _, true) => (true, "HOLD"),
+            (_, "computing", false) => (false, "심의중"),
+            (_, "computing", true) => (false, "deliberating"),
+            (_, "syncing", _) => (false, "SYNK"),
+            (_, "error", false) => (false, "신호없음"),
+            (_, "error", true) => (false, "SIGNAL LOST"),
+            (_, "online" | "reported", false) => (false, "응답완료"),
+            (_, "online" | "reported", true) => (false, "answered"),
+            (_, _, false) => (false, "대기"),
+            (_, _, true) => (false, "idle"),
+        };
+        if done {
+            votes.push(verdict);
+        }
+        let mark = match (done, ascii) {
+            (true, false) => "●",
+            (false, false) => "◌",
+            (true, true) => "*",
+            (false, true) => ".",
+        };
+        let seat_name = if ascii {
+            format!("{name}-{:02}", index + 1)
+        } else {
+            format!("{name}·{:02}", index + 1)
+        };
+        text.push_str(&format!(
+            "{seat_name:<12} {role:<5} {provider:<10} {short:<18} {mark} {label}\n"
+        ));
+    }
+    if seats.len() > 16 {
+        text.push_str(&format!("+{} more seats\n", seats.len() - 16));
+    }
+    // The narration strip under the seats.
+    let note = clean(state.get("note"), 120);
+    let judge = if ascii { "naevis" } else { "nævis" };
+    match phase.as_str() {
+        "VERDICT" => {
+            let count = |verdict: &str| votes.iter().filter(|vote| *vote == verdict).count();
+            let top = ["APPROVE", "CONDITIONAL", "REJECT"]
+                .into_iter()
+                .map(count)
+                .max()
+                .unwrap_or(0);
+            let lead: Vec<&str> = ["APPROVE", "CONDITIONAL", "REJECT"]
+                .into_iter()
+                .filter(|verdict| top > 0 && count(verdict) == top)
+                .collect();
+            let word = |verdict: &str| match (verdict, ascii) {
+                ("APPROVE", false) => "승인 YES",
+                ("APPROVE", true) => "APPROVE",
+                ("REJECT", false) => "거부 NO",
+                ("REJECT", true) => "REJECT",
+                (_, false) => "보류 HOLD",
+                (_, true) => "HOLD",
+            };
+            match (lead.as_slice(), ascii) {
+                ([], _) => {}
+                ([only], false) => {
+                    text.push_str(&format!("다수결  {} · {top}/{}\n", word(only), votes.len()))
+                }
+                ([only], true) => text.push_str(&format!(
+                    "majority  {} - {top}/{}\n",
+                    word(only),
+                    votes.len()
+                )),
+                (tied, _) => {
+                    let names: Vec<&str> = tied.iter().map(|verdict| word(verdict)).collect();
+                    text.push_str(&if ascii {
+                        format!(
+                            "tie  {} - {top}/{} - naevis decides\n",
+                            names.join(" = "),
+                            votes.len()
+                        )
+                    } else {
+                        format!(
+                            "동률  {} · {top}/{} · nævis 결정\n",
+                            names.join(" = "),
+                            votes.len()
+                        )
+                    });
+                }
+            }
+            let decision = note.trim_start();
+            let decision = decision.strip_prefix("FINAL:").unwrap_or(decision).trim();
+            let fallback = if ascii {
+                "a conclusion was reached."
+            } else {
+                "결론에 도달했습니다."
+            };
+            text.push_str(&format!(
+                "{judge}  {}\n",
+                if decision.is_empty() {
+                    fallback
+                } else {
+                    decision
+                }
+            ));
+        }
+        "JUDGING" => text.push_str(&if ascii {
+            format!("{judge}  judging\n")
+        } else {
+            format!("{judge}  판정 중\n")
+        }),
+        "VOTING" | "VOTED" => {
+            let body = if phase == "VOTED" && !note.is_empty() {
+                note.as_str()
+            } else if ascii {
+                "anonymous peer review"
+            } else {
+                "익명 상호 평가"
+            };
+            text.push_str(&format!(
+                "{}  {body}\n",
+                if ascii { "vote" } else { "표결" }
+            ));
+        }
+        "DELIBERATING" => {
+            text.push_str(&if ascii {
+                format!("deliberate  {answered}/{} answered", seats.len())
+            } else {
+                format!("심의  {answered}/{} 응답", seats.len())
+            });
+            if !votes.is_empty() {
+                text.push_str(&if ascii {
+                    format!(" - votes {}", votes.len())
+                } else {
+                    format!(" · 표 {}", votes.len())
+                });
+            }
+            text.push('\n');
+        }
+        "SYNC" => text.push_str(&format!(
+            "SYNK  DIVE {} seats {}\n",
+            if ascii { "-" } else { "·" },
+            seats.len()
+        )),
+        "TRIAGE" => text.push_str(if ascii {
+            "triage  analysing\n"
+        } else {
+            "선별  분석 중\n"
+        }),
+        "TRIAGED" => {
+            let class = note.to_uppercase();
+            text.push_str(&format!(
+                "{}  {} {}\n",
+                if ascii { "triage" } else { "선별" },
+                if ascii { "->" } else { "→" },
+                if class.is_empty() {
+                    "?"
+                } else {
+                    class.as_str()
+                }
+            ));
+        }
+        "FAIL" => text.push_str(&format!(
+            "{}  {}\n",
+            if ascii { "fail" } else { "고장" },
+            if note.is_empty() {
+                "council failed"
+            } else {
+                note.as_str()
+            }
+        )),
+        _ => {}
+    }
+    Some(text)
+}
+
+/// The newest finished council's conclusion, from the tail of the engine's
+/// append-only `history.jsonl`. At most the last 256 KiB are read.
+fn council_last_final(path: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let cut = meta.len() > TAIL_BYTES;
+    if cut {
+        file.seek(SeekFrom::Start(meta.len() - TAIL_BYTES)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    let tail = String::from_utf8_lossy(&bytes);
+    // After a cut the first line is partial; it never parses as a record.
+    for line in tail.lines().rev() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(conclusion) = row.get("final").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let first = conclusion.lines().next().unwrap_or("").trim_start();
+        let first = first.strip_prefix("FINAL:").unwrap_or(first).trim();
+        if first.is_empty() {
+            continue;
+        }
+        return Some(
+            first
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(120)
+                .collect(),
+        );
+    }
+    None
+}
+
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn compact(value: u64) -> String {
+    if value >= 1_000_000 {
+        let tenths = value / 100_000;
+        if tenths.is_multiple_of(10) {
+            format!("{}M", tenths / 10)
+        } else {
+            format!("{}.{}M", tenths / 10, tenths % 10)
+        }
+    } else if value >= 1_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+/// The session's own token flow. Values the frontend did not report print
+/// as a dash, never as zero.
+pub fn reactor_snapshot(context: &PaneContext, ascii: bool) -> String {
+    let dash = if ascii { "-" } else { "—" };
+    let count = |value: Option<u64>| value.map_or_else(|| dash.to_string(), grouped);
+    let model = if context.model.is_empty() {
+        dash
+    } else {
+        context.model.as_str()
+    };
+    let phase = context
+        .phase
+        .as_deref()
+        .map_or_else(|| dash.to_string(), str::to_uppercase);
+    let mut text = format!(
+        "REACTOR {} {model}  {phase}\n",
+        if ascii { "-" } else { "·" }
+    );
+    let rate = |value: u64| format!("{}.{}", value / 1_000, value % 1_000 / 100);
+    let current = match (context.live_rate_milli, context.rate_milli) {
+        // A streaming estimate (about four characters per token) is marked.
+        (Some(live), _) => format!("{}{} live", if ascii { "~" } else { "≈" }, rate(live)),
+        (None, Some(settled)) => rate(settled),
+        (None, None) => dash.to_string(),
+    };
+    text.push_str(&format!(
+        "tok/s   {current:<12} peak {}\n",
+        context
+            .peak_rate_milli
+            .map_or_else(|| dash.to_string(), rate)
+    ));
+    // Recent turns as a sparkline, scaled to the fastest of them.
+    let history = &context.rate_history[context.rate_history.len().saturating_sub(40)..];
+    if let Some(max) = history
+        .iter()
+        .copied()
+        .max()
+        .filter(|max| !ascii && *max > 0)
+    {
+        const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let line: String = history
+            .iter()
+            .map(|value| SPARK[(value.saturating_mul(7) / max).min(7) as usize])
+            .collect();
+        text.push_str(&format!("rate    {line}\n"));
+    }
+    text.push_str(&format!(
+        "out     {:<10} in  {}\n",
+        grouped(context.output_tokens),
+        grouped(context.input_tokens)
+    ));
+    // Cache and reasoning counts cover this run only: they are observed by
+    // the worker and not kept in the saved session.
+    if context.cache_read_tokens.is_some()
+        || context.cache_write_tokens.is_some()
+        || context.reasoning_tokens.is_some()
+    {
+        text.push_str(&format!(
+            "cache   read {}  write {}  reason {}  (this run)\n",
+            count(context.cache_read_tokens),
+            count(context.cache_write_tokens),
+            count(context.reasoning_tokens)
+        ));
+    } else {
+        text.push_str(&format!("cache   {dash}\n"));
+    }
+    match (context.used_tokens, context.window_tokens) {
+        (Some(used), Some(window)) if window > 0 => {
+            let filled = (used.saturating_mul(20) / window).min(20) as usize;
+            let (full, empty) = if ascii { ("#", ".") } else { ("█", "░") };
+            text.push_str(&format!(
+                "ctx     {}{}  {} / {}  {}%\n",
+                full.repeat(filled),
+                empty.repeat(20 - filled),
+                compact(used),
+                compact(window),
+                used.saturating_mul(100) / window
+            ));
+        }
+        _ => text.push_str(&format!("ctx     {dash}\n")),
+    }
+    text.push_str(&format!(
+        "cost    ${:.4}{}  turns {}  tools {}\n",
+        context.cost_microcents as f64 / 1_000_000.0,
+        if context.cost_uncertain {
+            " (uncertain)"
+        } else {
+            ""
+        },
+        count(context.turns),
+        count(context.turn_tools)
+    ));
+    text
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct WorkspaceCount {
     pub files: usize,
@@ -1288,11 +1830,507 @@ mod existing_read_lock_tests {
     }
 }
 
+// ── the council, parsed once for the panes that draw it ─────────────
+
+/// Parsed-state cache, keyed by path identity and file metadata: the pane
+/// beat runs several times a second and the files change only when the
+/// engine writes them. A failed stat disables caching for that read.
+fn cached_parse<T: Clone + Send + 'static>(
+    path: &Path,
+    parse: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::UNIX_EPOCH;
+    type CacheValue = (u128, u64, Box<dyn std::any::Any + Send>);
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, CacheValue>>> =
+        std::sync::OnceLock::new();
+    let key = path.to_path_buf();
+    let stamp = fs::metadata(path).ok().and_then(|meta| {
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some((modified, meta.len()))
+    });
+    let Some((modified, len)) = stamp else {
+        return parse();
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().ok()?;
+    if let Some((seen_modified, seen_len, value)) = guard.get(&key)
+        && *seen_modified == modified
+        && *seen_len == len
+        && let Some(value) = value.downcast_ref::<T>()
+    {
+        return Some(value.clone());
+    }
+    let parsed = parse()?;
+    guard.insert(key, (modified, len, Box::new(parsed.clone())));
+    Some(parsed)
+}
+
+/// Read the council state and parse it into the shape a pane draws: the
+/// phase, the seats with what each is doing, the verdicts they carried, the
+/// winner, and the newest finished council from the record. Every list is
+/// bounded here; nothing from the file is passed on unbounded.
+///
+/// Callers that only have a `PaneContext` use [`council_from_state_file`].
+pub fn council_snapshot_state(path: &Path, now: f64) -> Option<CouncilSnapshot> {
+    let value = cached_parse::<serde_json::Value>(path, || read_council_state(path))?;
+    let mut snapshot = council_parse(&value, now);
+    // A quiet council shows its last conclusion: the record is the only
+    // place the seats' verdicts survive the state file being rewritten.
+    let history_path = path.with_file_name("history.jsonl");
+    if let Some((history, last_at)) =
+        cached_parse::<(CouncilHistoryRecord, Option<f64>)>(&history_path, || {
+            council_last_record(&history_path)
+        })
+    {
+        snapshot.last_final = history.last_final;
+        snapshot.last_seats = history.last_seats;
+        snapshot.finished = history.finished;
+        snapshot.seen = history.seen;
+        snapshot.last_at = last_at;
+        if snapshot.winner_seats.is_empty() {
+            snapshot.winner_seats = history.winner_names;
+        }
+        snapshot.last_tie = history.tie;
+        if snapshot.seats.is_empty() {
+            snapshot.seats = snapshot.last_seats.clone();
+        }
+    }
+    Some(snapshot)
+}
+
+/// The council state of the default location, cached by file metadata.
+pub fn council_from_state_file(now: f64) -> Option<CouncilSnapshot> {
+    council_state_cached(now)
+}
+
+fn council_state_cached(now: f64) -> Option<CouncilSnapshot> {
+    let path = council_state_path()?;
+    cached_parse::<CouncilSnapshot>(&path, || council_snapshot_state(&path, now))
+}
+
+/// The bounded text fallback, from a parsed state: the phase line, one
+/// line per seat, and the record's last conclusion on a quiet council.
+fn council_text_snapshot(snapshot: &CouncilSnapshot, ascii: bool) -> (PaneState, String) {
+    let phase = if snapshot.phase.is_empty() {
+        return (PaneState::Missing, "No council has run".into());
+    } else {
+        snapshot.phase.clone()
+    };
+    let phase_en = match phase.as_str() {
+        "SYNC" => "SYNK",
+        "DELIBERATING" => "DELIBERATE",
+        "JUDGING" => "JUDGE",
+        other => other,
+    };
+    let mut text = if ascii {
+        format!("MAGI - {phase_en}\n")
+    } else {
+        format!("MAGI · {} {phase_en}\n", council_phase_hangul(&phase))
+    };
+    const ROLES: [&str; 4] = ["LEAD", "EDGE", "EXACT", "BOLD"];
+    for (index, seat) in snapshot.seats.iter().take(4).enumerate() {
+        let short = seat
+            .model
+            .strip_prefix("claude-")
+            .or_else(|| seat.model.strip_prefix("or-"))
+            .unwrap_or(&seat.model);
+        let label = match (seat.verdict.as_deref(), seat.activity.as_str(), ascii) {
+            (Some("approve"), _, false) => "승인 YES",
+            (Some("approve"), _, true) => "APPROVE",
+            (Some("reject"), _, false) => "거부 NO",
+            (Some("reject"), _, true) => "REJECT",
+            (Some(_), _, false) => "보류 HOLD",
+            (Some(_), _, true) => "HOLD",
+            (None, "working", false) => "심의중",
+            (None, "working", true) => "deliberating",
+            (None, "wiring", _) => "SYNK",
+            (None, "lost", false) => "신호없음",
+            (None, "lost", true) => "SIGNAL LOST",
+            (None, "answered", false) => "응답완료",
+            (None, "answered", true) => "answered",
+            (_, _, false) => "대기",
+            (_, _, true) => "idle",
+        };
+        let mark = if seat.verdict.is_some() {
+            if ascii { "*" } else { "●" }
+        } else if ascii {
+            "."
+        } else {
+            "◌"
+        };
+        let name = if ascii {
+            format!("{}-{:02}", seat.name, index + 1)
+        } else {
+            format!("{}·{:02}", seat.name, index + 1)
+        };
+        let role = ROLES.get(index).copied().unwrap_or("");
+        text.push_str(&format!(
+            "{name:<12} {role:<5} {:<10} {short:<18} {mark} {label}\n",
+            seat.lab
+        ));
+    }
+    if matches!(
+        snapshot.phase.as_str(),
+        "IDLE" | "TRIAGE" | "TRIAGED" | "FAIL"
+    ) && !snapshot.last_final.is_empty()
+    {
+        text.push_str(&format!(
+            "{}  {}\n",
+            if ascii { "last" } else { "최근" },
+            snapshot.last_final
+        ));
+    }
+    (PaneState::Ready, text)
+}
+
+/// The state document, read the same bounded, no-follow way the text pane
+/// reads it. `None` when there is no readable state.
+fn read_council_state(path: &Path) -> Option<serde_json::Value> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > COUNCIL_STATE_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(COUNCIL_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > COUNCIL_STATE_MAX_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The bench definitions, in order. Names are the engine's seat calls.
+const BENCH: [(&str, &str); 4] = [
+    ("KARINA", "LEAD"),
+    ("GISELLE", "EDGE"),
+    ("WINTER", "EXACT"),
+    ("NINGNING", "BOLD"),
+];
+
+fn council_parse(value: &serde_json::Value, now: f64) -> CouncilSnapshot {
+    let clean = |value: Option<&serde_json::Value>, max: usize| -> String {
+        value
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(max)
+            .collect()
+    };
+    let published_at = value.get("ts").and_then(serde_json::Value::as_f64);
+    // The engine's own quiet rule: a state older than two minutes is idle.
+    let stale = published_at.is_none_or(|ts| now - ts > COUNCIL_STALE_SECS);
+    let mut phase = clean(value.get("phase"), 16);
+    if stale {
+        phase = "IDLE".into();
+    }
+    let raw_seats: &[serde_json::Value] = value
+        .get("seats")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[], Vec::as_slice);
+    let seats = raw_seats
+        .iter()
+        .take(COUNCIL_SEATS.len())
+        .enumerate()
+        .map(|(index, seat)| parse_seat(index, seat, &phase, &clean))
+        .collect::<Vec<_>>();
+    let extra_seats = raw_seats
+        .iter()
+        .skip(COUNCIL_SEATS.len())
+        .take(12)
+        .enumerate()
+        .map(|(offset, seat)| CouncilChip {
+            name: format!("ae·{:02}", COUNCIL_SEATS.len() + offset + 1),
+            lab: council_lab(&clean(seat.get("model"), 40)),
+            activity: match clean(seat.get("status"), 16).as_str() {
+                "online" | "reported" => "answered".into(),
+                "error" => "lost".into(),
+                _ => "resting".into(),
+            },
+        })
+        .collect();
+    // The winner, as the engine names it (`winner.seats`).
+    let winner_seats = value
+        .get("winner")
+        .and_then(|winner| winner.get("seats"))
+        .and_then(serde_json::Value::as_array)
+        .map(|seats| {
+            seats
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|name| name.chars().filter(|c| !c.is_control()).take(24).collect())
+                .take(COUNCIL_SEATS.len())
+                .collect()
+        })
+        .unwrap_or_default();
+    CouncilSnapshot {
+        phase,
+        note: clean(value.get("note"), 240),
+        seats,
+        extra_seats,
+        winner_seats,
+        last_seats: Vec::new(),
+        last_final: String::new(),
+        finished: 0,
+        seen: 0,
+        last_at: None,
+        published_at,
+        last_tie: false,
+    }
+}
+
+fn parse_seat(
+    index: usize,
+    seat: &serde_json::Value,
+    phase: &str,
+    clean: &dyn Fn(Option<&serde_json::Value>, usize) -> String,
+) -> CouncilSeat {
+    let (name, role) = BENCH
+        .get(index)
+        .map_or(("AE", ""), |(name, role)| (*name, *role));
+    let model = clean(seat.get("model"), 40);
+    let status = clean(seat.get("status"), 16);
+    let verdict = match clean(seat.get("verdict"), 16).to_uppercase().as_str() {
+        "APPROVE" => Some("approve".to_string()),
+        "REJECT" => Some("reject".to_string()),
+        "CONDITIONAL" => Some("hold".to_string()),
+        _ => None,
+    };
+    // What the seat is doing, in the pane's terms. A quiet council rests
+    // whatever the last run left behind.
+    let quiet = matches!(phase, "IDLE" | "TRIAGE" | "TRIAGED" | "FAIL");
+    let activity = if quiet {
+        "resting"
+    } else {
+        match status.as_str() {
+            "error" => "lost",
+            "syncing" => "wiring",
+            "online" | "reported" => "answered",
+            "computing" => "working",
+            _ if verdict.is_some() => "answered",
+            _ => "working",
+        }
+    };
+    CouncilSeat {
+        name: name.into(),
+        number: format!("{:02}", index + 1),
+        role: role.into(),
+        lab: council_lab(&model),
+        model,
+        activity: activity.into(),
+        verdict,
+        confidence: None,
+    }
+}
+
+/// The engine's phase word in Hangul, as the panes label it.
+fn council_phase_hangul(name: &str) -> &str {
+    match name {
+        "TRIAGE" => "분석중",
+        "TRIAGED" => "선별",
+        "SYNC" => "기동",
+        "DELIBERATING" => "심의",
+        "VOTING" => "표결",
+        "VOTED" => "투표완료",
+        "JUDGING" => "판정",
+        "VERDICT" => "결론도달",
+        "FAIL" => "고장",
+        _ => "대기",
+    }
+}
+
+/// The provider a model name implies, spelled the way the panes spell it.
+fn council_lab(model: &str) -> String {
+    let lower = model.to_lowercase();
+    [
+        ("opus", "ANTHROPIC"),
+        ("haiku", "ANTHROPIC"),
+        ("sonnet", "ANTHROPIC"),
+        ("deepseek", "DEEPSEEK"),
+        ("glm", "ZHIPU"),
+        ("minimax", "MINIMAX"),
+        ("qwen", "ALIBABA"),
+        ("gemini", "GOOGLE"),
+        ("gpt", "OPENAI"),
+        ("kimi", "MOONSHOT"),
+        ("mistral", "MISTRAL"),
+        ("claude", "ANTHROPIC"),
+    ]
+    .into_iter()
+    .find(|(key, _)| lower.contains(key))
+    .map_or_else(|| "ae".to_string(), |(_, lab)| lab.to_string())
+}
+
+/// The newest finished council from the append-only record: its seats with
+/// the verdict and confidence each answer carried, its conclusion, and how
+/// many of the recent records finished.
+fn council_last_record(path: &Path) -> Option<(CouncilHistoryRecord, Option<f64>)> {
+    use std::io::{Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let cut = meta.len() > TAIL_BYTES;
+    if cut {
+        file.seek(SeekFrom::Start(meta.len() - TAIL_BYTES)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    let tail = String::from_utf8_lossy(&bytes);
+    // After a cut the first line is partial; it never parses as a record.
+    let records: Vec<serde_json::Value> = tail
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    let recent = &records[records.len().saturating_sub(20)..];
+    let finished = recent
+        .iter()
+        .filter(|row| {
+            row.get("final")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|final_text| !final_text.trim().is_empty())
+        })
+        .count() as u32;
+    let last = records.iter().rev().find(|row| {
+        row.get("final")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|final_text| !final_text.trim().is_empty())
+    })?;
+    let last_at = last.get("ts").and_then(serde_json::Value::as_f64);
+    let answers = last.get("answers").and_then(serde_json::Value::as_object);
+    let models = last.get("models").and_then(serde_json::Value::as_object);
+    let winner = last.get("winner");
+    let winner_names: Vec<String> = winner
+        .and_then(|winner| winner.get("seats"))
+        .and_then(serde_json::Value::as_array)
+        .map(|seats| {
+            seats
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let last_seats: Vec<CouncilSeat> = BENCH
+        .iter()
+        .enumerate()
+        .map(|(index, (name, role))| {
+            let answer = answers
+                .and_then(|answers| answers.get(*name))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let model = models
+                .and_then(|models| models.get(*name))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            CouncilSeat {
+                name: (*name).into(),
+                number: format!("{:02}", index + 1),
+                role: (*role).into(),
+                lab: council_lab(model),
+                model: model.to_owned(),
+                activity: "resting".into(),
+                verdict: verdict_word(answer),
+                confidence: confidence_value(answer),
+            }
+        })
+        .collect();
+    let final_text = last
+        .get("final")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let first = final_text.lines().next().unwrap_or("");
+    let first = first.trim_start();
+    let first = first.strip_prefix("FINAL:").unwrap_or(first).trim();
+    let any_verdict = last_seats.iter().any(|seat| seat.verdict.is_some());
+    Some((
+        CouncilHistoryRecord {
+            finished,
+            seen: recent.len() as u32,
+            last_seats,
+            last_final: first
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect(),
+            tie: winner_names.is_empty() && any_verdict,
+            winner_names,
+        },
+        last_at,
+    ))
+}
+
+#[derive(Clone)]
+struct CouncilHistoryRecord {
+    finished: u32,
+    seen: u32,
+    last_seats: Vec<CouncilSeat>,
+    last_final: String,
+    winner_names: Vec<String>,
+    /// The newest finished council named no winner: every verdict split.
+    tie: bool,
+}
+
+/// The verdict an answer text states, if it states one.
+fn verdict_word(answer: &str) -> Option<String> {
+    let upper = answer.to_uppercase();
+    let at = upper.find("VERDICT:")?;
+    let rest = upper[at + "VERDICT:".len()..].trim_start();
+    for (word, verdict) in [
+        ("APPROVE", "approve"),
+        ("REJECT", "reject"),
+        ("CONDITIONAL", "hold"),
+    ] {
+        if rest.starts_with(word) {
+            return Some(verdict.to_string());
+        }
+    }
+    None
+}
+
+/// The confidence an answer text states, if it states one.
+fn confidence_value(answer: &str) -> Option<u8> {
+    let upper = answer.to_uppercase();
+    let at = upper.find("CONFIDENCE:")?;
+    let digits: String = upper[at + "CONFIDENCE:".len()..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .take(3)
+        .collect();
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 mod backup_tests {
     use super::*;
 
-    /// REA G6: a second write keeps the first generation as a .bak sibling.
+    /// a second write keeps the first generation as a .bak sibling.
     #[test]
     fn profile_replace_keeps_the_previous_generation_as_bak() {
         let home = std::env::temp_dir().join(format!("orbit-g6-{}", std::process::id()));

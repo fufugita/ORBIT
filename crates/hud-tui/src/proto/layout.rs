@@ -224,6 +224,28 @@ impl Node {
         }
     }
 
+    /// The picker's built-in panes: the panel at `index` shows a named pane.
+    /// The conversation panel keeps its view, as with `set_view`.
+    pub fn set_custom(&mut self, index: usize, pane_id: &str) -> bool {
+        if self.view_at(index) == Some(View::Conversation)
+            || !orbit_frontend_protocol::customization::valid_id(pane_id)
+        {
+            return false;
+        }
+        let Some(path) = self.path_of(index) else {
+            return false;
+        };
+        match self.at_mut(&path) {
+            Some(node) if matches!(node, Node::Panel { .. } | Node::Custom { .. }) => {
+                *node = Node::Custom {
+                    pane_id: pane_id.into(),
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// `x` — close the panel; its share goes to its neighbours.
     /// The last panel cannot close.
     pub fn close(&mut self, index: usize) -> bool {

@@ -335,6 +335,26 @@ impl App {
         }
     }
 
+    /// The picker's answer when it names a built-in pane (council, reactor).
+    pub fn pick_custom(&mut self, pane_id: &str) -> bool {
+        let Some(p) = self.picker.take() else {
+            return false;
+        };
+        match p.kind {
+            PickerKind::Split => {
+                if self.panel_count() >= 9
+                    || !self.tree.split(self.focus, p.direction, View::Activity)
+                {
+                    return false;
+                }
+                self.focus += 1; // focus the new panel
+                self.tree.set_custom(self.focus, pane_id);
+                true
+            }
+            PickerKind::Change => self.tree.set_custom(self.focus, pane_id),
+        }
+    }
+
     /// Save the layout as "yours" (any change calls this).
     pub fn save_yours(&mut self) -> Result<(), String> {
         let preset_name = match self.tree {
@@ -451,6 +471,38 @@ mod tests {
             std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         App::new(home.to_path_buf(), false)
+    }
+
+    #[test]
+    fn picker_places_builtin_panes_by_split_and_change_but_keeps_the_conversation() {
+        let home = std::env::temp_dir().join(format!("orbit-app-panes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let mut a = app(&home);
+        assert!(!a.pick_custom("council"), "no picker is open");
+
+        // v on the conversation, then Council: a new panel shows the pane.
+        a.key(Key::Esc);
+        a.key(Key::Char('v'));
+        assert!(a.pick_custom("council"));
+        assert_eq!(a.panel_count(), 4);
+        assert_eq!(a.focus, 2);
+        assert_eq!(a.tree.custom_id_at(2).as_deref(), Some("council"));
+        assert_eq!(a.tree.view_at(2), Some(View::Custom));
+
+        // p on that panel, then Reactor: the same panel changes.
+        a.key(Key::Char('p'));
+        assert!(a.pick_custom("reactor"));
+        assert_eq!(a.panel_count(), 4);
+        assert_eq!(a.tree.custom_id_at(2).as_deref(), Some("reactor"));
+
+        // The conversation panel never becomes a pane.
+        a.focus = 1;
+        a.key(Key::Char('p'));
+        assert!(!a.pick_custom("council"));
+        assert_eq!(a.tree.view_at(1), Some(View::Conversation));
+        assert!(!a.tree.set_custom(0, "Not An Id"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

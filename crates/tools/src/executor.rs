@@ -148,7 +148,7 @@ impl<'a> Wave1Executor<'a> {
                     tool: call.name.clone(),
                     summary: summarize(&input),
                     risk: risk_for(&call.name, &input),
-                    working_dir: self.cx.working_dir.to_string_lossy().into_owned(),
+                    working_dir: self.cx.cwd().to_string_lossy().into_owned(),
                 };
                 match self.approvals.ask(&card) {
                     ApprovalAnswer::AllowOnce => {}
@@ -285,6 +285,20 @@ pub fn load_rules_in(home: &Path, project: &Path) -> RuleSet {
     }
 }
 
+/// The settings file named with `--settings` for this run (carried in
+/// `ORBIT_SETTINGS_FILE` as an absolute path).
+pub fn extra_settings_file() -> Option<std::path::PathBuf> {
+    std::env::var_os("ORBIT_SETTINGS_FILE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Is this settings file Claude Code's JSON form?
+pub fn is_json(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "json")
+}
+
 /// The source label is a bounded scope name, never an unrelated file's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourcedPermissionRule {
@@ -302,7 +316,7 @@ pub fn load_sourced_rules_in(
     let mut entries = Vec::new();
     // A file that exists but does not parse is WARNED, never silently
     // skipped (S1: silent skip deleted the user's deny rules).
-    for (path, scope, source) in [
+    let mut sources = vec![
         (home.join("settings.toml"), Scope::User, "user"),
         (
             project.join(".orbit/settings.toml"),
@@ -320,7 +334,14 @@ pub fn load_sourced_rules_in(
             Scope::User,
             "operator-override",
         ),
-    ] {
+    ];
+    // `--settings <file>`: the operator's own extra rules for this run, read
+    // after their user settings. A Claude Code `settings.json` named there
+    // contributes hooks only.
+    if let Some(path) = extra_settings_file().filter(|path| !is_json(path)) {
+        sources.insert(1, (path, Scope::User, "flag"));
+    }
+    for (path, scope, source) in sources {
         if source == "operator-override"
             && std::fs::symlink_metadata(&path)
                 .is_ok_and(|meta| !meta.file_type().is_file() || meta.len() > 64 * 1024)

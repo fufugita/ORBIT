@@ -678,17 +678,19 @@ fn edit_routing<T: SetupTerminal>(
     }
 }
 
-/// The themes a user may pick (REA G4). Keep in sync with the palette
+/// The themes a user may pick. Keep in sync with the palette
 /// match in hud-tui's `pal::from_profile`.
-pub const THEME_OPTIONS: &[&str] = &["orbit", "midnight", "paper"];
+pub const THEME_OPTIONS: &[&str] = &orbit_frontend_protocol::customization::THEMES;
 
-/// REA G4: render each theme as a swatch line so the picker shows the
+/// render each theme as a swatch line so the picker shows the
 /// palette, not just the name. Uses the same palette the TUI draws with.
 fn theme_choice_with_preview(theme: &str, current: &str) -> SetupChoice<'static> {
     let owned: &'static str = match theme {
         "orbit" => "orbit",
         "midnight" => "midnight",
         "paper" => "paper",
+        "aespa-pastel" => "aespa-pastel",
+        "kwangya-ice" => "kwangya-ice",
         _ => "orbit",
     };
     let profile = Profile {
@@ -875,7 +877,7 @@ pub fn edit_appearance<T: SetupTerminal>(
             },
             _ => {
                 let options: &[&str] = match key.as_str() {
-                    // REA G4: themes preview as ANSI swatches, not bare names.
+                    // themes preview as ANSI swatches, not bare names.
                     "theme" => THEME_OPTIONS,
                     "layout.preset" => &["default", "columns", "build", "agents", "review"],
                     "density" => &["comfortable", "compact"],

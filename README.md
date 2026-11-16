@@ -196,6 +196,23 @@ your shell and source it from your profile (`bash`, `zsh`, or `fish`):
 orbit completions bash >> ~/.bashrc
 ```
 
+The default output is a shell script. Use `orbit completions bash --json`
+when you need the script inside a machine-readable response.
+
+Before moving a Claude Code project to ORBIT, inspect its configuration and
+the readiness of your ORBIT home without changing either:
+
+```sh
+orbit migrate --from claude
+orbit migrate --from claude --json
+```
+
+The report lists what carries over, what needs review, and the next setup
+commands. Credentials and conversation history remain in their original stores.
+See the [migration guide](docs/migration.md) for the daily-use trial checklist.
+The [CLI harness comparison](docs/harness-comparison.md) records the observed
+comparison scope and useful remaining QOL work.
+
 To create only the local identity and configure providers later:
 
 ```sh

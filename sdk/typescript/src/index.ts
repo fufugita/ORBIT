@@ -125,7 +125,7 @@ export interface QueryOptions {
   permissionMode?: string;
   /** Round guard (default 100). */
   maxTurns?: number;
-  /** Cost budget in microcents. */
+  /** Cost budget in micro-dollars (1000000 is $1). The field name is historical. */
   maxCostMicrocents?: number;
   /** Extra args passed verbatim to `orbit -p`. */
   extraArgs?: string[];

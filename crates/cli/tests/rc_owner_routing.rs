@@ -2375,9 +2375,7 @@ mod caller_journal_activation {
     use super::*;
     use orbit_adapter::types::ChatMessage;
     use orbit_cli::context_history::{context_journal, load_compaction_source};
-    use orbit_engine::{
-        AccountingBaseline, AccountingKnownness, AttemptPurpose, CompactionJournal,
-    };
+    use orbit_engine::{AccountingBaseline, AccountingKnownness, CompactionJournal};
     use orbit_hud_tui::msg::{OrdinaryEnd, OrdinaryPublication, ProjectionReason};
     use orbit_hud_tui::worker::{CancelHandle, ForegroundOperation, WorkerCommand, WorkerCtx};
     use orbit_hud_tui::{ApprovalRegistry, bus::Bus, msg::Msg};
@@ -2917,7 +2915,23 @@ mod caller_journal_activation {
         prefix: (u64, u64, u64),
         calls: u64,
     ) {
-        let checkpoint = journal(f, session).accounting_checkpoint().unwrap();
+        assert_known_checkpoint(
+            f,
+            session,
+            journal(f, session).accounting_checkpoint().unwrap(),
+            revision,
+            prefix,
+            calls,
+        );
+    }
+    fn assert_known_checkpoint(
+        f: &Fixture,
+        session: &str,
+        checkpoint: orbit_engine::AccountingCheckpoint,
+        revision: u64,
+        prefix: (u64, u64, u64),
+        calls: u64,
+    ) {
         assert_eq!(checkpoint.owner_session_id, session);
         assert_eq!(checkpoint.child_id, None);
         assert_eq!(checkpoint.baseline, AccountingBaseline::UnknownLegacy);
@@ -3155,13 +3169,22 @@ mod caller_journal_activation {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
-        fn wait_plan(&self) -> Value {
+        fn wait_plan_projection(&self, session: &str, mut plan: Option<Value>) -> Value {
             let end = Instant::now() + Duration::from_secs(3);
             loop {
                 match self.bus.try_recv() {
-                    Some(Msg::PlanReady(text)) => return json!({"type":"plan_ready","text":text}),
-                    Some(Msg::BackendNotice(_)) => {
-                        panic!("unexpected notice while waiting for an unbound plan")
+                    Some(Msg::PlanReady(text)) => {
+                        assert!(plan.is_none(), "duplicate unbound plan approval offer");
+                        plan = Some(json!({"type":"plan_ready","text":text}));
+                    }
+                    Some(Msg::SessionProjection(view))
+                        if matches!(view.reason, ProjectionReason::Refresh) =>
+                    {
+                        assert_eq!(view.binding.session_id, session);
+                        return plan.expect("plan projection preceded its approval offer");
+                    }
+                    Some(Msg::BackendError(_) | Msg::BackendNotice(_)) => {
+                        panic!("unexpected error or notice while waiting for an unbound plan")
                     }
                     Some(Msg::OrdinaryTurnEnded { .. }) => {
                         panic!("unbound plan received a managed result")
@@ -3170,7 +3193,7 @@ mod caller_journal_activation {
                 }
                 assert!(
                     Instant::now() < end,
-                    "successful plan was not offered for approval"
+                    "successful plan approval offer and projection were not published"
                 );
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -3300,22 +3323,26 @@ mod caller_journal_activation {
                 })
                 .collect::<Vec<_>>();
             if mode == "cancel" {
+                // The stopped request is closed as abandoned: the turn ends
+                // cancelled, the session is saved and can go on, and what
+                // the request cost is not claimed to be known.
                 assert!(matches!(
                     ends.as_slice(),
-                    [(
-                        OrdinaryEnd::Cancelled,
-                        OrdinaryPublication::BlockedOrUncertain
-                    )]
+                    [(OrdinaryEnd::Cancelled, OrdinaryPublication::Saved)]
                 ));
                 let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
-                assert!(checkpoint.pending.as_ref().unwrap().uncertain);
-                assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Uncertain);
+                assert!(checkpoint.pending.is_none());
+                assert_eq!(
+                    checkpoint.totals.knownness,
+                    AccountingKnownness::UnknownLegacy
+                );
+                assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
                 assert_eq!(
                     saved(&f, SESSION)
                         .accounting_watermark
                         .unwrap()
                         .full_cost_status,
-                    orbit_cli::session_accounting::FullCostStatus::Uncertain
+                    orbit_cli::session_accounting::FullCostStatus::UnknownLegacy
                 );
                 assert!(
                     !events
@@ -3400,15 +3427,27 @@ mod caller_journal_activation {
         seed(&f, &wire, SESSION, &[], (0, 0, 0));
         let tui = Tui::start(&f, SESSION);
         let events = tui.run(WorkerCommand::PlanPrompt(PROMPT.into()), None);
-        let plan = events
-            .iter()
-            .find(|event| event["type"] == "plan_ready")
-            .cloned()
-            .unwrap_or_else(|| tui.wait_plan());
+        // PlanReady precedes the worker's final admission check. The following
+        // projection is the command barrier, after that short writer lock ends.
+        let plan = tui.wait_plan_projection(
+            SESSION,
+            events
+                .iter()
+                .find(|event| event["type"] == "plan_ready")
+                .cloned(),
+        );
         assert_eq!(plan["text"], PLAN);
         // No approval/execution command has been sent, and the worker still owns
         // the session. Provider billing and its watermark must already be durable.
-        assert_known(&f, SESSION, 2, (0, 0, 0), 1);
+        assert!(matches!(
+            SessionLease::acquire(&f.home, SESSION, "plan-before-approval"),
+            Err(sessions::SessionLeaseError::Busy { .. })
+        ));
+        // Inert inspection cannot sync or repair the evidence being asserted.
+        let checkpoint = orbit_cli::context_history::inspect_accounting(&f.home, SESSION, None)
+            .unwrap()
+            .checkpoint;
+        assert_known_checkpoint(&f, SESSION, checkpoint, 2, (0, 0, 0), 1);
         let observed = saved(&f, SESSION);
         assert_eq!(
             observed
@@ -3440,9 +3479,9 @@ mod caller_journal_activation {
     }
 
     #[test]
-    fn actual_tui_paid_summary_then_failed_ordinary_retains_cost_and_halts_replay() {
+    fn actual_tui_paid_summary_then_failed_ordinary_retains_cost_and_the_session_goes_on() {
         if !dispatch_isolated(
-            "caller_journal_activation::actual_tui_paid_summary_then_failed_ordinary_retains_cost_and_halts_replay",
+            "caller_journal_activation::actual_tui_paid_summary_then_failed_ordinary_retains_cost_and_the_session_goes_on",
         ) {
             return;
         }
@@ -3456,7 +3495,7 @@ mod caller_journal_activation {
         let mut wire = Wire::new(vec![
             Response::complete(SUMMARY),
             malformed,
-            Response::complete("must not be called"),
+            Response::complete("answered after the failed request"),
         ]);
         configure(&f, &wire, 10_000);
         let original = history();
@@ -3478,11 +3517,15 @@ mod caller_journal_activation {
                 .housekeeping_microcents,
             7
         );
+        // The ordinary request ended without a usable outcome: it is
+        // closed as abandoned, so nothing is pending and its cost is not
+        // claimed; the summary's known cost stays.
+        assert!(checkpoint.pending.is_none());
         assert_eq!(
-            checkpoint.pending.as_ref().unwrap().intent.purpose,
-            AttemptPurpose::Ordinary
+            checkpoint.totals.knownness,
+            AccountingKnownness::UnknownLegacy
         );
-        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
         let durable = saved(&f, SESSION);
         assert_eq!(
             (
@@ -3498,7 +3541,7 @@ mod caller_journal_activation {
                 .as_ref()
                 .unwrap()
                 .full_cost_status,
-            orbit_cli::session_accounting::FullCostStatus::Uncertain
+            orbit_cli::session_accounting::FullCostStatus::UnknownLegacy
         );
         assert_eq!(
             durable
@@ -3527,39 +3570,49 @@ mod caller_journal_activation {
             load_compaction_source(&f.home, SESSION, None, record).unwrap(),
             archived
         );
-        let bytes = fs::read(
-            f.home
-                .join("context-history")
-                .join(SESSION)
-                .join("accounting.json"),
-        )
-        .unwrap();
+        // The failed request is never sent again. The same session takes
+        // the operator's next prompt: one new request, answered.
+        assert!(!orbit_cli::session_accounting::admission_blocked_for(
+            &f.home, SESSION
+        ));
         tui.run(
-            WorkerCommand::Prompt("new intent cannot replay uncertain work".into()),
+            WorkerCommand::Prompt("new intent is asked in the same session".into()),
             None,
         );
-        assert_eq!(
-            fs::read(
-                f.home
-                    .join("context-history")
-                    .join(SESSION)
-                    .join("accounting.json")
-            )
-            .unwrap(),
-            bytes
-        );
+        assert_eq!(sessions::list_sessions(&f.home).unwrap().len(), 1);
         tui.close(&f, SESSION);
+        let after = self::saved(&f, SESSION);
+        assert!(
+            after
+                .transcript
+                .iter()
+                .any(|message| message.content == "new intent is asked in the same session")
+        );
+        assert!(
+            after
+                .transcript
+                .iter()
+                .any(|message| message.content == "answered after the failed request")
+        );
+        assert!(
+            journal(&f, SESSION)
+                .accounting_checkpoint()
+                .unwrap()
+                .pending
+                .is_none()
+        );
         wire.finish();
-        assert_wire(&wire, 2);
+        assert_wire(&wire, 3);
         let calls = wire.requests.lock().unwrap();
         assert_eq!(calls[0].body["model"], "summary-model");
         assert_eq!(calls[1].body["model"], RAW_A);
+        assert_eq!(calls[2].body["model"], RAW_A);
     }
 
     #[test]
-    fn actual_tui_cancel_after_accepted_post_is_uncertain_and_refuses_next_turn() {
+    fn actual_tui_cancel_after_accepted_post_is_abandoned_and_the_session_goes_on() {
         if !dispatch_isolated(
-            "caller_journal_activation::actual_tui_cancel_after_accepted_post_is_uncertain_and_refuses_next_turn",
+            "caller_journal_activation::actual_tui_cancel_after_accepted_post_is_abandoned_and_the_session_goes_on",
         ) {
             return;
         }
@@ -3574,15 +3627,24 @@ mod caller_journal_activation {
             WorkerCommand::Prompt("cancel this actual TUI request".into()),
             Some((&wire, 1)),
         );
+        // The operator stopped the request after it was sent: what it cost
+        // is not known. The interactive session closes it as abandoned and
+        // goes on as the same session: nothing is pending, the totals stay
+        // unknown (this session began before accounting did), and no cost
+        // is claimed.
         let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
         assert_eq!(checkpoint.revision.0, 2);
-        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
-        assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Uncertain);
+        assert!(checkpoint.pending.is_none());
+        assert_eq!(
+            checkpoint.totals.knownness,
+            AccountingKnownness::UnknownLegacy
+        );
+        assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
         let saved = saved(&f, SESSION);
         assert_eq!(saved.cost_microcents, 0);
         assert_eq!(
             saved.accounting_watermark.unwrap().full_cost_status,
-            orbit_cli::session_accounting::FullCostStatus::Uncertain
+            orbit_cli::session_accounting::FullCostStatus::UnknownLegacy
         );
         assert_eq!(
             saved
@@ -3592,15 +3654,17 @@ mod caller_journal_activation {
                 .count(),
             1
         );
-        tui.run(
-            WorkerCommand::Prompt("no automatic retry after cancel".into()),
-            None,
-        );
+        // The stopped request is not sent again, the session takes the
+        // next prompt, and no copy of the conversation was made.
+        assert!(!orbit_cli::session_accounting::admission_blocked_for(
+            &f.home, SESSION
+        ));
+        assert_eq!(sessions::list_sessions(&f.home).unwrap().len(), 1);
+        tui.close(&f, SESSION);
         assert_eq!(
             journal(&f, SESSION).accounting_checkpoint().unwrap(),
             checkpoint
         );
-        tui.close(&f, SESSION);
         wire.finish();
         assert_wire(&wire, 1);
     }

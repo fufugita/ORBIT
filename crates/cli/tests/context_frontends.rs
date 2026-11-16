@@ -4275,11 +4275,15 @@ mod frontend_manual_baselines {
                 assert_eq!(result.role, orbit_adapter::types::ChatRole::Tool);
                 assert_eq!(result.tool_call_id.as_deref(), Some(CALL));
                 assert_eq!(result.tool_result.as_deref(), Some(result.content.as_str()));
-                assert!(orbit_tools::result_is_denial(&result.content));
+                // A signal supplies no operator answer. Preserve the typed
+                // cancellation result, while the ledger denies execution.
                 assert_eq!(
-                    orbit_tools::denial_reason(&result.content).as_deref(),
-                    Some("operator denied")
+                    serde_json::from_str::<serde_json::Value>(&result.content).unwrap(),
+                    serde_json::json!({"ok":false,"error":"cancelled by user"})
                 );
+                assert!(orbit_tools::result_is_error(&result.content));
+                assert!(!orbit_tools::result_is_denial(&result.content));
+                assert!(orbit_tools::denial_reason(&result.content).is_none());
                 let records = orbit_ledger::verify_ledger(&f.home.join("ledger"))
                     .unwrap()
                     .0;
@@ -4302,7 +4306,7 @@ mod frontend_manual_baselines {
                             assert_eq!(value.call_id, CALL);
                             assert_eq!(value.tool_name, "Bash");
                             assert!(!value.allowed);
-                            assert_eq!(value.reason, "operator denied");
+                            assert_eq!(value.reason, "cancelled by user");
                             tool_kinds.push("verdict");
                         }
                         orbit_ledger::LedgerEvent::ToolResult(value) => {
@@ -4310,7 +4314,7 @@ mod frontend_manual_baselines {
                             assert_eq!(value.decision_id, decision);
                             assert_eq!(value.call_id, CALL);
                             assert_eq!(value.tool_name, "Bash");
-                            assert_eq!(value.status, "denied");
+                            assert_eq!(value.status, "error");
                             assert_eq!(
                                 value.output_sha256,
                                 hex::encode(Sha256::digest(result.content.as_bytes()))

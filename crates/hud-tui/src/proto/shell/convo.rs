@@ -69,6 +69,9 @@ pub(crate) struct ReadInput<'a> {
 pub(crate) struct ConversationFrame {
     pub(crate) epoch: u64,
     pub(crate) panel: Rect,
+    /// Where the conversation's own rows were painted, inside the panel:
+    /// not its title, the composer or an approval card.
+    pub(crate) rows: Rect,
     pub(crate) viewport: usize,
     pub(crate) total: usize,
     pub(crate) start: usize,
@@ -1027,7 +1030,15 @@ fn card_rows_themed(
             ]),
             ToolState::Denied => right.extend([
                 Seg::bold("⊘ ", colors.muted),
-                Seg::new("denied by you", colors.muted),
+                // A channel that answers approval prompts refused it.
+                Seg::new(
+                    if crate::proto::scenario::names_who_refused(&meta) {
+                        meta.as_str()
+                    } else {
+                        "denied by you"
+                    },
+                    colors.muted,
+                ),
             ]),
             ToolState::Blocked => right.extend([
                 Seg::new(sep, colors.muted),
@@ -1707,7 +1718,13 @@ fn draw_approval(
             Some('+') => ("+", colors.green),
             _ => (" ", colors.muted),
         };
-        let body = line.get(1..).unwrap_or("").trim_start_matches(' ');
+        // Only a diff line carries a marker to take off; any other line
+        // (a question's field, an instruction) is shown whole.
+        let body = if marker == " " {
+            line.trim_start_matches(' ')
+        } else {
+            line.get(1..).unwrap_or("").trim_start_matches(' ')
+        };
         cv.bold(x + 3, yy, marker, colour, Some(colors.inset));
         cv.text(
             x + 5,
@@ -2581,6 +2598,12 @@ pub(crate) fn draw_reading(
                 };
                 let shown = total.saturating_sub(start).min(view_h);
                 let top = y + used + view_h as i32 - shown as i32;
+                let painted = Rect {
+                    x: inner.x,
+                    y: top.max(0) as u16,
+                    width: inner.width,
+                    height: shown as u16,
+                };
                 if let (Some(input), Some(origins)) = (reading, exact)
                     && view_h > 0
                 {
@@ -2588,6 +2611,7 @@ pub(crate) fn draw_reading(
                     feedback = Some(ConversationFrame {
                         epoch: input.epoch,
                         panel: r,
+                        rows: painted,
                         viewport: view_h,
                         total,
                         start,

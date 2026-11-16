@@ -271,12 +271,14 @@ pub struct CostGuard {
 }
 
 impl CostGuard {
-    /// Should the run stop? Returns the reason when over budget.
+    /// Should the run stop? Returns the reason when over budget. The
+    /// amounts are micro-dollars (1,000,000 is $1): the names say
+    /// micro-cents for historical reasons, the values never were.
     pub fn check(&self, spent_microcents: u64) -> Option<String> {
         self.max_microcents
             .map(|max| {
                 if spent_microcents >= max {
-                    format!("cost guard: spent {spent_microcents}µ¢ of {max}µ¢ budget — stopping")
+                    format!("cost guard: spent {spent_microcents}µ$ of {max}µ$ budget — stopping")
                 } else {
                     String::new()
                 }

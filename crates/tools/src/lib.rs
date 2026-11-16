@@ -87,6 +87,11 @@ pub type LedgerSink = std::sync::Arc<dyn Fn(&LedgerNote) + Send + Sync>;
 /// Bash — between waits. The engine's turn token sits behind it.
 pub type CancelCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Directories beyond the working ones that this session's commands may
+/// read (see [`ToolContext::allow_reading`]).
+#[derive(Default)]
+struct ReadRoots(std::sync::Mutex<Vec<PathBuf>>);
+
 /// What a tool execution needs: paths, session identity, spill dir.
 /// Cloned per tool call; the read-before-edit state is shared (an
 /// interior-mutex) so every tool call in a session sees the same map.
@@ -123,9 +128,16 @@ pub struct ToolContext {
     pub turn_checkpoint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub home: PathBuf,
     pub session_id: String,
+    /// The project the session was opened in. Settings, permission rules,
+    /// folder trust and MCP configuration are looked up here, and it never
+    /// moves. Where commands run is [`ToolContext::cwd`].
     pub working_dir: PathBuf,
     /// Working directories the operator added (`/add-dir`, phase 4).
     pub working_dirs: Vec<PathBuf>,
+    /// Where commands start and relative paths resolve, once `/cd` or a
+    /// worktree tool has moved it away from `working_dir`. Shared by every
+    /// clone, so a move made during one call holds for the next.
+    cwd: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     /// Read-before-edit state: file path → content hash at last full
     /// read. Shared across the session's tool calls.
     read_hashes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>>,
@@ -146,7 +158,67 @@ impl ToolContext {
             cancel: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             ledger_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
             extensions: Default::default(),
+            cwd: Default::default(),
         }
+    }
+
+    /// Where commands start and relative paths resolve: the project
+    /// directory, unless the session has moved.
+    pub fn cwd(&self) -> PathBuf {
+        self.cwd
+            .lock()
+            .ok()
+            .and_then(|moved| moved.clone())
+            .unwrap_or_else(|| self.working_dir.clone())
+    }
+
+    /// Move where commands run, for this context and every clone of it.
+    /// `None`, or the project directory itself, goes back to the project.
+    pub fn set_cwd(&self, dir: Option<PathBuf>) {
+        if let Ok(mut moved) = self.cwd.lock() {
+            *moved = dir.filter(|dir| *dir != self.working_dir);
+        }
+    }
+
+    /// The directories a sandboxed command may write in: the working
+    /// directories, and where it runs when that lies outside them (a
+    /// worktree a hook made elsewhere).
+    /// Let commands of this session read `dir` (a loaded skill's folder,
+    /// with its scripts and reference files): the shell sandbox shows it
+    /// read-only from then on.
+    pub fn allow_reading(&self, dir: PathBuf) {
+        let roots = match self.ext::<ReadRoots>() {
+            Some(roots) => roots,
+            None => {
+                self.set_ext(ReadRoots::default());
+                match self.ext::<ReadRoots>() {
+                    Some(roots) => roots,
+                    None => return,
+                }
+            }
+        };
+        if let Ok(mut list) = roots.0.lock()
+            && !list.contains(&dir)
+            && list.len() < 64
+        {
+            list.push(dir);
+        }
+    }
+
+    /// The directories [`ToolContext::allow_reading`] added.
+    pub fn readable_dirs(&self) -> Vec<PathBuf> {
+        self.ext::<ReadRoots>()
+            .and_then(|roots| roots.0.lock().ok().map(|list| list.clone()))
+            .unwrap_or_default()
+    }
+
+    pub fn writable_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = self.working_dirs.clone();
+        let cwd = self.cwd();
+        if !dirs.iter().any(|dir| cwd.starts_with(dir)) {
+            dirs.push(cwd);
+        }
+        dirs
     }
 
     /// Attach `value` to this context, replacing an earlier value of the
@@ -293,7 +365,15 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    pub fn ok(payload: serde_json::Value) -> Self {
+    pub fn ok(mut payload: serde_json::Value) -> Self {
+        // A successful result says so in its own payload. Front ends read
+        // the saved payload back (a resumed session, a finished turn) and
+        // take a result without a verdict for one they cannot vouch for.
+        if let Some(object) = payload.as_object_mut()
+            && !object.contains_key("ok")
+        {
+            object.insert("ok".into(), serde_json::Value::Bool(true));
+        }
         ToolResult {
             payload: payload.to_string(),
             is_error: false,
@@ -379,7 +459,7 @@ pub fn finish(mut result: ToolResult, cx: &ToolContext, call_id: &str) -> ToolRe
                 // (the payload's own top-level ok, parsed — never
                 // a substring of the preview).
                 "ok": !result_is_error(&result.payload) && !result.is_error,
-                "note": "result too long for inline display",
+                "note": "result too long to show whole: preview is its start and the whole result is in the file at spilled_to; open that file in parts with the Read tool (offset and limit), not from a shell command",
                 "spilled_to": path.to_string_lossy(),
                 "preview": preview,
             })
@@ -400,6 +480,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(GrepTool),
         Box::new(bash::BashTool),
         Box::new(bash::TaskStopTool),
+        Box::new(bash::TaskOutputTool),
         Box::new(tasks::TaskCreateTool),
         Box::new(tasks::TaskUpdateTool),
         Box::new(tasks::TaskListTool),
@@ -480,6 +561,9 @@ pub fn tool_description(name: &str) -> &'static str {
             "Stops a background command started with Bash's run_in_background, by its \
             background id. The command's process group is killed."
         }
+        "TaskOutput" => {
+            "The last lines a background command has written, and whether it is still running."
+        }
         "AskUserQuestion" => {
             "Asks the operator 1-4 multiple-choice questions when a decision is \
             genuinely theirs. Each question has 2-4 options; the operator may always answer \
@@ -523,6 +607,7 @@ pub fn is_wave1(name: &str) -> bool {
             | "Grep"
             | "Bash"
             | "TaskStop"
+            | "TaskOutput"
             | "AskUserQuestion"
             | "ExitPlanMode"
             // B3: these have real implementations in registry() but
@@ -569,7 +654,7 @@ pub fn is_read_only(name: &str) -> bool {
     // tool's own read_only() flag still marks it parallel-safe.
     matches!(
         name,
-        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList" | "WebSearch"
+        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList" | "TaskOutput" | "WebSearch"
     )
 }
 
@@ -662,7 +747,44 @@ pub fn resolve_path(cx: &ToolContext, p: &str) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        cx.working_dir.join(path)
+        cx.cwd().join(path)
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    /// Moving where commands run leaves the project where it was: relative
+    /// paths follow the move, every clone sees it, and going back clears it.
+    #[test]
+    fn a_move_changes_where_paths_resolve_and_never_the_project() {
+        let cx = ToolContext::new("/h".into(), "s".into(), "/w".into());
+        let clone = cx.clone();
+        assert_eq!(cx.cwd(), PathBuf::from("/w"));
+        assert_eq!(resolve_path(&cx, "a.txt"), PathBuf::from("/w/a.txt"));
+
+        cx.set_cwd(Some("/w/sub".into()));
+        assert_eq!(cx.working_dir, PathBuf::from("/w"), "the project stays");
+        assert_eq!(clone.cwd(), PathBuf::from("/w/sub"), "clones share it");
+        assert_eq!(resolve_path(&clone, "a.txt"), PathBuf::from("/w/sub/a.txt"));
+        assert_eq!(resolve_path(&cx, "/abs/a.txt"), PathBuf::from("/abs/a.txt"));
+        assert_eq!(cx.writable_dirs(), vec![PathBuf::from("/w")]);
+
+        // A directory outside the working directories (a worktree a hook
+        // made elsewhere) becomes writable only while the session is in it.
+        cx.set_cwd(Some("/elsewhere/tree".into()));
+        assert_eq!(
+            cx.writable_dirs(),
+            vec![PathBuf::from("/w"), PathBuf::from("/elsewhere/tree")]
+        );
+
+        cx.set_cwd(Some("/w".into()));
+        assert_eq!(clone.cwd(), PathBuf::from("/w"));
+        assert_eq!(cx.writable_dirs(), vec![PathBuf::from("/w")]);
+        cx.set_cwd(Some("/w/sub".into()));
+        cx.set_cwd(None);
+        assert_eq!(cx.cwd(), PathBuf::from("/w"));
     }
 }
 

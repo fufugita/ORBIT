@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_PROFILE_BYTES: usize = 128 * 1024;
+/// The built-in themes. Keep in sync with hud-tui's `pal::from_profile`.
+pub const THEMES: [&str; 5] = ["orbit", "midnight", "paper", "aespa-pastel", "kwangya-ice"];
 pub const MAX_PANE_OUTPUT_BYTES: usize = 32 * 1024;
 pub const MAX_PANE_LINES: usize = 512;
 
-/// The top-bar chips a user may toggle (REA G1). Keep in sync with
+/// The top-bar chips a user may toggle. Keep in sync with
 /// hud-tui's `bars::top_bar` chip construction.
 pub const CHIP_IDS: [&str; 6] = ["cwd", "branch", "model", "context", "cost", "ledger"];
 pub const CHIP_IDS_LIST: &str = "cwd, branch, model, context, cost, ledger";
@@ -31,12 +33,12 @@ pub struct Profile {
     pub browser: BrowserStyle,
     pub layout: Layout,
     pub panes: Vec<PaneDef>,
-    /// Per-chip visibility in the top bar (REA G1): the id is a chip name
+    /// Per-chip visibility in the top bar: the id is a chip name
     /// (`cwd`, `branch`, `model`, `context`, `cost`, `ledger`) and the value
     /// says whether it shows. Absent ids default to visible.
     #[serde(default)]
     pub chip_visibility: BTreeMap<String, bool>,
-    /// Width-responsive chip bounds (REA G3): a chip with a minimum hides
+    /// Width-responsive chip bounds: a chip with a minimum hides
     /// below that terminal width; a maximum hides above it.
     #[serde(default)]
     pub chip_width_bounds: BTreeMap<String, ChipWidthBounds>,
@@ -278,6 +280,10 @@ pub enum SnapshotKind {
     Scope,
     Evidence,
     Findings,
+    /// The MAGI council state, read from one fixed, code-defined file.
+    Council,
+    /// The ORBIT session's own token flow, from `PaneContext`.
+    Reactor,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -287,7 +293,7 @@ pub enum PaneAction {
     InsertPrompt { text: String },
     OwnerCancel,
 }
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PaneContext {
     pub permission_mode: Option<String>,
@@ -297,6 +303,88 @@ pub struct PaneContext {
     pub cost_microcents: u64,
     pub agents: Vec<PaneAgent>,
     pub controller: bool,
+    /// Session facts for the built-in `reactor` pane. `None` means the
+    /// frontend did not report the value; it is never rendered as zero.
+    pub model: String,
+    pub provider: String,
+    pub phase: Option<String>,
+    pub used_tokens: Option<u64>,
+    pub window_tokens: Option<u64>,
+    pub turns: Option<u64>,
+    pub turn_tools: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// The cost total is unpriced or rests on incomplete usage history.
+    pub cost_uncertain: bool,
+    /// Output rate in thousandths of a token per second: the last finished
+    /// turn (exact), the session peak, and a rough estimate while streaming.
+    pub rate_milli: Option<u64>,
+    pub peak_rate_milli: Option<u64>,
+    pub live_rate_milli: Option<u64>,
+    /// Recent per-turn rates, oldest first (at most 40), for a sparkline.
+    pub rate_history: Vec<u64>,
+    /// The council engine's state, already parsed and bounded by the
+    /// frontend that read it. `None` when no council has published anything
+    /// this session. The council pane draws it as seat cards; a frontend
+    /// that does not understand it falls back to `PaneOutput::text`.
+    pub council: Option<CouncilSnapshot>,
+}
+
+/// What a published council state said, in the terms the panes draw in.
+/// Every list is bounded here, at the point of reading, so a pane can never
+/// be handed an unbounded foreign document.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CouncilSnapshot {
+    /// The engine's phase word (`DELIBERATING`, `VERDICT`, …); empty when
+    /// the state was unreadable.
+    pub phase: String,
+    /// The engine's note for the phase.
+    pub note: String,
+    /// Up to four seats on the bench.
+    pub seats: Vec<CouncilSeat>,
+    /// Seats past the bench: name and model only.
+    pub extra_seats: Vec<CouncilChip>,
+    /// Seat names that carried a majority, when the engine names them.
+    pub winner_seats: Vec<String>,
+    /// The newest finished council's seats, by bench position.
+    pub last_seats: Vec<CouncilSeat>,
+    /// Its conclusion, first line, `FINAL:` removed.
+    pub last_final: String,
+    /// Finished councils in the recent window, and the window's size.
+    pub finished: u32,
+    pub seen: u32,
+    /// When the newest finished council ended, in epoch seconds.
+    pub last_at: Option<f64>,
+    /// When this state was published, in epoch seconds.
+    pub published_at: Option<f64>,
+    /// The newest finished council ended without a single winner.
+    pub last_tie: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CouncilSeat {
+    pub name: String,
+    pub number: String,
+    pub role: String,
+    pub lab: String,
+    pub model: String,
+    /// `resting`, `wiring`, `working`, `answered` or `lost`.
+    pub activity: String,
+    /// `approve`, `reject` or `hold`.
+    pub verdict: Option<String>,
+    pub confidence: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CouncilChip {
+    pub name: String,
+    pub lab: String,
+    /// `answered`, `lost` or `resting`.
+    pub activity: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,6 +524,41 @@ pub struct ProfileCommandResult {
     pub profile: Option<ResolvedProfile>,
 }
 
+/// Panes ORBIT knows without a profile entry. They are selectable in any
+/// layout, yet `Profile::default()` keeps `panes: []`, so stored and fresh
+/// profiles stay byte-identical. A profile pane with the same id wins.
+pub const BUILTIN_PANE_IDS: [&str; 2] = ["council", "reactor"];
+
+/// The definition of a built-in pane, or `None` for any other id.
+pub fn builtin_pane(id: &str) -> Option<PaneDef> {
+    let (title, snapshot, actions) = match id {
+        "council" => (
+            "Council",
+            SnapshotKind::Council,
+            vec![
+                PaneAction::Refresh,
+                PaneAction::FocusConversation,
+                PaneAction::InsertPrompt {
+                    text: "Convene the council on: ".into(),
+                },
+            ],
+        ),
+        "reactor" => (
+            "Reactor",
+            SnapshotKind::Reactor,
+            vec![PaneAction::Refresh, PaneAction::FocusConversation],
+        ),
+        _ => return None,
+    };
+    Some(PaneDef {
+        id: id.into(),
+        title: title.into(),
+        surfaces: vec![Surface::Terminal, Surface::Browser],
+        source: PaneSource::Snapshot { snapshot },
+        actions,
+    })
+}
+
 pub fn valid_id(id: &str) -> bool {
     (1..=48).contains(&id.len())
         && id.as_bytes()[0].is_ascii_lowercase()
@@ -467,6 +590,14 @@ pub fn canonical_token(token: &str) -> Option<&str> {
     })
 }
 impl Profile {
+    /// A pane by id: the profile's own definition first, then the built-ins.
+    pub fn pane_def(&self, id: &str) -> Option<PaneDef> {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == id)
+            .cloned()
+            .or_else(|| builtin_pane(id))
+    }
     pub fn validate(&self) -> Result<(), CustomizationError> {
         let invalid = |field: &str| CustomizationError::Invalid(field.into());
         if self.schema_version != 1 {
@@ -475,7 +606,7 @@ impl Profile {
         if self.name.is_empty() || self.name.len() > 64 || self.name.chars().any(char::is_control) {
             return Err(invalid("name must contain 1..64 printable bytes"));
         }
-        if !["orbit", "midnight", "paper"].contains(&self.theme.as_str()) {
+        if !THEMES.contains(&self.theme.as_str()) {
             return Err(invalid("theme is unsupported"));
         }
         for (key, value) in &self.token_overrides {
@@ -517,7 +648,7 @@ impl Profile {
         if self.panes.len() > 32 {
             return Err(invalid("panes exceeds 32"));
         }
-        // Chip visibility (REA G1): only known chip ids, bounded entries.
+        // Chip visibility: only known chip ids, bounded entries.
         if self.chip_visibility.len() > 16 {
             return Err(invalid("chip_visibility exceeds 16 entries"));
         }
@@ -639,6 +770,8 @@ impl Profile {
             }
             Ok(())
         }
+        // Built-in panes resolve without a profile entry.
+        ids.extend(BUILTIN_PANE_IDS);
         walk(&self.layout.tree, 1, &ids, &mut leaves, &mut conversation)?;
         if conversation != 1 {
             return Err(invalid("layout.tree must retain exactly one conversation"));
@@ -684,6 +817,78 @@ fn unique_tokens<'de, D: serde::Deserializer<'de>>(
         }
     }
     d.deserialize_map(Visitor)
+}
+
+#[cfg(test)]
+mod builtin_pane_tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_is_unchanged_and_builtin_panes_resolve_in_layouts() {
+        let mut profile = Profile::default();
+        assert!(profile.panes.is_empty());
+        assert_eq!(profile.layout, Layout::default());
+        for id in BUILTIN_PANE_IDS {
+            let pane = profile.pane_def(id).expect("built-in pane resolves");
+            assert_eq!(pane.id, id);
+            assert!(valid_id(&pane.id));
+            assert!(pane.actions.len() <= 8);
+        }
+        assert!(profile.pane_def("notes").is_none());
+        profile.layout.tree = LayoutNode::Split {
+            direction: Direction::Right,
+            shares: vec![40, 30, 30],
+            children: vec![
+                LayoutNode::panel(View::Conversation),
+                LayoutNode::Custom {
+                    pane_id: "council".into(),
+                },
+                LayoutNode::Custom {
+                    pane_id: "reactor".into(),
+                },
+            ],
+        };
+        profile
+            .validate()
+            .expect("built-in panes need no profile entry");
+        profile.layout.tree = LayoutNode::Split {
+            direction: Direction::Right,
+            shares: vec![50, 50],
+            children: vec![
+                LayoutNode::panel(View::Conversation),
+                LayoutNode::Custom {
+                    pane_id: "unknown".into(),
+                },
+            ],
+        };
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn a_profile_pane_shadows_the_builtin_of_the_same_id() {
+        let mut profile = Profile::default();
+        profile.panes.push(PaneDef {
+            id: "council".into(),
+            title: "Mine".into(),
+            surfaces: vec![Surface::Terminal],
+            source: PaneSource::Text { text: "own".into() },
+            actions: Vec::new(),
+        });
+        profile.validate().unwrap();
+        assert_eq!(profile.pane_def("council").unwrap().title, "Mine");
+    }
+
+    #[test]
+    fn new_snapshot_kinds_use_their_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&SnapshotKind::Council).unwrap(),
+            "\"council\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotKind::Reactor).unwrap(),
+            "\"reactor\""
+        );
+    }
 }
 
 #[cfg(test)]

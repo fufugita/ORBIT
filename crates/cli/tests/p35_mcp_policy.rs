@@ -240,18 +240,26 @@ fn explicit_ask_dont_ask_mode_is_refused_before_channel() {
     assert_eq!(answer.asked, 0);
     assert_eq!(f.calls(), 0);
 }
+/// A rule that asks still asks in bypass mode, as in Claude Code: bypass
+/// skips the prompts the mode would raise, not the ones the operator wrote.
 #[test]
-fn explicit_ask_existing_bypass_mode_still_runs_once() {
+fn explicit_ask_holds_in_bypass_mode() {
     let f = Fixture::new();
     f.explicit_ask();
-    let mut answer = Answer::new(ApprovalVerdict::Deny);
     let scope = PermissionScope {
         mode: PermissionMode::Bypass,
         ..Default::default()
     };
+    let mut answer = Answer::new(ApprovalVerdict::Deny);
+    let out = f.run(&scope, false, true, &mut AutoGrants::new(), &mut answer);
+    assert_eq!(out["ok"], false, "{out}");
+    assert_eq!(answer.asked, 1);
+    assert_eq!(f.calls(), 0);
+
+    let mut answer = Answer::new(ApprovalVerdict::AllowOnce);
     let out = f.run(&scope, false, true, &mut AutoGrants::new(), &mut answer);
     assert_eq!(out["ok"], true, "{out}");
-    assert_eq!(answer.asked, 0);
+    assert_eq!(answer.asked, 1);
     assert_eq!(f.calls(), 1);
 }
 

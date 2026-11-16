@@ -159,7 +159,7 @@
       "kind": "tool",
       "tool_name": "Bash",
       "call_id": "call-one",
-      "summary": "",
+      "summary": "printf fixture",
       "outcome": "failed",
       "meta": "exit 3"
     },
@@ -167,7 +167,7 @@
       "kind": "tool",
       "tool_name": "Glob",
       "call_id": "call-two",
-      "summary": "",
+      "summary": "*.txt",
       "outcome": "ok",
       "meta": "1 file"
     },

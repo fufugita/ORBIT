@@ -53,7 +53,7 @@ pub use dispatch::{
 };
 pub use turn::{
     DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, MAX_TURN_ACCOUNTING_ATTEMPTS, SpendAllowance,
-    TurnCompletion, TurnEnd, TurnFailure, TurnOptions, run_turn, run_turn_detailed,
+    SubagentTurn, TurnCompletion, TurnEnd, TurnFailure, TurnOptions, run_turn, run_turn_detailed,
 };
 
 use orbit_adapter::types::ChatMessage;
@@ -69,8 +69,12 @@ pub struct TurnReport {
     pub ok: bool,
     pub interrupted: bool,
     pub rounds: u32,
+    /// Earlier tool results dropped from this turn to fit its context budget.
+    pub dropped_tool_results: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Micro-dollars (1,000,000 is $1). The name is historical and is kept
+    /// because saved sessions and the CLI's JSON carry it.
     pub cost_microcents: u64,
     pub final_text: String,
     /// Current-turn deltas, separate from occupancy and historical checkpoints.
@@ -96,14 +100,19 @@ pub trait ToolExecutor {
     /// default ignores it.
     fn begin_turn(&mut self, _config: &TurnConfig) {}
 
-    /// The turn is about to run a round's tools: its cancel token is now
-    /// the current one. An executor that runs cancellable work (Bash)
-    /// points its tool context at the token; the default ignores it.
+    /// The turn (or a nested round of tools) is starting: its cancel token
+    /// is now current, including while lifecycle hooks run. The default
+    /// ignores it.
     fn begin_cancel_scope(&mut self, _token: &orbit_provider_http::CancelToken) {}
 
-    /// The round's tools are done; the previous token (a parent turn's,
-    /// when this was a subagent) is current again.
+    /// The cancellation scope is done; restore its previous token.
     fn end_cancel_scope(&mut self) {}
+
+    /// The handler runner for this invocation's context. A subagent must
+    /// supply its own context rather than using the installed session's.
+    fn hook_handler_runner(&self) -> Option<std::sync::Arc<crate::hooks::HandlerRunner>> {
+        None
+    }
 }
 
 /// One executed tool call: the provider call id + the JSON payload

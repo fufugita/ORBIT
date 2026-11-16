@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "orbit plugin inspect PATH [--format portable|claude|codex|hermes] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin import|install PATH [--scope user|project] [--no-enable] [--format FORMAT] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin list [--json]\norbit plugin status ID [--scope user|project] [--json]\norbit plugin enable|disable|remove ID [--scope user|project] [--revision REV] [--json]\norbit plugin upgrade ID PATH [--scope user|project] [--revision REV] [--format FORMAT] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]";
+const USAGE: &str = "orbit plugin inspect PATH [--format portable|claude|codex|hermes] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin import|install PATH [--scope user|project] [--no-enable] [--format FORMAT] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin install NAME@MARKETPLACE [the import flags]\norbit plugin marketplace add SOURCE | list | update [NAME] | remove NAME [--json]\norbit plugin list [--json]\norbit plugin status ID [--scope user|project] [--json]\norbit plugin enable|disable|remove ID [--scope user|project] [--revision REV] [--json]\norbit plugin upgrade ID PATH [--scope user|project] [--revision REV] [--format FORMAT] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]";
 const WITHHELD: &str = "[configured literal]";
 const MAX_TEXT: usize = 8192;
 const MAX_REPORT: usize = 256 * 1024;
@@ -45,6 +45,9 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
         );
     }
     let operation = words[0];
+    if operation == "marketplace" {
+        return crate::marketplace::command(home, project, &words[1..]);
+    }
     if operation == "list" {
         if words.len() != 1 {
             return Err(usage("plugin list accepts only --json"));
@@ -136,10 +139,22 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
         index += 1;
     }
     let path = path.ok_or_else(|| usage("operation requires a package path"))?;
-    let path = if path.is_absolute() {
-        path
-    } else {
-        project.join(path)
+    // `NAME@MARKETPLACE`: the plugin's directory in a recorded marketplace,
+    // unless a path of that spelling exists. A marketplace holds Claude
+    // Code packages, so that is the format unless one was given.
+    let from_marketplace = importing
+        .then(|| path.to_str().and_then(crate::marketplace::split_reference))
+        .flatten()
+        .filter(|_| !project.join(&path).exists());
+    let path = match from_marketplace {
+        Some((plugin, marketplace)) => {
+            if options.format.is_none() {
+                options.format = Some(PluginFormat::Claude);
+            }
+            crate::marketplace::resolve(home, plugin, marketplace)?
+        }
+        None if path.is_absolute() => path,
+        None => project.join(path),
     };
     if upgrading {
         let id = PluginId {
@@ -752,6 +767,9 @@ fn safe_text(text: &str, literals: &LiteralCatalog, budget: &mut DisplayBudget) 
 /// Render only inspection metadata; package bodies and raw source metadata stay
 /// in the bounded, redacted JSON record rather than being printed as prose.
 pub fn human_report(value: &Value) -> String {
+    if let Some(text) = crate::marketplace::human_report(value) {
+        return text;
+    }
     if value.get("command").and_then(Value::as_str) == Some("plugin help") {
         return format!(
             "{USAGE}\nManage local snapshots without executing package code. Runtime readiness remains unchecked.\n"

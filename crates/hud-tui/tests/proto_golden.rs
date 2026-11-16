@@ -547,8 +547,9 @@ fn typing_a_slash_opens_the_command_list_above_the_composer() {
     assert!(all.contains("↓ more"), "{all}");
     let n = orbit_hud_tui::proto::chrome::COMMANDS.len();
     let scrolled = shot("/", n.saturating_sub(1));
+    let last = orbit_hud_tui::proto::chrome::COMMANDS[n - 1].0;
     assert!(
-        scrolled.contains("/usage") && !scrolled.contains("↓ more"),
+        scrolled.contains(last) && !scrolled.contains("↓ more"),
         "{scrolled}"
     );
 

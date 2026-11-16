@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 mod http;
 mod legacy;
+pub mod oauth;
 
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_PAGES: usize = 32;
@@ -150,6 +151,7 @@ impl McpConfig {
         working_dir: &Path,
         project_trusted: bool,
     ) -> Result<Self, String> {
+        oauth::remember_home(home);
         let mut cfg = Self::default();
         for (path, is_project) in [
             (home.join("mcp.json"), false),
@@ -172,8 +174,155 @@ impl McpConfig {
                 cfg.servers.insert(name, server);
             }
         }
+        // Claude Code's project file, for a trusted project. ORBIT's own
+        // entries win a name clash, and an entry ORBIT cannot use is left
+        // out: this file was written for another program.
+        if project_trusted
+            && let Some(text) = read_small(&working_dir.join(".mcp.json"))
+            && let Ok(servers) = parse_claude_servers(&text)
+        {
+            for (name, server) in servers {
+                if server.validate().is_ok() {
+                    cfg.servers.entry(name).or_insert(server);
+                }
+            }
+        }
+        // `--mcp-config <file>`: one more file in either format, named by
+        // the operator, so every entry must be valid and it overrides.
+        if let Some(extra) = std::env::var_os("ORBIT_MCP_CONFIG").filter(|path| !path.is_empty()) {
+            let path = PathBuf::from(extra);
+            let text = read_small(&path).ok_or_else(|| {
+                format!("read mcp config {}: not a readable file", path.display())
+            })?;
+            let servers = match serde_json::from_str::<McpConfig>(&text) {
+                Ok(own) if !own.servers.is_empty() => own.servers,
+                _ => parse_claude_servers(&text)
+                    .map_err(|e| format!("parse mcp config {}: {e}", path.display()))?,
+            };
+            for (name, server) in servers {
+                server
+                    .validate()
+                    .map_err(|e| format!("mcp server {name}: {e}"))?;
+                cfg.servers.insert(name, server);
+            }
+        }
         Ok(cfg)
     }
+}
+
+fn read_small(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    (meta.is_file() && meta.len() <= 1024 * 1024)
+        .then(|| std::fs::read_to_string(path).ok())
+        .flatten()
+}
+
+/// `${VAR}` and `${VAR:-default}` from the environment, as Claude Code's
+/// `.mcp.json` allows. An unset variable with no default is left as written.
+fn expand_env(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let (name, default) = match after[..end].split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (&after[..end], None),
+        };
+        match (std::env::var(name).ok().filter(|v| !v.is_empty()), default) {
+            (Some(value), _) => out.push_str(&value),
+            (None, Some(default)) => out.push_str(default),
+            (None, None) => out.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The `mcpServers` object of a Claude Code `.mcp.json`: `{command, args,
+/// env}` is a stdio server; `{type: "http" | "sse", url, headers}` a remote
+/// one.
+pub fn parse_claude_servers(text: &str) -> Result<BTreeMap<String, McpServerConfig>, String> {
+    let root: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let servers = root
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("no \"servers\" or \"mcpServers\" object")?;
+    let text_of = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(expand_env)
+    };
+    let map_of = |value: &serde_json::Value, key: &str| -> BTreeMap<String, String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), expand_env(v.as_str()?))))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = BTreeMap::new();
+    for (name, entry) in servers {
+        let kind = entry.get("type").and_then(serde_json::Value::as_str);
+        let transport = match (kind, entry.get("url").is_some()) {
+            (Some("sse"), _) => McpTransport::Sse,
+            (Some("http" | "streamable-http"), _) | (None, true) => McpTransport::StreamableHttp,
+            (Some("stdio") | None, false) => McpTransport::Stdio,
+            // A transport ORBIT does not speak (for example "ws").
+            _ => continue,
+        };
+        let remote = transport != McpTransport::Stdio;
+        out.insert(
+            name.clone(),
+            McpServerConfig {
+                transport,
+                command: if remote {
+                    String::new()
+                } else {
+                    text_of(entry, "command").unwrap_or_default()
+                },
+                args: if remote {
+                    Vec::new()
+                } else {
+                    entry
+                        .get("args")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|args| {
+                            args.iter()
+                                .filter_map(|arg| arg.as_str().map(expand_env))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+                env: if remote {
+                    BTreeMap::new()
+                } else {
+                    map_of(entry, "env")
+                },
+                url: remote.then(|| text_of(entry, "url")).flatten(),
+                headers: if remote {
+                    map_of(entry, "headers")
+                } else {
+                    BTreeMap::new()
+                },
+                enabled: entry.get("disabled") != Some(&serde_json::Value::Bool(true)),
+                tools: None,
+                timeout_ms: default_timeout_ms(),
+                initialize_timeout_ms: default_initialize_timeout_ms(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// One absolute budget for lock waits, initialization, writes and reads.
@@ -183,6 +332,9 @@ pub struct McpCallOptions {
     pub cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// None uses the process's current directory at the start of a pool operation.
     pub working_dir: Option<PathBuf>,
+    /// The server this request is going to, for requests it sends back
+    /// while we wait. Set by the session.
+    pub server: Option<String>,
 }
 
 impl McpCallOptions {
@@ -191,6 +343,7 @@ impl McpCallOptions {
             deadline: Instant::now() + timeout,
             cancel: None,
             working_dir: None,
+            server: None,
         }
     }
 
@@ -228,6 +381,273 @@ impl McpCallOptions {
     }
 }
 
+/// A server's request for input from the operator (`elicitation/create`),
+/// sent while one of our requests to it is open.
+#[derive(Clone)]
+pub struct Elicitation {
+    pub server: String,
+    /// What the server asks, bounded.
+    pub message: String,
+    /// `form`: fields described by `schema`. `url`: the operator is sent to
+    /// `url` and confirms when done.
+    pub mode: String,
+    /// The JSON schema of the fields asked for (`requestedSchema`).
+    pub schema: serde_json::Value,
+    pub url: Option<String>,
+    /// When the wait for an answer ends.
+    pub deadline: Instant,
+    /// True once the request that is waiting has been cancelled.
+    pub cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+/// The operator's answer to an [`Elicitation`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElicitationAnswer {
+    /// The values asked for, as an object.
+    Accept(serde_json::Value),
+    /// The operator said no.
+    Decline,
+    /// The question was dismissed or never answered.
+    Cancel,
+}
+
+impl ElicitationAnswer {
+    fn result(self) -> serde_json::Value {
+        match self {
+            ElicitationAnswer::Accept(content) => {
+                serde_json::json!({"action": "accept", "content": content})
+            }
+            ElicitationAnswer::Decline => serde_json::json!({"action": "decline"}),
+            ElicitationAnswer::Cancel => serde_json::json!({"action": "cancel"}),
+        }
+    }
+}
+
+pub type ElicitationHandler = dyn Fn(&Elicitation) -> ElicitationAnswer + Send + Sync;
+
+static ELICITATION: Mutex<Option<Arc<ElicitationHandler>>> = Mutex::new(None);
+
+/// How long a stdio server's question may wait for the operator. The time
+/// spent answering is not charged to the request that is waiting.
+const ELICITATION_WAIT: Duration = Duration::from_secs(300);
+
+/// Install what answers servers' questions. With one installed, sessions
+/// opened afterwards tell their server that elicitation is supported;
+/// without one the capability is not offered and a question is refused as
+/// an unsupported method. Sessions already open keep what they announced.
+pub fn set_elicitation_handler(handler: Option<Arc<ElicitationHandler>>) {
+    if let Ok(mut slot) = ELICITATION.lock() {
+        *slot = handler;
+    }
+}
+
+fn elicitation_handler() -> Option<Arc<ElicitationHandler>> {
+    ELICITATION.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The reply to a request a server sent us while we wait for its response:
+/// `ping`, an elicitation when a handler is installed, and a refusal for
+/// anything else.
+static WITHHELD_ENV: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Environment variables a stdio server is not to inherit from this
+/// process: the names that hold the model provider's credentials. A server
+/// whose own configuration sets one of them still gets its own value.
+pub fn set_withheld_env(names: Vec<String>) {
+    if let Ok(mut slot) = WITHHELD_ENV.lock() {
+        *slot = names;
+    }
+}
+
+fn withheld_env() -> Vec<String> {
+    WITHHELD_ENV
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// A message a channel server pushed into the session: Claude Code's
+/// `notifications/claude/channel`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelEvent {
+    pub server: String,
+    pub content: String,
+    /// Attributes of the event. Only keys of letters, digits and `_` are
+    /// kept, as in Claude Code.
+    pub meta: BTreeMap<String, String>,
+}
+
+/// Receives channel events. One per process.
+pub type ChannelSink = dyn Fn(ChannelEvent) + Send + Sync;
+
+static CHANNEL_SINK: Mutex<Option<(Vec<String>, Arc<ChannelSink>)>> = Mutex::new(None);
+
+/// Deliver `notifications/claude/channel` from the named servers to `sink`.
+/// A notification from any other server is dropped: a server becomes a
+/// channel because the operator named it, not because it says so. `None`
+/// stops delivery.
+pub fn set_channel_sink(sink: Option<(Vec<String>, Arc<ChannelSink>)>) {
+    if let Ok(mut slot) = CHANNEL_SINK.lock() {
+        *slot = sink;
+    }
+}
+
+const CHANNEL_METHOD: &str = "notifications/claude/channel";
+const PERMISSION_REQUEST_METHOD: &str = "notifications/claude/channel/permission_request";
+const PERMISSION_VERDICT_METHOD: &str = "notifications/claude/channel/permission";
+
+/// A channel's answer to a permission prompt that was relayed to it:
+/// Claude Code's `notifications/claude/channel/permission`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionVerdict {
+    pub server: String,
+    /// The id the request went out with: five letters of `a`-`z` without `l`.
+    pub request_id: String,
+    pub allow: bool,
+}
+
+/// Receives permission verdicts. One per process.
+pub type PermissionSink = dyn Fn(PermissionVerdict) + Send + Sync;
+
+static PERMISSION_SINK: Mutex<Option<(Vec<String>, Arc<PermissionSink>)>> = Mutex::new(None);
+
+/// Deliver permission verdicts from the named servers to `sink`. A verdict
+/// from any other server is dropped. `None` stops delivery.
+pub fn set_permission_sink(sink: Option<(Vec<String>, Arc<PermissionSink>)>) {
+    if let Ok(mut slot) = PERMISSION_SINK.lock() {
+        *slot = sink;
+    }
+}
+
+/// Is `id` shaped like a permission request id?
+pub fn permission_request_id_ok(id: &str) -> bool {
+    id.len() == 5 && id.bytes().all(|b| b.is_ascii_lowercase() && b != b'l')
+}
+
+fn dispatch_permission_verdict(server: &str, params: Option<&serde_json::Value>) {
+    let sink = PERMISSION_SINK.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .filter(|(servers, _)| servers.iter().any(|name| name == server))
+            .map(|(_, sink)| sink.clone())
+    });
+    let Some(sink) = sink else {
+        return;
+    };
+    let text = |key: &str| {
+        params
+            .and_then(|params| params.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    let (Some(request_id), Some(behavior)) = (text("request_id"), text("behavior")) else {
+        return;
+    };
+    let allow = match behavior {
+        "allow" => true,
+        "deny" => false,
+        _ => return,
+    };
+    if !permission_request_id_ok(request_id) {
+        return;
+    }
+    sink(PermissionVerdict {
+        server: server.to_owned(),
+        request_id: request_id.to_owned(),
+        allow,
+    });
+}
+/// How much of a server's `instructions` is kept.
+const MAX_INSTRUCTIONS: usize = 4_000;
+const MAX_CHANNEL_CONTENT: usize = 16 * 1024;
+const MAX_CHANNEL_META: usize = 16;
+
+/// Hand a channel notification to the sink, when `server` is a channel the
+/// operator enabled and the notification has the documented shape.
+pub(crate) fn dispatch_channel(server: &str, method: &str, params: Option<&serde_json::Value>) {
+    if method == PERMISSION_VERDICT_METHOD {
+        return dispatch_permission_verdict(server, params);
+    }
+    if method != CHANNEL_METHOD {
+        return;
+    }
+    let sink = CHANNEL_SINK.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .filter(|(servers, _)| servers.iter().any(|name| name == server))
+            .map(|(_, sink)| sink.clone())
+    });
+    let Some(sink) = sink else {
+        return;
+    };
+    let Some(content) = params
+        .and_then(|params| params.get("content"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let meta = params
+        .and_then(|params| params.get("meta"))
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            !key.is_empty()
+                && key.len() <= 64
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.chars().take(256).collect())))
+        .take(MAX_CHANNEL_META)
+        .collect();
+    sink(ChannelEvent {
+        server: server.to_owned(),
+        content: content.chars().take(MAX_CHANNEL_CONTENT).collect(),
+        meta,
+    });
+}
+
+pub(crate) fn server_request_reply(
+    method: &str,
+    request_id: &serde_json::Value,
+    params: Option<&serde_json::Value>,
+    options: &McpCallOptions,
+) -> serde_json::Value {
+    let handler = (method == "elicitation/create")
+        .then(elicitation_handler)
+        .flatten();
+    match (method, handler) {
+        ("ping", _) => serde_json::json!({"jsonrpc":"2.0", "id":request_id, "result":{}}),
+        (_, Some(handler)) => {
+            let text = |key: &str| {
+                params
+                    .and_then(|params| params.get(key))
+                    .and_then(serde_json::Value::as_str)
+            };
+            let request = Elicitation {
+                server: options.server.clone().unwrap_or_default(),
+                message: text("message").unwrap_or("").chars().take(4_000).collect(),
+                mode: text("mode").unwrap_or("form").to_owned(),
+                schema: params
+                    .and_then(|params| params.get("requestedSchema"))
+                    .filter(|schema| schema.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                url: text("url").map(str::to_owned),
+                deadline: options.deadline,
+                cancelled: options.cancel.clone(),
+            };
+            serde_json::json!({
+                "jsonrpc":"2.0", "id":request_id, "result": handler(&request).result()
+            })
+        }
+        _ => serde_json::json!({
+            "jsonrpc":"2.0", "id":request_id,
+            "error":{"code":-32601,"message":"client method not supported"}
+        }),
+    }
+}
+
+/// How much of a stdio server's standard error is kept (its end).
+#[cfg(unix)]
+const STDERR_TAIL_BYTES: usize = 2048;
+
 /// A live session, retired immediately after transport or protocol failure.
 pub struct McpSession {
     pub server_name: String,
@@ -238,6 +658,15 @@ pub struct McpSession {
     input: Vec<u8>,
     next_id: u64,
     cfg: McpServerConfig,
+    /// What the server said about itself at the handshake (`instructions`).
+    instructions: Option<String>,
+    /// Whether the server declared that it relays permission prompts.
+    relays_permission: bool,
+    /// How the server's process ended, when it ended on its own before
+    /// this session was retired.
+    ended: Option<std::process::ExitStatus>,
+    /// The server closed a pipe itself (not this side retiring it).
+    peer_closed: bool,
 }
 
 enum RemoteTransport {
@@ -316,16 +745,21 @@ impl McpSession {
                     .url
                     .as_deref()
                     .ok_or("mcp remote configuration requires a URL")?;
+                // A stored sign-in supplies the bearer token unless the
+                // configuration brings its own Authorization header. It
+                // never enters the configuration itself.
+                let mut headers = cfg.headers.clone();
+                if !headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("authorization"))
+                    && let Some(token) = oauth::bearer_for(name, url)
+                {
+                    headers.insert("Authorization".into(), format!("Bearer {token}"));
+                }
                 let remote = if cfg.transport == McpTransport::StreamableHttp {
-                    RemoteTransport::Streamable(Box::new(http::HttpTransport::new(
-                        url,
-                        &cfg.headers,
-                    )?))
+                    RemoteTransport::Streamable(Box::new(http::HttpTransport::new(url, &headers)?))
                 } else {
-                    RemoteTransport::Legacy(Box::new(legacy::LegacyTransport::new(
-                        url,
-                        &cfg.headers,
-                    )?))
+                    RemoteTransport::Legacy(Box::new(legacy::LegacyTransport::new(url, &headers)?))
                 };
                 let mut session = Self {
                     server_name: name.into(),
@@ -335,6 +769,10 @@ impl McpSession {
                     stdout: None,
                     input: Vec::new(),
                     next_id: 1,
+                    instructions: None,
+                    relays_permission: false,
+                    ended: None,
+                    peer_closed: false,
                     cfg: cfg.clone(),
                 };
                 session.initialize(&initialize_options)?;
@@ -350,17 +788,51 @@ impl McpSession {
         {
             let cwd = options.effective_cwd()?;
             options.check()?;
-            let mut child = Command::new(&cfg.command)
+            let mut command = Command::new(&cfg.command);
+            // The model provider's credentials are ORBIT's own: a server
+            // does not inherit them. One that needs such a variable gets it
+            // from its own `env` entry, which is applied after.
+            for name in withheld_env() {
+                command.env_remove(name);
+            }
+            let mut child = command
                 .args(&cfg.args)
                 .envs(&cfg.env)
                 .current_dir(cwd)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("spawn mcp server {name}: {e}"))?;
             let stdin = child.stdin.take();
             let stdout = child.stdout.take();
+            // What the server writes to standard error is read and dropped,
+            // keeping only its end: when the server does not come up, its
+            // last line is usually the reason.
+            let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let (stderr_done, stderr_drained) = std::sync::mpsc::channel();
+            if let Some(mut stderr) = child.stderr.take() {
+                let tail = stderr_tail.clone();
+                std::thread::spawn(move || {
+                    let mut bytes = [0_u8; 4096];
+                    loop {
+                        let read = match stderr.read(&mut bytes) {
+                            Ok(0) => break,
+                            Ok(read) => read,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(_) => break,
+                        };
+                        if let Ok(mut tail) = tail.lock() {
+                            tail.extend_from_slice(&bytes[..read]);
+                            let extra = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                            tail.drain(..extra);
+                        }
+                    }
+                    let _ = stderr_done.send(());
+                });
+            }
             let mut session = Self {
                 server_name: name.into(),
                 remote: None,
@@ -369,6 +841,10 @@ impl McpSession {
                 stdout,
                 input: Vec::new(),
                 next_id: 1,
+                instructions: None,
+                relays_permission: false,
+                ended: None,
+                peer_closed: false,
                 cfg: cfg.clone(),
             };
             set_nonblocking(
@@ -385,20 +861,119 @@ impl McpSession {
                     .ok_or("mcp has no stdout")?
                     .as_raw_fd(),
             )?;
-            session.initialize(&initialize_options)?;
+            if let Err(error) = session.initialize(&initialize_options) {
+                return Err(session.startup_failure(error, &stderr_tail, &stderr_drained));
+            }
             Ok(session)
         }
     }
 
+    /// Why a server that was started did not answer its handshake: the
+    /// handshake's own error, and when the process has already ended, how
+    /// it ended and the last thing it wrote to standard error.
+    #[cfg(unix)]
+    fn startup_failure(
+        &self,
+        error: String,
+        stderr_tail: &Mutex<Vec<u8>>,
+        stderr_drained: &std::sync::mpsc::Receiver<()>,
+    ) -> String {
+        if matches!(
+            error.as_str(),
+            "mcp request cancelled" | "mcp request timed out"
+        ) {
+            return error;
+        }
+        let Some(status) = self.ended else {
+            return error;
+        };
+        // Wait for the final stderr bytes, but never join an unbounded reader:
+        // a descendant may retain the pipe after the owned process exits.
+        let _ = stderr_drained.recv_timeout(Duration::from_millis(100));
+        let said = stderr_tail
+            .lock()
+            .map(|tail| String::from_utf8_lossy(&tail).into_owned())
+            .unwrap_or_default();
+        let last: String = said
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(160)
+            .collect();
+        if last.is_empty() {
+            format!("its process ended before answering ({status})")
+        } else {
+            format!("its process ended before answering ({status}): {last}")
+        }
+    }
+
+    /// The `instructions` the server gave at its handshake, if any.
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
+    }
+
+    /// Did the server declare, at its handshake, that it can relay
+    /// permission prompts (`experimental["claude/channel/permission"]`)?
+    pub fn relays_permission(&self) -> bool {
+        self.relays_permission
+    }
+
+    /// Send a permission prompt to a server that relays them. Returns
+    /// whether it was sent: a server that did not declare the capability
+    /// is sent nothing.
+    pub fn relay_permission_request(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        description: &str,
+        input_preview: &str,
+    ) -> Result<bool, String> {
+        if !self.relays_permission || self.remote.is_some() {
+            return Ok(false);
+        }
+        let options = self.cfg.options();
+        self.notify(
+            PERMISSION_REQUEST_METHOD,
+            serde_json::json!({
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "description": description,
+                "input_preview": input_preview,
+            }),
+            &options,
+        )?;
+        Ok(true)
+    }
+
     fn initialize(&mut self, options: &McpCallOptions) -> Result<(), String> {
-        self.request_with_options(
+        let answer = self.request_with_options(
             "initialize",
             serde_json::json!({
-                "protocolVersion":"2025-06-18", "capabilities":{},
+                "protocolVersion":"2025-06-18",
+                "capabilities": if elicitation_handler().is_some() {
+                    serde_json::json!({"elicitation":{}})
+                } else {
+                    serde_json::json!({})
+                },
                 "clientInfo":{"name":"orbit","version":env!("CARGO_PKG_VERSION")}
             }),
             options,
         )?;
+        self.instructions = answer
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(MAX_INSTRUCTIONS).collect());
+        // An object declares it; `false` or nothing does not.
+        self.relays_permission = answer
+            .pointer("/capabilities/experimental")
+            .and_then(|experimental| experimental.get("claude/channel/permission"))
+            .is_some_and(serde_json::Value::is_object);
         if let Err(error) = self.notify("notifications/initialized", serde_json::json!({}), options)
         {
             self.retire();
@@ -438,13 +1013,15 @@ impl McpSession {
         {
             return Err("mcp transport is retired".into());
         }
-        let options = options.bounded(self.cfg.timeout_ms);
+        let mut options = options.bounded(self.cfg.timeout_ms);
+        options.server = Some(self.server_name.clone());
+        let options = &options;
         let id = self.next_id;
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or("mcp request id exhausted")?;
-        let result = self.exchange(id, method, params, &options);
+        let result = self.exchange(id, method, params, options);
         match result {
             Ok(value) => Ok(value),
             Err((error, fatal)) => {
@@ -507,6 +1084,10 @@ impl McpSession {
         id: u64,
         options: &McpCallOptions,
     ) -> Result<serde_json::Value, (String, bool)> {
+        // The time an operator takes to answer a server's question is given
+        // back to the request that is waiting for it.
+        let mut extended = options.clone();
+        let options = &mut extended;
         loop {
             let line = self.read_frame(options).map_err(|error| (error, true))?;
             options.check().map_err(|error| (error, true))?;
@@ -529,16 +1110,26 @@ impl McpSession {
                     if !(request_id.is_string() || request_id.is_i64() || request_id.is_u64()) {
                         return Err(("mcp server request has invalid id".into(), true));
                     }
-                    let response = if method.as_str() == Some("ping") {
-                        serde_json::json!({"jsonrpc":"2.0", "id":request_id, "result":{}})
-                    } else {
-                        serde_json::json!({
-                            "jsonrpc":"2.0", "id":request_id,
-                            "error":{"code":-32601,"message":"client method not supported"}
-                        })
-                    };
+                    let asked = Instant::now();
+                    let mut waiting = options.clone();
+                    waiting.deadline = asked + ELICITATION_WAIT;
+                    let response = server_request_reply(
+                        method.as_str().unwrap_or(""),
+                        request_id,
+                        object.get("params"),
+                        &waiting,
+                    );
+                    options.deadline += asked.elapsed();
                     self.write_frame(&response, options)
                         .map_err(|error| (error, true))?;
+                } else {
+                    // A notification. The only kind acted on is a channel
+                    // event, and only from a server the operator enabled.
+                    dispatch_channel(
+                        &self.server_name,
+                        method.as_str().unwrap_or(""),
+                        object.get("params"),
+                    );
                 }
                 continue;
             }
@@ -597,7 +1188,10 @@ impl McpSession {
         while written < bytes.len() {
             options.check()?;
             match stdin.write(&bytes[written..]) {
-                Ok(0) => return Err("mcp server closed stdin".into()),
+                Ok(0) => {
+                    self.peer_closed = true;
+                    return Err("mcp server closed stdin".into());
+                }
                 Ok(n) => {
                     *bytes_sent = true;
                     written += n;
@@ -606,7 +1200,10 @@ impl McpSession {
                     wait_writable(stdin, options)?
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("mcp write: {e}")),
+                Err(e) => {
+                    self.peer_closed |= e.kind() == std::io::ErrorKind::BrokenPipe;
+                    return Err(format!("mcp write: {e}"));
+                }
             }
         }
         loop {
@@ -617,7 +1214,10 @@ impl McpSession {
                     wait_writable(stdin, options)?
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("mcp flush: {e}")),
+                Err(e) => {
+                    self.peer_closed |= e.kind() == std::io::ErrorKind::BrokenPipe;
+                    return Err(format!("mcp flush: {e}"));
+                }
             }
         }
     }
@@ -639,13 +1239,73 @@ impl McpSession {
             let stdout = self.stdout.as_mut().ok_or("mcp transport is retired")?;
             let mut bytes = [0_u8; 8192];
             match stdout.read(&mut bytes) {
-                Ok(0) => return Err("mcp server closed stdout".into()),
+                Ok(0) => {
+                    self.peer_closed = true;
+                    return Err("mcp server closed stdout".into());
+                }
                 Ok(n) => self.input.extend_from_slice(&bytes[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     wait_readable(stdout, options)?
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(format!("mcp read: {e}")),
+            }
+        }
+    }
+
+    /// Listen for what a stdio server sends while no request is waiting:
+    /// channel events are delivered, a server's own request (a ping, a
+    /// question) is answered, anything else is dropped. Returns after
+    /// `wait` with nothing more to read. An error means the session is no
+    /// longer usable.
+    pub fn poll_channel(&mut self, wait: Duration) -> Result<(), String> {
+        if self.remote.is_some() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') else {
+                if self.input.len() > MAX_FRAME_BYTES {
+                    return Err("mcp input frame exceeds 1 MiB".into());
+                }
+                let stdout = self.stdout.as_mut().ok_or("mcp transport is retired")?;
+                let mut bytes = [0_u8; 8192];
+                match stdout.read(&mut bytes) {
+                    Ok(0) => {
+                        self.peer_closed = true;
+                        return Err("mcp server closed stdout".into());
+                    }
+                    Ok(n) => self.input.extend_from_slice(&bytes[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(format!("mcp read: {e}")),
+                }
+                continue;
+            };
+            let mut frame: Vec<_> = self.input.drain(..=newline).collect();
+            frame.pop();
+            let Ok(serde_json::Value::Object(object)) =
+                serde_json::from_slice::<serde_json::Value>(&frame)
+            else {
+                return Err("malformed mcp frame".into());
+            };
+            let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
+                // A response nobody is waiting for.
+                continue;
+            };
+            match object.get("id") {
+                Some(request_id) => {
+                    let options = self.cfg.options();
+                    let response =
+                        server_request_reply(method, request_id, object.get("params"), &options);
+                    self.write_frame(&response, &options)?;
+                }
+                None => dispatch_channel(&self.server_name, method, object.get("params")),
             }
         }
     }
@@ -830,14 +1490,32 @@ impl McpSession {
         if let Some(mut remote) = self.remote.take() {
             remote.retire();
         }
+        if let Some(mut child) = self.child.take() {
+            // Observe natural exit before closing our pipes or killing the
+            // process. After peer closure only, give it a bounded moment to
+            // finish; live timeouts and cancellations get no extra grace.
+            for attempt in 0..if self.peer_closed { 11 } else { 1 } {
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        self.ended = Some(status);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+            // Kill only this Child, never a process group or a text-parsed PID.
+            if self.ended.is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
         self.stdin.take();
         self.stdout.take();
         self.input.clear();
-        if let Some(mut child) = self.child.take() {
-            // Kill only this Child, never a process group or a text-parsed PID.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
@@ -1017,6 +1695,84 @@ impl McpPool {
     pub fn get(&self, name: &str, cfg: &McpServerConfig) -> Result<(), String> {
         self.get_with_options(name, cfg, &cfg.options())
     }
+
+    /// What each running server said about itself at its handshake
+    /// (`instructions`), by server name, in name order. A server that is
+    /// busy with a call right now is left out rather than waited for.
+    pub fn instructions(&self) -> Vec<(String, String)> {
+        let Some(mutex) = self.sessions.get() else {
+            return Vec::new();
+        };
+        let slots: Vec<(String, Arc<Mutex<ServerSlot>>)> = match mutex.lock() {
+            Ok(map) => map
+                .iter()
+                .map(|(name, slot)| (name.clone(), slot.clone()))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        let mut said: Vec<(String, String)> = slots
+            .into_iter()
+            .filter_map(|(name, slot)| {
+                let entry = slot.try_lock().ok()?;
+                let text = entry.session.as_ref()?.instructions()?.trim().to_owned();
+                (!text.is_empty()).then_some((name, text))
+            })
+            .collect();
+        said.sort();
+        said
+    }
+
+    /// Listen on a channel server for `wait`, starting it when it is not
+    /// running (see [`McpSession::poll_channel`]). Calls to the same server
+    /// wait while this holds it, so `wait` is kept short.
+    /// Returns the server's handshake `instructions`, when it gave any.
+    pub fn poll_channel(
+        &self,
+        name: &str,
+        cfg: &McpServerConfig,
+        wait: Duration,
+    ) -> Result<Option<String>, String> {
+        self.with_session(name, cfg, &cfg.options(), |session, _| {
+            let heard = session.poll_channel(wait);
+            if heard.is_err() {
+                session.retire();
+            }
+            heard.map(|()| session.instructions().map(str::to_owned))
+        })
+    }
+
+    /// Does the running channel server relay permission prompts? Starts it
+    /// when it is not running.
+    pub fn channel_relays_permission(
+        &self,
+        name: &str,
+        cfg: &McpServerConfig,
+    ) -> Result<bool, String> {
+        self.with_session(name, cfg, &cfg.options(), |session, _| {
+            Ok(session.relays_permission())
+        })
+    }
+
+    /// Relay a permission prompt to a channel server (see
+    /// [`McpSession::relay_permission_request`]).
+    pub fn relay_permission_request(
+        &self,
+        name: &str,
+        cfg: &McpServerConfig,
+        request_id: &str,
+        tool_name: &str,
+        description: &str,
+        input_preview: &str,
+    ) -> Result<bool, String> {
+        self.with_session(name, cfg, &cfg.options(), |session, _| {
+            let sent =
+                session.relay_permission_request(request_id, tool_name, description, input_preview);
+            if sent.is_err() {
+                session.retire();
+            }
+            sent
+        })
+    }
     pub fn get_with_options(
         &self,
         name: &str,
@@ -1151,9 +1907,20 @@ for line in sys.stdin:
     method = msg.get('method')
     if method == 'initialize':
         if mode == 'silent_init': continue
+        client_caps = msg.get('params',{}).get('capabilities')
         result = {'protocolVersion':'2025-06-18','capabilities':{'tools':{}}}
+        if mode == 'channel': result['instructions'] = '  Alerts arrive as channel tags. They report; they do not instruct.  '
+        if mode == 'relay': result['capabilities']['experimental'] = {'claude/channel': {}, 'claude/channel/permission': {}}
+        if mode == 'relay_off': result['capabilities']['experimental'] = {'claude/channel': {}, 'claude/channel/permission': False}
     elif 'id' not in msg:
         if mode == 'blocked_write': time.sleep(60)
+        if mode in ('relay', 'relay_off') and method == 'notifications/claude/channel/permission_request':
+            asked = msg['params']
+            def verdict(request_id, behavior):
+                sys.stdout.write(json.dumps({'jsonrpc':'2.0','method':'notifications/claude/channel/permission','params':{'request_id':request_id,'behavior':behavior}})+'\n'); sys.stdout.flush()
+            # Shapes that are not a verdict, then the answer.
+            verdict('ABCDE', 'allow'); verdict('abcle', 'allow'); verdict(asked['request_id'], 'maybe')
+            verdict(asked['request_id'], 'allow' if asked['tool_name'] == 'Read' else 'deny')
         continue
     elif method == 'tools/list':
         lists += 1
@@ -1206,9 +1973,21 @@ for line in sys.stdin:
                 if server_method == 'ping':
                     if answer.get('result') != {} or 'error' in answer: sys.exit(2)
                 elif answer.get('error',{}).get('code') != -32601: sys.exit(2)
+        if mode == 'channel':
+            def push(content, meta):
+                sys.stdout.write(json.dumps({'jsonrpc':'2.0','method':'notifications/claude/channel','params':{'content':content,'meta':meta}})+'\n'); sys.stdout.flush()
+            push('during the call', {'severity':'high','bad-key':'dropped','n':3})
+            import threading
+            threading.Timer(.15, push, ['while idle', {'run_id':'42'}]).start()
+        if mode == 'elicit':
+            sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':'ask-1','method':'elicitation/create','params':{
+                'message':'Which branch?','requestedSchema':{'type':'object','properties':{'branch':{'type':'string'}},'required':['branch']}}})+'\n'); sys.stdout.flush()
+            answer = json.loads(sys.stdin.readline())
+            result = {'content':[{'type':'text','text':json.dumps({'answer':answer,'caps':client_caps}, sort_keys=True)}]}
+            sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}) + '\n'); sys.stdout.flush(); continue
         if mode == 'rpc_error' and calls == 1:
             sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32000,'message':'fixture failure'}})+'\n'); sys.stdout.flush(); continue
-        result = {'content':[{'type':'text','text':'hello from mcp'}], 'pid':os.getpid(), 'cwd':os.getcwd(), 'arguments':msg.get('params',{}).get('arguments')}
+        result = {'content':[{'type':'text','text':'hello from mcp'}], 'pid':os.getpid(), 'cwd':os.getcwd(), 'arguments':msg.get('params',{}).get('arguments'), 'home':os.environ.get('HOME')}
     sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}) + '\n')
     sys.stdout.flush()
 "#;
@@ -1265,6 +2044,226 @@ for line in sys.stdin:
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_servers_question_reaches_the_handler_and_its_answer_goes_back() {
+        // The handler is one per process: this is the only test that sets it.
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let record = asked.clone();
+        set_elicitation_handler(Some(Arc::new(move |request: &Elicitation| {
+            record.lock().unwrap().push((
+                request.server.clone(),
+                request.message.clone(),
+                request.mode.clone(),
+                request.schema["required"][0].as_str().map(str::to_owned),
+            ));
+            // Longer than the fixture's whole request budget (2 s): the
+            // time spent answering is given back to the waiting call.
+            std::thread::sleep(Duration::from_millis(2_300));
+            ElicitationAnswer::Accept(serde_json::json!({"branch": "main"}))
+        })));
+        let fixture = Fixture::new("elicit");
+        let mut session = McpSession::spawn("forge", &fixture.cfg).unwrap();
+        let result = session.call_tool("echo", serde_json::json!({})).unwrap();
+        let text: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            text["answer"],
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": "ask-1",
+                "result": {"action": "accept", "content": {"branch": "main"}}
+            })
+        );
+        assert_eq!(text["caps"], serde_json::json!({"elicitation": {}}));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [(
+                "forge".to_owned(),
+                "Which branch?".to_owned(),
+                "form".to_owned(),
+                Some("branch".to_owned())
+            )]
+        );
+        // Declined and dismissed answers have their own shapes.
+        assert_eq!(
+            ElicitationAnswer::Decline.result(),
+            serde_json::json!({"action": "decline"})
+        );
+        assert_eq!(
+            ElicitationAnswer::Cancel.result(),
+            serde_json::json!({"action": "cancel"})
+        );
+        set_elicitation_handler(None);
+        // Without a handler the capability is not offered and the question
+        // is refused as an unsupported method.
+        let fixture = Fixture::new("elicit");
+        let mut session = McpSession::spawn("forge", &fixture.cfg).unwrap();
+        let result = session.call_tool("echo", serde_json::json!({})).unwrap();
+        let text: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["answer"]["error"]["code"], -32601);
+        assert_eq!(text["caps"], serde_json::json!({}));
+    }
+
+    /// A stdio server does not inherit a variable that holds the provider's
+    /// credentials, unless its own configuration sets it.
+    #[test]
+    fn a_withheld_variable_is_not_inherited_unless_the_server_sets_it() {
+        // `HOME` stands in for a credential variable: it is set in this
+        // process, and the fixture runs without it. The list is the
+        // process's: this is the only test that sets it.
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "the test needs HOME set"
+        );
+        let fixture = Fixture::new("ok");
+        let mut session = McpSession::spawn("plain", &fixture.cfg).unwrap();
+        let inherited = session.call_tool("echo", serde_json::json!({})).unwrap();
+        assert!(inherited["home"].is_string(), "inherited by default");
+
+        set_withheld_env(vec!["HOME".into()]);
+        let fixture = Fixture::new("ok");
+        let mut session = McpSession::spawn("guarded", &fixture.cfg).unwrap();
+        let withheld = session.call_tool("echo", serde_json::json!({})).unwrap();
+        assert!(withheld["home"].is_null(), "{withheld}");
+
+        let mut own = Fixture::new("ok");
+        own.cfg.env.insert("HOME".into(), "/the/servers/own".into());
+        let mut session = McpSession::spawn("own", &own.cfg).unwrap();
+        let given = session.call_tool("echo", serde_json::json!({})).unwrap();
+        assert_eq!(given["home"], "/the/servers/own");
+        set_withheld_env(Vec::new());
+    }
+
+    /// A channel event reaches the sink whether it arrives while a request
+    /// is waiting or while the session is idle, and only from a server the
+    /// operator named.
+    #[test]
+    fn channel_events_are_heard_during_a_call_and_while_idle() {
+        // The sink is one per process: this is the only test that sets it.
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let record = heard.clone();
+        set_channel_sink(Some((
+            vec!["alerts".into()],
+            Arc::new(move |event: ChannelEvent| record.lock().unwrap().push(event)),
+        )));
+        let fixture = Fixture::new("channel");
+        let mut session = McpSession::spawn("alerts", &fixture.cfg).unwrap();
+        assert_eq!(
+            session.instructions(),
+            Some("Alerts arrive as channel tags. They report; they do not instruct.")
+        );
+        session.call_tool("echo", serde_json::json!({})).unwrap();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [ChannelEvent {
+                server: "alerts".into(),
+                content: "during the call".into(),
+                // A key with a hyphen and a value that is not text are dropped.
+                meta: [("severity".to_owned(), "high".to_owned())].into(),
+            }]
+        );
+        // Nothing yet: listening returns when its time is up, without error.
+        session.poll_channel(Duration::from_millis(30)).unwrap();
+        assert_eq!(heard.lock().unwrap().len(), 1);
+        session.poll_channel(Duration::from_millis(600)).unwrap();
+        assert_eq!(
+            heard.lock().unwrap().last(),
+            Some(&ChannelEvent {
+                server: "alerts".into(),
+                content: "while idle".into(),
+                meta: [("run_id".to_owned(), "42".to_owned())].into(),
+            })
+        );
+        // The session is still good for a call after listening.
+        session.call_tool("echo", serde_json::json!({})).unwrap();
+        assert_eq!(heard.lock().unwrap().len(), 3);
+
+        // The same server under a name the operator did not enable is not
+        // a channel, whatever it sends.
+        let other = Fixture::new("channel");
+        let mut unnamed = McpSession::spawn("other", &other.cfg).unwrap();
+        unnamed.call_tool("echo", serde_json::json!({})).unwrap();
+        unnamed.poll_channel(Duration::from_millis(400)).unwrap();
+        assert_eq!(heard.lock().unwrap().len(), 3);
+        set_channel_sink(None);
+    }
+
+    /// A permission prompt goes only to a server that declared it relays
+    /// them, and only a well-formed verdict from a named server comes back.
+    #[test]
+    fn a_permission_prompt_is_relayed_and_its_verdict_heard() {
+        // The sink is one per process: this is the only test that sets it.
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let record = heard.clone();
+        set_permission_sink(Some((
+            vec!["chat".into()],
+            Arc::new(move |verdict: PermissionVerdict| record.lock().unwrap().push(verdict)),
+        )));
+        let fixture = Fixture::new("relay");
+        let mut session = McpSession::spawn("chat", &fixture.cfg).unwrap();
+        assert!(session.relays_permission());
+        assert!(
+            session
+                .relay_permission_request("abcde", "Read", "Read a file", "{\"path\":\"a\"}")
+                .unwrap()
+        );
+        session.poll_channel(Duration::from_millis(500)).unwrap();
+        assert!(
+            session
+                .relay_permission_request("fghij", "Bash", "Run shell command", "{}")
+                .unwrap()
+        );
+        session.poll_channel(Duration::from_millis(500)).unwrap();
+        let verdict = |request_id: &str, allow| PermissionVerdict {
+            server: "chat".into(),
+            request_id: request_id.into(),
+            allow,
+        };
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [verdict("abcde", true), verdict("fghij", false)]
+        );
+        let asked = fixture
+            .events()
+            .into_iter()
+            .find(|e| e["msg"]["method"] == "notifications/claude/channel/permission_request")
+            .unwrap();
+        assert_eq!(
+            asked["msg"]["params"],
+            serde_json::json!({
+                "request_id": "abcde",
+                "tool_name": "Read",
+                "description": "Read a file",
+                "input_preview": "{\"path\":\"a\"}",
+            })
+        );
+
+        // `false` is not a declaration: nothing is sent.
+        let off = Fixture::new("relay_off");
+        let mut silent = McpSession::spawn("chat", &off.cfg).unwrap();
+        assert!(!silent.relays_permission());
+        assert!(
+            !silent
+                .relay_permission_request("abcde", "Read", "", "")
+                .unwrap()
+        );
+
+        // The same server under a name that was not enabled is not heard.
+        let other = Fixture::new("relay");
+        let mut unnamed = McpSession::spawn("other", &other.cfg).unwrap();
+        unnamed
+            .relay_permission_request("abcde", "Read", "", "")
+            .unwrap();
+        unnamed.poll_channel(Duration::from_millis(400)).unwrap();
+        assert_eq!(heard.lock().unwrap().len(), 2);
+        set_permission_sink(None);
+
+        assert!(permission_request_id_ok("abcde"));
+        for bad in ["abcd", "abcdef", "abcle", "ABCDE", "abc1e", "abcdé"] {
+            assert!(!permission_request_id_ok(bad), "{bad}");
         }
     }
 
@@ -1937,5 +2936,211 @@ for line in sys.stdin:
                 .iter()
                 .any(|e| e["msg"]["method"] == "tools/call")
         );
+    }
+
+    #[test]
+    fn claude_mcp_json_entries_become_server_configs() {
+        // SAFETY-free: a name no other test reads.
+        let servers = parse_claude_servers(
+            r#"{"mcpServers": {
+                "files": {"command": "npx", "args": ["-y", "server-fs", "${ORBIT_TEST_UNSET_DIR:-/tmp}"], "env": {"LEVEL": "debug"}},
+                "docs": {"type": "http", "url": "https://mcp.example.com/mcp", "headers": {"X-Key": "${ORBIT_TEST_UNSET_KEY}"}},
+                "events": {"type": "sse", "url": "https://mcp.example.com/sse"},
+                "bare": {"url": "https://mcp.example.com/bare"},
+                "socket": {"type": "ws", "url": "wss://mcp.example.com"},
+                "off": {"command": "x", "disabled": true}
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            servers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["bare", "docs", "events", "files", "off"]
+        );
+        let files = &servers["files"];
+        assert_eq!(files.transport, McpTransport::Stdio);
+        assert_eq!(files.args, ["-y", "server-fs", "/tmp"]);
+        assert_eq!(files.env["LEVEL"], "debug");
+        assert!(files.validate().is_ok());
+        let docs = &servers["docs"];
+        assert_eq!(docs.transport, McpTransport::StreamableHttp);
+        assert_eq!(
+            docs.headers["X-Key"], "${ORBIT_TEST_UNSET_KEY}",
+            "unset stays as written"
+        );
+        assert!(docs.validate().is_ok());
+        assert_eq!(servers["events"].transport, McpTransport::Sse);
+        assert_eq!(servers["bare"].transport, McpTransport::StreamableHttp);
+        assert!(!servers["off"].enabled);
+        assert!(parse_claude_servers("{}").is_err());
+    }
+
+    #[test]
+    fn a_trusted_project_mcp_json_is_merged_under_orbits_own_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "orbit-mcp-compat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let (home, project) = (root.join("home"), root.join("project"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home.join("mcp.json"),
+            r#"{"servers": {"files": {"command": "orbit-fs"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".mcp.json"),
+            r#"{"mcpServers": {"files": {"command": "claude-fs"}, "git": {"command": "git-mcp"}, "broken": {"type": "http"}}}"#,
+        )
+        .unwrap();
+        let trusted = McpConfig::try_load_at(&home, &project, true).unwrap();
+        assert_eq!(trusted.servers["files"].command, "orbit-fs");
+        assert_eq!(trusted.servers["git"].command, "git-mcp");
+        assert!(!trusted.servers.contains_key("broken"));
+        let untrusted = McpConfig::try_load_at(&home, &project, false).unwrap();
+        assert_eq!(untrusted.servers.len(), 1);
+    }
+
+    fn uninitialized_stdio_session(
+        cfg: McpServerConfig,
+    ) -> (McpSession, std::process::ChildStderr) {
+        let mut child = Command::new(&cfg.command)
+            .args(&cfg.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let session = McpSession {
+            server_name: "handshake-fixture".into(),
+            remote: None,
+            child: Some(child),
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            input: Vec::new(),
+            next_id: 1,
+            cfg,
+            instructions: None,
+            relays_permission: false,
+            ended: None,
+            peer_closed: false,
+        };
+        set_nonblocking(session.stdin.as_ref().unwrap().as_raw_fd()).unwrap();
+        set_nonblocking(session.stdout.as_ref().unwrap().as_raw_fd()).unwrap();
+        (session, stderr)
+    }
+
+    fn exited_handshake_session() -> (McpSession, Mutex<Vec<u8>>) {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"command": "/bin/sh", "args": ["-c", "echo first >&2; echo no such module >&2; exit 3"]}"#,
+        )
+        .unwrap();
+        let (mut session, mut stderr) = uninitialized_stdio_session(cfg);
+        // Force the write/exit ordering: no pipe reader remains when the
+        // handshake starts. Child caches the exit status for retirement.
+        assert_eq!(
+            session.child.as_mut().unwrap().wait().unwrap().code(),
+            Some(3)
+        );
+        let mut tail = Vec::new();
+        stderr.read_to_end(&mut tail).unwrap();
+        (session, Mutex::new(tail))
+    }
+
+    #[test]
+    fn a_server_that_exits_before_the_first_write_says_how_and_why() {
+        let (mut session, tail) = exited_handshake_session();
+        let error = session.initialize(&options(1000)).unwrap_err();
+        assert!(error.contains("Broken pipe"), "{error}");
+        let (done, drained) = std::sync::mpsc::channel();
+        done.send(()).unwrap();
+        let error = session.startup_failure(error, &tail, &drained);
+        assert!(error.contains("ended before answering"), "{error}");
+        assert!(error.contains("exit status: 3"), "{error}");
+        assert!(error.ends_with("no such module"), "{error}");
+    }
+
+    #[test]
+    fn a_server_that_exits_after_the_first_write_says_how_and_why() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"command": "/bin/sh", "args": ["-c", "IFS= read -r request; echo first >&2; echo no such module >&2; exit 3"]}"#,
+        )
+        .unwrap();
+        let error = McpSession::spawn("gone-after-write", &cfg).err().unwrap();
+        assert!(error.contains("ended before answering"), "{error}");
+        assert!(error.contains("exit status: 3"), "{error}");
+        assert!(error.ends_with("no such module"), "{error}");
+    }
+
+    #[test]
+    fn startup_exit_diagnostics_preserve_cancellation_and_timeout() {
+        for cancelled in [false, true] {
+            let (mut session, tail) = exited_handshake_session();
+            let opts = if cancelled {
+                options(1000).with_cancel(Arc::new(|| true))
+            } else {
+                options(0)
+            };
+            let expected = if cancelled {
+                "mcp request cancelled"
+            } else {
+                "mcp request timed out"
+            };
+            let error = session.initialize(&opts).unwrap_err();
+            assert_eq!(session.ended.unwrap().code(), Some(3));
+            let (_done, drained) = std::sync::mpsc::channel();
+            assert_eq!(session.startup_failure(error, &tail, &drained), expected);
+        }
+    }
+
+    #[test]
+    fn startup_stderr_drain_wait_is_bounded() {
+        let (mut session, tail) = exited_handshake_session();
+        let error = session.initialize(&options(1000)).unwrap_err();
+        // Model a descendant retaining stderr: the drain signal stays open
+        // after the owned child exits, but startup diagnostics still return.
+        let (_done, drained) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let error = session.startup_failure(error, &tail, &drained);
+        assert!(error.ends_with("no such module"), "{error}");
+        assert_quick(start);
+    }
+
+    #[test]
+    fn a_live_server_with_closed_stdin_is_reaped_without_a_false_exit_diagnostic() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"command": "python3", "args": ["-c", "import os, time; os.close(0); print('closed', flush=True); time.sleep(60)"]}"#,
+        )
+        .unwrap();
+        let (mut session, _stderr) = uninitialized_stdio_session(cfg);
+        assert_eq!(session.read_frame(&options(1000)).unwrap(), b"closed");
+        let start = Instant::now();
+        let error = session.initialize(&options(1000)).unwrap_err();
+        assert!(session.ended.is_none());
+        assert!(session.child.is_none());
+        assert!(!session.is_alive());
+        let (_done, drained) = std::sync::mpsc::channel();
+        let error = session.startup_failure(error, &Mutex::new(Vec::new()), &drained);
+        assert!(error.contains("Broken pipe"), "{error}");
+        assert_quick(start);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_ends_at_once_says_how_and_why() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"command": "/bin/sh", "args": ["-c", "echo first >&2; echo no such module >&2; exit 3"]}"#,
+        )
+        .unwrap();
+        let error = McpSession::spawn("gone", &cfg).err().unwrap();
+        assert!(error.contains("ended before answering"), "{error}");
+        assert!(error.contains("exit status: 3"), "{error}");
+        assert!(error.ends_with("no such module"), "{error}");
     }
 }

@@ -17,10 +17,15 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - deny.toml
       - rust-toolchain.toml
       - crates/**
       - packaging/npm/**
-      - scripts/package_install_bundle.py
+      - scripts/**
+      - docs/**
+      - README.md
+      - install.sh
+      - .github/workflows/ci.yml
       - .github/workflows/distribution.yml
 
 permissions:
@@ -58,6 +63,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: release test environment
+        run: python3 -B scripts/release_preflight.py
       - uses: Swatinem/rust-cache@v2
         with:
           key: distribution-${{ matrix.target }}
@@ -67,10 +77,17 @@ jobs:
         run: |
           target/${{ matrix.target }}/release/orbit --version
           target/${{ matrix.target }}/release/orbit --help >/dev/null
+      - name: Verify installed release and documented commands
+        # This job already has its own container PID namespace. The fixture
+        # installs only under a disposable directory and uses local providers.
+        shell: bash
+        run: python3 -B scripts/rc_release_checks.py --binary-dir target/${{ matrix.target }}/release --check-doc-commands 2>&1 | tee target/native-installed-release.log
       - name: Package actual release bytes
         run: |
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; v={x["version"] for x in p if x["name"] in ("orbit-cli","orbit-web")}; assert len(v)==1; print(v.pop())')"
           python3 scripts/package_install_bundle.py --orbit target/${{ matrix.target }}/release/orbit --orbit-web target/${{ matrix.target }}/release/orbit-web --version "$version" --target '${{ matrix.target }}' --output dist/native
+      - name: Verify candidate matches installed-tested binaries
+        run: python3 -B scripts/check_release_package.py --acceptance-log target/native-installed-release.log --package-dir dist/native
       - name: Install and run the actual native npm packages
         shell: bash
         run: |

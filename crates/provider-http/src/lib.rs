@@ -291,7 +291,9 @@ pub(crate) fn reqwest_dispatch_error(
 
 pub(crate) fn dispatch_deadline_error(phase: &str) -> orbit_adapter::error::AdapterError {
     orbit_adapter::error::AdapterError::DispatchAmbiguous(format!(
-        "{phase} deadline expired after request delivery may have begun (E0412)"
+        "{phase} deadline expired after request delivery may have begun (E0412). \
+         The model took longer than ORBIT waits for it; a slow model can be given more time \
+         with first_byte_timeout_ms and idle_timeout_ms on its entry in providers.toml"
     ))
 }
 

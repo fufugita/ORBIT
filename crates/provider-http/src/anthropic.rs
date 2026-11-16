@@ -3,9 +3,9 @@
 //! Speaks the Messages streaming wire format (`/v1/messages`) with the
 //! credential in `x-api-key`. Full conversation support: top-level
 //! `system`, messages mapped from content blocks, tools with
-//! `input_schema`, adaptive thinking, one explicit `cache_control`
-//! breakpoint at the end of the system prompt, and the real stop
-//! reasons (`end_turn`, `tool_use`, `max_tokens`, `pause_turn`).
+//! `input_schema`, adaptive thinking, `cache_control` breakpoints at
+//! the end of the system prompt and on the conversation's tail, and the
+//! real stop reasons (`end_turn`, `tool_use`, `max_tokens`, `pause_turn`).
 //! Thinking deltas are assembled into opaque blocks for replay — they
 //! are never surfaced as text.
 
@@ -69,7 +69,11 @@ pub(crate) fn render_body(
 ) -> Result<serde_json::Value, AdapterError> {
     // Messages: the transcript when present, else the single prompt.
     let (system, messages) = match input.messages {
-        Some(transcript) => anthropic_messages(transcript),
+        Some(transcript) => {
+            let (system, mut messages) = anthropic_messages(transcript);
+            mark_tail_breakpoints(&mut messages);
+            (system, messages)
+        }
         None => (
             None,
             vec![serde_json::json!({
@@ -97,8 +101,9 @@ pub(crate) fn render_body(
         body["output_config"] = serde_json::json!({ "effort": effort });
     }
 
-    // One explicit cache breakpoint at the end of the system prompt:
-    // the stable prefix caches, the growing tail re-caches per round.
+    // A cache breakpoint at the end of the system prompt: the stable
+    // prefix (tools and system) caches. The conversation's tail carries
+    // its own (see `mark_tail_breakpoints`).
     if let Some(sys) = &system {
         body["system"] = serde_json::json!([{
             "type": "text",
@@ -215,6 +220,52 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_js
         Some(system_parts.join("\n\n"))
     };
     (system, wire)
+}
+
+/// How many of the conversation's newest user-side messages carry a cache
+/// breakpoint. With the one on the system prompt that is three of the four
+/// the API allows.
+const TAIL_BREAKPOINTS: usize = 2;
+
+/// Put a cache breakpoint on the last block of the newest user-side
+/// messages (a prompt or a tool result). Each request then reads everything
+/// up to the previous request's tail from the cache and writes only what
+/// was added since: without it a long session pays full price for its whole
+/// history on every round. Two are marked so that the previous tail is
+/// still a breakpoint in this request, whatever was appended after it.
+///
+/// Only a block the API accepts a breakpoint on is marked: a non-empty
+/// text block, an image, or a tool result. A single prompt sent without a
+/// transcript is left alone: nothing follows it to read the cache.
+fn mark_tail_breakpoints(messages: &mut [serde_json::Value]) {
+    let mut marked = 0;
+    for message in messages.iter_mut().rev() {
+        if marked == TAIL_BREAKPOINTS {
+            break;
+        }
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(block) = message
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|blocks| blocks.last_mut())
+        else {
+            continue;
+        };
+        let cacheable = match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()),
+            Some("image" | "tool_result") => true,
+            _ => false,
+        };
+        if cacheable {
+            block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            marked += 1;
+        }
+    }
 }
 
 /// A user message's wire blocks: structured blocks when present,
@@ -820,5 +871,68 @@ mod tool_result_image_tests {
             "no block, no array: {}",
             tr["content"]
         );
+    }
+}
+
+#[cfg(test)]
+mod tail_breakpoint_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn marked(message: &serde_json::Value) -> bool {
+        message["content"]
+            .as_array()
+            .and_then(|blocks| blocks.last())
+            .is_some_and(|block| block.get("cache_control").is_some())
+    }
+
+    /// The two newest user-side messages carry a breakpoint on their last
+    /// block; assistant messages and older ones do not.
+    #[test]
+    fn the_newest_two_user_side_messages_are_marked() {
+        let mut messages = vec![
+            json!({"role":"user","content":[{"type":"text","text":"first prompt"}]}),
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"Read","input":{}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"file text","is_error":false}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"done"}]}),
+            json!({"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":"and now?"}]}),
+        ];
+        mark_tail_breakpoints(&mut messages);
+        assert_eq!(
+            messages.iter().map(marked).collect::<Vec<_>>(),
+            [false, false, true, false, true]
+        );
+        assert_eq!(
+            messages[4]["content"][1]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert!(
+            messages[4]["content"][0].get("cache_control").is_none(),
+            "only the last block of a message"
+        );
+        let total = messages
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .filter(|block| block.get("cache_control").is_some())
+            .count();
+        assert_eq!(total, TAIL_BREAKPOINTS);
+    }
+
+    /// A block the API refuses a breakpoint on is passed over, and the
+    /// search goes on to an older message.
+    #[test]
+    fn an_empty_text_block_is_not_marked() {
+        let mut messages = vec![
+            json!({"role":"user","content":[{"type":"text","text":"real"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"  "}]}),
+            json!({"role":"user","content":"a bare string"}),
+        ];
+        mark_tail_breakpoints(&mut messages);
+        assert_eq!(
+            messages.iter().map(marked).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        let mut none: Vec<serde_json::Value> = Vec::new();
+        mark_tail_breakpoints(&mut none);
     }
 }

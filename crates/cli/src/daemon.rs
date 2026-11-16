@@ -505,10 +505,15 @@ impl OwnerHandle {
                     orbit_tools::permissions::PermissionMode::Plan => "plan",
                     orbit_tools::permissions::PermissionMode::DontAsk => "dontAsk",
                     orbit_tools::permissions::PermissionMode::Bypass => "bypass",
+                    orbit_tools::permissions::PermissionMode::Auto => "auto",
                 }
                 .into(),
             ),
             controller: false,
+            model: hub.snapshot.model.clone(),
+            provider: hub.snapshot.provider.clone(),
+            turns: Some(hub.snapshot.turns),
+            ..Default::default()
         };
         Ok((hub.snapshot.session_id.clone(), context))
     }
@@ -1773,11 +1778,17 @@ impl DisplayStream {
 }
 
 fn session_context(config: &OwnerConfig, handle: &OwnerHandle) -> orbit_tools::ToolContext {
-    let cx = orbit_tools::ToolContext::new(
+    // `--add-dir` at launch applies to an owned session as to any other.
+    let cx = crate::tools::with_extra_dirs(orbit_tools::ToolContext::new(
         config.turn.home.clone(),
         config.turn.session_id.clone(),
         config.working_dir.clone(),
-    );
+    ));
+    // Hooks that ask a model or an MCP tool run on this session, and an MCP
+    // server's question is put to the Elicitation hooks: an attached front
+    // end has no form for one, so without a hook it is dismissed. Both are
+    // one per process; with several owned sessions the newest answers.
+    crate::tools::install_session_services(&config.turn.home, &cx);
     let events = handle.clone();
     cx.set_ledger_sink(Some(Arc::new(move |note:&orbit_tools::LedgerNote|{
         if let Ok(mut hub)=events.lock(){hub.emit("activity",json!({"kind":note.kind,"target":note.target,"fact":note.fact,"digest":note.digest}));}
@@ -2582,6 +2593,10 @@ struct OwnedExecutor<'a> {
     grants: AutoGrants,
 }
 impl orbit_engine::ToolExecutor for OwnedExecutor<'_> {
+    fn hook_handler_runner(&self) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+        Some(crate::hook_handlers::runner(&self.cx.home, &self.cx))
+    }
+
     fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
         crate::tool_runtime::remember_turn_config(&self.cx, config);
     }

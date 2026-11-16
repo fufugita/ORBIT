@@ -101,6 +101,28 @@ pub fn find_executable(command: &str, path: Option<&std::ffi::OsStr>) -> Option<
         .filter(|p| p.is_absolute() && p.as_os_str().len() <= 256)
         .find_map(|p| check(p.join(command)))
 }
+/// Whether a server's configured command can be run: an executable file,
+/// reached directly or through links. A command such as `python3` or `npx`
+/// is commonly a link to the real program, so [`find_executable`], which
+/// refuses links, would call a working server unavailable.
+fn command_can_run(command: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if command.is_empty() || command.len() > 256 || command.chars().any(char::is_control) {
+        return false;
+    }
+    let runs = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if command.contains('/') {
+        return Path::new(command).is_absolute() && runs(Path::new(command));
+    }
+    path.is_some_and(|path| {
+        std::env::split_paths(path)
+            .take(128)
+            .filter(|p| p.is_absolute() && p.as_os_str().len() <= 256)
+            .any(|p| runs(&p.join(command)))
+    })
+}
 fn inspect_integration(home: &Path, filename: &str, report: &mut DoctorReport) {
     let label = if filename == "mcp.json" { "mcp" } else { "lsp" };
     let bytes = match optional_file(home, filename, 128 * 1024) {
@@ -168,11 +190,11 @@ fn inspect_integration_bytes(bytes: &[u8], label: &str, report: &mut DoctorRepor
                     "Remote MCP endpoint is configured; connectivity not tested and no request sent",
                     false,
                 );
-            } else if find_executable(&server.command, path_env.as_deref()).is_none() {
+            } else if !command_can_run(&server.command, path_env.as_deref()) {
                 report.add(
                     &id,
                     CheckStatus::Unavailable,
-                    "Configured executable is absent or not a regular executable; not launched",
+                    "Configured executable is absent or cannot be run; not launched",
                     false,
                 );
             } else {
@@ -287,11 +309,11 @@ fn inspect_integration_bytes(bytes: &[u8], label: &str, report: &mut DoctorRepor
                     "Diagnostics are disabled; not launched",
                     false,
                 );
-            } else if find_executable(&server.command, path_env.as_deref()).is_none() {
+            } else if !command_can_run(&server.command, path_env.as_deref()) {
                 report.add(
                     &id,
                     CheckStatus::Unavailable,
-                    "Configured executable is absent or not a regular executable; not launched",
+                    "Configured executable is absent or cannot be run; not launched",
                     false,
                 );
             } else {
@@ -613,7 +635,7 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
         ),
         false,
     );
-    // Cache introspection (REA G7): surface the on-disk caches with
+    // Cache introspection: surface the on-disk caches with
     // their sizes so `orbit doctor` doubles as `cache show`.
     for (label, path) in [
         ("cache.profile_backup", home.join("customization.json.bak")),
@@ -625,11 +647,16 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
     ] {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {
-                let (files, bytes) = directory_footprint(&path);
+                let (files, bytes, partial) = directory_footprint(&path);
+                let qualifier = if partial {
+                    " (partial; scan limit or unreadable entry)"
+                } else {
+                    ""
+                };
                 report.add(
                     label,
                     CheckStatus::Ready,
-                    &format!("{files} files, {bytes} bytes"),
+                    &format!("{files} files, {bytes} bytes{qualifier}"),
                     false,
                 );
             }
@@ -862,33 +889,127 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
     report
 }
 
-/// Recursively count entries and bytes under a cache directory, bounded
-/// to keep `orbit doctor` fast on large histories.
-fn directory_footprint(dir: &Path) -> (usize, u64) {
-    const LIMIT: usize = 4096;
-    let mut files = 0usize;
-    let mut bytes = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        if files > LIMIT {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&current) else {
+/// Count a bounded prefix of cache entries without descending through links.
+/// The final flag distinguishes complete counts from lower bounds.
+fn directory_footprint(dir: &Path) -> (usize, u64, bool) {
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_DEPTH: usize = 32;
+    let (mut examined, mut files, mut bytes) = (0usize, 0usize, 0u64);
+    let mut partial = false;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        // Validate every ancestor, then enumerate the held directory itself.
+        // A symlink in context-history/owner must not redirect cache inspection.
+        let Ok(directory) = Directory::open(&current, false) else {
+            partial = true;
             continue;
         };
-        for entry in entries.flatten() {
+        let Ok(io) = directory.io() else {
+            partial = true;
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(io) else {
+            partial = true;
+            continue;
+        };
+        for entry in entries {
+            if examined == MAX_ENTRIES {
+                return (files, bytes, true);
+            }
+            examined += 1;
+            let Ok(entry) = entry else {
+                partial = true;
+                continue;
+            };
             match entry.file_type() {
-                Ok(t) if t.is_dir() => stack.push(entry.path()),
-                Ok(_) => {
-                    files += 1;
-                    bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    if files > LIMIT {
-                        return (files, bytes);
+                Ok(kind) if kind.is_dir() => {
+                    if depth == MAX_DEPTH {
+                        partial = true;
+                    } else {
+                        stack.push((current.join(entry.file_name()), depth + 1));
                     }
                 }
-                Err(_) => {}
+                Ok(kind) if kind.is_file() => match entry.metadata() {
+                    Ok(metadata) => {
+                        files += 1;
+                        match bytes.checked_add(metadata.len()) {
+                            Some(total) => bytes = total,
+                            None => return (files, u64::MAX, true),
+                        }
+                    }
+                    Err(_) => partial = true,
+                },
+                Ok(_) => partial = true,
+                Err(_) => partial = true,
             }
         }
+        partial |= directory.check().is_err();
     }
-    (files, bytes)
+    (files, bytes, partial)
+}
+
+#[cfg(test)]
+mod footprint_tests {
+    use super::directory_footprint;
+    use std::path::PathBuf;
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("orbit-footprint-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn empty_directory_fanout_is_bounded_and_reported_as_partial() {
+        let tree = Tree::new();
+        for index in 0..4097 {
+            std::fs::create_dir(tree.0.join(index.to_string())).unwrap();
+        }
+        assert_eq!(directory_footprint(&tree.0), (0, 0, true));
+    }
+
+    #[test]
+    fn deep_directory_chains_are_bounded_and_normal_counts_remain_exact() {
+        let tree = Tree::new();
+        std::fs::write(tree.0.join("sample"), b"four").unwrap();
+        assert_eq!(directory_footprint(&tree.0), (1, 4, false));
+        let mut path = tree.0.clone();
+        for _ in 0..34 {
+            path = path.join("nested");
+            std::fs::create_dir(&path).unwrap();
+        }
+        assert_eq!(directory_footprint(&tree.0), (1, 4, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_files_and_directories_are_not_counted_or_followed() {
+        let tree = Tree::new();
+        let outside = Tree::new();
+        std::fs::write(outside.0.join("private"), b"not cache content").unwrap();
+        std::os::unix::fs::symlink(&outside.0, tree.0.join("directory-link")).unwrap();
+        std::os::unix::fs::symlink(outside.0.join("private"), tree.0.join("file-link")).unwrap();
+        assert_eq!(directory_footprint(&tree.0), (0, 0, true));
+        std::fs::create_dir_all(outside.0.join("owner/archives")).unwrap();
+        std::fs::write(
+            outside.0.join("owner/archives/private"),
+            b"not cache content",
+        )
+        .unwrap();
+        assert_eq!(
+            directory_footprint(&tree.0.join("directory-link/owner/archives")),
+            (0, 0, true),
+            "an intermediate symlink must not redirect inspection"
+        );
+    }
 }

@@ -192,6 +192,59 @@ impl Palette {
                 p.amber = (139, 88, 18);
                 p.red = (176, 49, 41);
             }
+            // The aespa palettes: pink and sky on plum, ice blue on navy.
+            "aespa-pastel" => {
+                p.app = (18, 16, 25);
+                p.sidebar = (21, 19, 29);
+                p.panel = (26, 23, 34);
+                p.raise = (35, 31, 46);
+                p.raise2 = (44, 39, 57);
+                p.inset = (20, 18, 27);
+                p.topbar = (27, 24, 36);
+                p.rule = (51, 46, 66);
+                p.rule_hi = (90, 82, 112);
+                p.ink = (236, 228, 244);
+                p.ink2 = (201, 191, 214);
+                p.muted = (154, 143, 170);
+                p.faint = (122, 112, 144);
+                p.white = (255, 255, 255);
+                p.magenta = (255, 182, 213);
+                p.magenta_hi = (255, 208, 228);
+                p.magenta_dim = (168, 116, 140);
+                p.on_accent = (36, 16, 27);
+                p.cyan = (150, 220, 240);
+                p.violet = (200, 186, 255);
+                p.blue = (169, 196, 255);
+                p.green = (150, 235, 180);
+                p.amber = (245, 220, 140);
+                p.red = (250, 150, 170);
+            }
+            "kwangya-ice" => {
+                p.app = (7, 11, 20);
+                p.sidebar = (10, 15, 26);
+                p.panel = (14, 20, 34);
+                p.raise = (22, 32, 51);
+                p.raise2 = (30, 42, 66);
+                p.inset = (9, 14, 24);
+                p.topbar = (15, 22, 38);
+                p.rule = (38, 52, 77);
+                p.rule_hi = (69, 89, 122);
+                p.ink = (238, 246, 255);
+                p.ink2 = (188, 203, 224);
+                p.muted = (132, 150, 176);
+                p.faint = (100, 116, 143);
+                p.white = (255, 255, 255);
+                p.magenta = (146, 211, 247);
+                p.magenta_hi = (196, 232, 255);
+                p.magenta_dim = (79, 125, 154);
+                p.on_accent = (6, 20, 31);
+                p.cyan = (152, 200, 225);
+                p.violet = (162, 166, 246);
+                p.blue = (143, 180, 255);
+                p.green = (142, 230, 184);
+                p.amber = (242, 212, 138);
+                p.red = (255, 154, 168);
+            }
             _ => {}
         }
         let tokens = profile.resolved_tokens();

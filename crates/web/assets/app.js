@@ -141,6 +141,8 @@ function focusProfileConversation() { selectProfilePane("conversation"); $("comp
 function paneAction(pane,index) {
   send({type:"pane_action",pane_id:pane.id,action_index:index,revision:S.profile.revision});
 }
+// Panes the host knows without a profile entry (council, reactor).
+const BUILTIN_PANES={council:{id:"council",title:"Council"},reactor:{id:"reactor",title:"Reactor"}};
 function renderCustomPane(def, identity) {
   const section=el("section","layout-leaf custom-pane"); section.dataset.pane=identity;section.dataset.sourcePane=def.id;
   section.setAttribute("role","tabpanel");section.setAttribute("aria-label",def.title);
@@ -189,7 +191,7 @@ function renderProfileLayout() {
       return split;
     }
     let leaf,title;
-    if(node.kind==="custom") {const def=S.profile.profile.panes.find(p=>p.id===node.pane_id && p.surfaces.includes("browser"));
+    if(node.kind==="custom") {const def=S.profile.profile.panes.find(p=>p.id===node.pane_id && p.surfaces.includes("browser")) || (S.profile.profile.panes.some(p=>p.id===node.pane_id) ? undefined : BUILTIN_PANES[node.pane_id]);
       if(def){leaf=renderCustomPane(def,`custom:${def.id}@${path}`);title=def.title;}else {leaf=renderBuiltinPane("unavailable",`unavailable:${path}`);leaf.children[1].textContent="This pane is unavailable on the browser surface";title="Unavailable pane";}}
     else if(node.kind==="panel" && node.view==="conversation") {leaf=chat;title="Conversation";}
     else {leaf=renderBuiltinPane(node.view || "unknown",`${node.view || "unknown"}:${path}`);title=node.view || "Panel";}

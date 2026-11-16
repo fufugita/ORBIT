@@ -270,7 +270,7 @@ impl HttpState {
             kind if kind.eq_ignore_ascii_case("application/json") => {
                 let body = bounded_body(response, options).await.map_err(fatal)?;
                 let value = parse_message(&body)?;
-                match classify_message(value, id)? {
+                match classify_message(value, id, options)? {
                     Message::Response(result) => result.map(|value| (value, session)),
                     _ => Err(fatal("mcp HTTP JSON response does not match the request")),
                 }
@@ -281,7 +281,7 @@ impl HttpState {
                     if !event.kind.is_empty() && event.kind != "message" {
                         return Err(fatal("mcp HTTP response has an unexpected SSE event type"));
                     }
-                    match classify_message(parse_message(&event.data)?, id)? {
+                    match classify_message(parse_message(&event.data)?, id, options)? {
                         Message::Response(result) => return result.map(|value| (value, session)),
                         Message::Reply(reply) => {
                             self.send_accepted(
@@ -420,7 +420,7 @@ pub(super) fn supported_version(version: &str) -> bool {
 
 pub(super) fn status_error(status: reqwest::StatusCode) -> String {
     match status.as_u16() {
-        401 => "mcp HTTP authentication required (401); configure server credentials".into(),
+        401 => "mcp HTTP authentication required (401); configure server credentials or run /mcp login <server>".into(),
         403 => "mcp HTTP authorization refused (403)".into(),
         404 => "mcp HTTP endpoint or session expired (404)".into(),
         405 => "mcp HTTP method is not supported (405)".into(),
@@ -478,7 +478,11 @@ pub(super) enum Message {
     Ignore,
 }
 
-pub(super) fn classify_message(value: Value, id: u64) -> RpcResult<Message> {
+pub(super) fn classify_message(
+    value: Value,
+    id: u64,
+    options: &McpCallOptions,
+) -> RpcResult<Message> {
     let object = value
         .as_object()
         .ok_or_else(|| fatal("mcp frame is not an object"))?;
@@ -494,13 +498,11 @@ pub(super) fn classify_message(value: Value, id: u64) -> RpcResult<Message> {
         }
         return match object.get("id") {
             None => Ok(Message::Ignore),
-            Some(request_id) if valid_id(request_id) => Ok(Message::Reply(if method == "ping" {
-                json!({"jsonrpc":"2.0","id":request_id,"result":{}})
-            } else {
-                json!({"jsonrpc":"2.0","id":request_id,"error":{
-                    "code":-32601,"message":"client method not supported"
-                }})
-            })),
+            // A question for the operator is answered within what is left of
+            // the request's own time: this transport cannot extend it.
+            Some(request_id) if valid_id(request_id) => Ok(Message::Reply(
+                crate::server_request_reply(method, request_id, object.get("params"), options),
+            )),
             _ => Err(fatal("mcp server request has invalid id")),
         };
     }

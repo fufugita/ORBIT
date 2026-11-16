@@ -881,3 +881,174 @@ fn review_regression_absolute_read_rules_override_inherited_allow_on_every_pane_
         .contains("PRIVATE ABSOLUTE RULE NOTE")
     );
 }
+
+#[test]
+fn builtin_reactor_pane_needs_no_profile_entry_and_never_prints_unreported_as_zero() {
+    let f = Fixture::new();
+    let saved = f.save(&Profile::default());
+    assert!(saved.profile.panes.is_empty());
+    let context = PaneContext {
+        model: "claude-opus-5-5".into(),
+        phase: Some("respond".into()),
+        input_tokens: 412_880,
+        output_tokens: 18_204,
+        used_tokens: Some(412_000),
+        window_tokens: Some(1_000_000),
+        cost_microcents: 840_000,
+        turns: Some(12),
+        ..PaneContext::default()
+    };
+    let text = reactor_snapshot(&context, false);
+    assert!(text.starts_with("REACTOR · claude-opus-5-5  RESPOND\n"));
+    assert!(text.contains("tok/s   —"));
+    assert!(text.contains("18,204"));
+    assert!(text.contains("412,880"));
+    assert!(text.contains("cache   —\n"));
+    let cached = reactor_snapshot(
+        &PaneContext {
+            cache_read_tokens: Some(1_204_113),
+            cache_write_tokens: Some(88_020),
+            reasoning_tokens: Some(0),
+            ..PaneContext::default()
+        },
+        false,
+    );
+    assert!(cached.contains("cache   read 1,204,113  write 88,020  reason 0  (this run)"));
+    assert!(text.contains("412k / 1M  41%"));
+    assert!(text.contains("$0.8400  turns 12  tools —"));
+    let ascii = reactor_snapshot(&PaneContext::default(), true);
+    assert!(ascii.is_ascii());
+    assert!(ascii.contains("ctx     -"));
+    let uncertain = reactor_snapshot(
+        &PaneContext {
+            cost_uncertain: true,
+            ..PaneContext::default()
+        },
+        true,
+    );
+    assert!(uncertain.contains("(uncertain)"));
+    let metered = reactor_snapshot(
+        &PaneContext {
+            rate_milli: Some(42_700),
+            peak_rate_milli: Some(118_000),
+            ..PaneContext::default()
+        },
+        false,
+    );
+    assert!(metered.contains("tok/s   42.7"));
+    assert!(metered.contains("peak 118.0"));
+    assert!(!metered.contains("rate    "));
+    let history = PaneContext {
+        rate_history: vec![10_000, 50_000, 100_000],
+        ..PaneContext::default()
+    };
+    assert!(reactor_snapshot(&history, false).contains("rate    ▁▄█\n"));
+    assert!(reactor_snapshot(&history, true).is_ascii());
+    let live = reactor_snapshot(
+        &PaneContext {
+            rate_milli: Some(42_700),
+            live_rate_milli: Some(38_250),
+            ..PaneContext::default()
+        },
+        false,
+    );
+    assert!(live.contains("≈38.2 live"));
+    let out = read_pane(&f.home, &f.workspace, "reactor", &context).unwrap();
+    assert_eq!(out.id, "reactor");
+    assert_eq!(out.state, PaneState::Ready);
+    assert!(out.actions.contains(&PaneAction::Refresh));
+    assert!(read_pane(&f.home, &f.workspace, "unknown", &context).is_err());
+}
+
+#[test]
+fn council_snapshot_reports_missing_error_ready_and_idle_states() {
+    let f = Fixture::new();
+    let path = f.root.join("state.json");
+    let (state, text) = council_snapshot_at(&path, 0.0, false);
+    assert_eq!(state, PaneState::Missing);
+    assert_eq!(text, "No council has run");
+
+    std::fs::write(&path, b"{not json").unwrap();
+    assert_eq!(council_snapshot_at(&path, 0.0, false).0, PaneState::Error);
+    std::fs::write(&path, br#"{"ts":1.0,"seats":[]}"#).unwrap();
+    assert_eq!(council_snapshot_at(&path, 0.0, false).0, PaneState::Error);
+    std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+    assert_eq!(council_snapshot_at(&path, 0.0, false).0, PaneState::Error);
+
+    std::fs::write(
+        &path,
+        br#"{"ts":1000.0,"phase":"DELIBERATING","note":"","seats":[
+            {"model":"claude-haiku-5-5","status":"online","verdict":"APPROVE"},
+            {"model":"deepseek-v4-pro","status":"computing","verdict":null},
+            {"model":"claude-glm-5.3-flash","status":"reported","verdict":"CONDITIONAL"},
+            {"model":"minimax-m3","status":"computing","verdict":null},
+            {"model":"other\u001b[31m","status":"error","verdict":null}]}"#,
+    )
+    .unwrap();
+    let (state, text) = council_snapshot_at(&path, 1010.0, false);
+    assert_eq!(state, PaneState::Ready);
+    assert!(text.starts_with("MAGI · 심의 DELIBERATE\n"));
+    assert!(text.contains("심의  1/5 응답 · 표 2"));
+    assert!(text.contains("● 승인 YES"));
+    assert!(text.contains("신호없음"));
+    assert!(text.contains("KARINA·01"));
+    assert!(text.contains("ANTHROPIC"));
+    assert!(text.contains("haiku-5-5"));
+    assert!(text.contains("ZHIPU      glm-5.3-flash"));
+    assert!(text.contains("AE·05"));
+    assert!(!text.contains('\u{1b}'));
+    assert_eq!(text.lines().count(), 7);
+
+    let (state, ascii) = council_snapshot_at(&path, 1010.0, true);
+    assert_eq!(state, PaneState::Ready);
+    assert!(ascii.is_ascii());
+    assert!(ascii.contains("KARINA-01"));
+    assert!(ascii.contains("* APPROVE"));
+    assert!(ascii.contains("* HOLD"));
+    assert!(ascii.contains(". deliberating"));
+
+    let (state, idle) = council_snapshot_at(&path, 1421.0, false);
+    assert_eq!(state, PaneState::Ready);
+    assert!(idle.starts_with("MAGI · 대기 IDLE\n"));
+    assert!(!idle.contains("최근"));
+    std::fs::write(
+        f.root.join("history.jsonl"),
+        concat!(
+            r#"{"ts":1.0,"final":"FINAL: Older decision","answers":{}}"#,
+            "\n",
+            r#"{"ts":2.0,"final":"FINAL: Adopt SQLite in WAL mode\nmore detail","answers":{}}"#,
+            "\n",
+            r#"{"ts":3.0,"final":"","answers":{}}"#,
+            "\nnot json\n"
+        ),
+    )
+    .unwrap();
+    let (_, idle) = council_snapshot_at(&path, 1421.0, false);
+    assert!(idle.ends_with("최근  Adopt SQLite in WAL mode\n"));
+    let (_, busy) = council_snapshot_at(&path, 1010.0, false);
+    assert!(!busy.contains("최근"));
+
+    std::fs::write(
+        &path,
+        br#"{"ts":1000.0,"phase":"VERDICT","note":"FINAL: Adopt SQLite in WAL mode","seats":[
+            {"model":"claude-haiku-5-5","status":"reported","verdict":"APPROVE"},
+            {"model":"deepseek-v4-pro","status":"reported","verdict":"APPROVE"},
+            {"model":"glm-5.3-flash","status":"reported","verdict":"REJECT"}]}"#,
+    )
+    .unwrap();
+    let (_, verdict) = council_snapshot_at(&path, 1001.0, false);
+    assert!(verdict.contains("다수결  승인 YES · 2/3"));
+    assert!(verdict.contains("nævis  Adopt SQLite in WAL mode"));
+    assert!(verdict.contains("거부 NO"));
+}
+
+#[test]
+fn council_snapshot_refuses_a_symlinked_state_file() {
+    let f = Fixture::new();
+    let real = f.root.join("real.json");
+    std::fs::write(&real, br#"{"ts":1.0,"phase":"VERDICT","seats":[]}"#).unwrap();
+    let link = f.root.join("state.json");
+    symlink(&real, &link).unwrap();
+    assert_eq!(council_snapshot_at(&link, 1.0, false).0, PaneState::Error);
+    assert_eq!(council_snapshot_at(&real, 1.0, false).0, PaneState::Ready);
+}

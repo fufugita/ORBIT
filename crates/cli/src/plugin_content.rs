@@ -22,11 +22,20 @@ pub fn resolve_skill(
     }
     let catalog = orbit_engine::skills::load_catalog(&cx.home, &cx.working_dir, true)
         .map_err(|e| e.to_string())?;
-    let skill = catalog
+    let mut skill = catalog
         .skills
         .into_iter()
         .find(|entry| entry.skill.name == name)
-        .ok_or_else(|| format!("unknown or unavailable skill: {name}"))?;
+        .ok_or_else(|| {
+            untrusted_folder_skill(cx, name)
+                .unwrap_or_else(|| format!("unknown or unavailable skill: {name}"))
+        })?;
+    if let Some(spec) = skill.policy.as_mut() {
+        spec.allowed_tools = known_tools(spec.allowed_tools.take());
+        if inherits_session_model(cx, spec.model.as_deref()) {
+            spec.model = None;
+        }
+    }
     if let Some(spec) = &skill.policy {
         if origin == InvocationOrigin::Model && spec.disable_model_invocation {
             return Err("this skill requires explicit user invocation".into());
@@ -42,17 +51,51 @@ pub fn resolve_skill(
     Ok(skill)
 }
 
+/// A skill that sits in this folder but is left out because the folder is
+/// not trusted. "Unknown skill" would send the operator looking for a typo.
+fn untrusted_folder_skill(cx: &ToolContext, name: &str) -> Option<String> {
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !plain
+        || orbit_tools::permissions::FolderTrust::new(cx.home.clone()).is_trusted(&cx.working_dir)
+    {
+        return None;
+    }
+    [".orbit/skills", ".claude/skills"]
+        .iter()
+        .any(|dir| cx.working_dir.join(dir).join(name).join("SKILL.md").is_file())
+        .then(|| {
+            format!(
+                "skill {name} is in this folder, but the folder is not trusted, so what the folder provides is left out; the operator can run `orbit folder trust` here and start again"
+            )
+        })
+}
+
 pub fn resolve_agent(cx: &ToolContext, name: &str) -> Result<CatalogAgent, String> {
     if crate::tools::bare_mode() {
         return Err("agents are unavailable in bare mode".into());
     }
     let catalog = orbit_engine::skills::load_catalog(&cx.home, &cx.working_dir, true)
         .map_err(|e| e.to_string())?;
-    let agent = catalog
+    let mut agent = catalog
         .agents
         .into_iter()
         .find(|entry| entry.agent.name == name)
         .ok_or_else(|| format!("unknown or unavailable subagent: {name}"))?;
+    // Written for another harness: tool names it has and ORBIT does not are
+    // left out of the agent's ceiling (which only narrows it), and a model
+    // named by that harness's own alias means the session's model.
+    if agent.binding.is_some() {
+        agent.allowed_tools = known_tools(agent.allowed_tools.take());
+        if let Some(tools) = &agent.allowed_tools {
+            agent.agent.tools = tools.clone();
+        }
+        if inherits_session_model(cx, Some(agent.agent.model.as_str())) {
+            agent.agent.model.clear();
+        }
+    }
     validate_tools(agent.allowed_tools.as_deref())?;
     validate_model(
         cx,
@@ -96,9 +139,47 @@ pub fn invoke_skill(
             || policy.agent.is_some()
     });
     let body = expand_prompt(&resolved.skill.body, &arguments, resolved.binding.as_ref())?;
+    // A plugin's skill: its files live in the plugin's stored snapshot and
+    // are read through the snapshot's address. Say what that address is,
+    // beside the body (which stays the skill's own words): without it a
+    // path the skill names in passing cannot be followed.
+    let plugin_files = resolved.binding.as_ref().map(|binding| {
+        let prefix = binding.asset_prefix();
+        let folder = binding
+            .source_path
+            .as_deref()
+            .and_then(|path| path.rsplit_once('/'))
+            .map(|(folder, _)| format!("{prefix}/{folder}"))
+            .unwrap_or(prefix);
+        format!(
+            "Base address for this skill's files: {folder}\nPaths in these instructions are relative to it: read `{folder}/<path>` with the Read tool. These files can only be read; they cannot be listed, searched or run."
+        )
+    });
     if !needs_child {
+        // The operator's own skill folder: say where it is, so the files
+        // and scripts its instructions name can be found; let this
+        // session's commands read it; and let its `allowed-tools` cover
+        // the turn that loaded it, as a command file's do.
+        let base = resolved.dir.as_ref().map(|dir| dir.display().to_string());
+        let body = match &base {
+            Some(base) => format!(
+                "Base directory for this skill: {base}\nPaths in these instructions are relative to it. Read its files with Read and run its scripts with Bash from there.\n\n{body}"
+            ),
+            None => body,
+        };
+        if let Some(dir) = &resolved.dir {
+            cx.allow_reading(dir.clone());
+        }
+        let grants: Vec<orbit_tools::permissions::PermissionRule> = resolved
+            .grants
+            .iter()
+            .filter_map(|selector| checked_rule(selector).ok())
+            .collect();
+        if !grants.is_empty() {
+            crate::custom_commands::add_turn_grants(cx, grants);
+        }
         return Ok(
-            serde_json::json!({"ok":true,"body":body,"mode":"load","source_root":resolved.binding.as_ref().map(ContentBinding::asset_prefix)}),
+            serde_json::json!({"ok":true,"body":body,"mode":"load","base_dir":base,"files":plugin_files,"source_root":resolved.binding.as_ref().map(ContentBinding::asset_prefix)}),
         );
     }
     let policy = policy.expect("child invocation has policy");
@@ -129,6 +210,10 @@ pub fn invoke_skill(
     profile.agent.instructions =
         expand_prompt(&profile.agent.instructions, &[], profile.binding.as_ref())?;
     if !profile.agent.instructions.is_empty() {
+        profile.agent.instructions.push_str("\n\n");
+    }
+    if let Some(files) = &plugin_files {
+        profile.agent.instructions.push_str(files);
         profile.agent.instructions.push_str("\n\n");
     }
     profile.agent.instructions.push_str(&body);
@@ -187,6 +272,37 @@ fn validate_binding(binding: Option<&ContentBinding>) -> Result<(), String> {
         return Err("tool mapping requires an argument/result-equivalent adapter; arbitrary tool renaming is unavailable".into());
     }
     Ok(())
+}
+
+/// A tool ceiling without the names ORBIT has no tool for. A ceiling names
+/// what may be used at most, so dropping a name can only narrow it. Claude
+/// Code's `Task` is ORBIT's `Agent`; its other own tools (`LS`,
+/// `TodoWrite`, `BashOutput`, `KillShell`, `NotebookRead`, …) have no
+/// counterpart to grant.
+fn known_tools(tools: Option<Vec<String>>) -> Option<Vec<String>> {
+    tools.map(|tools| {
+        tools
+            .into_iter()
+            .filter(|selector| {
+                checked_rule(selector).is_ok_and(|rule| {
+                    crate::tools::is_known_tool(&rule.tool) || rule.tool.starts_with("mcp__")
+                })
+            })
+            .collect()
+    })
+}
+
+/// Whether a plugin's `model:` is another harness's alias for "one of your
+/// usual models" that this configuration cannot name: `inherit`, or a
+/// Claude tier (`sonnet`, `opus`, `haiku`) where no configured model has
+/// that id. Such content runs on the session's model. A full model id that
+/// is not configured is still an error: that was a specific request.
+fn inherits_session_model(cx: &ToolContext, model: Option<&str>) -> bool {
+    let Some(model) = model.filter(|model| !model.is_empty()) else {
+        return false;
+    };
+    matches!(model, "inherit" | "sonnet" | "opus" | "haiku")
+        && validate_model(cx, Some(model)).is_err()
 }
 
 fn validate_model(cx: &ToolContext, model: Option<&str>) -> Result<(), String> {
@@ -367,14 +483,43 @@ pub(crate) fn server_exposed(cx: &ToolContext, cfg: &orbit_mcp::McpConfig, serve
     })
 }
 
+/// Whether the text holds the command-file form `` !`command` ``: a bang
+/// that starts a word, a backtick, and a closing backtick on the same line
+/// with something between them. A code span that merely ends in `!`, or a
+/// sentence with a stray `` !` ``, is ordinary text.
+fn has_dynamic_shell(template: &str) -> bool {
+    template.lines().any(|line| {
+        let mut from = 0;
+        while let Some(at) = line[from..].find("!`") {
+            let start = from + at;
+            let opens_word = line[..start].chars().next_back().is_none_or(|before| {
+                before.is_whitespace() || matches!(before, '(' | '[' | ':' | '>')
+            });
+            let body = &line[start + 2..];
+            if opens_word
+                && body
+                    .find('`')
+                    .is_some_and(|end| !body[..end].trim().is_empty())
+            {
+                return true;
+            }
+            from = start + 2;
+        }
+        false
+    })
+}
+
 /// One pass: argument text is never reparsed as template or shell source.
 pub fn expand_prompt(
     template: &str,
     arguments: &[String],
     binding: Option<&ContentBinding>,
 ) -> Result<String, String> {
-    if template.contains("!`") {
-        return Err("dynamic shell context requires a gated Bash invocation".into());
+    if has_dynamic_shell(template) {
+        return Err(
+            "this content runs a shell command (!`command`), which only a command file may do"
+                .into(),
+        );
     }
     let all = arguments.join(" ");
     let mut output = String::new();
@@ -564,5 +709,74 @@ pub(crate) fn asset_result(cx: &ToolContext, args: &Value) -> orbit_tools::ToolR
     match read() {
         Ok(result) => orbit_tools::ToolResult::ok(result),
         Err(error) => orbit_tools::ToolResult::err(&error),
+    }
+}
+
+#[cfg(test)]
+mod dynamic_shell_tests {
+    use super::{expand_prompt, has_dynamic_shell};
+
+    #[test]
+    fn only_a_command_in_backticks_after_a_bang_is_shell_context() {
+        for plain in [
+            "reply like `!!!HELLO!!!`. Nothing else.",
+            "say `wow!` and then `ok`",
+            "a stray !` with no end",
+            "empty !`` is nothing",
+            "no bang `ls` here",
+        ] {
+            assert!(!has_dynamic_shell(plain), "{plain}");
+            assert!(expand_prompt(plain, &[], None).is_ok(), "{plain}");
+        }
+        for shell in [
+            "Status: !`git status --short`",
+            "!`ls`",
+            "first line\n(see !`date`)",
+        ] {
+            assert!(has_dynamic_shell(shell), "{shell}");
+            assert!(expand_prompt(shell, &[], None).is_err(), "{shell}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod skill_trust_tests {
+    use super::*;
+
+    /// A skill in a folder that is not trusted is left out. Asking for it
+    /// by name says so, and says what to run, instead of "unknown skill".
+    #[test]
+    fn a_skill_in_an_untrusted_folder_says_the_folder_is_not_trusted() {
+        let root = std::env::temp_dir().join(format!("orbit-skill-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, work) = (root.join("home"), root.join("work"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(work.join(".orbit/skills/shout")).unwrap();
+        std::fs::write(
+            work.join(".orbit/skills/shout/SKILL.md"),
+            "---\nname: shout\ndescription: shout\n---\nShout.\n",
+        )
+        .unwrap();
+        let cx = ToolContext::new(home.clone(), "skill-trust".into(), work.clone());
+        let error = resolve_skill(&cx, "shout", InvocationOrigin::User).unwrap_err();
+        assert!(
+            error.contains("not trusted") && error.contains("orbit folder trust"),
+            "{error}"
+        );
+        // A name that is nowhere is still simply unknown.
+        let error = resolve_skill(&cx, "nowhere", InvocationOrigin::User).unwrap_err();
+        assert_eq!(error, "unknown or unavailable skill: nowhere");
+        // Once the folder is trusted the skill loads.
+        orbit_tools::permissions::FolderTrust::new(home)
+            .trust(&work)
+            .unwrap();
+        assert_eq!(
+            resolve_skill(&cx, "shout", InvocationOrigin::User)
+                .unwrap()
+                .skill
+                .name,
+            "shout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1319,6 +1319,7 @@ mod recovery_baselines {
                 AttemptPurpose::Ordinary => "ordinary",
                 AttemptPurpose::Chunk => "chunk",
                 AttemptPurpose::Merge => "merge",
+                AttemptPurpose::Housekeeping => "housekeeping",
             }
         );
         assert_eq!(last["receipt"]["knownness"], "known");
@@ -1932,6 +1933,7 @@ mod recovery_baselines {
                 AttemptPurpose::Ordinary => "ordinary",
                 AttemptPurpose::Chunk => "chunk",
                 AttemptPurpose::Merge => "merge",
+                AttemptPurpose::Housekeeping => "housekeeping",
             }
         );
         assert_eq!(last["receipt"]["knownness"], "known");

@@ -538,17 +538,57 @@ fn invalid_phase_target_refuses_before_provider_or_agent() {
 }
 #[test]
 fn cancelled_parent_keeps_routed_agent_durable_without_provider_call() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let f = Fixture::new();
     f.cx.push_cancel_check(std::sync::Arc::new(|| true));
+    let skipped = f.task(json!({"agent":"Explore","prompt":"implement before admission"}));
+    f.cx.pop_cancel_check();
+    assert_eq!(skipped["ok"], false, "{skipped}");
+    assert_eq!(skipped["error"], "cancelled by user", "{skipped}");
+    assert!(skipped.get("agent_id").is_none(), "{skipped}");
+    assert!(f.store().list().unwrap().is_empty());
+    assert_eq!(f.a.calls() + f.b.calls(), 0);
+
+    // Let routing and admission finish before cancellation becomes visible.
+    let store = f.store();
+    let admitted_cancel = AtomicBool::new(false);
+    f.cx.push_cancel_check(std::sync::Arc::new(move || {
+        if !admitted_cancel.load(Ordering::SeqCst)
+            && store
+                .list()
+                .unwrap()
+                .iter()
+                .any(|agent| agent.status == orbit_engine::agent_store::AgentStatus::Running)
+        {
+            admitted_cancel.store(true, Ordering::SeqCst);
+        }
+        admitted_cancel.load(Ordering::SeqCst)
+    }));
     let result = f.task(json!({"agent":"Explore","prompt":"implement a parser"}));
     f.cx.pop_cancel_check();
     assert_eq!(result["ok"], false, "{result}");
     assert_eq!(f.a.calls() + f.b.calls(), 0);
-    let agent = f.store().list().unwrap().into_iter().next().unwrap();
+    let agent_id = result["agent_id"].as_str().unwrap();
+    let agent = f.store().load(agent_id).unwrap();
     assert_eq!(agent.model, "b/family/routed-notools");
     assert_eq!(
         agent.status,
         orbit_engine::agent_store::AgentStatus::Cancelled
+    );
+    assert_eq!(agent.turns, 1);
+    assert!(agent.active_run_id.is_none());
+    assert_eq!(
+        agent
+            .transcript
+            .iter()
+            .filter(|message| {
+                message.role == orbit_adapter::types::ChatRole::User
+                    && message.content == "implement a parser"
+            })
+            .count(),
+        1,
+        "the admitted task is preserved exactly once"
     );
 }
 

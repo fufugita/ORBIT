@@ -293,11 +293,15 @@ pub fn availability(home: &Path, cx: &ToolContext) -> Result<Option<LspAvailabil
 pub fn tool_definition() -> ToolDefinition {
     let parameters = json!({"type":"object","properties":{
         "file_path":{"type":"string","description":"One file in the permitted configured workspace"},
+        "operation":{"type":"string","enum":["diagnostics","definition","references","hover","document_symbols","workspace_symbols"],"description":"What to ask; diagnostics when omitted"},
+        "line":{"type":"integer","minimum":1,"description":"1-based line, for definition, references and hover"},
+        "character":{"type":"integer","minimum":1,"description":"1-based column on that line, on the symbol"},
+        "query":{"type":"string","description":"The symbol name to look for, for workspace_symbols"},
         "server":{"type":"string","description":"Optional configured server name"}
     },"required":["file_path"],"additionalProperties":false});
     ToolDefinition {
         name: "LspDiagnostics".into(),
-        description: "Request on-demand diagnostics from an explicitly configured language server. Results distinguish received, stale, and unavailable diagnostics and report freshness.".into(),
+        description: "Ask an explicitly configured language server about one file. Without an operation: on-demand diagnostics, which distinguish received, stale and unavailable results and report freshness. With an operation: where the symbol at a position is defined (definition) or used (references), what the server knows about it (hover), the symbols of the file (document_symbols), or symbols by name across the workspace (workspace_symbols). Results in files this session may not read are counted, not shown.".into(),
         schema_digest: orbit_adapter::types::Sha256Digest(hex::encode(Sha256::digest(parameters.to_string()))),
         parameters,
     }
@@ -367,29 +371,39 @@ fn authorize(
     Ok(())
 }
 
-/// The shared runtime performs normal approval evaluation before this call.
-/// Defense in depth repeats inherited scope, deny rules and path containment.
-pub fn diagnostics(
+/// Everything a request needs before a server is started: the one
+/// configured server that owns the document, the document's text read
+/// through an identity-checked descriptor, and the deadline. Authorization
+/// runs before the read, on the opened target, and after it.
+struct Prepared {
+    server: Server,
+    document: String,
+    uri: String,
+    deadline: Instant,
+}
+
+fn prepare(
     home: &Path,
     cx: &ToolContext,
     scope: &PermissionScope,
-    args: &LspDiagnosticsArgs,
-) -> Result<DiagnosticReport, LspError> {
+    file_path: &str,
+    server_name: Option<&String>,
+) -> Result<Prepared, LspError> {
     if cx.is_cancelled() {
         return Err(LspError::Cancelled);
     }
-    if args.file_path.is_empty() || args.file_path.len() > 4096 || args.file_path.contains('\0') {
+    if file_path.is_empty() || file_path.len() > 4096 || file_path.contains('\0') {
         return Err(LspError::Denied("invalid document path".into()));
     }
     let servers = configuration(home, cx)?
         .ok_or_else(|| LspError::Denied("diagnostics are disabled or unconfigured".into()))?;
-    let original = resolve_path(cx, &args.file_path);
+    let original = resolve_path(cx, file_path);
     let file = original
         .canonicalize()
         .map_err(|_| LspError::Denied("document is unavailable".into()))?;
     let extension = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mut candidates = servers.into_iter().filter(|s| {
-        args.server.as_ref().is_none_or(|name| &s.name == name)
+        server_name.is_none_or(|name| &s.name == name)
             && s.extensions.iter().any(|e| e == extension)
             && file.starts_with(&s.workspace_root)
     });
@@ -405,7 +419,7 @@ pub fn diagnostics(
         home,
         cx,
         scope,
-        &args.file_path,
+        file_path,
         &original,
         &file,
         &server.workspace_root,
@@ -455,7 +469,7 @@ pub fn diagnostics(
             home,
             cx,
             scope,
-            &args.file_path,
+            file_path,
             &original,
             &descriptor_path,
             &server.workspace_root,
@@ -480,11 +494,33 @@ pub fn diagnostics(
         home,
         cx,
         scope,
-        &args.file_path,
+        file_path,
         &original,
         &file,
         &server.workspace_root,
     )?;
+    Ok(Prepared {
+        server,
+        document,
+        uri,
+        deadline,
+    })
+}
+
+/// The shared runtime performs normal approval evaluation before this call.
+/// Defense in depth repeats inherited scope, deny rules and path containment.
+pub fn diagnostics(
+    home: &Path,
+    cx: &ToolContext,
+    scope: &PermissionScope,
+    args: &LspDiagnosticsArgs,
+) -> Result<DiagnosticReport, LspError> {
+    let Prepared {
+        server,
+        document,
+        uri,
+        deadline,
+    } = prepare(home, cx, scope, &args.file_path, args.server.as_ref())?;
     let mut report = DiagnosticReport {
         server: server.name.clone(),
         uri,
@@ -521,6 +557,513 @@ pub fn diagnostics(
         Err(LspError::Configuration(
             "stdio diagnostics currently require Unix".into(),
         ))
+    }
+}
+
+/// Arguments of a navigation request: the same tool as diagnostics, with
+/// an `operation`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LspNavigateArgs {
+    /// `definition`, `references`, `hover`, `document_symbols` or
+    /// `workspace_symbols`.
+    pub operation: String,
+    pub file_path: String,
+    /// 1-based, as an editor shows them. Needed for `definition`,
+    /// `references` and `hover`.
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub character: Option<u32>,
+    /// The name to look for, for `workspace_symbols`.
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// What a navigation request found.
+#[derive(Debug, Clone, Serialize)]
+pub struct NavigationReport {
+    pub server: String,
+    pub operation: String,
+    /// Locations and symbols: `path` relative to the server's workspace
+    /// where it lies inside it, `line` and `character` 1-based.
+    pub results: Vec<Value>,
+    /// Hover text, for `hover`.
+    pub text: Option<String>,
+    /// Results in files this session may not read are counted, not shown.
+    pub withheld: usize,
+    pub truncated: bool,
+    pub reason: Option<String>,
+    pub redactions: Vec<String>,
+}
+
+const NAVIGATION_RESULTS: usize = 200;
+const NAVIGATION_FILES: usize = 64;
+const NAVIGATION_ATTEMPTS: u32 = 40;
+
+/// The tool's one entry point: diagnostics when no `operation` is named (or
+/// `diagnostics`), otherwise navigation.
+pub fn run(
+    home: &Path,
+    cx: &ToolContext,
+    scope: &PermissionScope,
+    args: &Value,
+) -> Result<Value, LspError> {
+    let invalid = |error: serde_json::Error| LspError::Configuration(error.to_string());
+    let encode = |error: serde_json::Error| LspError::Protocol(error.to_string());
+    match args.get("operation").and_then(Value::as_str) {
+        None | Some("diagnostics") => {
+            let mut plain = args.clone();
+            if let Some(object) = plain.as_object_mut() {
+                object.remove("operation");
+            }
+            let arguments: LspDiagnosticsArgs = serde_json::from_value(plain).map_err(invalid)?;
+            serde_json::to_value(diagnostics(home, cx, scope, &arguments)?).map_err(encode)
+        }
+        Some(_) => {
+            let arguments: LspNavigateArgs =
+                serde_json::from_value(args.clone()).map_err(invalid)?;
+            serde_json::to_value(navigate(home, cx, scope, &arguments)?).map_err(encode)
+        }
+    }
+}
+
+/// The LSP method, the capability that announces it, and whether it takes a
+/// position.
+fn navigation_method(operation: &str) -> Option<(&'static str, &'static str, bool)> {
+    Some(match operation {
+        "definition" => ("textDocument/definition", "definitionProvider", true),
+        "references" => ("textDocument/references", "referencesProvider", true),
+        "hover" => ("textDocument/hover", "hoverProvider", true),
+        "document_symbols" => (
+            "textDocument/documentSymbol",
+            "documentSymbolProvider",
+            false,
+        ),
+        "workspace_symbols" => ("workspace/symbol", "workspaceSymbolProvider", false),
+        _ => return None,
+    })
+}
+
+/// A 1-based character column of `line` as the offset the server counts in.
+fn encoded_column(line: &str, column: u32, encoding: &str) -> u32 {
+    let before = line.chars().take(column.saturating_sub(1) as usize);
+    match encoding {
+        "utf-8" => before.map(char::len_utf8).sum::<usize>() as u32,
+        "utf-32" => before.count() as u32,
+        _ => before.map(char::len_utf16).sum::<usize>() as u32,
+    }
+}
+
+/// Symbol kinds as words (the protocol's numbering).
+fn symbol_kind(kind: u64) -> &'static str {
+    const KINDS: [&str; 26] = [
+        "file",
+        "module",
+        "namespace",
+        "package",
+        "class",
+        "method",
+        "property",
+        "field",
+        "constructor",
+        "enum",
+        "interface",
+        "function",
+        "variable",
+        "constant",
+        "string",
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "key",
+        "null",
+        "enum member",
+        "struct",
+        "event",
+        "operator",
+        "type parameter",
+    ];
+    usize::try_from(kind)
+        .ok()
+        .and_then(|kind| KINDS.get(kind.checked_sub(1)?))
+        .copied()
+        .unwrap_or("symbol")
+}
+
+/// Navigate from one authorized document: where a symbol is defined, where
+/// it is used, what the server says about it, and the symbols of the
+/// document or the workspace. The document passes the same checks as for
+/// diagnostics. Every file a result names is checked the same way: one this
+/// session may not read is counted in `withheld` and not named.
+pub fn navigate(
+    home: &Path,
+    cx: &ToolContext,
+    scope: &PermissionScope,
+    args: &LspNavigateArgs,
+) -> Result<NavigationReport, LspError> {
+    let (method, capability, positional) = navigation_method(&args.operation).ok_or_else(|| {
+        LspError::Denied(
+            "operation must be diagnostics, definition, references, hover, document_symbols or workspace_symbols"
+                .into(),
+        )
+    })?;
+    let position = match (positional, args.line, args.character) {
+        (true, Some(line), Some(character)) if line >= 1 && character >= 1 => {
+            Some((line, character))
+        }
+        (true, _, _) => {
+            return Err(LspError::Denied(
+                "this operation needs a 1-based line and character".into(),
+            ));
+        }
+        (false, _, _) => None,
+    };
+    let query = args.query.as_deref().unwrap_or("").trim();
+    if args.operation == "workspace_symbols" && (query.is_empty() || query.len() > 200) {
+        return Err(LspError::Denied(
+            "workspace_symbols needs a query of at most 200 characters".into(),
+        ));
+    }
+    let Prepared {
+        server,
+        document,
+        uri,
+        deadline,
+    } = prepare(home, cx, scope, &args.file_path, args.server.as_ref())?;
+    let mut report = NavigationReport {
+        server: server.name.clone(),
+        operation: args.operation.clone(),
+        results: Vec::new(),
+        text: None,
+        withheld: 0,
+        truncated: false,
+        reason: None,
+        redactions: Vec::new(),
+    };
+    #[cfg(unix)]
+    {
+        let mut peer = transport::Peer::start(&server, cx, deadline)?;
+        let answer = navigation_exchange(
+            &mut peer, &server, &document, &uri, method, capability, position, query, cx, deadline,
+        );
+        let cleanup = peer.finish(cx);
+        if answer.is_ok() || matches!(answer, Err(LspError::Timeout)) {
+            cleanup?;
+        }
+        match answer {
+            Ok(Some(result)) => {
+                fill_navigation(home, cx, scope, &server, &mut report, &result);
+                Ok(report)
+            }
+            Ok(None) => {
+                report.reason = Some("the server found nothing there".into());
+                Ok(report)
+            }
+            Err(LspError::Timeout) => {
+                report.reason = Some(
+                    "the language server gave no answer before the deadline; it may still be indexing"
+                        .into(),
+                );
+                Ok(report)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            server, document, uri, deadline, method, capability, position, query, report,
+        );
+        Err(LspError::Configuration(
+            "stdio language servers currently require Unix".into(),
+        ))
+    }
+}
+
+/// Handshake, open the document, ask. A server that is still loading
+/// answers with an error or with nothing: the request is repeated, a little
+/// apart, until it answers or the deadline passes. `Ok(None)` is a server
+/// that answered "nothing".
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn navigation_exchange(
+    peer: &mut transport::Peer,
+    server: &Server,
+    document: &str,
+    uri: &str,
+    method: &str,
+    capability: &str,
+    position: Option<(u32, u32)>,
+    query: &str,
+    cx: &ToolContext,
+    deadline: Instant,
+) -> Result<Option<Value>, LspError> {
+    let root_uri = url::Url::from_directory_path(&server.workspace_root)
+        .map_err(|_| LspError::Configuration("workspace URI cannot be encoded".into()))?
+        .to_string();
+    peer.send(
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "processId":std::process::id(),"rootUri":root_uri,"capabilities":{
+            "general":{"positionEncodings":["utf-8","utf-16","utf-32"]},
+            "textDocument":{
+                "definition":{"linkSupport":true},
+                "references":{},
+                "hover":{"contentFormat":["plaintext","markdown"]},
+                "documentSymbol":{"hierarchicalDocumentSymbolSupport":true}
+            },
+            "workspace":{"symbol":{}}
+        },"clientInfo":{"name":"ORBIT"}}}),
+        cx,
+        deadline,
+    )?;
+    let initialization = response(peer, 1, cx, deadline)?;
+    let caps = initialization
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| LspError::Protocol("initialize response lacks capabilities".into()))?;
+    let offered = caps
+        .get(capability)
+        .is_some_and(|value| value.as_bool().unwrap_or(!value.is_null()));
+    if !offered {
+        return Err(LspError::Denied(
+            "the language server does not offer this operation".into(),
+        ));
+    }
+    let encoding = caps
+        .get("positionEncoding")
+        .and_then(Value::as_str)
+        .filter(|encoding| ["utf-8", "utf-16", "utf-32"].contains(encoding))
+        .unwrap_or("utf-16");
+    peer.send(
+        &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        cx,
+        deadline,
+    )?;
+    peer.send(
+        &json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{
+            "uri":uri,"languageId":server.language_id,"version":1,"text":document
+        }}}),
+        cx,
+        deadline,
+    )?;
+    peer.document_uri = Some(uri.to_owned());
+    let mut params = match position {
+        Some((line, character)) => {
+            let text = document.lines().nth(line as usize - 1).unwrap_or("");
+            json!({"textDocument":{"uri":uri},"position":{
+                "line": line - 1,
+                "character": encoded_column(text, character, encoding)
+            }})
+        }
+        None if method == "workspace/symbol" => json!({"query": query}),
+        None => json!({"textDocument":{"uri":uri}}),
+    };
+    if method == "textDocument/references" {
+        params["context"] = json!({"includeDeclaration": true});
+    }
+    for attempt in 0..NAVIGATION_ATTEMPTS {
+        let id = 2 + i64::from(attempt);
+        peer.send(
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            cx,
+            deadline,
+        )?;
+        let answered = loop {
+            let message = peer.receive(cx, deadline)?;
+            if reject_server_request(peer, &message, cx, deadline)? {
+                continue;
+            }
+            if message.get("id").and_then(Value::as_i64) != Some(id) {
+                continue;
+            }
+            break message;
+        };
+        let result = answered.get("result");
+        let empty = result
+            .is_none_or(|result| result.is_null() || result.as_array().is_some_and(Vec::is_empty));
+        if !empty {
+            return Ok(result.cloned());
+        }
+        // An explicit "nothing" from a server that has had time to load is
+        // an answer; an error, or nothing on the first tries, is asked again.
+        if answered.get("error").is_none() && attempt >= 2 {
+            return Ok(None);
+        }
+        check(cx, deadline)?;
+        std::thread::sleep(
+            Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+        );
+        check(cx, deadline)?;
+    }
+    Ok(None)
+}
+
+fn clean_into(value: &str, redactions: &mut Vec<String>) -> String {
+    let mut scratch = DiagnosticReport {
+        server: String::new(),
+        uri: String::new(),
+        document_version: 0,
+        position_encoding: String::new(),
+        status: DiagnosticStatus::Unavailable,
+        freshness: Freshness::Unconfirmed,
+        reason: None,
+        diagnostics: Vec::new(),
+        truncated: false,
+        redactions: std::mem::take(redactions),
+    };
+    let text = clean_text(value, &mut scratch);
+    *redactions = scratch.redactions;
+    text
+}
+
+/// Turn the server's answer into bounded, checked results.
+fn fill_navigation(
+    home: &Path,
+    cx: &ToolContext,
+    scope: &PermissionScope,
+    server: &Server,
+    report: &mut NavigationReport,
+    result: &Value,
+) {
+    if report.operation == "hover" {
+        let contents = result.get("contents").unwrap_or(&Value::Null);
+        let piece = |value: &Value| {
+            value
+                .as_str()
+                .or_else(|| value.get("value").and_then(Value::as_str))
+                .map(str::to_owned)
+        };
+        let text = match contents {
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(piece)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            other => piece(other).unwrap_or_default(),
+        };
+        let text: String = text.chars().take(8_000).collect();
+        if text.trim().is_empty() {
+            report.reason = Some("the server has nothing to say about that position".into());
+        } else {
+            report.text = Some(clean_into(&text, &mut report.redactions));
+        }
+        return;
+    }
+    // Which files may be named: each is put through the document's own
+    // checks once.
+    let mut verdicts: std::collections::HashMap<PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    let mut shown_path = |uri: &str| -> Option<String> {
+        let path = url::Url::parse(uri).ok()?.to_file_path().ok()?;
+        if !verdicts.contains_key(&path) && verdicts.len() >= NAVIGATION_FILES {
+            return None;
+        }
+        verdicts
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let real = path.canonicalize().ok()?;
+                let named = real.to_string_lossy().into_owned();
+                authorize(
+                    home,
+                    cx,
+                    scope,
+                    &named,
+                    &real,
+                    &real,
+                    &server.workspace_root,
+                )
+                .ok()?;
+                Some(
+                    real.strip_prefix(&server.workspace_root)
+                        .map_or(named.clone(), |inside| {
+                            inside.to_string_lossy().into_owned()
+                        }),
+                )
+            })
+            .clone()
+    };
+    let start_of = |range: Option<&Value>| {
+        let start = range?.get("start")?;
+        Some((
+            start.get("line")?.as_u64()? + 1,
+            start.get("character")?.as_u64()? + 1,
+        ))
+    };
+    // Flatten: a location, a list of them, location links, or symbols (flat
+    // or nested under `children`).
+    let mut pending: Vec<(&Value, Option<String>)> = match result {
+        Value::Array(items) => items.iter().rev().map(|item| (item, None)).collect(),
+        single => vec![(single, None)],
+    };
+    while let Some((item, container)) = pending.pop() {
+        if report.results.len() >= NAVIGATION_RESULTS {
+            report.truncated = true;
+            break;
+        }
+        let location = item.get("location").unwrap_or(item);
+        let uri = location
+            .get("uri")
+            .or_else(|| location.get("targetUri"))
+            .and_then(Value::as_str);
+        let range = location
+            .get("targetSelectionRange")
+            .or_else(|| location.get("selectionRange"))
+            .or_else(|| location.get("range"));
+        let name = item.get("name").and_then(Value::as_str);
+        let mut entry = serde_json::Map::new();
+        match uri {
+            Some(uri) => match shown_path(uri) {
+                Some(path) => {
+                    entry.insert("path".into(), json!(path));
+                }
+                None => {
+                    report.withheld += 1;
+                    continue;
+                }
+            },
+            // A document symbol has no URI: it is in the document asked about.
+            None if name.is_some() => {}
+            None => continue,
+        }
+        if let Some((line, character)) = start_of(range) {
+            entry.insert("line".into(), json!(line));
+            entry.insert("character".into(), json!(character));
+        }
+        if let Some(name) = name {
+            let name: String = name.chars().take(200).collect();
+            entry.insert(
+                "name".into(),
+                json!(clean_into(&name, &mut report.redactions)),
+            );
+            if let Some(kind) = item.get("kind").and_then(Value::as_u64) {
+                entry.insert("kind".into(), json!(symbol_kind(kind)));
+            }
+            let within = container.clone().or_else(|| {
+                item.get("containerName")
+                    .and_then(Value::as_str)
+                    .filter(|within| !within.is_empty())
+                    .map(|within| within.chars().take(200).collect())
+            });
+            if let Some(within) = within {
+                entry.insert(
+                    "in".into(),
+                    json!(clean_into(&within, &mut report.redactions)),
+                );
+            }
+            if let Some(children) = item.get("children").and_then(Value::as_array) {
+                for child in children.iter().rev() {
+                    pending.push((child, Some(name.clone())));
+                }
+            }
+        }
+        report.results.push(Value::Object(entry));
+    }
+    if report.results.is_empty() && report.withheld == 0 {
+        report.reason = Some("the server found nothing there".into());
     }
 }
 

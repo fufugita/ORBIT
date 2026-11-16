@@ -79,6 +79,671 @@ fn checked_cost(
     }
 }
 
+/// The enabled MCP servers of this home and (when trusted) project.
+fn enabled_mcp_servers(
+    home: &std::path::Path,
+) -> Result<Vec<(String, orbit_mcp::McpServerConfig)>, String> {
+    let trusted = orbit_engine::hooks::project_trusted(home);
+    Ok(orbit_mcp::McpConfig::try_load(home, trusted)
+        .map_err(|error| format!("mcp configuration is invalid: {error}"))?
+        .servers
+        .into_iter()
+        .filter(|(_, server)| server.enabled)
+        .collect())
+}
+
+/// `/mcp prompts`: the prompts each enabled server offers.
+fn mcp_prompt_list(home: &std::path::Path) -> String {
+    let servers = match enabled_mcp_servers(home) {
+        Ok(servers) => servers,
+        Err(error) => return error,
+    };
+    let mut lines = Vec::new();
+    for (server, config) in &servers {
+        let Ok(answer) =
+            orbit_mcp::POOL.request(server, config, "prompts/list", serde_json::json!({}))
+        else {
+            continue;
+        };
+        for prompt in answer
+            .get("prompts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(64)
+        {
+            let text = |key: &str| {
+                prompt
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(orbit_hud::safe_text)
+                    .unwrap_or_default()
+            };
+            let arguments: Vec<String> = prompt
+                .get("arguments")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|argument| argument.get("name")?.as_str().map(orbit_hud::safe_text))
+                .collect();
+            let description: String = text("description").chars().take(96).collect();
+            lines.push(format!(
+                "/mcp prompt {server} {}{} — {description}",
+                text("name"),
+                arguments
+                    .iter()
+                    .map(|name| format!(" {name}=…"))
+                    .collect::<String>()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        "no MCP server offers prompts".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// `/mcp prompt <server> <name> [key=value …]`: the text of one server
+/// prompt, to be sent as the operator's own prompt.
+fn mcp_prompt_text(
+    home: &std::path::Path,
+    server: &str,
+    name: &str,
+    pairs: &[&str],
+) -> Result<String, String> {
+    const MAX_PROMPT_BYTES: usize = 32 * 1024;
+    let servers = enabled_mcp_servers(home)?;
+    let (_, config) = servers
+        .iter()
+        .find(|(known, _)| known == server)
+        .ok_or_else(|| format!("no enabled MCP server named {server} (see /mcp)"))?;
+    let mut arguments = serde_json::Map::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("argument {pair} is not key=value"))?;
+        arguments.insert(key.to_owned(), serde_json::json!(value));
+    }
+    let answer = orbit_mcp::POOL.request(
+        server,
+        config,
+        "prompts/get",
+        serde_json::json!({ "name": name, "arguments": arguments }),
+    )?;
+    let mut text = String::new();
+    for message in answer
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        // Text content only; a prompt's images and embedded resources are
+        // not carried.
+        if let Some(part) = message
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(part);
+        }
+    }
+    if text.trim().is_empty() {
+        return Err(format!("prompt {name} from {server} has no text"));
+    }
+    if text.len() > MAX_PROMPT_BYTES {
+        return Err(format!("prompt {name} from {server} is larger than 32 KiB"));
+    }
+    Ok(text)
+}
+
+/// Fire `FileChanged` for each watched file whose modification time differs
+/// from the one recorded at the previous call. The first sight of a file
+/// only records it. Nothing is read or hashed: a change is a changed
+/// mtime, a file appearing or a file going away.
+fn fire_file_changes(
+    home: &std::path::Path,
+    working_dir: &std::path::Path,
+    seen: &mut std::collections::BTreeMap<String, Option<std::time::SystemTime>>,
+) {
+    let hooks = orbit_engine::hooks::Hooks::load(home, orbit_engine::hooks::project_trusted(home));
+    let names = orbit_engine::hooks::watched_files(&hooks);
+    seen.retain(|name, _| names.contains(name));
+    for name in names {
+        let path = working_dir.join(&name);
+        let now = std::fs::metadata(&path)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        match seen.insert(name.clone(), now) {
+            Some(before) if before != now => {
+                let change = match (before, now) {
+                    (None, Some(_)) => "created",
+                    (Some(_), None) => "deleted",
+                    _ => "modified",
+                };
+                let _ = hooks.fire(
+                    orbit_engine::hooks::HookEvent::FileChanged,
+                    &serde_json::json!({
+                        "file_name": name,
+                        "file_path": path.to_string_lossy(),
+                        "change": change,
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `/tasks`: everything this session has running or waiting besides the
+/// conversation: background commands, background agents, monitors and the
+/// prompts scheduled for this directory.
+fn background_work(home: &std::path::Path, working_dir: &std::path::Path) -> String {
+    let short = |text: &str| -> String {
+        let line: String = orbit_hud::safe_text(text).chars().take(80).collect();
+        line
+    };
+    let mut lines = Vec::new();
+    for (id, command) in orbit_tools::bash::background_commands() {
+        let state = match orbit_tools::bash::background_task(&id)
+            .and_then(|(_, pid, _)| orbit_tools::bash::pid_alive(pid))
+        {
+            Some(true) => "running",
+            Some(false) => "ended",
+            None => "started",
+        };
+        lines.push(format!("command {id} · {state} · {}", short(&command)));
+    }
+    for handle in crate::tools::background_agents() {
+        lines.push(format!(
+            "agent {handle} · running · /tasks stop {handle} stops it"
+        ));
+    }
+    match crate::tools::monitors_running() {
+        0 => {}
+        n => lines.push(format!("{n} monitor(s) watching background commands")),
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let cwd = working_dir.to_string_lossy();
+    for job in orbit_hud_tui::schedule::load(home)
+        .iter()
+        .filter(|job| job.cwd == cwd && !job.id.starts_with("monitor-"))
+    {
+        lines.push(format!(
+            "schedule {}",
+            short(&orbit_hud_tui::schedule::describe(job, now))
+        ));
+    }
+    if lines.is_empty() {
+        "nothing is running in the background and nothing is scheduled here".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// `/btw`: one request that sees the conversation and answers a side
+/// question. Nothing is added to the transcript or saved, no tool runs.
+/// Its tokens are billed to the session's housekeeping subtotal when the
+/// session runs managed accounting; an unmanaged session answers without a
+/// bill, as before.
+fn side_question(
+    config: &TuiTurnConfig,
+    system_prompt: &str,
+    transcript: &[ChatMessage],
+    question: &str,
+    accounting: &crate::session_accounting::RootSessionAccounting,
+) -> Result<String, String> {
+    let turn = configured_turn(config)?;
+    let options = orbit_engine::TurnOptions {
+        max_rounds: 1,
+        // The session's own tools stay declared so earlier tool calls in
+        // the history remain valid; none of them can run here.
+        tools: crate::tools::session_tool_definitions(&config.home),
+        system_directive: Some(format!(
+            "{system_prompt}\n\nThe next message is a side question from the operator. Answer it briefly from the conversation so far. Do not call tools and do not continue the task."
+        )),
+        request_stem: "orbit-btw".into(),
+        session_id: config.session_id.clone(),
+        output_reserve_tokens: 1_024,
+        ..Default::default()
+    };
+    // Managed sessions bill the side question to their own namespace.
+    let mut options = options;
+    if accounting
+        .namespace()
+        .apply_options_detailed(&mut options, None, None)
+        .is_err()
+    {
+        options.journal = None;
+        options.spend_allowance = None;
+        options.session_id = format!("btw-{}", ulid::Ulid::new());
+    }
+    let mut scratch = transcript.to_vec();
+    let report = orbit_engine::turn::run_turn(
+        &config.home,
+        &turn,
+        &options,
+        question,
+        &mut scratch,
+        &mut crate::auto_mode::NoTools,
+        &orbit_provider_http::CancelToken::new(),
+        &mut |_| {},
+    )?;
+    if report.final_text.trim().is_empty() {
+        return Err("the model gave no answer".into());
+    }
+    Ok(report.final_text)
+}
+
+/// How a saved session began: the first line the operator typed, cut short.
+fn session_opening(transcript: &[ChatMessage]) -> Option<String> {
+    let first = without_hook_context(
+        &transcript
+            .iter()
+            .find(|message| message.role == ChatRole::User)?
+            .content,
+    )
+    .lines()
+    .map(str::trim)
+    .find(|line| !line.is_empty())?;
+    // Conversation text, not a status line: a title that names a role
+    // marker ("prompt: ...") is shown, with secrets still redacted.
+    let mut opening: String = orbit_hud::display_safe_content(first)
+        .chars()
+        .take(40)
+        .collect();
+    if first.chars().count() > 40 {
+        opening.push('…');
+    }
+    Some(format!("“{opening}”"))
+}
+
+/// When a session was last saved, as an age: its stored time is seconds
+/// since 1970, which nobody reads. Anything else is shown as stored.
+fn session_age(updated_at: &str) -> String {
+    let Ok(then) = updated_at.trim().parse::<u64>() else {
+        return updated_at.to_owned();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(then, |since| since.as_secs());
+    age_text(now.saturating_sub(then))
+}
+
+fn age_text(seconds: u64) -> String {
+    match seconds {
+        0..=89 => "just now".to_owned(),
+        90..=5_399 => format!("{}m ago", seconds / 60),
+        5_400..=172_799 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+/// The approval card of a question the model put to the operator: its first
+/// line as the card's subject, and under it which key gives which answer.
+/// The card has two keys, so a third option and beyond are named as not on
+/// offer here rather than silently dropped.
+fn question_card(question: &str, options: &[String]) -> (String, Vec<String>) {
+    let subject: String = question
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("a question")
+        .chars()
+        .take(160)
+        .collect();
+    let option = |index: usize| -> String {
+        options
+            .get(index)
+            .map(|text| orbit_hud::safe_text(text).chars().take(80).collect())
+            .unwrap_or_default()
+    };
+    let mut preview = Vec::new();
+    match options.len() {
+        0 => preview.push(" y  yes · n  no".to_string()),
+        1 => preview.push(format!(" y  {} · n  decline", option(0))),
+        _ => {
+            preview.push(format!(" y  {}", option(0)));
+            preview.push(format!(" n  {}", option(1)));
+        }
+    }
+    if options.len() > 2 {
+        preview.push(format!(
+            " {} more option(s): press n and type the one you want",
+            options.len() - 2
+        ));
+    }
+    (subject, preview)
+}
+
+/// What the operator is told when a stopped request was closed as
+/// abandoned and the session carries on.
+const STOPPED_REQUEST_NOTICE: &str = "the stopped request may still have been billed, and what it cost is not known · this session goes on, and its cost is shown as a lower bound from here";
+
+/// Close the request that was just stopped (or timed out) as abandoned, so
+/// this same session takes the next prompt. `true` when one was abandoned;
+/// `false` when nothing was pending that way or it could not be done (the
+/// caller then falls back to continuing in a copy).
+fn abandon_stopped_request(accounting: &RootSessionAccounting) -> bool {
+    accounting
+        .namespace()
+        .abandon_stopped_request()
+        .unwrap_or(false)
+}
+
+/// When the session's accounting can admit no further request (one was
+/// stopped, or timed out, before its outcome was known), the conversation
+/// goes on in a copy with fresh accounting, as `--fork-session` would make:
+/// the copy's id and what to tell the operator. With no id, the copy could
+/// not be made and the text says how to continue by hand. `None` when the
+/// session can go on as it is.
+fn continue_in_copy(
+    home: &std::path::Path,
+    lease: &crate::sessions::SessionLease,
+    namespace: &session_accounting::NamespaceAccounting,
+) -> Option<(Option<String>, String)> {
+    if !namespace.admission_blocked() {
+        return None;
+    }
+    Some(
+        match crate::sessions::fork_held_session(home, lease, None) {
+            Ok(fork) => (
+                Some(fork.session_id.clone()),
+                format!(
+                    "the last request ended before its outcome was known, so session {} takes no more requests · continuing in a copy, {}, with the same conversation (cost before this point: unknown)",
+                    short_session_id(lease.session_id()),
+                    short_session_id(&fork.session_id)
+                ),
+            ),
+            Err(error) => (
+                None,
+                format!(
+                    "the last request ended before its outcome was known, so this session takes no more requests, and a copy could not be made ({error}) · quit and run: orbit --continue --fork-session"
+                ),
+            ),
+        },
+    )
+}
+
+/// The prompt a custom command file stands for, when `command` names one
+/// this session may read (project files only in a trusted folder).
+fn custom_command_body(
+    home: &std::path::Path,
+    command: &WorkerCommand,
+    shell: crate::custom_commands::Shell,
+) -> Option<String> {
+    expand_custom_command(home, command, shell).and_then(Result::ok)
+}
+
+/// As [`custom_command_body`], telling a refusal apart from "no such
+/// command": `Some(Err(reason))` when a `UserPromptExpansion` hook blocked
+/// the command. The hook fires once per call of this function.
+fn expand_custom_command(
+    home: &std::path::Path,
+    command: &WorkerCommand,
+    shell: crate::custom_commands::Shell,
+) -> Option<Result<String, String>> {
+    let WorkerCommand::SlashCommand(name, args) = command else {
+        return None;
+    };
+    let working_dir = std::env::current_dir().ok()?;
+    crate::custom_commands::expand_command(
+        home,
+        &working_dir,
+        orbit_engine::hooks::project_trusted(home),
+        name,
+        args,
+        shell,
+    )
+}
+
+/// `/mcp login <server>`: the OAuth sign-in for one configured remote
+/// server. Blocks this worker until the browser returns or three minutes
+/// pass; the consent URL is announced first.
+fn mcp_sign_in(
+    home: &std::path::Path,
+    server: &str,
+    client_id: Option<&str>,
+    announce: &mut dyn FnMut(&str),
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    let trusted = orbit_engine::hooks::project_trusted(home);
+    let config = match orbit_mcp::McpConfig::try_load(home, trusted) {
+        Ok(config) => config,
+        Err(error) => return format!("mcp configuration is invalid: {error}"),
+    };
+    let Some(entry) = config.servers.get(server) else {
+        return format!("no MCP server named {server} (see /mcp)");
+    };
+    match orbit_mcp::oauth::login(
+        home,
+        server,
+        entry,
+        client_id,
+        announce,
+        std::time::Duration::from_secs(180),
+        Some(std::sync::Arc::new(move || {
+            cancel.load(std::sync::atomic::Ordering::SeqCst)
+        })),
+    ) {
+        Ok(message) => format!("{message} — its tools connect on the next call"),
+        Err(error) => error,
+    }
+}
+
+/// The sign-in waiting for its browser, if any: its server and stop flag.
+static MCP_SIGN_IN: std::sync::Mutex<
+    Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+> = std::sync::Mutex::new(None);
+
+/// Start `/mcp login` on its own thread, so the session keeps working while
+/// the browser is open. One at a time; the outcome arrives as a message.
+fn start_mcp_sign_in(
+    home: &std::path::Path,
+    server: &str,
+    client_id: Option<&str>,
+    sender: BusSender,
+) -> String {
+    let Ok(mut slot) = MCP_SIGN_IN.lock() else {
+        return "mcp sign-in is unavailable".into();
+    };
+    if let Some((waiting, _)) = slot.as_ref() {
+        return format!(
+            "a sign-in to {waiting} is already waiting for its browser · /mcp login cancel stops it"
+        );
+    }
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *slot = Some((server.to_owned(), cancel.clone()));
+    drop(slot);
+    let (home, server_name, client_id) = (
+        home.to_path_buf(),
+        server.to_owned(),
+        client_id.map(str::to_owned),
+    );
+    let spawned = std::thread::Builder::new()
+        .name("orbit-mcp-sign-in".into())
+        .spawn(move || {
+            let announce_to = sender.clone();
+            let outcome = mcp_sign_in(
+                &home,
+                &server_name,
+                client_id.as_deref(),
+                &mut |url| {
+                    announce_to.send(Msg::SystemMessage(format!(
+                        "Open this page to sign in (waiting up to 3 minutes, /mcp login cancel stops it):\n{url}"
+                    )));
+                },
+                cancel,
+            );
+            if let Ok(mut slot) = MCP_SIGN_IN.lock() {
+                *slot = None;
+            }
+            sender.send(Msg::SystemMessage(outcome));
+        });
+    match spawned {
+        Ok(_) => format!("signing in to {server}; the consent page follows"),
+        Err(error) => {
+            if let Ok(mut slot) = MCP_SIGN_IN.lock() {
+                *slot = None;
+            }
+            format!("could not start the sign-in: {error}")
+        }
+    }
+}
+
+/// `/mcp login cancel`: stop the sign-in that is waiting, if there is one.
+fn cancel_mcp_sign_in() -> String {
+    match MCP_SIGN_IN.lock().ok().and_then(|slot| slot.clone()) {
+        Some((server, cancel)) => {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            format!("stopping the sign-in to {server}")
+        }
+        None => "no sign-in is waiting".into(),
+    }
+}
+
+/// `/hooks`, `/skills`, `/agents`, `/mcp`: what is configured for this home
+/// and (when trusted) this project. Read-only; nothing is started.
+fn inspect_configuration(home: &std::path::Path, what: &str) -> String {
+    let trusted = orbit_engine::hooks::project_trusted(home);
+    let short = |text: &str| -> String {
+        let line = text.lines().next().unwrap_or("").trim();
+        let cut: String = line.chars().take(96).collect();
+        if cut.len() < line.len() {
+            format!("{cut}…")
+        } else {
+            cut
+        }
+    };
+    let mut lines: Vec<String> = match what {
+        "hooks" => orbit_engine::hooks::Hooks::load(home, trusted)
+            .hooks
+            .iter()
+            .map(|hook| {
+                format!(
+                    "{} [{}] {}",
+                    hook.event,
+                    hook.matcher
+                        .as_deref()
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or("*"),
+                    short(&hook.command)
+                )
+            })
+            .collect(),
+        "skills" => orbit_engine::skills::load_skills(home, trusted)
+            .iter()
+            .map(|skill| format!("/{} — {}", skill.name, short(&skill.description)))
+            .collect(),
+        "memory" => orbit_engine::context::instruction_files(
+            home,
+            &std::env::current_dir().unwrap_or_default(),
+        )
+        .iter()
+        .map(|(path, bytes)| format!("{} · {bytes} bytes", path.display()))
+        .collect(),
+        "agents" => orbit_engine::skills::load_agents(home, trusted)
+            .iter()
+            .map(|agent| format!("{} — {}", agent.name, short(&agent.description)))
+            .collect(),
+        "mcp" => match orbit_mcp::McpConfig::try_load(home, trusted) {
+            Ok(config) => config
+                .servers
+                .iter()
+                .map(|(name, server)| {
+                    let transport = match server.transport {
+                        orbit_mcp::McpTransport::Stdio => "stdio",
+                        orbit_mcp::McpTransport::StreamableHttp => "streamable-http",
+                        orbit_mcp::McpTransport::Sse => "sse",
+                    };
+                    let mut line = format!(
+                        "{name} · {transport} · {}",
+                        if server.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    if let Some(status) = orbit_mcp::oauth::status(home, name) {
+                        line.push_str(" · ");
+                        line.push_str(&status);
+                    }
+                    if server.enabled {
+                        line.push_str(" · ");
+                        line.push_str(
+                            &crate::tools::mcp_state_text(name)
+                                .unwrap_or_else(|| "starts when a prompt needs it".into()),
+                        );
+                    }
+                    line
+                })
+                .collect(),
+            Err(error) => vec![format!("mcp configuration is invalid: {error}")],
+        },
+        _ => vec![format!("nothing to list for {what}")],
+    };
+    if lines.is_empty() {
+        lines.push(match what {
+            "hooks" => "no hooks — add [[hooks]] tables to settings.toml".into(),
+            "skills" => "no skills — add skills/<name>/SKILL.md".into(),
+            "agents" => "no agents — add agents/<name>.md".into(),
+            "memory" => "no instruction files — add ORBIT.md (or run /init)".into(),
+            _ => "no MCP servers — add them to mcp.json".into(),
+        });
+    } else {
+        lines.insert(0, format!("{what} ({})", lines.len()));
+    }
+    if !trusted {
+        lines.push("this folder is not trusted: project entries are not loaded".into());
+    }
+    crate::daemon::scan_display(&lines.join("\n"))
+}
+
+/// Cache and reasoning tokens seen by this worker for the open session.
+/// Session accounting persists input, output and cost only, so these totals
+/// live in memory: they cover finished turns since this process opened the
+/// session and start again on resume or a session switch.
+#[derive(Debug, Default)]
+struct RunUsage {
+    session_id: String,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+}
+
+impl RunUsage {
+    fn observe(&mut self, session_id: &str, report: &orbit_engine::TurnReport, sender: &BusSender) {
+        if self.session_id != session_id {
+            *self = Self {
+                session_id: session_id.into(),
+                ..Self::default()
+            };
+        }
+        // Each receipt is one provider request; only validated usage counts.
+        for usage in report
+            .attempts
+            .iter()
+            .filter(|receipt| receipt.knownness == orbit_engine::AccountingKnownness::Known)
+            .filter_map(|receipt| receipt.usage)
+        {
+            self.cache_read = self.cache_read.saturating_add(usage.cache_read_tokens);
+            self.cache_write = self.cache_write.saturating_add(usage.cache_write_tokens);
+            self.reasoning = self.reasoning.saturating_add(usage.reasoning_tokens);
+        }
+        sender.send(Msg::UsageDetail {
+            session_id: self.session_id.clone(),
+            cache_read_tokens: self.cache_read,
+            cache_write_tokens: self.cache_write,
+            reasoning_tokens: self.reasoning,
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_session_projection(
     sender: &BusSender,
@@ -218,6 +883,17 @@ fn save_controls(
         return false;
     }
     true
+}
+
+/// The line that stays in the conversation after a turn dropped some of
+/// its own tool results to stay within the context limit.
+fn dropped_results_notice(dropped: usize) -> Option<String> {
+    (dropped > 0).then(|| {
+        format!(
+            "the context limit was reached in that turn: {dropped} of its earlier tool result{} dropped so it could go on · a higher limit for this model (context_limits in providers.toml) leaves more room",
+            if dropped == 1 { " was" } else { "s were" }
+        )
+    })
 }
 
 fn retain_local_intent(
@@ -394,46 +1070,113 @@ pub fn make_spawner_owned(
                 &self,
                 questions: &[orbit_tools::askuser::AskQuestion],
             ) -> orbit_tools::askuser::AskAnswer {
-                let first = &questions[0];
-                let summary = format!(
-                    "{} — options: {}",
-                    first.question,
-                    first.options.join(" / ")
-                );
-                let call_id = format!("ask-{}", ulid::Ulid::new());
+                // One card per question, in order: each is answered on its
+                // own, and a question that was never shown is never answered.
+                let mut choices = Vec::with_capacity(questions.len());
+                for question in questions {
+                    let (summary, preview) = question_card(&question.question, &question.options);
+                    let call_id = format!("ask-{}", ulid::Ulid::new());
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.approvals.register(&call_id, tx);
+                    // The whole question (a plan can run to many lines) goes
+                    // in the conversation, where it wraps and scrolls; the
+                    // card says which key gives which answer.
+                    self.sender.send(orbit_hud_tui::msg::Msg::SystemMessage(
+                        orbit_hud::safe_text(&question.question),
+                    ));
+                    orbit_hud_tui::emit_approval_detail(
+                        &self.sender,
+                        &call_id,
+                        Vec::new(),
+                        preview,
+                        None,
+                    );
+                    self.sender
+                        .send(orbit_hud_tui::msg::Msg::ApprovalRequested {
+                            call_id: call_id.clone(),
+                            tool_name: "AskUserQuestion".into(),
+                            summary,
+                            risk: 1,
+                            working_dir: std::env::current_dir()
+                                .map(|d| d.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        });
+                    let allowed = matches!(
+                        rx.recv(),
+                        Ok(orbit_hud_tui::ApprovalResponse::Allow
+                            | orbit_hud_tui::ApprovalResponse::AllowSession
+                            | orbit_hud_tui::ApprovalResponse::AllowRule
+                            | orbit_hud_tui::ApprovalResponse::AllowRuleAlways)
+                    );
+                    // `n` with words typed after it is the operator's own
+                    // answer; a bare `n` is the second option.
+                    let typed = self.approvals.take_note(&call_id);
+                    choices.push(vec![match (allowed, typed) {
+                        (true, _) => question.options.first().cloned().unwrap_or_default(),
+                        (false, Some(text)) => text,
+                        (false, None) => question
+                            .options
+                            .get(1)
+                            .or_else(|| question.options.first())
+                            .cloned()
+                            .unwrap_or_default(),
+                    }]);
+                }
+                orbit_tools::askuser::AskAnswer { choices }
+            }
+        }
+        // An MCP server's question, as an approval card: `y` answers yes,
+        // `n` answers no, and words typed after `n` are the value asked for.
+        struct TuiElicitation {
+            sender: orbit_hud_tui::bus::BusSender,
+            approvals: orbit_hud_tui::ApprovalRegistry,
+        }
+        impl crate::elicitation::Asker for TuiElicitation {
+            fn card(
+                &self,
+                title: &str,
+                text: &str,
+                details: &[String],
+            ) -> crate::elicitation::CardReply {
+                let call_id = format!("elicit-{}", ulid::Ulid::new());
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.approvals.register(&call_id, tx);
+                // What a server sent is shown as text, never as terminal
+                // control sequences.
+                orbit_hud_tui::emit_approval_detail(
+                    &self.sender,
+                    &call_id,
+                    Vec::new(),
+                    details
+                        .iter()
+                        .map(|line| orbit_hud::safe_text(line))
+                        .collect(),
+                    None,
+                );
                 self.sender
                     .send(orbit_hud_tui::msg::Msg::ApprovalRequested {
-                        call_id,
-                        tool_name: "AskUserQuestion".into(),
-                        summary,
+                        call_id: call_id.clone(),
+                        tool_name: orbit_hud::safe_text(title),
+                        summary: orbit_hud::safe_text(text),
                         risk: 1,
-                        working_dir: std::env::current_dir()
-                            .map(|d| d.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        working_dir: String::new(),
                     });
-                let pick = match rx.recv() {
-                    Ok(orbit_hud_tui::ApprovalResponse::Allow)
-                    | Ok(orbit_hud_tui::ApprovalResponse::AllowSession) => 0,
-                    _ => 1,
-                };
-                orbit_tools::askuser::AskAnswer {
-                    choices: questions
-                        .iter()
-                        .map(|q| {
-                            vec![
-                                q.options
-                                    .get(pick)
-                                    .or_else(|| q.options.first())
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            ]
-                        })
-                        .collect(),
+                match rx.recv() {
+                    Ok(
+                        orbit_hud_tui::ApprovalResponse::Allow
+                        | orbit_hud_tui::ApprovalResponse::AllowSession
+                        | orbit_hud_tui::ApprovalResponse::AllowRule
+                        | orbit_hud_tui::ApprovalResponse::AllowRuleAlways,
+                    ) => crate::elicitation::CardReply::Yes,
+                    _ => crate::elicitation::CardReply::No(self.approvals.take_note(&call_id)),
                 }
             }
         }
+        crate::elicitation::install(&config.home);
+        crate::elicitation::set_asker(Some(std::sync::Arc::new(TuiElicitation {
+            sender: ctx.sender.clone(),
+            approvals: ctx.approvals.clone(),
+        })));
         orbit_tools::askuser::set_ask_channel(Some(std::sync::Arc::new(TuiAsk {
             sender: ask_sender,
             approvals: ask_approvals,
@@ -460,11 +1203,11 @@ pub fn make_spawner_owned(
 /// is wired to the proof surface: every ledger record the session
 /// appends is announced to the Activity panel and counted by the chip.
 fn session_tool_context(config: &TuiTurnConfig, sender: &BusSender) -> orbit_tools::ToolContext {
-    let cx = orbit_tools::ToolContext::new(
+    let cx = crate::tools::with_extra_dirs(orbit_tools::ToolContext::new(
         config.home.clone(),
         config.session_id.clone(),
         std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
-    );
+    ));
     let ledger_sender = sender.clone();
     cx.set_ledger_sink(Some(std::sync::Arc::new(
         move |n: &orbit_tools::LedgerNote| {
@@ -606,6 +1349,7 @@ fn worker_main_owned(
     // D9 (§13.5 rule 5): the session file must carry CUMULATIVE totals —
     // resumed values plus everything this run adds. Tracking them per-turn
     // only (as run_tui_turn does) made every save overwrite the history.
+    let mut run_usage = RunUsage::default();
     let mut cum_input: u64 = config.initial_input_tokens;
     let mut cum_output: u64 = config.initial_output_tokens;
     let mut cum_cost: u64 = config.initial_cost_microcents;
@@ -643,12 +1387,99 @@ fn worker_main_owned(
     let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
     tool_cx.set_ext(MemoryBytes(built.memory_bytes));
     let mut system_prompt = built.text;
+    // SessionStart hooks run for interactive sessions too. What they print
+    // (or return as additionalContext) becomes context for the model, kept
+    // apart from the system prompt so rebuilding that never drops it.
+    let _ = SANDBOX_HOME.set(config.home.clone());
+    orbit_engine::hooks::set_permission_mode(config.scope.mode.config_name());
+    orbit_engine::hooks::set_session_context(
+        &config.session_id,
+        Some(
+            &crate::sessions::sessions_dir(&config.home)
+                .join(format!("{}.json", config.session_id)),
+        ),
+    );
+    let session_hook_context = {
+        let hooks = orbit_engine::hooks::Hooks::load(
+            &config.home,
+            orbit_engine::hooks::project_trusted(&config.home),
+        );
+        // InstructionsLoaded: one event per instruction or rule file the
+        // prompt was built from. Skipped entirely when nothing listens.
+        if hooks
+            .hooks
+            .iter()
+            .any(|hook| hook.event == "InstructionsLoaded")
+        {
+            let working_dir = std::env::current_dir().unwrap_or_default();
+            for (path, bytes) in
+                orbit_engine::context::instruction_files(&config.home, &working_dir)
+            {
+                let _ = hooks.fire(
+                    orbit_engine::hooks::HookEvent::InstructionsLoaded,
+                    &serde_json::json!({
+                        "file_path": path.to_string_lossy(),
+                        "bytes": bytes,
+                        "load_reason": "session_start",
+                    }),
+                );
+            }
+        }
+        let outcomes = hooks.fire(
+            orbit_engine::hooks::HookEvent::SessionStart,
+            &serde_json::json!({
+                "frontend": "tui",
+                "source": if config.initial_turns > 0 { "resume" } else { "startup" },
+                "session_id": config.session_id,
+            }),
+        );
+        orbit_engine::hooks::prompt_context(&outcomes)
+            .map(|context| format!("\n\n## Session start hook output\n{context}"))
+            .unwrap_or_default()
+    };
 
     let mut binding = SessionBinding {
         session_id: config.session_id.clone(),
         generation: 1,
     };
     let mut qualification = checked_cost(&accounting, &seed, true);
+    // The auto-mode classifier reads the operator's recent messages and
+    // bills to this session's housekeeping. Both are refreshed as turns
+    // run; the accounting binding never changes for the session.
+    tool_cx.set_ext(crate::auto_mode::ClassifierAccounting {
+        owner_session_id: config.session_id.clone(),
+        spend_policy: None,
+    });
+    tool_cx.set_ext(crate::auto_mode::OperatorContext::default());
+    crate::hook_handlers::install(&config.home, &tool_cx);
+    // A terminal session fires queued events when idle, and `--channels`
+    // servers are listened to from here on.
+    crate::tools::enable_idle_delivery();
+    crate::telemetry::session_started(&config.home, &config.session_id);
+    crate::channels::prompts_are_asked();
+    for line in crate::channels::start(&config.home, &tool_cx) {
+        orbit_hud_tui::emit_status(&ctx.sender, &line);
+    }
+    // The operator's own status line, when they configured a command.
+    let status_command = crate::status_line::command(&config.home);
+    if let Some(command) = &status_command {
+        refresh_status_line(
+            command,
+            &ctx.sender,
+            crate::status_line::Snapshot {
+                session_id: config.session_id.clone(),
+                model: config.model.clone(),
+                provider: config.provider_id.clone(),
+                permission_mode: config.scope.mode.config_name().to_owned(),
+                current_dir: tool_cx.cwd().to_string_lossy().into_owned(),
+                project_dir: workspace.to_string_lossy().into_owned(),
+                turns,
+                input_tokens: cum_input,
+                output_tokens: cum_output,
+                cost_microdollars: cum_cost,
+            },
+        );
+    }
     orbit_hud_tui::emit_status(
         &ctx.sender,
         &format!("session {}", short_session_id(&config.session_id)),
@@ -676,6 +1507,22 @@ fn worker_main_owned(
 
     // Locally-queued commands (mod commands re-enter the Prompt flow).
     let mut pending: Vec<WorkerCommand> = Vec::new();
+    // Said once the interface shows the copy a blocked session went on in.
+    let mut copy_notice: Option<String> = None;
+    // `--fallback-model` has been used in this chat.
+    let mut fallback_used = false;
+    // The `allowed-tools` of the command file whose prompt is about to run.
+    let mut command_grants: Option<crate::custom_commands::TurnGrants> = None;
+    // The skill a `/skill` line named, for the turn it starts.
+    let mut command_skill: Option<String> = None;
+    // The `model` that command file named for its turn.
+    let mut command_model: Option<String> = None;
+    // How the files `FileChanged` hooks watch looked at the last prompt.
+    let mut watched_files: std::collections::BTreeMap<String, Option<std::time::SystemTime>> =
+        std::collections::BTreeMap::new();
+    // What the operator ran with `!` since their last prompt: the next
+    // prompt carries it, so the model knows what they did and saw.
+    let mut shell_notes: Vec<String> = Vec::new();
     loop {
         let mut cmd = match pending.pop() {
             Some(c) => c,
@@ -723,6 +1570,46 @@ fn worker_main_owned(
         {
             cmd = WorkerCommand::Prompt(body);
         }
+        // A custom command is expanded once, here: a bound one becomes the
+        // prompt it stands for; anything else (unbound, unknown, or refused
+        // by a hook) is answered by the SlashCommand arm below.
+        let mut slash_expansion = expand_custom_command(
+            &config.home,
+            &cmd,
+            crate::custom_commands::Shell::for_scope(&config.scope),
+        )
+        // Not a command file: a skill a person may invoke by name, run
+        // through the Skill tool as it is in the plain chat.
+        .or_else(|| match &cmd {
+            WorkerCommand::SlashCommand(name, args) => {
+                let prompt = crate::custom_commands::skill_prompt(&tool_cx, name, args)?;
+                command_skill = Some(name.clone());
+                Some(Ok(prompt))
+            }
+            _ => None,
+        });
+        // The command's `allowed-tools` cover the turn it starts, and only
+        // that one: the next prompt takes them (see the Prompt arm).
+        if let (WorkerCommand::SlashCommand(name, _), Some(Ok(_))) = (&cmd, &slash_expansion) {
+            command_grants = Some(crate::custom_commands::turn_grants(
+                &config.home,
+                &workspace,
+                orbit_engine::hooks::project_trusted(&config.home),
+                name,
+            ));
+            command_model = crate::custom_commands::turn_model(
+                &config.home,
+                &workspace,
+                orbit_engine::hooks::project_trusted(&config.home),
+                name,
+            );
+        }
+        if foreground.is_some()
+            && let Some(Ok(body)) = &slash_expansion
+        {
+            cmd = WorkerCommand::Prompt(body.clone());
+            slash_expansion = None;
+        }
         // Only the actual successfully started ordinary registration can
         // mint this display publisher. Unbound/nonordinary commands retain
         // their existing sender and never acquire ordinary source evidence.
@@ -757,12 +1644,55 @@ fn worker_main_owned(
             WorkerCommand::ClearSession(_) => Some(ManualAction::Clear),
             _ => None,
         };
+        // What to tell the operator once the view has been redrawn from the
+        // saved conversation: said earlier, the redraw would take it away.
+        let mut after_projection: Vec<String> = Vec::new();
+        let switching_session = matches!(&cmd, WorkerCommand::ResumeSession(_));
         'command: {
             match cmd {
                 WorkerCommand::Bound { .. } => {
                     unreachable!("bound commands are unwrapped before admission")
                 }
+                WorkerCommand::PlanPrompt(_) | WorkerCommand::Prompt(_) => {
+                    // The auto-mode classifier sees what the operator asked
+                    // for: refresh its view before the turn's calls run.
+                    let operator: Vec<&str> = transcript
+                        .iter()
+                        .filter(|message| message.role == ChatRole::User)
+                        .map(|message| message.content.as_str())
+                        .collect();
+                    tool_cx.set_ext(crate::auto_mode::OperatorContext::from_messages(operator));
+                    // What a command file allowed for the turn it started;
+                    // an ordinary prompt starts with none.
+                    crate::custom_commands::set_turn_grants(
+                        &tool_cx,
+                        command_grants.take().unwrap_or_default(),
+                    );
+                    crate::custom_commands::set_user_skill(&tool_cx, command_skill.take());
+                    // And the model it named for that turn, if it did.
+                    crate::custom_commands::set_turn_model(&tool_cx, command_model.take());
+                    // `/cd` or a worktree tool may have moved the session:
+                    // @file mentions resolve where its tools now run.
+                    session_tool_cx.set_cwd(Some(tool_cx.cwd()));
+                    // FileChanged: files a hook asked to have watched are
+                    // compared with how they were at the previous prompt.
+                    fire_file_changes(&config.home, &tool_cx.working_dir, &mut watched_files);
+                    // Fall through to the turn itself below.
+                }
+                _ => {}
+            }
+            match cmd {
+                WorkerCommand::Bound { .. } => {
+                    unreachable!("bound commands are unwrapped before admission")
+                }
                 WorkerCommand::PlanPrompt(prompt) => {
+                    // A request stopped outside a prompt's turn (a manual
+                    // compaction, say) leaves the same closed session: it
+                    // is closed as abandoned before this prompt is asked.
+                    if abandon_stopped_request(&accounting) {
+                        turn_sender.send(Msg::SystemMessage(STOPPED_REQUEST_NOTICE.to_owned()));
+                        after_projection.push(STOPPED_REQUEST_NOTICE.to_owned());
+                    }
                     let Some(next_turns) = turns.checked_add(1) else {
                         orbit_hud_tui::emit_error(&turn_sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
@@ -801,7 +1731,7 @@ fn worker_main_owned(
                         *guard = Some(token.clone());
                     }
                     let plan_directive = format!(
-                        "{system_prompt}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
+                        "{system_prompt}{session_hook_context}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes: tools that only read still work, every tool that changes something is refused. Explore the problem, then write a concise, numbered implementation plan and call ExitPlanMode with it so the operator can approve it. If they approve, carry it out; if they do not, or ExitPlanMode is not available, give the plan as your reply and end with a line: `PLAN READY`."
                     );
                     let mut scope = std::mem::take(&mut config.scope);
                     let completion = run_tui_turn_observed(
@@ -827,6 +1757,10 @@ fn worker_main_owned(
                     }
                     let usable_plan = match &completion {
                         Ok((completion, measured_context)) => {
+                            run_usage.observe(&config.session_id, &completion.report, &turn_sender);
+                            after_projection.extend(dropped_results_notice(
+                                completion.report.dropped_tool_results,
+                            ));
                             context_projection = project_context_after_command(
                                 context_projection_command,
                                 *measured_context,
@@ -842,6 +1776,13 @@ fn worker_main_owned(
                             false
                         }
                     };
+                    // A request the operator stopped, or that timed out, after it
+                    // was sent would close this session to more requests. The
+                    // operator goes on in the same session: that request is
+                    // closed as abandoned and the cost before now is unknown.
+                    if abandon_stopped_request(&accounting) {
+                        after_projection.push(STOPPED_REQUEST_NOTICE.to_owned());
+                    }
                     let saved = save_turn(
                         &config,
                         &lease,
@@ -879,8 +1820,30 @@ fn worker_main_owned(
                     {
                         orbit_hud_tui::emit_plan_ready(&turn_sender, &completion.report.final_text);
                     }
+                    // As after an ordinary prompt: a planning request that
+                    // was stopped or timed out closes this session to more
+                    // requests, so the work goes on in a copy.
+                    if pending.is_empty()
+                        && let Some((fork_id, notice)) =
+                            continue_in_copy(&config.home, &lease, accounting.namespace())
+                    {
+                        match fork_id {
+                            Some(id) => {
+                                copy_notice = Some(notice);
+                                pending.push(WorkerCommand::ResumeSession(id));
+                            }
+                            None => orbit_hud_tui::emit_status(&turn_sender, &notice),
+                        }
+                    }
                 }
                 WorkerCommand::Prompt(prompt) => {
+                    // A request stopped outside a prompt's turn (a manual
+                    // compaction, say) leaves the same closed session: it
+                    // is closed as abandoned before this prompt is asked.
+                    if abandon_stopped_request(&accounting) {
+                        turn_sender.send(Msg::SystemMessage(STOPPED_REQUEST_NOTICE.to_owned()));
+                        after_projection.push(STOPPED_REQUEST_NOTICE.to_owned());
+                    }
                     let Some(next_turns) = turns.checked_add(1) else {
                         orbit_hud_tui::emit_error(&turn_sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
@@ -928,6 +1891,14 @@ fn worker_main_owned(
                     // expansion is what the model sees.
                     let expanded = expand_file_mentions(&prompt, &session_tool_cx);
                     let (expanded_prompt, user_blocks) = expanded.into_prompt();
+                    let expanded_prompt = if shell_notes.is_empty() {
+                        expanded_prompt
+                    } else {
+                        format!(
+                            "{OPERATOR_SHELL_OPEN}\n{}\n{OPERATOR_SHELL_CLOSE}\n\n{expanded_prompt}",
+                            std::mem::take(&mut shell_notes).join("\n")
+                        )
+                    };
                     if let Some(log) = &transcript_log {
                         let _ =
                             log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
@@ -935,7 +1906,28 @@ fn worker_main_owned(
                             });
                     }
                     let transcript_len_before = transcript.len();
-                    let directive = system_prompt.clone();
+                    // Hooks are told the session this prompt belongs to: it
+                    // may not be the one the screen opened with (a resumed,
+                    // cleared or copied session).
+                    orbit_engine::hooks::set_session_context(
+                        &binding.session_id,
+                        Some(
+                            &crate::sessions::sessions_dir(&config.home)
+                                .join(format!("{}.json", binding.session_id)),
+                        ),
+                    );
+                    let directive = format!(
+                        "{system_prompt}{session_hook_context}{}{}{}",
+                        crate::worktree::prompt_note(&tool_cx, &workspace),
+                        crate::channels::prompt_note(),
+                        crate::tools::mcp_instructions_note(&config.home, &tool_cx)
+                    );
+                    // Said now, and again once the finished turn has been
+                    // drawn from the saved session, which holds no notices.
+                    for notice in crate::tools::take_mcp_failure_notices() {
+                        turn_sender.send(Msg::SystemMessage(notice.clone()));
+                        after_projection.push(notice);
+                    }
                     let mut scope = std::mem::take(&mut config.scope);
                     let completion = run_tui_turn_observed(
                         &config,
@@ -959,7 +1951,20 @@ fn worker_main_owned(
                         *guard = None;
                     }
                     match &completion {
-                        Ok((_, measured_context)) => {
+                        Ok((finished, measured_context)) => {
+                            run_usage.observe(&config.session_id, &finished.report, &turn_sender);
+                            after_projection.extend(dropped_results_notice(
+                                finished.report.dropped_tool_results,
+                            ));
+                            crate::telemetry::turn_finished(
+                                &config.home,
+                                &crate::telemetry::Turn::from_report(
+                                    &config.session_id,
+                                    &config.model,
+                                    &config.provider_id,
+                                    &finished.report,
+                                ),
+                            );
                             turns = next_turns;
                             context_projection = project_context_after_command(
                                 context_projection_command,
@@ -970,6 +1975,13 @@ fn worker_main_owned(
                             orbit_hud_tui::emit_error(&turn_sender, error);
                             retain_local_intent(&mut transcript, &expanded_prompt, user_blocks);
                         }
+                    }
+                    // A request the operator stopped, or that timed out, after it
+                    // was sent would close this session to more requests. The
+                    // operator goes on in the same session: that request is
+                    // closed as abandoned and the cost before now is unknown.
+                    if abandon_stopped_request(&accounting) {
+                        after_projection.push(STOPPED_REQUEST_NOTICE.to_owned());
                     }
                     let saved = save_turn(
                         &config,
@@ -985,6 +1997,21 @@ fn worker_main_owned(
                         &mut qualification,
                         false,
                     );
+                    // A request stopped or timed out before its outcome
+                    // was known closes this session to further requests:
+                    // go on in a copy instead of failing the next prompt.
+                    if pending.is_empty()
+                        && let Some((fork_id, notice)) =
+                            continue_in_copy(&config.home, &lease, accounting.namespace())
+                    {
+                        match fork_id {
+                            Some(id) => {
+                                copy_notice = Some(notice);
+                                pending.push(WorkerCommand::ResumeSession(id));
+                            }
+                            None => orbit_hud_tui::emit_status(&turn_sender, &notice),
+                        }
+                    }
                     // E10: the attestation scan runs in EVERY front-end —
                     // an unverified claim becomes a visible status, not a
                     // silent exit 0.
@@ -1062,6 +2089,58 @@ fn worker_main_owned(
                             }
                         }
                     }
+                    // `--fallback-model`: the model could not be reached at
+                    // all and nothing came back. This session keeps the
+                    // unsettled request and admits nothing more, so the
+                    // prompt is asked again in a fork of it, on the fallback
+                    // model. Once per chat: a fallback that fails too is
+                    // reported as it is.
+                    let unreachable = match &completion {
+                        Ok((finished, _)) => match &finished.end {
+                            orbit_engine::TurnEnd::Failed(failure) => crate::fallback::applies(
+                                &failure.message,
+                                &finished.report.final_text,
+                                finished.report.output_tokens,
+                                finished.report.rounds,
+                            ),
+                            _ => false,
+                        },
+                        // Without a report, there is no proof that the failed
+                        // operation completed no tool rounds. Do not replay it.
+                        Err(_) => false,
+                    };
+                    if unreachable
+                        && !fallback_used
+                        && !token.is_cancelled()
+                        && let Some(spec) = crate::fallback::requested()
+                    {
+                        fallback_used = true;
+                        match crate::sessions::fork_held_session(
+                            &config.home,
+                            &lease,
+                            Some(&expanded_prompt),
+                        ) {
+                            Ok(fork) => {
+                                orbit_hud_tui::emit_status(
+                                    &turn_sender,
+                                    &format!(
+                                        "{} is unavailable · asking again on {spec} in a fork ({}); this session keeps the failed request",
+                                        config.model,
+                                        short_session_id(&fork.session_id)
+                                    ),
+                                );
+                                // Run in this order: switch to the fork,
+                                // select the fallback model, ask again.
+                                pending.push(WorkerCommand::Prompt(prompt.clone()));
+                                pending.push(WorkerCommand::SetModel(spec));
+                                pending.push(WorkerCommand::ResumeSession(fork.session_id));
+                            }
+                            Err(error) => orbit_hud_tui::emit_status(
+                                &turn_sender,
+                                &format!("the fallback model could not be started: {error}"),
+                            ),
+                        }
+                    }
                 }
                 WorkerCommand::SetModel(model) => {
                     if model.is_empty() {
@@ -1097,6 +2176,23 @@ fn worker_main_owned(
                             break 'command;
                         }
                     };
+                    // PreModelSwitch: a hook may refuse the switch.
+                    let switch_hooks = orbit_engine::hooks::Hooks::load(
+                        &config.home,
+                        orbit_engine::hooks::project_trusted(&config.home),
+                    );
+                    let switch = serde_json::json!({
+                        "model": candidate.model,
+                        "previous_model": config.model,
+                    });
+                    if let Some(reason) = orbit_engine::hooks::blocked(
+                        &switch_hooks.fire(orbit_engine::hooks::HookEvent::PreModelSwitch, &switch),
+                    ) {
+                        turn_sender.send(Msg::EffortStatus(format!(
+                            "Model unchanged:\nblocked by hook: {reason}"
+                        )));
+                        break 'command;
+                    }
                     if !save_controls(
                         &candidate,
                         &lease,
@@ -1112,6 +2208,8 @@ fn worker_main_owned(
                     ) {
                         break 'command;
                     }
+                    let _ =
+                        switch_hooks.fire(orbit_engine::hooks::HookEvent::PostModelSwitch, &switch);
                     selection_origin = crate::phase_routing::SelectionOrigin::Interactive;
                     let old = config.model.clone();
                     candidate.provider_id = resolved.provider_id;
@@ -1233,14 +2331,26 @@ fn worker_main_owned(
                     };
                 }
                 WorkerCommand::ListSessions => {
+                    let names = crate::session_names::load(&config.home);
                     let rows = match crate::sessions::list_sessions(&config.home) {
                         Ok(list) => list
                             .iter()
                             .map(|s| MsgSessionRow {
                                 id: s.session_id.clone(),
-                                model: s.model.clone(),
+                                // A `/rename` name leads the model column;
+                                // without one, how the session began, so
+                                // the list can be told apart by more than
+                                // its ids.
+                                model: match names
+                                    .get(&s.session_id)
+                                    .cloned()
+                                    .or_else(|| session_opening(&s.transcript))
+                                {
+                                    Some(name) => format!("{name} · {}", s.model),
+                                    None => s.model.clone(),
+                                },
                                 turns: s.turns,
-                                updated_at: s.updated_at.clone(),
+                                updated_at: session_age(&s.updated_at),
                                 current: s.session_id == binding.session_id,
                             })
                             .collect(),
@@ -1435,6 +2545,9 @@ fn worker_main_owned(
                         let scope_guard = ToolCancelScope::new(&tool_cx, &token);
                         let original_source = serde_json::to_vec(&transcript).ok();
                         let mut applied = false;
+                        // Why a requested summary was refused, for the line
+                        // the operator reads.
+                        let mut refusal: Option<String> = None;
                         let outcome;
                         if expected == ManualAction::Compact {
                             let result = compact_manual(
@@ -1485,10 +2598,12 @@ fn worker_main_owned(
                                     {
                                         ManualOutcome::Completed
                                     } else {
+                                        refusal = Some(completion.status.to_string());
                                         ManualOutcome::Failed
                                     };
                                 }
-                                Err(_) => {
+                                Err(error) => {
+                                    refusal = Some(error.to_string());
                                     outcome = if !saved || uncertain {
                                         ManualOutcome::Unknown
                                     } else if token.is_cancelled() {
@@ -1609,20 +2724,25 @@ fn worker_main_owned(
                         );
                         if expected == ManualAction::Compact {
                             let text = match outcome {
-                                ManualOutcome::Completed if applied => "context compacted",
-                                ManualOutcome::Completed => "nothing to compact",
+                                ManualOutcome::Completed if applied => "context compacted".to_owned(),
+                                ManualOutcome::Completed => "nothing to compact".to_owned(),
                                 ManualOutcome::Cancelled => {
-                                    "compaction cancelled; history retained"
+                                    "compaction cancelled; history retained".to_owned()
                                 }
-                                ManualOutcome::Failed => "compaction refused; history retained",
+                                ManualOutcome::Failed => match &refusal {
+                                    Some(reason) => format!(
+                                        "compaction refused; history retained · {reason}"
+                                    ),
+                                    None => "compaction refused; history retained".to_owned(),
+                                },
                                 ManualOutcome::Unknown if applied => {
-                                    "context applied in memory; inspect the saved outcome before continuing"
+                                    "context applied in memory; inspect the saved outcome before continuing".to_owned()
                                 }
                                 ManualOutcome::Unknown => {
-                                    "compaction accounting is uncertain; inspect before continuing"
+                                    "compaction accounting is uncertain; inspect before continuing".to_owned()
                                 }
                             };
-                            turn_sender.send(Msg::SystemMessage(text.into()));
+                            turn_sender.send(Msg::SystemMessage(text));
                         }
                     } else {
                         let _ = operation.finish_unstarted();
@@ -1718,6 +2838,14 @@ fn worker_main_owned(
                 WorkerCommand::RefreshMods => {
                     mods = crate::mods::load_all(&config.home);
                     mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
+                    let _ = orbit_engine::hooks::Hooks::load(
+                        &config.home,
+                        orbit_engine::hooks::project_trusted(&config.home),
+                    )
+                    .fire(
+                        orbit_engine::hooks::HookEvent::ConfigChange,
+                        &serde_json::json!({ "source": "mods" }),
+                    );
                     let built =
                         build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
                     tool_cx.set_ext(MemoryBytes(built.memory_bytes));
@@ -1737,6 +2865,16 @@ fn worker_main_owned(
                         &config.home,
                         &config.session_id,
                     );
+                    // `/rewind last` is the newest checkpoint: its id is 29
+                    // characters nobody should have to type.
+                    let arg = if matches!(arg.trim(), "last" | "latest") {
+                        match cps.list().last() {
+                            Some(id) => id.to_string(),
+                            None => String::new(),
+                        }
+                    } else {
+                        arg
+                    };
                     if arg.trim().is_empty() {
                         let list = cps.list();
                         if list.is_empty() {
@@ -1752,7 +2890,7 @@ fn worker_main_owned(
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             turn_sender.send(Msg::SystemMessage(format!(
-                                "checkpoints (newest first):\n{text}"
+                                "checkpoints (newest first) · /rewind last restores the newest:\n{text}"
                             )));
                         }
                     } else {
@@ -1828,13 +2966,14 @@ fn worker_main_owned(
                     match orbit_tools::permissions::PermissionMode::from_config(&mode_name) {
                         Some(mode) => {
                             config.scope.mode = mode;
+                            orbit_engine::hooks::set_permission_mode(mode.config_name());
                             orbit_hud_tui::emit_mode_changed(&turn_sender, &mode_name);
                         }
                         None => {
                             orbit_hud_tui::emit_notice(
                                 &turn_sender,
                                 &format!(
-                                    "unknown mode {mode_name} (default, acceptEdits, plan, dontAsk, bypass)"
+                                    "unknown mode {mode_name} (default, acceptEdits, auto, plan, dontAsk, bypass)"
                                 ),
                             );
                         }
@@ -1849,6 +2988,443 @@ fn worker_main_owned(
                     )
                     .unwrap_or_else(|error| format!("permissions: {error}"));
                     turn_sender.send(Msg::SystemMessage(text));
+                }
+                WorkerCommand::Inspect(what) => {
+                    let words: Vec<&str> = what.split_whitespace().collect();
+                    let owned = |words: &[&str]| -> Vec<String> {
+                        words.iter().map(|word| (*word).to_owned()).collect()
+                    };
+                    let text = match words.as_slice() {
+                        // The same commands as `orbit plugin …`, `orbit mcp …`
+                        // and `orbit doctor`, from inside the chat. Arguments
+                        // are split on spaces: a value with a space in it
+                        // needs the command line.
+                        ["plugin"] => crate::plugin_commands::command(
+                            &config.home,
+                            &workspace,
+                            &["list".to_owned()],
+                        )
+                        .map_or_else(
+                            |error| error.to_string(),
+                            |report| {
+                                format!(
+                                    "{}/plugin marketplace list shows what can be installed · /plugin install NAME@MARKETPLACE installs it",
+                                    crate::plugin_commands::human_report(&report)
+                                )
+                            },
+                        ),
+                        ["plugin", rest @ ..] => {
+                            crate::plugin_commands::command(&config.home, &workspace, &owned(rest))
+                                .map_or_else(
+                                    |error| error.to_string(),
+                                    |report| {
+                                        format!(
+                                            "{}a plugin installed now is used by sessions started after this one",
+                                            crate::plugin_commands::human_report(&report)
+                                        )
+                                    },
+                                )
+                        }
+                        ["mcp", "add" | "remove" | "get" | "list", ..] => {
+                            crate::mcp_commands::command(&config.home, &workspace, &owned(&words[1..]))
+                                .map_or_else(
+                                    |error| error.to_string(),
+                                    |report| crate::mcp_commands::human_report(&report),
+                                )
+                        }
+                        ["doctor"] => crate::cli_release_commands::doctor(&config.home, &[])
+                            .map_or_else(
+                                |(code, message)| format!("{code}: {message}"),
+                                |report| crate::cli_release_commands::human_report(&report),
+                            ),
+                        // `/goal`'s separate check of the round that just
+                        // ended. It answers with a verdict for the
+                        // interface, not with a line in the conversation.
+                        ["goal-check", ..] => {
+                            let last_reply = transcript
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == ChatRole::Assistant)
+                                .map_or("", |message| message.content.as_str());
+                            let verdict = crate::hook_handlers::judge_goal(
+                                &config.home,
+                                &tool_cx,
+                                what.trim_start_matches("goal-check").trim(),
+                                last_reply,
+                            );
+                            turn_sender.send(match verdict {
+                                Ok((met, impossible, reason)) => Msg::GoalVerdict {
+                                    met,
+                                    impossible,
+                                    available: true,
+                                    reason,
+                                },
+                                // No judge (no provider for it, an unreadable
+                                // answer): the reply's own words decide.
+                                Err(reason) => Msg::GoalVerdict {
+                                    met: false,
+                                    impossible: false,
+                                    available: false,
+                                    reason,
+                                },
+                            });
+                            String::new()
+                        }
+                        ["mcp", "login", "cancel"] => cancel_mcp_sign_in(),
+                        ["mcp", "login", server, rest @ ..] if rest.len() <= 1 => start_mcp_sign_in(
+                            &config.home,
+                            server,
+                            rest.first().copied(),
+                            turn_sender.clone(),
+                        ),
+                        ["mcp", "logout", server] => {
+                            match orbit_mcp::oauth::logout(&config.home, server) {
+                                Ok(true) => format!("signed out of {server}"),
+                                Ok(false) => format!("no stored sign-in for {server}"),
+                                Err(error) => error,
+                            }
+                        }
+                        ["tasks"] => background_work(&config.home, &tool_cx.working_dir),
+                        // The operator's own stop for a background agent: the
+                        // same flag AgentStop raises for the model.
+                        ["tasks", "stop", agent] => {
+                            match crate::tools::agent_stop(&serde_json::json!({ "agent": agent })) {
+                                Ok(_) => format!(
+                                    "agent {agent} was asked to stop; it ends at its next cancellation point"
+                                ),
+                                Err(error) => error.replace("AgentStop requires", "/tasks stop needs"),
+                            }
+                        }
+                        // The agents this session started, and one agent's
+                        // own conversation: what it was asked, said and
+                        // called.
+                        ["tasks", "agents"] => {
+                            match crate::tool_runtime::agent_store_for_context(
+                                &config.home,
+                                &binding.session_id,
+                                &tool_cx,
+                            ) {
+                                Ok(store) => crate::tools::agent_listing(&store),
+                                Err(error) => format!("agents cannot be listed: {error}"),
+                            }
+                        }
+                        ["tasks", "show", agent] => {
+                            crate::tool_runtime::agent_store_for_context(
+                                &config.home,
+                                &binding.session_id,
+                                &tool_cx,
+                            )
+                            .and_then(|store| crate::tools::agent_transcript(&store, agent))
+                            .unwrap_or_else(|error| error)
+                        }
+                        ["tasks", ..] => {
+                            "usage: /tasks lists what runs in the background · /tasks agents lists this session's agents · /tasks show <agent> shows one agent's conversation · /tasks stop <agent> stops a background agent".into()
+                        }
+                        // Where the session's commands run; the project,
+                        // its settings and its files stay where it started.
+                        ["cd"] => format!(
+                            "working directory: {} · /cd <path> moves it inside this session's directories",
+                            tool_cx.cwd().display()
+                        ),
+                        ["cd", ..] => {
+                            match crate::worktree::change_dir(
+                                &config.home,
+                                &tool_cx,
+                                what.trim_start_matches("cd").trim(),
+                            ) {
+                                Ok(dir) => format!(
+                                    "working directory is now {} · the session's files stay where it started",
+                                    dir.display()
+                                ),
+                                Err(error) => error,
+                            }
+                        }
+                        // A session is bound to its directory and lease, so a
+                        // fork starts as its own process; this names the
+                        // command instead of pretending to branch in place.
+                        // `/fork`: the conversation so far is copied into a
+                        // new session and this chat carries on there. The
+                        // original stays as it was saved and its lease is
+                        // released, so `/resume` (or another terminal) can
+                        // go back to it.
+                        ["fork"] => {
+                            match crate::sessions::fork_held_session(&config.home, &lease, None) {
+                                Ok(fork) => {
+                                    let text = format!(
+                                        "forked: this chat continues as {} · the conversation up to here stays in {} (/resume {} returns to it)",
+                                        short_session_id(&fork.session_id),
+                                        short_session_id(&binding.session_id),
+                                        binding.session_id
+                                    );
+                                    pending.push(WorkerCommand::ResumeSession(fork.session_id));
+                                    text
+                                }
+                                Err(error) => format!("fork failed: {error}"),
+                            }
+                        }
+                        ["rename", ..] => {
+                            let name = what.trim_start_matches("rename").trim();
+                            match crate::session_names::set(&config.home, &binding.session_id, name)
+                            {
+                                Ok(name) if name.is_empty() => "session name cleared".into(),
+                                Ok(name) => format!("session named \"{name}\" (shown in /sessions)"),
+                                Err(error) => error,
+                            }
+                        }
+                        ["add-dir"] => format!(
+                            "working directories: {} · /add-dir <path> adds one",
+                            tool_cx
+                                .working_dirs
+                                .iter()
+                                .map(|dir| dir.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        ["add-dir", ..] => {
+                            let raw = what.trim_start_matches("add-dir").trim();
+                            match std::fs::canonicalize(raw) {
+                                Ok(dir) if !dir.is_dir() => format!("{raw} is not a directory"),
+                                Ok(dir) if orbit_tools::is_deny_read(&dir) => {
+                                    format!("{raw} is on the deny-read list")
+                                }
+                                Ok(dir) if tool_cx.working_dirs.contains(&dir) => {
+                                    format!("{} is already a working directory", dir.display())
+                                }
+                                Ok(dir) if tool_cx.working_dirs.len() >= 8 => {
+                                    let _ = dir;
+                                    "at most 8 working directories".into()
+                                }
+                                Ok(dir) => {
+                                    tool_cx.working_dirs.push(dir.clone());
+                                    let _ = orbit_engine::hooks::Hooks::load(
+                                        &config.home,
+                                        orbit_engine::hooks::project_trusted(&config.home),
+                                    )
+                                    .fire(
+                                        orbit_engine::hooks::HookEvent::DirectoryAdded,
+                                        &serde_json::json!({
+                                            "source": "slash_command",
+                                            "directory": dir.to_string_lossy(),
+                                        }),
+                                    );
+                                    format!(
+                                        "added {} for this session: sandboxed commands may write there",
+                                        dir.display()
+                                    )
+                                }
+                                Err(error) => format!("{raw}: {error}"),
+                            }
+                        }
+                        ["btw", ..] if words.len() > 1 => {
+                            let question = what.trim_start_matches("btw").trim();
+                            match side_question(&config, &system_prompt, &transcript, question, &accounting) {
+                                Ok(answer) => format!("btw: {answer}"),
+                                Err(error) => format!("btw failed: {error}"),
+                            }
+                        }
+                        ["btw"] => "usage: /btw <question> — answered from the conversation, not added to it".into(),
+                        ["sandbox"] => {
+                            let report = sandbox_report();
+                            let mut lines = vec![report.readiness.clone()];
+                            lines.extend(
+                                sandbox_facts()
+                                    .iter()
+                                    .map(|(label, value)| format!("{label}: {value}")),
+                            );
+                            lines.push(format!(
+                                "writable: {}",
+                                tool_cx
+                                    .working_dirs
+                                    .iter()
+                                    .map(|dir| dir.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                            if report.confined {
+                                lines.extend(sandbox_additions_lines(&config.home));
+                            }
+                            lines.join("\n")
+                        }
+                        ["status"] => [
+                            format!("session: {}", binding.session_id),
+                            format!("model: {}/{}", config.provider_id, config.model),
+                            format!("permission mode: {}", config.scope.mode.config_name()),
+                            format!("working directory: {}", tool_cx.cwd().display()),
+                            format!("turns: {turns}"),
+                            sandbox_report().readiness.clone(),
+                            format!("home: {}", config.home.display()),
+                        ]
+                        .join("\n"),
+                        ["output-style"] => {
+                            "usage: /output-style <default|explanatory|learning|name> — a name is a file in .orbit/output-styles, .claude/output-styles or the home's output-styles".into()
+                        }
+                        ["output-style", name] => {
+                            if orbit_engine::context::set_output_style(
+                                &config.home,
+                                &tool_cx.working_dir,
+                                Some(name),
+                            ) {
+                                let built = build_session_prompt(
+                                    &config.home,
+                                    &config.model,
+                                    &mods,
+                                    &mods_enabled,
+                                );
+                                tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                                system_prompt = built.text;
+                                let _ = orbit_engine::hooks::Hooks::load(
+                                    &config.home,
+                                    orbit_engine::hooks::project_trusted(&config.home),
+                                )
+                                .fire(
+                                    orbit_engine::hooks::HookEvent::ConfigChange,
+                                    &serde_json::json!({
+                                        "source": "output_style",
+                                        "value": name,
+                                    }),
+                                );
+                                format!("output style: {name} (from the next turn)")
+                            } else {
+                                format!("no output style named {name}; style unchanged")
+                            }
+                        }
+                        // Editing from the chat: a line in an instruction
+                        // file, or one of the single-value settings.
+                        // `/memory edit`, `/config edit`: the terminal owns
+                        // the screen, so it opens the editor and then asks
+                        // what was saved (`… edited`).
+                        ["memory", "edit", ..] => {
+                            match crate::config_edit::memory_edit_target(
+                                &config.home,
+                                &workspace,
+                                what.trim_start_matches("memory").trim().trim_start_matches("edit"),
+                            ) {
+                                Ok((path, scope)) => {
+                                    turn_sender.send(Msg::EditFile {
+                                        path,
+                                        then: format!("memory edited {scope}"),
+                                    });
+                                    String::new()
+                                }
+                                Err(error) => error,
+                            }
+                        }
+                        ["memory", "edited", scope] => {
+                            crate::config_edit::memory_edited(&config.home, &workspace, scope)
+                        }
+                        ["config", "edit"] => {
+                            match crate::config_edit::config_edit_target(&config.home) {
+                                Ok(path) => {
+                                    turn_sender.send(Msg::EditFile {
+                                        path,
+                                        then: "config edited".into(),
+                                    });
+                                    String::new()
+                                }
+                                Err(error) => error,
+                            }
+                        }
+                        ["config", "edited"] => {
+                            match crate::config_edit::config_edited(&config.home) {
+                                Ok(text) => {
+                                    let _ = orbit_engine::hooks::Hooks::load(
+                                        &config.home,
+                                        orbit_engine::hooks::project_trusted(&config.home),
+                                    )
+                                    .fire(
+                                        orbit_engine::hooks::HookEvent::ConfigChange,
+                                        &serde_json::json!({ "source": "settings.toml" }),
+                                    );
+                                    text
+                                }
+                                Err(error) => error,
+                            }
+                        }
+                        ["memory", "add", ..] => crate::config_edit::memory_add(
+                            &config.home,
+                            &workspace,
+                            what.trim_start_matches("memory").trim().trim_start_matches("add"),
+                        )
+                        .unwrap_or_else(|error| error),
+                        ["memory", "remove", ..] => crate::config_edit::memory_remove(
+                            &config.home,
+                            &workspace,
+                            what.trim_start_matches("memory")
+                                .trim()
+                                .trim_start_matches("remove"),
+                        )
+                        .unwrap_or_else(|error| error),
+                        ["config", "set", key, ..] => {
+                            let value = what
+                                .split_once(key)
+                                .map_or("", |(_, value)| value);
+                            match crate::config_edit::config_set(&config.home, key, value) {
+                                Ok(text) => {
+                                    let _ = orbit_engine::hooks::Hooks::load(
+                                        &config.home,
+                                        orbit_engine::hooks::project_trusted(&config.home),
+                                    )
+                                    .fire(
+                                        orbit_engine::hooks::HookEvent::ConfigChange,
+                                        &serde_json::json!({ "source": key, "value": value.trim() }),
+                                    );
+                                    text
+                                }
+                                Err(error) => error,
+                            }
+                        }
+                        ["config", "unset", key] => {
+                            crate::config_edit::config_unset(&config.home, key)
+                                .unwrap_or_else(|error| error)
+                        }
+                        ["config", "set"] | ["config", "unset"] => {
+                            "usage: /config set <key> <value> · /config unset <key> · /config edit · keys: claude_compat, output_style, status_line".into()
+                        }
+                        ["config"] => [
+                            format!("model: {}/{}", config.provider_id, config.model),
+                            format!(
+                                "effort: {}",
+                                config
+                                    .effort
+                                    .as_ref()
+                                    .map_or("default".to_owned(), |effort| format!("{effort:?}"))
+                            ),
+                            format!("permission mode: {:?}", config.scope.mode),
+                            format!("home: {}", config.home.display()),
+                            format!(
+                                "claude_compat: {}",
+                                if orbit_engine::hooks::claude_compat(&config.home) {
+                                    "on"
+                                } else {
+                                    "off"
+                                }
+                            ),
+                            "change with /model, /effort, /mode, /config set <key> <value> (claude_compat, output_style, status_line), /config edit (the file in your editor), or `orbit config`".to_owned(),
+                        ]
+                        .join("\n"),
+                        ["mcp", "prompts"] => mcp_prompt_list(&config.home),
+                        ["mcp", "prompt", server, name, rest @ ..] => {
+                            match mcp_prompt_text(&config.home, server, name, rest) {
+                                Ok(prompt) => {
+                                    pending.push(WorkerCommand::Prompt(prompt));
+                                    format!("running prompt {name} from {server}")
+                                }
+                                Err(error) => error,
+                            }
+                        }
+                        ["mcp", ..] if words.len() > 1 => {
+                            "usage: /mcp · /mcp login <server> [client-id] · /mcp login cancel · /mcp logout <server> · /mcp prompts · /mcp prompt <server> <name> [key=value …]"
+                                .into()
+                        }
+                        _ => inspect_configuration(
+                            &config.home,
+                            words.first().copied().unwrap_or(""),
+                        ),
+                    };
+                    // A command that answered another way has no line.
+                    if !text.is_empty() {
+                        turn_sender.send(Msg::SystemMessage(text));
+                    }
                 }
                 WorkerCommand::ShellBang(command) => {
                     // The shell bang (gate 1): one command through the Bash
@@ -1865,13 +3441,16 @@ fn worker_main_owned(
                             .into_bytes(),
                     };
                     let decision_id = format!("bang-{}", ulid::Ulid::new());
-                    let mut approval_channel =
-                        TuiApprovalChannel::new(turn_sender.clone(), ctx.approvals.clone());
                     let token = orbit_provider_http::CancelToken::new();
                     if let Ok(mut slot) = cancel_slot.lock() {
                         *slot = Some(token.clone());
                     }
                     let scope_guard = ToolCancelScope::new(&tool_cx, &token);
+                    let mut approval_channel = TuiApprovalChannel::with_context(
+                        turn_sender.clone(),
+                        ctx.approvals.clone(),
+                        &tool_cx,
+                    );
                     // The session's context: its ledger sink announces the
                     // `!` command's records like any other call's.
                     let tool_cx = tool_cx.clone();
@@ -1905,6 +3484,16 @@ fn worker_main_owned(
                         outcome,
                         &fact,
                     );
+                    // The command and what it printed stay in the
+                    // conversation (the Terminal panel may be out of view),
+                    // and the next prompt tells the model about them.
+                    if let Some((note, shown)) = shell_bang_record(&command, &result) {
+                        shell_notes.push(note);
+                        if shell_notes.len() > 8 {
+                            shell_notes.remove(0);
+                        }
+                        turn_sender.send(Msg::SystemMessage(shown));
+                    }
                     drop(scope_guard);
                     if let Ok(mut slot) = cancel_slot.lock() {
                         *slot = None;
@@ -1917,17 +3506,42 @@ fn worker_main_owned(
                         .find(|m| m.name == mod_name)
                         .and_then(|m| m.commands.get(&cmd_name))
                         .cloned();
+                    // `/a:b` may also be a namespaced custom command.
+                    let body = body.or_else(|| {
+                        custom_command_body(
+                            &config.home,
+                            &WorkerCommand::SlashCommand(
+                                format!("{mod_name}:{cmd_name}"),
+                                String::new(),
+                            ),
+                            crate::custom_commands::Shell::for_scope(&config.scope),
+                        )
+                    });
+                    // Or a plugin's skill, `/plugin:skill`: run through the
+                    // Skill tool like a native `/skill-name`.
+                    let body = body.or_else(|| {
+                        let name = format!("{mod_name}:{cmd_name}");
+                        let prompt = crate::custom_commands::skill_prompt(&tool_cx, &name, "")?;
+                        command_skill = Some(name);
+                        Some(prompt)
+                    });
                     match body {
                         Some(prompt) => {
                             pending.push(WorkerCommand::Prompt(prompt));
                         }
                         None => {
-                            turn_sender.send(Msg::SystemMessage(format!(
-                                "no command {cmd_name} in mod {mod_name}"
-                            )));
+                            after_projection
+                                .push(format!("no command {cmd_name} in mod {mod_name}"));
                         }
                     }
                 }
+                WorkerCommand::SlashCommand(name, _args) => match slash_expansion.take() {
+                    Some(Ok(prompt)) => pending.push(WorkerCommand::Prompt(prompt)),
+                    Some(Err(reason)) => {
+                        after_projection.push(format!("/{name} was blocked by a hook: {reason}"));
+                    }
+                    None => after_projection.push(format!("unknown command: /{name} · try /help")),
+                },
             }
         }
         if let Some((operation, registration)) = foreground {
@@ -1996,7 +3610,77 @@ fn worker_main_owned(
                 context_projection,
             );
         }
+        for text in after_projection
+            .into_iter()
+            .chain(orbit_engine::hooks::take_hook_problems())
+        {
+            ctx.sender.send(Msg::SystemMessage(text));
+        }
+        if switching_session && let Some(text) = copy_notice.take() {
+            ctx.sender.send(Msg::SystemMessage(text));
+        }
+        // The operator's status line follows what just happened. The
+        // command runs off this thread: a slow one delays nothing.
+        if let Some(command) = &status_command {
+            refresh_status_line(
+                command,
+                &ctx.sender,
+                crate::status_line::Snapshot {
+                    session_id: binding.session_id.clone(),
+                    model: config.model.clone(),
+                    provider: config.provider_id.clone(),
+                    permission_mode: config.scope.mode.config_name().to_owned(),
+                    current_dir: tool_cx.cwd().to_string_lossy().into_owned(),
+                    project_dir: workspace.to_string_lossy().into_owned(),
+                    turns,
+                    input_tokens: cum_input,
+                    output_tokens: cum_output,
+                    cost_microdollars: cum_cost,
+                },
+            );
+        }
     }
+    // The front end went away: the interactive session is over.
+    fire_session_end(&config.home);
+}
+
+/// The interactive session's `SessionEnd` hooks, once. The worker reaches
+/// its end only if the process outlives the screen, which it usually does
+/// not: the process calls this itself when the screen closes. The payload
+/// names the session the last prompt belonged to.
+pub fn fire_session_end(home: &std::path::Path) {
+    // Held while the hooks run: whichever caller comes second waits for
+    // the first to finish, so the process does not end under a hook that
+    // the worker has only just started.
+    static FIRED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut fired = FIRED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if std::mem::replace(&mut *fired, true) {
+        return;
+    }
+    let _ = orbit_engine::hooks::Hooks::load(home, orbit_engine::hooks::project_trusted(home))
+        .fire(
+            orbit_engine::hooks::HookEvent::SessionEnd,
+            &serde_json::json!({ "frontend": "tui", "reason": "exit" }),
+        );
+}
+
+/// Run the status-line command for this snapshot and post what it printed.
+/// Runs overlap when commands come quickly: only the newest one's line is
+/// shown, so a slow earlier run cannot overwrite a later one.
+fn refresh_status_line(command: &str, sender: &BusSender, snapshot: crate::status_line::Snapshot) {
+    static NEWEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run = NEWEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let (command, sender) = (command.to_owned(), sender.clone());
+    let _ = std::thread::Builder::new()
+        .name("orbit-status-line".into())
+        .spawn(move || {
+            let line = crate::status_line::run(&command, &snapshot);
+            if NEWEST.load(std::sync::atomic::Ordering::SeqCst) == run {
+                sender.send(Msg::StatusLine(line));
+            }
+        });
 }
 
 struct ToolCancelScope(orbit_tools::ToolContext);
@@ -2592,6 +4276,142 @@ impl OrdinaryViewJournal {
     }
 }
 
+/// The operator's prompt as they typed it: what a `UserPromptSubmit` hook
+/// added for the model (`<hook-context>` at the end) is not theirs to read
+/// back as their own words.
+fn without_hook_context(prompt: &str) -> &str {
+    let prompt = operator_shell_split(prompt).1;
+    match prompt.rfind("\n\n<hook-context>\n") {
+        Some(at) if prompt.trim_end().ends_with("</hook-context>") => &prompt[..at],
+        _ => prompt,
+    }
+}
+
+/// A saved prompt with each `@file` mention back to the way it was typed.
+/// What the model was sent has the file's numbered lines in a fenced block
+/// right after the mention; the operator typed only the mention.
+fn collapse_file_mentions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("\n```") {
+        let (before, after) = rest.split_at(open);
+        let follows_mention = before
+            .rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|token| {
+                token
+                    .trim_start_matches(['(', '[', '{', '<', '"', '\'', '`'])
+                    .starts_with('@')
+            });
+        // The block's end: a line that starts with the fence again, reached
+        // through numbered lines only (what a file read looks like).
+        let block_end = after[1..].find('\n').map(|n| n + 2).and_then(|start| {
+            let mut at = start;
+            for line in after[start..].split_inclusive('\n') {
+                let bare = line.trim_end_matches('\n');
+                if bare.starts_with("```") {
+                    return Some(at + 3);
+                }
+                let numbered = bare.split_once('\t').is_some_and(|(number, _)| {
+                    !number.trim().is_empty() && number.trim().chars().all(|c| c.is_ascii_digit())
+                });
+                if !numbered && !bare.ends_with("chars truncated)") {
+                    return None;
+                }
+                at += line.len();
+            }
+            None
+        });
+        out.push_str(before);
+        match block_end {
+            Some(end) if follows_mention => rest = &after[end..],
+            _ => {
+                out.push_str("\n```");
+                rest = &after[4..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What opens and closes the record of the operator's own `!` commands at
+/// the front of a prompt.
+const OPERATOR_SHELL_OPEN: &str = "<operator-shell>\nThe operator ran these commands themselves, in this session's shell, before this message:";
+const OPERATOR_SHELL_CLOSE: &str = "</operator-shell>";
+
+/// A prompt as `(the operator's own commands, the prompt they typed)`.
+/// The first is empty when the prompt carries no such record.
+fn operator_shell_split(prompt: &str) -> (&str, &str) {
+    let Some(rest) = prompt.strip_prefix(OPERATOR_SHELL_OPEN) else {
+        return ("", prompt);
+    };
+    let close = format!("\n{OPERATOR_SHELL_CLOSE}\n\n");
+    match rest.find(&close) {
+        Some(at) => (&rest[..at], &rest[at + close.len()..]),
+        None => ("", prompt),
+    }
+}
+
+/// The commands in such a record, one line each, as the conversation shows
+/// them: `! git status · exit 0`.
+fn operator_shell_lines(record: &str) -> Vec<String> {
+    record
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("<command exit=\"")?;
+            let (exit, rest) = rest.split_once("\">")?;
+            let command = rest.strip_suffix("</command>")?;
+            Some(format!("! {command} · exit {exit}"))
+        })
+        .collect()
+}
+
+/// One finished `!` command as `(what the model is told, what the
+/// conversation shows)`; `None` when the command did not run (it was
+/// refused, or failed before starting).
+fn shell_bang_record(command: &str, result: &str) -> Option<(String, String)> {
+    const MODEL_OUTPUT: usize = 6_000;
+    const SHOWN_LINES: usize = 12;
+    let value: serde_json::Value = serde_json::from_str(result).ok()?;
+    let exit = value.get("exit_code").and_then(serde_json::Value::as_i64)?;
+    let output = value
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim_end();
+    let one_line: String = command
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut for_model: String = output.chars().take(MODEL_OUTPUT).collect();
+    if for_model.len() < output.len() {
+        for_model.push_str("\n… (cut)");
+    }
+    let note = format!(
+        "<command exit=\"{exit}\">{one_line}</command>\n<output>\n{}\n</output>",
+        // The record's own closing words cannot be forged by the output.
+        for_model
+            .replace(OPERATOR_SHELL_CLOSE, "< /operator-shell>")
+            .replace("<command exit=", "< command exit=")
+    );
+    let mut shown = vec![format!("! {one_line} · exit {exit}")];
+    let lines: Vec<&str> = output.lines().collect();
+    shown.extend(
+        lines
+            .iter()
+            .take(SHOWN_LINES)
+            .map(|line| format!("  {}", orbit_hud::display_safe_content(line))),
+    );
+    if lines.len() > SHOWN_LINES {
+        shown.push(format!(
+            "  … {} more line(s) in the Terminal panel",
+            lines.len() - SHOWN_LINES
+        ));
+    }
+    Some((note, shown.join("\n")))
+}
+
 fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
     use orbit_hud_tui::model::ToolOutcome;
     use std::collections::HashMap;
@@ -2619,10 +4439,16 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
     let mut lines = Vec::new();
     for msg in msgs {
         match msg.role {
-            ChatRole::User => lines.push(TranscriptLine::User {
-                text: msg.content.clone(),
-                time: None,
-            }),
+            ChatRole::User => {
+                // The operator's own `!` commands before this prompt.
+                for line in operator_shell_lines(operator_shell_split(&msg.content).0) {
+                    lines.push(TranscriptLine::System(line));
+                }
+                lines.push(TranscriptLine::User {
+                    text: collapse_file_mentions(without_hook_context(&msg.content)),
+                    time: None,
+                });
+            }
             ChatRole::Assistant => {
                 if let Some(calls) = &msg.tool_calls {
                     // Reasoning and raw arguments are never rendered. Each
@@ -2645,9 +4471,20 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                             } else {
                                 String::new()
                             },
-                            // Saved arguments are raw JSON and are deliberately
-                            // not treated as the bridge's safe display summary.
-                            summary: String::new(),
+                            // What the card showed while the call ran: the
+                            // one-line target, taken from the saved
+                            // arguments by the same scanner-backed summary
+                            // the live call used. The raw JSON is never
+                            // shown. Without this a finished turn, and a
+                            // resumed session, show cards and Terminal
+                            // entries with no file or command on them.
+                            summary: display_target(
+                                &call.name,
+                                &orbit_engine::turn::call_target(
+                                    &call.name,
+                                    call.arguments.as_bytes(),
+                                ),
+                            ),
                             outcome: Some(outcome),
                             meta,
                             started_at: None,
@@ -2741,10 +4578,64 @@ fn classify_saved_tool_result(
         "exit 0".to_string()
     } else if matches!(outcome, ToolOutcome::Ok | ToolOutcome::Failed) {
         result_fact(tool, payload)
+    } else if outcome == ToolOutcome::Denied {
+        // Who refused, when it was not the person at the terminal.
+        denial_fact(&value).unwrap_or_default()
     } else {
         String::new()
     };
     (outcome, fact)
+}
+
+/// Who refused a call, when it was not the person at the terminal: a
+/// channel answering for them, or the harness itself (a hook, a permission
+/// rule, plan mode, auto mode, a run with no one to ask). The card says
+/// "denied by you" only for a refusal this returns `None` for.
+fn denial_fact(result: &serde_json::Value) -> Option<String> {
+    if let Some(channel) = channel_denial_fact(result) {
+        return Some(channel);
+    }
+    if result.get("denied").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let error = result.get("error").and_then(serde_json::Value::as_str)?;
+    if refused_by_a_person(Some(error)) {
+        return None;
+    }
+    Some(
+        if error.starts_with("blocked by hook") {
+            "blocked by a hook"
+        } else if error.starts_with("plan mode") {
+            "blocked in plan mode"
+        } else if error.contains("auto mode") {
+            "blocked by auto mode"
+        } else if error.starts_with("non-interactive") {
+            "blocked: no one to ask"
+        } else {
+            "blocked by a rule"
+        }
+        .to_owned(),
+    )
+}
+
+/// "denied by the channel <name>" for a refusal that a channel gave in the
+/// person's place (`--channel-permissions`), read from the refusal's own
+/// fixed words. `None` for any other result.
+fn channel_denial_fact(result: &serde_json::Value) -> Option<String> {
+    if result.get("denied").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let name = result
+        .get("error")?
+        .as_str()?
+        .strip_prefix("denied through the channel ")?
+        .strip_suffix(" (--channel-permissions)")?;
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    .then(|| format!("denied by the channel {name}"))
 }
 
 #[cfg(test)]
@@ -3113,9 +5004,17 @@ mod ordinary_view_producer_tests {
             "identical earlier text is a different source slot"
         );
         let visible = format!("{lines:?}");
-        for omitted in ["pre-tool A", "generic hidden tool body", "printf fixture"] {
-            assert!(!visible.contains(omitted));
+        // The call's one-line target is shown (scanned, as the live card
+        // showed it); the raw argument JSON and the tool's body are not.
+        for omitted in [
+            "pre-tool A",
+            "generic hidden tool body",
+            r#"{"command""#,
+            "\"command\"",
+        ] {
+            assert!(!visible.contains(omitted), "{omitted}");
         }
+        assert!(visible.contains("printf fixture"));
         assert!(
             matches!(&lines[0], TranscriptLine::System(text) if text == "provider System remains canonical")
         );
@@ -3153,7 +5052,9 @@ mod ordinary_view_producer_tests {
             data["expected_layout"]
         );
         let lines = session_to_transcript_lines(&messages);
-        assert!(matches!(&lines[2], TranscriptLine::User { text, .. } if text == &expansion));
+        // The model was sent the file's lines; the screen shows the prompt
+        // as it was typed.
+        assert!(matches!(&lines[2], TranscriptLine::User { text, .. } if text == literal));
         assert_eq!(fixture_lines(&lines)[5], data["expected_lines"][5]);
     }
 
@@ -3643,6 +5544,10 @@ pub struct TuiApprovalChannel {
     approvals: ApprovalRegistry,
     /// The call the last question was about, to fetch its denial note.
     last_call: Option<String>,
+    /// The channel that answered the last question, when one did.
+    answered_by: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Captured from this turn, so a late registration cannot outlive Escape.
+    cancel: Option<orbit_tools::CancelCheck>,
 }
 
 impl TuiApprovalChannel {
@@ -3651,7 +5556,188 @@ impl TuiApprovalChannel {
             sender,
             approvals,
             last_call: None,
+            answered_by: std::sync::Arc::default(),
+            cancel: None,
         }
+    }
+
+    fn with_context(
+        sender: BusSender,
+        approvals: ApprovalRegistry,
+        cx: &orbit_tools::ToolContext,
+    ) -> Self {
+        Self {
+            cancel: cx.cancel_check(),
+            ..Self::new(sender, approvals)
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|check| check())
+    }
+
+    fn cancel_prompt(&mut self, call_id: &str) -> crate::tool_runtime::ApprovalVerdict {
+        // resolve removes only this call's sender. A verdict racing with
+        // cancellation may already have removed it; cancellation still wins
+        // when the waiting worker decides whether to accept that verdict.
+        self.approvals.resolve(call_id, ApprovalResponse::Deny);
+        let _ = self.approvals.take_note(call_id);
+        self.last_call = None;
+        *self
+            .answered_by
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner()) = None;
+        crate::tool_runtime::ApprovalVerdict::Deny
+    }
+}
+
+#[cfg(test)]
+mod cancelled_tui_approval_tests {
+    use super::*;
+    use crate::tool_runtime::{ApprovalChannel, ApprovalRequest, ApprovalVerdict};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest {
+            call_id: "cancelled-tui-call".into(),
+            tool_name: "Read".into(),
+            summary: "Read(example.txt)".into(),
+            risk: crate::tools::RiskLevel::Low,
+            preview: Vec::new(),
+            grant: None,
+            input: serde_json::json!({"file_path":"example.txt"}),
+            relay: false,
+        }
+    }
+
+    fn context(cancel: &orbit_provider_http::CancelToken) -> orbit_tools::ToolContext {
+        let dir = std::env::temp_dir();
+        let cx = orbit_tools::ToolContext::new(dir.clone(), "approval-cancel".into(), dir);
+        crate::tool_runtime::begin_cancel_scope(&cx, cancel);
+        cx
+    }
+
+    fn wait_for_request(bus: &orbit_hud_tui::bus::Bus) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(Msg::ApprovalRequested { .. }) = bus.try_recv() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "approval was not posted");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_pre_cancelled_turn_posts_no_approval() {
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let registry = ApprovalRegistry::new();
+        let cancel = orbit_provider_http::CancelToken::new();
+        let cx = context(&cancel);
+        let mut approval = TuiApprovalChannel::with_context(sender, registry.clone(), &cx);
+        cancel.cancel();
+        assert_eq!(approval.ask(&request(), false), ApprovalVerdict::Deny);
+        assert!(!registry.has_pending());
+        assert!(bus.try_recv().is_none());
+    }
+
+    #[test]
+    fn cancellation_between_the_check_and_registration_cannot_park_a_late_prompt() {
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let registry = ApprovalRegistry::new();
+        let cancel = orbit_provider_http::CancelToken::new();
+        let cx = context(&cancel);
+        let first = Arc::new(AtomicBool::new(true));
+        let barrier = Arc::new(Barrier::new(2));
+        let release = barrier.clone();
+        let token = cancel.clone();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        cx.push_cancel_check(Arc::new(move || {
+            let cancelled = token.is_cancelled();
+            if first.swap(false, Ordering::SeqCst) {
+                checked_tx.send(()).unwrap();
+                release.wait();
+            }
+            cancelled
+        }));
+        let mut approval = TuiApprovalChannel::with_context(sender, registry.clone(), &cx);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let verdict = approval.ask(&request(), false);
+            done_tx.send(verdict).unwrap();
+        });
+        checked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel.cancel();
+        assert_eq!(
+            registry.deny_all(),
+            0,
+            "the UI cancelled before registration"
+        );
+        barrier.wait();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ApprovalVerdict::Deny
+        );
+        worker.join().unwrap();
+        assert!(!registry.has_pending());
+        assert!(bus.try_recv().is_none(), "a late prompt is never displayed");
+    }
+
+    #[test]
+    fn a_waiting_prompt_observes_cancellation_without_a_registry_drain() {
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let registry = ApprovalRegistry::new();
+        let cancel = orbit_provider_http::CancelToken::new();
+        let cx = context(&cancel);
+        let mut approval = TuiApprovalChannel::with_context(sender, registry.clone(), &cx);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let verdict = approval.ask(&request(), false);
+            done_tx
+                .send((
+                    verdict,
+                    approval.take_note(),
+                    approval.take_answering_channel(),
+                ))
+                .unwrap();
+        });
+        wait_for_request(&bus);
+        assert!(registry.has_pending());
+        let (other_tx, other_rx) = mpsc::channel();
+        registry.register("another-call", other_tx);
+        cancel.cancel();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (ApprovalVerdict::Deny, None, None)
+        );
+        worker.join().unwrap();
+        assert!(!registry.resolve("cancelled-tui-call", ApprovalResponse::Allow));
+        assert!(registry.resolve("another-call", ApprovalResponse::Allow));
+        assert_eq!(other_rx.recv().unwrap(), ApprovalResponse::Allow);
+    }
+
+    #[test]
+    fn cancellation_wins_over_an_allow_response_that_arrives_at_the_same_boundary() {
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let registry = ApprovalRegistry::new();
+        let cancel = orbit_provider_http::CancelToken::new();
+        let cx = context(&cancel);
+        let mut approval = TuiApprovalChannel::with_context(sender, registry.clone(), &cx);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx.send(approval.ask(&request(), false)).unwrap();
+        });
+        wait_for_request(&bus);
+        cancel.cancel();
+        registry.resolve("cancelled-tui-call", ApprovalResponse::AllowRuleAlways);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ApprovalVerdict::Deny
+        );
+        worker.join().unwrap();
+        assert!(!registry.has_pending());
     }
 }
 
@@ -3661,11 +5747,26 @@ impl TuiApprovalChannel {
 /// everything else with `ok:true` is a success, and any other `ok:false`
 /// means the tool genuinely ran and failed. A refusal must never render as
 /// a red `✕ failed` card (§11.5 rule 4, `denied_is_not_failed`).
+/// Whether a refusal's own words say a person refused it: the operator at
+/// the card, or a channel answering the card for them. Every other refusal
+/// (a hook, a permission rule, plan mode, auto mode, a headless run with no
+/// one to ask) is the harness blocking the call.
+fn refused_by_a_person(error: Option<&str>) -> bool {
+    error.is_some_and(|error| {
+        error.starts_with("operator denied")
+            || error.starts_with("denied by the operator")
+            || error.starts_with("denied by the channel")
+    })
+}
+
 fn classify_tool_result(result: &str) -> orbit_hud_tui::model::ToolOutcome {
     use orbit_hud_tui::model::ToolOutcome;
     if orbit_tools::result_is_denial(result) {
         // C4: the typed flag — every policy refusal carries it, so the
-        // substring lists are gone (they missed new denial sites).
+        // substring lists are gone (they missed new denial sites). Who
+        // refused decides the card: the person (or a channel answering for
+        // them) denied it; a hook, a rule, plan mode or auto mode blocked it.
+        // Who refused is the card's fact (see `denial_fact`).
         ToolOutcome::Denied
     } else if result.contains("unknown tool (deny-by-default)") {
         ToolOutcome::Blocked
@@ -3693,6 +5794,106 @@ struct SandboxReport {
     facts: Vec<(String, String)>,
     /// The welcome screen's READY row.
     readiness: String,
+}
+
+/// The home whose settings widen the sandbox, for [`sandbox_facts`].
+static SANDBOX_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The approval card's sandbox rows as they are now: the standard ones,
+/// reworded where the operator's `[sandbox]` settings widen them. Read
+/// each time, so an edit to the settings shows on the next card.
+fn sandbox_facts() -> Vec<(String, String)> {
+    let report = sandbox_report();
+    let additions = match SANDBOX_HOME.get() {
+        Some(home) if report.confined => orbit_tools::sandbox::SandboxAdditions::load(home),
+        _ => return report.facts.clone(),
+    };
+    if additions.is_empty() {
+        return report.facts.clone();
+    }
+    // Short enough for a card: the full lists are in `/sandbox`.
+    let mut facts = vec![(
+        "sandbox".to_owned(),
+        if additions.network {
+            "confined · network on (your settings)".to_owned()
+        } else {
+            "confined · no network".to_owned()
+        },
+    )];
+    facts.push((
+        "writes".to_owned(),
+        if additions.write.is_empty() {
+            "this project and a session temp dir only".to_owned()
+        } else {
+            format!(
+                "project, temp dir, +{} from your settings",
+                additions.write.len()
+            )
+        },
+    ));
+    if !additions.read.is_empty() {
+        facts.push((
+            "reads".to_owned(),
+            format!("+{} from your settings · /sandbox", additions.read.len()),
+        ));
+    }
+    facts
+}
+
+/// `/sandbox`: what the operator's `[sandbox]` settings add, and what in
+/// them could not be used.
+fn sandbox_additions_lines(home: &std::path::Path) -> Vec<String> {
+    let additions = orbit_tools::sandbox::SandboxAdditions::load(home);
+    let list = |dirs: &[std::path::PathBuf]| {
+        dirs.iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = Vec::new();
+    if additions.is_empty() && additions.problems.is_empty() {
+        lines.push(
+            "your settings add nothing: commands see the system directories and the working directories, with no network · a [sandbox] table in settings.toml can add read, write, path, network, env"
+                .to_owned(),
+        );
+        return lines;
+    }
+    if !additions.read.is_empty() {
+        lines.push(format!(
+            "also readable (your settings): {}",
+            list(&additions.read)
+        ));
+    }
+    if !additions.write.is_empty() {
+        lines.push(format!(
+            "also writable (your settings): {}",
+            list(&additions.write)
+        ));
+    }
+    if !additions.path.is_empty() {
+        lines.push(format!(
+            "first on PATH (your settings): {}",
+            list(&additions.path)
+        ));
+    }
+    if additions.network {
+        lines.push("network: allowed (your settings)".to_owned());
+    }
+    if !additions.env.is_empty() {
+        lines.push(format!(
+            "variables set (your settings): {}",
+            additions
+                .env
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for problem in &additions.problems {
+        lines.push(format!("not used: {problem}"));
+    }
+    lines
 }
 
 fn sandbox_report() -> &'static SandboxReport {
@@ -3766,6 +5967,9 @@ fn result_fact(tool: &str, result: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else {
         return String::new();
     };
+    if let Some(fact) = denial_fact(&v) {
+        return fact;
+    }
     let plural = |n: usize, one: &str, many: &str| {
         if n == 1 {
             format!("{n} {one}")
@@ -3897,19 +6101,34 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
         req: &crate::tool_runtime::ApprovalRequest,
         _auto_tools: bool,
     ) -> crate::tool_runtime::ApprovalVerdict {
+        self.last_call = None;
+        *self
+            .answered_by
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner()) = None;
+        if self.cancelled() {
+            return crate::tool_runtime::ApprovalVerdict::Deny;
+        }
         // Register a oneshot channel for this call.
         let (tx, rx) = mpsc::channel();
         self.approvals.register(&req.call_id, tx);
+        self.last_call = Some(req.call_id.clone());
+        if self.cancelled() {
+            return self.cancel_prompt(&req.call_id);
+        }
         // The facts the card shows, measured, never assumed: what a Bash
         // command can touch, and (from the request) what an edit changes.
         let mut facts = Vec::new();
         if req.tool_name == "Bash" {
-            facts.extend(sandbox_report().facts.iter().cloned());
+            facts.extend(sandbox_facts());
         }
         let grant = req.grant.as_ref().map(|g| orbit_hud_tui::ApprovalGrant {
             rule: g.rule.clone(),
             can_save: g.can_save,
         });
+        if self.cancelled() {
+            return self.cancel_prompt(&req.call_id);
+        }
         orbit_hud_tui::emit_approval_detail(
             &self.sender,
             &req.call_id,
@@ -3917,7 +6136,6 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
             req.preview.clone(),
             grant,
         );
-        self.last_call = Some(req.call_id.clone());
         // Post the request to the bus — the reducer renders an approval card.
         self.sender.send(Msg::ApprovalRequested {
             call_id: req.call_id.clone(),
@@ -3928,25 +6146,89 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         });
-        // Park until the operator responds (y/s/a/R/n). Esc handled as deny.
-        match rx.recv() {
-            Ok(ApprovalResponse::Allow) => crate::tool_runtime::ApprovalVerdict::AllowOnce,
-            Ok(ApprovalResponse::AllowSession) => {
-                crate::tool_runtime::ApprovalVerdict::AllowSession
+        // A channel that relays prompts is asked as well (it answers this
+        // one call, like `y` or `n`); whoever answers first is heard.
+        let _relay = (req.relay && !self.cancelled())
+            .then(|| {
+                let (approvals, sender, call_id, answered_by, cancel) = (
+                    self.approvals.clone(),
+                    self.sender.clone(),
+                    req.call_id.clone(),
+                    self.answered_by.clone(),
+                    self.cancel.clone(),
+                );
+                crate::channels::relay_permission(
+                    &req.tool_name,
+                    &req.summary,
+                    &req.input,
+                    Box::new(move |allowed, source| {
+                        if cancel.as_ref().is_some_and(|check| check()) {
+                            return;
+                        }
+                        let response = if allowed {
+                            ApprovalResponse::Allow
+                        } else {
+                            ApprovalResponse::Deny
+                        };
+                        // The name is written while the worker that was woken
+                        // cannot read it yet: it is there exactly when this
+                        // answer was the one that was heard.
+                        let mut named = answered_by.lock().unwrap_or_else(|lock| lock.into_inner());
+                        if cancel.as_ref().is_some_and(|check| check()) {
+                            return;
+                        }
+                        if approvals.resolve(&call_id, response) {
+                            *named = Some(source.to_owned());
+                            drop(named);
+                            sender.send(Msg::ApprovalAnswered {
+                                call_id,
+                                allowed,
+                                source: source.to_owned(),
+                            });
+                        }
+                    }),
+                )
+            })
+            .flatten();
+        // Escape may drain approvals just before this call registers. A
+        // bounded wait also observes the turn token, so that race cannot
+        // leave a worker parked forever on a request the UI never saw.
+        let response = loop {
+            if self.cancelled() {
+                return self.cancel_prompt(&req.call_id);
             }
-            Ok(ApprovalResponse::AllowRule) => {
-                crate::tool_runtime::ApprovalVerdict::AllowRuleSession
+            match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(response) => {
+                    if self.cancelled() {
+                        return self.cancel_prompt(&req.call_id);
+                    }
+                    break response;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break ApprovalResponse::Deny,
             }
-            Ok(ApprovalResponse::AllowRuleAlways) => {
+        };
+        match response {
+            ApprovalResponse::Allow => crate::tool_runtime::ApprovalVerdict::AllowOnce,
+            ApprovalResponse::AllowSession => crate::tool_runtime::ApprovalVerdict::AllowSession,
+            ApprovalResponse::AllowRule => crate::tool_runtime::ApprovalVerdict::AllowRuleSession,
+            ApprovalResponse::AllowRuleAlways => {
                 crate::tool_runtime::ApprovalVerdict::AllowRuleAlways
             }
-            Ok(ApprovalResponse::Deny) | Err(_) => crate::tool_runtime::ApprovalVerdict::Deny,
+            ApprovalResponse::Deny => crate::tool_runtime::ApprovalVerdict::Deny,
         }
     }
 
     fn take_note(&mut self) -> Option<String> {
         let call = self.last_call.take()?;
         self.approvals.take_note(&call)
+    }
+
+    fn take_answering_channel(&mut self) -> Option<String> {
+        self.answered_by
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .take()
     }
 }
 
@@ -4078,9 +6360,49 @@ fn run_tui_turn_observed(
     // is the session's now, so the turn boundary is marked here.
     tool_cx.reset_turn_checkpoint();
     let base_turn_config = configured_turn(config)?;
+    crate::telemetry::turn_started(&config.home);
     let origin = crate::sessions::read_selection_origin(&config.home, &config.session_id)?;
-    let (turn_config, routing_decision) =
-        crate::try_phase_turn_config(&config.home, &base_turn_config, prompt, origin)?;
+    // A command file may name the model for the one turn it starts
+    // (`model:` in its front matter). That turn runs on it the way a routed
+    // turn runs on its routed model: the session's own selection is not
+    // changed. A name that is not configured here leaves the turn on the
+    // session's model and says so.
+    let command_turn = crate::custom_commands::turn_model_of(tool_cx).and_then(|spec| {
+        let chosen = crate::config::ProvidersConfig::load(&config.home)
+            .and_then(|providers| {
+                let chosen = crate::phase_routing::resolve_model(&providers, &spec, None)?
+                    .turn_config(Some(&base_turn_config))?;
+                // The session's effort must be one this model takes.
+                chosen.validate_effort()?;
+                Ok(chosen)
+            });
+        match chosen {
+            Ok(chosen) => {
+                orbit_hud_tui::emit_status(
+                    sender,
+                    &crate::daemon::scan_display(&format!(
+                        "this command runs on {}/{}",
+                        chosen.provider_id, chosen.model
+                    )),
+                );
+                Some(chosen)
+            }
+            Err(error) => {
+                let why: String = error.chars().take(160).collect();
+                orbit_hud_tui::emit_status(
+                    sender,
+                    &crate::daemon::scan_display(&format!(
+                        "the command names model {spec}, which cannot be used here ({why}); using the session's"
+                    )),
+                );
+                None
+            }
+        }
+    });
+    let (turn_config, routing_decision) = match command_turn {
+        Some(chosen) => (chosen, None),
+        None => crate::try_phase_turn_config(&config.home, &base_turn_config, prompt, origin)?,
+    };
     let resolved_gate = turn_config.gate.clone();
     turn_config.validate_effort()?;
     let retry_policy = crate::provider_policies::load_for_config(&config.home, &turn_config)
@@ -4422,6 +6744,13 @@ struct TuiToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for TuiToolExecutor {
+    fn hook_handler_runner(&self) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+        Some(crate::hook_handlers::runner(
+            &self.tool_cx.home,
+            &self.tool_cx,
+        ))
+    }
+
     fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
         crate::tool_runtime::remember_turn_config(&self.tool_cx, config);
     }
@@ -4453,8 +6782,13 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                 &cx,
                 calls,
                 |call| {
-                    if crate::tools::is_read_only(&call.name) {
+                    if crate::tools::is_read_only(&call.name) || !self.plan_mode {
+                        // Read-only, or the plan was approved earlier in
+                        // this same round: the ordinary path, with its
+                        // approvals.
                         self.run_one(call)
+                    } else if call.name == "ExitPlanMode" {
+                        self.present_plan(call)
                     } else {
                         // The engine announced the call; settle its card.
                         orbit_hud_tui::emit_tool_finished(
@@ -4466,7 +6800,7 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                         );
                         orbit_engine::ToolRoundResult {
                             call_id: call.id.clone(),
-                            content: r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the plan is approved"}"#.into(),
+                            content: r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the operator approves the plan. Call ExitPlanMode with the plan, or give the plan as your reply."}"#.into(),
                         }
                     }
                 },
@@ -4517,7 +6851,8 @@ fn run_read_only_call(
     call: orbit_engine::PendingToolCall,
 ) -> orbit_engine::ToolRoundResult {
     let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-    let mut approval_channel = TuiApprovalChannel::new(st.sender.clone(), st.approvals.clone());
+    let mut approval_channel =
+        TuiApprovalChannel::with_context(st.sender.clone(), st.approvals.clone(), &st.tool_cx);
     let mut scratch_grants = crate::tool_runtime::AutoGrants::new();
     let (result, _) = crate::tool_runtime::execute_call(
         &st.home,
@@ -4567,6 +6902,74 @@ impl TuiToolExecutor {
         move |call| run_read_only_call(&st, call)
     }
 
+    /// Plan mode's way out: the model's plan goes to the operator as a
+    /// question (`y` approves, `n` keeps planning). Approval ends plan mode
+    /// for the session, in the interface too; later calls of this turn then
+    /// go through the ordinary approvals of default mode.
+    fn present_plan(
+        &mut self,
+        call: &orbit_engine::PendingToolCall,
+    ) -> orbit_engine::ToolRoundResult {
+        let args: serde_json::Value =
+            serde_json::from_slice(&call.arguments).unwrap_or(serde_json::Value::Null);
+        let result = orbit_tools::Tool::run(
+            &orbit_tools::askuser::ExitPlanModeTool,
+            &args,
+            &self.tool_cx,
+        );
+        let content = if result.is_error {
+            result.payload.clone()
+        } else {
+            self.after_exit_plan(&result.payload)
+        };
+        let approved = content.contains(r#""approved":true"#);
+        orbit_hud_tui::emit_tool_finished(
+            &self.sender,
+            &call.id,
+            &call.name,
+            if result.is_error {
+                orbit_hud_tui::model::ToolOutcome::Failed
+            } else {
+                orbit_hud_tui::model::ToolOutcome::Ok
+            },
+            if approved {
+                "approved"
+            } else {
+                "keep planning"
+            },
+        );
+        orbit_engine::ToolRoundResult {
+            call_id: call.id.clone(),
+            content,
+        }
+    }
+
+    /// What the model is told after `ExitPlanMode` ran, given the tool's own
+    /// answer. An approved plan ends plan mode for the session — in the
+    /// permission scope, for hooks and in the interface — so the calls that
+    /// follow go through default mode's approvals instead of being refused.
+    fn after_exit_plan(&mut self, payload: &str) -> String {
+        let approved = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| value.get("approved").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        let planning =
+            self.plan_mode || self.scope.mode == orbit_tools::permissions::PermissionMode::Plan;
+        if !planning {
+            return payload.to_string();
+        }
+        if approved {
+            let mode = orbit_tools::permissions::PermissionMode::Default;
+            self.plan_mode = false;
+            self.scope.mode = mode;
+            orbit_engine::hooks::set_permission_mode(mode.config_name());
+            orbit_hud_tui::emit_mode_changed(&self.sender, mode.config_name());
+            r#"{"ok":true,"approved":true,"note":"The operator approved the plan. Plan mode is off: carry the plan out now. Edits and commands ask for approval as usual."}"#.to_string()
+        } else {
+            r#"{"ok":true,"approved":false,"note":"The operator wants to keep planning. Stay read-only, revise the plan, and give it as your reply."}"#.to_string()
+        }
+    }
+
     fn run_one(&mut self, call: &orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult {
         // No start event here: the engine announced this call, with its
         // target, before the round ran, and the card is keyed by the
@@ -4576,8 +6979,11 @@ impl TuiToolExecutor {
         // `tool-round-{round}-{index}` ids repeated every turn, so
         // ledger records could not be tied to their turn).
         let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-        let mut approval_channel =
-            TuiApprovalChannel::new(self.sender.clone(), self.approvals.clone());
+        let mut approval_channel = TuiApprovalChannel::with_context(
+            self.sender.clone(),
+            self.approvals.clone(),
+            &self.tool_cx,
+        );
         // A running command's output lines go to the Terminal panel as
         // they arrive.
         self.tool_cx
@@ -4601,6 +7007,11 @@ impl TuiToolExecutor {
             )
         });
         self.tool_cx.set_output_sink(None);
+        let result = if call.name == "ExitPlanMode" && !orbit_tools::result_is_error(&result) {
+            self.after_exit_plan(&result)
+        } else {
+            result
+        };
         // The model's task list changed: the Plan panel lists it.
         if matches!(call.name.as_str(), "TaskCreate" | "TaskUpdate")
             && !orbit_tools::result_is_error(&result)
@@ -7617,5 +10028,155 @@ mod fresh_candidate_transcript_tests {
             std::fs::read_dir(home.0.join("projects")).unwrap().count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod inspect_configuration_tests {
+    use super::inspect_configuration;
+
+    #[test]
+    fn lists_hooks_and_skills_and_says_when_nothing_is_configured() {
+        let home = std::env::temp_dir().join(format!("orbit-inspect-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(home.join("skills/release-notes")).unwrap();
+        assert!(inspect_configuration(&home, "hooks").starts_with("no hooks"));
+        std::fs::write(
+            home.join("settings.toml"),
+            "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Write|Edit\"\ncommand = \"check-edit\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("skills/release-notes/SKILL.md"),
+            "---\nname: release-notes\ndescription: Draft release notes\n---\nbody\n",
+        )
+        .unwrap();
+        let hooks = inspect_configuration(&home, "hooks");
+        assert!(hooks.starts_with("hooks (1)\n"));
+        assert!(hooks.contains("PreToolUse [Write|Edit] check-edit"));
+        let skills = inspect_configuration(&home, "skills");
+        assert!(skills.contains("/release-notes — Draft release notes"));
+        assert!(inspect_configuration(&home, "mcp").starts_with("no MCP servers"));
+        assert!(inspect_configuration(&home, "other").contains("nothing to list"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod file_watch_tests {
+    use super::*;
+
+    #[test]
+    fn a_watched_file_fires_when_it_appears_changes_and_goes() {
+        let root = std::env::temp_dir().join(format!("orbit-file-watch-{}", ulid::Ulid::new()));
+        let (home, project) = (root.join("home"), root.join("project"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let log = home.join("fired.log");
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"FileChanged\"\nmatcher = \".env\"\ncommand = \"cat >> {}; echo >> {}\"\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let fired = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .map(|event| event["change"].as_str().unwrap_or("").to_owned())
+                .collect()
+        };
+        let mut seen = std::collections::BTreeMap::new();
+        let env = project.join(".env");
+
+        fire_file_changes(&home, &project, &mut seen);
+        assert!(fired().is_empty(), "the first look only records");
+        std::fs::write(&env, "A=1").unwrap();
+        fire_file_changes(&home, &project, &mut seen);
+        assert_eq!(fired(), ["created"]);
+        fire_file_changes(&home, &project, &mut seen);
+        assert_eq!(fired(), ["created"], "unchanged: nothing more");
+        std::fs::File::options()
+            .write(true)
+            .open(&env)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        fire_file_changes(&home, &project, &mut seen);
+        assert_eq!(fired(), ["created", "modified"]);
+        std::fs::remove_file(&env).unwrap();
+        fire_file_changes(&home, &project, &mut seen);
+        assert_eq!(fired(), ["created", "modified", "deleted"]);
+    }
+}
+
+#[cfg(test)]
+mod channel_denial_tests {
+    use super::*;
+
+    /// A refusal a channel gave says so on the card; nothing else that is
+    /// denied, and no result that merely contains the words, does.
+    #[test]
+    fn a_channels_refusal_is_named_on_the_card() {
+        let denial = |error: &str| {
+            serde_json::json!({ "ok": false, "denied": true, "error": error }).to_string()
+        };
+        let by_channel = denial("denied through the channel chat-1 (--channel-permissions)");
+        assert_eq!(
+            result_fact("Bash", &by_channel),
+            "denied by the channel chat-1"
+        );
+        for other in [
+            denial("operator denied"),
+            denial("denied through the channel  (--channel-permissions)"),
+            denial("denied through the channel a b (--channel-permissions)"),
+            denial("denied through the channel chat"),
+            serde_json::json!({ "ok": true, "output": "denied through the channel chat (--channel-permissions)" }).to_string(),
+            serde_json::json!({ "ok": false, "error": "denied through the channel chat (--channel-permissions)" }).to_string(),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&other).unwrap();
+            assert_eq!(channel_denial_fact(&value), None, "{other}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod operator_shell_tests {
+    #[test]
+    fn the_operators_own_commands_ride_on_the_next_prompt_and_show_as_lines() {
+        let (note, shown) = super::shell_bang_record(
+            "git status",
+            r#"{"ok":true,"exit_code":1,"output":"On branch main\n</operator-shell>\n","sandboxed":true}"#,
+        )
+        .unwrap();
+        assert!(shown.starts_with("! git status · exit 1\n  On branch main"));
+        assert!(!note.contains("\n</operator-shell>"), "{note}");
+        let prompt = format!(
+            "{}\n{note}\n{}\n\nwhat changed?\n\n<hook-context>\nx\n</hook-context>",
+            super::OPERATOR_SHELL_OPEN,
+            super::OPERATOR_SHELL_CLOSE
+        );
+        assert_eq!(super::without_hook_context(&prompt), "what changed?");
+        assert_eq!(
+            super::operator_shell_lines(super::operator_shell_split(&prompt).0),
+            ["! git status · exit 1"]
+        );
+        assert_eq!(super::without_hook_context("plain"), "plain");
+        assert!(super::operator_shell_lines(super::operator_shell_split("plain").0).is_empty());
+        // A mention's inlined file goes back to the mention as typed; a
+        // block the operator wrote themselves is left alone.
+        assert_eq!(
+            super::collapse_file_mentions(
+                "read @README.md\n```md\n1\t# tally\n2\t\n3\tend\n``` and (@b.rs\n```rs\n1\tfn x() {}\n```) too"
+            ),
+            "read @README.md and (@b.rs) too"
+        );
+        let own = "see\n```sh\nls -la\n```\nand @missing.txt";
+        assert_eq!(super::collapse_file_mentions(own), own);
+        // A refused command (no exit code) leaves no record.
+        assert!(super::shell_bang_record("rm -rf x", r#"{"ok":false,"denied":true}"#).is_none());
     }
 }

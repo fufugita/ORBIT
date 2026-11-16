@@ -370,6 +370,10 @@ pub enum WorkerCommand {
     /// A mod-contributed command `/name:cmd` — run the command's prompt
     /// body as a normal turn.
     ModCommand(String, String),
+    /// `/name args` that is no built-in command: a custom command file
+    /// (`.orbit/commands`, `.claude/commands`, …) run as a normal turn.
+    /// The worker reads the file; an unknown name is answered, not sent.
+    SlashCommand(String, String),
     /// `/undo` — drop the last exchange (user prompt + its assistant
     /// reply + any tool plumbing) from the working transcript, and emit
     /// the removed text so the operator can re-paste it.
@@ -378,6 +382,9 @@ pub enum WorkerCommand {
     /// persistent permission rules (CLI-side: the rules module lives in
     /// orbit-cli, which the TUI crate can't depend on).
     Permissions(String),
+    /// `/hooks`, `/skills`, `/agents`, `/mcp` — list what is configured.
+    /// Read-only; the worker formats the answer. Payload: the list name.
+    Inspect(String),
     /// Change the session's permission mode at runtime (S5): the
     /// worker mutates the session's PermissionScope in place; the next
     /// turn (and every approval card) obeys it. Payload: the mode name
@@ -394,7 +401,9 @@ pub enum WorkerCommand {
 impl WorkerCommand {
     pub fn foreground_kind(&self) -> Option<ForegroundKind> {
         match self {
-            Self::Prompt(_) | Self::ModCommand(_, _) => Some(ForegroundKind::Prompt),
+            Self::Prompt(_) | Self::ModCommand(_, _) | Self::SlashCommand(_, _) => {
+                Some(ForegroundKind::Prompt)
+            }
             Self::PlanPrompt(_) => Some(ForegroundKind::PlanPrompt),
             Self::ResumeSession(_) => Some(ForegroundKind::Resume),
             Self::SetModel(_)
@@ -405,6 +414,7 @@ impl WorkerCommand {
             | Self::RefreshMods
             | Self::Undo
             | Self::Permissions(_)
+            | Self::Inspect(_)
             | Self::SetMode(_)
             | Self::ShellBang(_) => Some(ForegroundKind::Control),
             Self::Bound { .. }

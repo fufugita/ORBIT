@@ -70,6 +70,10 @@ pub const PICKER_VIEWS: [View; 8] = [
     View::Agent,
 ];
 
+/// Built-in panes the picker offers after the views: `(key, pane id, title)`.
+pub const PICKER_PANES: [(char, &str, &str); 2] =
+    [('9', "council", "Council"), ('0', "reactor", "Reactor")];
+
 /// A snapshot of what changes the animations: taken before and after
 /// each key, so `Fx::observe` can stamp what moved.
 #[derive(Clone, Debug)]
@@ -563,15 +567,41 @@ pub(super) fn draw_with_reading(
                     }
                 } else if *view == View::Custom {
                     let id = sh.tree.custom_id_at(*i).unwrap_or_default();
-                    crate::customization::draw_pane(
-                        cv,
-                        *r,
-                        &id,
-                        s.custom_panes.get(&id),
-                        i + 1,
-                        *i == focus,
-                        inp.scrolls.get(*i).copied().unwrap_or(0),
-                    );
+                    // The council pane draws its structured state when the
+                    // session carries one; the text snapshot is the fallback.
+                    let cards = id == "council" && s.council.is_some();
+                    if cards {
+                        cv.clipped(*r, |cv| {
+                            crate::customization::draw_pane_at_with_council(
+                                cv,
+                                *r,
+                                &id,
+                                s.custom_panes.get(&id),
+                                i + 1,
+                                *i == focus,
+                                inp.scrolls.get(*i).copied().unwrap_or(0),
+                                Some(crate::customization::PaneClock {
+                                    now_ms: inp.now_ms,
+                                    reduced: inp.reduced,
+                                }),
+                                s.council.as_ref(),
+                            );
+                        });
+                    } else {
+                        crate::customization::draw_pane_at(
+                            cv,
+                            *r,
+                            &id,
+                            s.custom_panes.get(&id),
+                            i + 1,
+                            *i == focus,
+                            inp.scrolls.get(*i).copied().unwrap_or(0),
+                            Some(crate::customization::PaneClock {
+                                now_ms: inp.now_ms,
+                                reduced: inp.reduced,
+                            }),
+                        );
+                    }
                 } else {
                     panes::draw(
                         cv,

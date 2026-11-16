@@ -68,6 +68,12 @@ offline configuration and explains what to set before launching again. Local
 configuration and `orbit doctor` checks do not establish provider connectivity;
 a successful model response does. Change appearance later with `orbit config`.
 
+In a terminal that takes colour, each choice is a full-screen panel under the
+ORBIT mark: the highlighted row is the one Enter picks, the line under the panel
+describes it, and typing a number or a name picks directly. Between screens the
+steps done so far stay in the scroll-back as a row of dots. Terminals smaller
+than 40 columns by 12 rows get the plain list.
+
 For a sequential numbered menu, set `NO_COLOR=1` or `TERM=dumb` before running
 `orbit init`. This avoids the alternate-screen picker while keeping the same
 provider choices and save confirmation.
@@ -357,7 +363,19 @@ orbit compact --session SESSION_ID --json
 
 Manual compaction adds no user turn. It uses the saved conversation selection
 and the configured `compaction` role for summary requests, which can incur
-provider charges. Configured integrations may initialize while preparing the
+provider charges. It keeps the last two exchanges as they are and summarizes
+everything before them; with only two exchanges it keeps the latest. One
+exchange alone has nothing to summarize, and a summary that would be longer
+than what it replaces is refused and the conversation is left as it was.
+
+Automatic compaction runs when the conversation nears its limit and keeps as
+much recent history as fits. A summary covers only what came before the turn in
+progress. When the turn's own tool results fill the context, ORBIT drops the
+oldest long ones so the turn can go on, and says how many: the model sees that
+a result was dropped and can run the tool again. A higher limit for the model
+(`context_limits`, above) leaves more room; without one the 64,000-token
+fallback applies. `/context` shows the room left for messages after the output
+reserve. Configured integrations may initialize while preparing the
 context. Applied summaries retain the original typed history privately. A
 no-op, refusal, cancellation or uncertain publication is reported explicitly;
 check the result before continuing.
@@ -370,6 +388,91 @@ compaction and plain chat report storage, input or cleanup failures rather than
 claiming a clean cancellation. Ending one of these processes does not mean
 canceling a turn and continuing to read prompts in the same process. The TUI's
 `Esc` action is a separate way to cancel its active operation.
+
+## Give a slow model more time
+
+ORBIT waits 120 seconds for the first byte of a model's answer and lets a
+started answer go silent for 180 seconds. A gateway that queues or routes
+requests, or a model that thinks before it writes, can need longer. Set the
+waits on the model's own entry in `providers.toml`, in milliseconds:
+
+```toml
+[[provider.models]]
+id = "my-slow-model"
+first_byte_timeout_ms = 300000
+idle_timeout_ms = 300000
+```
+
+A request cut off by either wait ends with `ORBIT-E0412`. Whether the
+provider acted on it, and what it cost, is then unknown.
+
+## When a request ends without a known outcome
+
+Stopping a turn with `Esc`, a wait that runs out, or a lost connection can
+leave a request whose outcome ORBIT cannot know: it may have been billed, and
+what it cost was never reported.
+
+In the chat the session carries on. The request is closed as abandoned, a
+line says so, and your next prompt goes into the same session. From then on
+the session's cost is shown as a lower bound ("full session cost is
+unknown"), because the abandoned request is not counted. Nothing is sent
+again: a stopped request is never retried on its own. `orbit --continue` and
+`orbit --resume ID` at a terminal do the same for a session that a script
+left in this state.
+
+Scripted use is stricter. A headless run (`-p`), `serve` and a chat with
+piped input refuse such a session with `ORBIT-E0400` and change nothing, so
+automation that depends on exact accounting never continues over a cost it
+does not know. `orbit recovery status --session ID` shows what is recorded;
+opening the session once in the chat closes the request as above, and
+`--fork-session` continues in a copy instead. A spend cap (`--max-cost`) is
+refused for a session whose earlier cost is unknown.
+
+## Let commands use your toolchain or the network
+
+Commands that ORBIT runs for the model are confined (Linux, with
+bubblewrap). By default a command can:
+
+- write in the working directories and a temporary directory, nowhere else;
+- see the system's programs (`/usr`, `/bin`, `/etc` and the like) and the
+  working directories, but not the rest of your home directory;
+- not reach the network.
+
+That is safe, and it is also why `cargo` installed by rustup, a `node` from
+a version manager, `npm install` or `git push` do not work out of the box:
+the program is under your home directory, or it needs the network. When a
+command fails for one of these reasons, its result says so, and the model
+reports what the command needs instead of retrying it.
+
+To widen the sandbox on your own machine, add a `[sandbox]` table to
+`settings.toml` in ORBIT's home (`~/.orbit/settings.toml`):
+
+```toml
+[sandbox]
+read = ["~/.cargo", "~/.rustup"]   # more directories commands may read
+write = ["~/.cargo/registry"]      # more directories commands may write
+path = ["~/.cargo/bin"]            # put first on PATH (must be readable)
+network = true                     # let commands reach the network
+env = { CARGO_HOME = "~/.cargo", RUSTUP_HOME = "~/.rustup" }
+```
+
+Every key is optional. A leading `~/` is your home directory. Each
+directory must exist. An entry that cannot be used is left out and the rest
+still applies; `/sandbox` in the chat lists what the table adds and what was
+not used, and the approval card for a command says when the network or more
+directories are open.
+
+Three things do not change, whatever the table says:
+
+- only your own `settings.toml` is read; a project's settings cannot widen
+  the sandbox it runs in;
+- the paths that are never readable (`~/.ssh`, `~/.aws`, `.env` files and the
+  rest of that list) stay hidden;
+- ORBIT's own home, which holds the saved provider keys and the ledger, stays
+  hidden even when a directory above it is listed.
+
+With `network = true` a confined command can send what it can read to
+anywhere. Keep `read` as narrow as the tools need.
 
 ## Preserve an inactive session
 

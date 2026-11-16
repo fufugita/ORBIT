@@ -13,6 +13,8 @@
 /receipts/
 /review-receipts/
 handoff.md
+/HANDOFF.md
+/Claude outputs/
 
 # Local environment and editor files
 .env

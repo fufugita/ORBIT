@@ -1235,6 +1235,7 @@ fn purpose(value: AttemptPurpose) -> &'static str {
         AttemptPurpose::Ordinary => "ordinary",
         AttemptPurpose::Chunk => "chunk",
         AttemptPurpose::Merge => "merge",
+        AttemptPurpose::Housekeeping => "housekeeping",
     }
 }
 

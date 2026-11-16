@@ -813,3 +813,191 @@ fn helper_child_probe(name: &str) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
+
+// ── Navigation: the same tool with an `operation` ─────────────────────
+
+fn navigation_fixture(mode: &str) -> Fixture {
+    let f = Fixture::new("pull");
+    std::fs::write(f.work.join("file.rs"), "fn héllo() { start(8080); }\n").unwrap();
+    std::fs::write(
+        f.work.join("lib.rs"),
+        "\n\n\n\npub fn start(port: u16) {}\n",
+    )
+    .unwrap();
+    std::fs::write(f.work.join(".env"), "TOKEN=x\n").unwrap();
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures/lsp_nav_server.py");
+    std::fs::write(
+        f.home.join("lsp.toml"),
+        format!(
+            "enabled = true\n[[servers]]\nname = 'fixture'\ncommand = 'python3'\nargs = [{:?}, {:?}, {:?}, {:?}]\nlanguage_id = 'rust'\nextensions = ['rs']\nworkspace_root = {:?}\ntimeout_ms = 4000\n",
+            script.to_string_lossy(),
+            mode,
+            f.base.join("frames.jsonl").to_string_lossy(),
+            f.work.to_string_lossy(),
+            f.work.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        f.home.join("lsp.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    f
+}
+
+fn navigate(
+    f: &Fixture,
+    operation: &str,
+    position: Option<(u32, u32)>,
+    query: Option<&str>,
+) -> Result<lsp::NavigationReport, lsp::LspError> {
+    lsp::navigate(
+        &f.home,
+        &f.cx,
+        &PermissionScope::default(),
+        &lsp::LspNavigateArgs {
+            operation: operation.into(),
+            file_path: "file.rs".into(),
+            line: position.map(|p| p.0),
+            character: position.map(|p| p.1),
+            query: query.map(str::to_owned),
+            server: None,
+        },
+    )
+}
+
+#[test]
+fn navigation_definition_names_the_place_and_counts_columns_as_the_server_does() {
+    let f = navigation_fixture("normal");
+    let found = navigate(&f, "definition", Some((1, 14)), None).unwrap();
+    assert_eq!(
+        found.results,
+        [serde_json::json!({"path": "lib.rs", "line": 5, "character": 8})]
+    );
+    assert_eq!((found.withheld, found.truncated), (0, false));
+    // Column 14 follows thirteen characters, one of them outside the BMP
+    // plane's single unit in UTF-8 only: UTF-16 counts 13, UTF-8 counts 14.
+    let asked = |f: &Fixture| {
+        f.frames()
+            .iter()
+            .find(|frame| frame["method"] == "textDocument/definition")
+            .map(|frame| frame["params"]["position"].clone())
+            .unwrap()
+    };
+    assert_eq!(asked(&f), serde_json::json!({"line": 0, "character": 13}));
+    let utf8 = navigation_fixture("utf8");
+    navigate(&utf8, "definition", Some((1, 14)), None).unwrap();
+    assert_eq!(
+        asked(&utf8),
+        serde_json::json!({"line": 0, "character": 14})
+    );
+}
+
+#[test]
+fn navigation_references_withhold_files_the_session_may_not_read() {
+    let f = navigation_fixture("normal");
+    let found = navigate(&f, "references", Some((1, 14)), None).unwrap();
+    assert_eq!(
+        found.results,
+        [
+            serde_json::json!({"path": "file.rs", "line": 1, "character": 4}),
+            serde_json::json!({"path": "lib.rs", "line": 5, "character": 8}),
+        ]
+    );
+    assert_eq!(
+        found.withheld, 2,
+        "a deny-read file and one outside the workspace"
+    );
+    let text = serde_json::to_string(&found).unwrap();
+    assert!(
+        !text.contains(".env") && !text.contains("hostname"),
+        "{text}"
+    );
+}
+
+#[test]
+fn navigation_hover_symbols_and_workspace_search() {
+    let f = navigation_fixture("normal");
+    let hover = navigate(&f, "hover", Some((1, 14)), None).unwrap();
+    assert!(hover.text.unwrap().contains("Starts the server."));
+    let symbols = navigate(&f, "document_symbols", None, None).unwrap();
+    assert_eq!(
+        symbols.results,
+        [
+            serde_json::json!({"line": 1, "character": 8, "name": "Server", "kind": "struct"}),
+            serde_json::json!({"line": 2, "character": 5, "name": "port", "kind": "field", "in": "Server"}),
+            serde_json::json!({"line": 6, "character": 4, "name": "main", "kind": "function"}),
+        ]
+    );
+    let search = navigate(&f, "workspace_symbols", None, Some("start")).unwrap();
+    assert_eq!(
+        search.results,
+        [
+            serde_json::json!({"path": "lib.rs", "line": 5, "character": 8, "name": "start", "kind": "function", "in": "server"})
+        ]
+    );
+}
+
+#[test]
+fn navigation_waits_for_a_loading_server_and_says_when_there_is_nothing() {
+    let loading = navigation_fixture("loading");
+    let found = navigate(&loading, "definition", Some((1, 14)), None).unwrap();
+    assert_eq!(found.results.len(), 1, "asked again after two errors");
+    let tries = loading
+        .frames()
+        .iter()
+        .filter(|frame| frame["method"] == "textDocument/definition")
+        .count();
+    assert_eq!(tries, 3);
+    let nothing = navigation_fixture("nothing");
+    let none = navigate(&nothing, "definition", Some((1, 14)), None).unwrap();
+    assert!(none.results.is_empty());
+    assert_eq!(
+        none.reason.as_deref(),
+        Some("the server found nothing there")
+    );
+}
+
+#[test]
+fn navigation_refuses_before_launch_what_it_cannot_ask() {
+    let f = navigation_fixture("normal");
+    for (operation, position, query) in [
+        ("rename", Some((1, 1)), None),
+        ("definition", None, None),
+        ("hover", Some((0, 1)), None),
+        ("workspace_symbols", None, None),
+        ("workspace_symbols", None, Some("  ")),
+    ] {
+        let refused = navigate(&f, operation, position, query);
+        assert!(
+            matches!(refused, Err(lsp::LspError::Denied(_))),
+            "{operation}"
+        );
+    }
+    f.assert_not_launched();
+    let unsupported = navigation_fixture("no_references");
+    let refused = navigate(&unsupported, "references", Some((1, 14)), None);
+    assert!(matches!(refused, Err(lsp::LspError::Denied(_))));
+    // The one tool entry point picks by `operation`.
+    let via_tool = lsp::run(
+        &f.home,
+        &f.cx,
+        &PermissionScope::default(),
+        &serde_json::json!({"file_path": "file.rs", "operation": "hover", "line": 1, "character": 14}),
+    )
+    .unwrap();
+    assert_eq!(via_tool["operation"], "hover");
+    let unknown_field = lsp::run(
+        &f.home,
+        &f.cx,
+        &PermissionScope::default(),
+        &serde_json::json!({"file_path": "file.rs", "operation": "hover", "line": 1, "character": 14, "extra": 1}),
+    );
+    assert!(matches!(
+        unknown_field,
+        Err(lsp::LspError::Configuration(_))
+    ));
+}

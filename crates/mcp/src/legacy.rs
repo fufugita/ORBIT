@@ -317,7 +317,7 @@ async fn duplex(
         let is_response = value.get("method").is_none();
         let matches =
             expected_id.is_some_and(|id| value.get("id").and_then(Value::as_u64) == Some(id));
-        match classify_message(value, expected_id.unwrap_or(0))? {
+        match classify_message(value, expected_id.unwrap_or(0), &options)? {
             Message::Response(response) if matches && result.is_none() => result = Some(response),
             Message::Response(_) | Message::Ignore if is_response => {
                 return Err(fatal(
