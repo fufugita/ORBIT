@@ -49,6 +49,9 @@ fn claude_command(text: &str) -> Option<String> {
 
 /// The status-line command configured for this home, if any.
 pub fn command(home: &Path) -> Option<String> {
+    if crate::tools::bare_mode() {
+        return None;
+    }
     let flag = orbit_tools::executor::extra_settings_file();
     let read = |path: &Path| {
         std::fs::metadata(path)
@@ -166,6 +169,9 @@ pub fn clean(output: &str) -> String {
 /// Run the command once and return what it wants shown. Empty when it
 /// failed, timed out or printed nothing.
 pub fn run(command: &str, snapshot: &Snapshot) -> String {
+    if crate::tools::bare_mode() {
+        return String::new();
+    }
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let Ok(mut child) = Command::new("bash")

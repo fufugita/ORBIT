@@ -8,11 +8,9 @@
 use orbit_adapter::types::ToolDefinition;
 use sha2::{Digest, Sha256};
 
-static BARE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Select the process's script-friendly tool set before starting workers.
 pub fn enable_bare_mode() {
-    BARE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    orbit_engine::enable_bare_mode();
 }
 
 /// What a session's process needs beyond its tool context: the runner for
@@ -48,8 +46,7 @@ pub fn with_extra_dirs(mut cx: orbit_tools::ToolContext) -> orbit_tools::ToolCon
 }
 
 pub fn bare_mode() -> bool {
-    BARE_MODE.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("ORBIT_BARE").is_ok_and(|value| value == "1")
+    orbit_engine::bare_mode()
 }
 
 pub(crate) fn config_home_from_env() -> std::path::PathBuf {
@@ -2857,8 +2854,51 @@ mod tests {
             if mode == "flag" {
                 enable_bare_mode();
             }
-            let home = std::env::temp_dir().join(format!("orbit-bare-{}", ulid::Ulid::new()));
-            std::fs::create_dir(&home).unwrap();
+            struct FixtureDir(std::path::PathBuf);
+            impl Drop for FixtureDir {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let fixture =
+                FixtureDir(std::env::temp_dir().join(format!("orbit-bare-{}", ulid::Ulid::new())));
+            let home = fixture.0.join("home");
+            let project = fixture.0.join("project");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::env::set_current_dir(&project).unwrap();
+            let command = |marker: &str| {
+                format!(
+                    "printf ran > '{}'",
+                    fixture
+                        .0
+                        .join(marker)
+                        .display()
+                        .to_string()
+                        .replace('\'', "'\\''")
+                )
+            };
+            std::fs::write(
+                home.join("mcp.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "servers": {
+                        "startup-probe": {
+                            "command":"/bin/sh", "args":["-c",command("mcp.marker")],
+                        },
+                    },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let status_command = format!("{}; printf ORBIT_STATUS_TRIAL", command("status.marker"));
+            std::fs::write(
+                home.join("settings.toml"),
+                format!(
+                    "status_line = {}\n",
+                    serde_json::to_string(&status_command).unwrap()
+                ),
+            )
+            .unwrap();
             let definitions = session_tool_definitions(&home);
             let has = |name: &str| definitions.iter().any(|tool| tool.name == name);
             assert!(has("Read") && has("Bash") && has("calculator"));
@@ -2868,7 +2908,35 @@ mod tests {
                 assert_eq!(definitions.len(), tool_definitions().len());
                 assert!(!has("Skill") && !has("Task") && !has("ListAgents"));
             }
-            std::fs::remove_dir_all(home).unwrap();
+            // The stdio server exits immediately, so discovery proves startup
+            // effects without leaving a listener or long-lived fixture child.
+            assert_eq!(fixture.0.join("mcp.marker").exists(), mode == "full");
+            let status = crate::status_line::command(&home);
+            assert_eq!(
+                status.as_deref(),
+                (mode == "full").then_some(status_command.as_str())
+            );
+            // Even a command discovered before bare mode was selected cannot
+            // execute through the status-line runner.
+            assert_eq!(
+                crate::status_line::run(&status_command, &crate::status_line::Snapshot::default()),
+                if mode == "full" {
+                    "ORBIT_STATUS_TRIAL"
+                } else {
+                    ""
+                },
+            );
+            assert_eq!(fixture.0.join("status.marker").exists(), mode == "full");
+            let cx = orbit_tools::ToolContext::new(home.clone(), "bare-test".into(), project);
+            let channels = crate::channels::start(&home, &cx);
+            if mode == "full" {
+                assert_eq!(
+                    channels,
+                    ["channel missing-bare-probe: no MCP server of that name"]
+                );
+            } else {
+                assert!(channels.is_empty());
+            }
             println!("ORBIT_BARE_TOOLS_CHECKED={mode}");
             return;
         }
@@ -2882,6 +2950,14 @@ mod tests {
                 ])
                 .env(CHILD, mode)
                 .env("ORBIT_BARE", bare)
+                .env("ORBIT_CHANNELS", "missing-bare-probe")
+                .env("ORBIT_CLAUDE_COMPAT", "0")
+                .env_remove("ORBIT_CHANNEL_PERMISSIONS")
+                .env_remove("ORBIT_SETTINGS_FILE")
+                .env_remove("ORBIT_MCP_CONFIG")
+                .env_remove("ORBIT_HOME")
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()

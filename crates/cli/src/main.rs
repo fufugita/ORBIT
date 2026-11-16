@@ -116,6 +116,51 @@ fn take_setup_flags(args: Vec<String>) -> Result<Vec<String>, String> {
     Ok(kept)
 }
 
+/// Select minimal startup before lifecycle hooks, while keeping prompt text,
+/// option values and downstream command arguments out of flag parsing.
+fn bare_startup_requested(args: &[String]) -> bool {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(argument) = args.next() {
+        match argument {
+            "--" => break,
+            "--bare" => return true,
+            "-p"
+            | "--print"
+            | "--home"
+            | "--model"
+            | "--provider"
+            | "--gate"
+            | "--effort"
+            | "--resume"
+            | "--permission-mode"
+            | "--allowedTools"
+            | "--disallowedTools"
+            | "--output-format"
+            | "--json-schema"
+            | "--max-turns"
+            | "--max-cost"
+            | "--worktree"
+            | "--socket"
+            | "--session"
+            | "--settings"
+            | "--append-system-prompt"
+            | "--append-system-prompt-file"
+            | "--output-style"
+            | "--fallback-model"
+            | "--channels"
+            | "--channel-permissions"
+            | "--add-dir"
+            | "--mcp-config" => {
+                args.next();
+            }
+            "chat" | "serve" => {}
+            value if value.starts_with('-') => {}
+            _ => break,
+        }
+    }
+    false
+}
+
 /// The prompt a plain chat asks first when it was started as another chat's
 /// fallback (see `fallback::chat_rerun`).
 static CHAT_FIRST_PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -133,6 +178,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if bare_startup_requested(&args) {
+        tools::enable_bare_mode();
+    }
     if let Some(code) = orbit_cli::recovery_commands::try_run(&args) {
         std::process::exit(code);
     }
@@ -1668,9 +1716,13 @@ fn build_session_prompt_with_tool_names(
     model: &str,
     tool_names: &[&str],
 ) -> orbit_engine::context::SystemPrompt {
-    let mods = orbit_cli::mods::load_all(home);
-    let enabled = orbit_cli::mods::initial_enabled(home, &mods);
-    let mods_directive = orbit_cli::mods::system_directive(&mods, &enabled);
+    let mods_directive = if tools::bare_mode() {
+        String::new()
+    } else {
+        let mods = orbit_cli::mods::load_all(home);
+        let enabled = orbit_cli::mods::initial_enabled(home, &mods);
+        orbit_cli::mods::system_directive(&mods, &enabled)
+    };
     orbit_engine::context::build_system_prompt(
         home,
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -2677,6 +2729,10 @@ fn cmd_headless(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // Select minimal startup before configuration discovery or lifecycle hooks.
+    if args.iter().any(|a| a == "--bare") {
+        tools::enable_bare_mode();
+    }
     let home = orbit_home(args)
         .or_else(|| std::env::var("ORBIT_HOME").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(".orbit"));
@@ -2693,11 +2749,6 @@ fn cmd_headless(args: &[String]) -> i32 {
     let requested_model =
         value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok());
     let format = options.format;
-    // --bare: skip discovering hooks, skills, mods, MCP servers and
-    // memory files (phase 6 — fast start; recommended for scripts).
-    if args.iter().any(|a| a == "--bare") {
-        tools::enable_bare_mode();
-    }
     // --json-schema <file>: structured output. Anthropic gets
     // output_config.format natively later; here the honest path for
     // every provider: validate the final text as JSON against the
@@ -3813,6 +3864,9 @@ fn cmd_chat(args: &[String]) -> i32 {
         eprintln!("ORBIT-E1101: {error}");
         return 2;
     }
+    if args.iter().any(|argument| argument == "--bare") {
+        tools::enable_bare_mode();
+    }
     // Model-independent input must be valid before setup, worktree creation
     // or session ownership. Keep the parsed value for later capability checks.
     let requested_effort = match startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok()) {
@@ -4201,7 +4255,7 @@ fn cmd_chat(args: &[String]) -> i32 {
     // stdout lines (§11.4). The TUI never enables this — its worker threads
     // must not print to the alt screen.
     tool_runtime::enable_plain_output();
-    if orbit_cli::mods::validation_status(&home).is_err() {
+    if !tools::bare_mode() && orbit_cli::mods::validation_status(&home).is_err() {
         eprintln!(
             "Instruction bundles or enabled metadata are malformed or unsafe. Run orbit doctor; invalid entries remain disabled and stored files are unchanged."
         );
@@ -7011,6 +7065,9 @@ fn owner_model_entry<'a>(
 fn cmd_serve(args: &[String]) -> i32 {
     let result = (|| -> Result<i32, String> {
         orbit_cli::validate_owner_arguments("serve", args).map_err(|error| error.to_string())?;
+        if args.iter().any(|argument| argument == "--bare") {
+            tools::enable_bare_mode();
+        }
         let home = command_home(args);
         ensure_initialized(&home).map_err(|(code, text)| format!("{code}: {text}"))?;
         let socket = value_after(args, "--socket")
@@ -7134,9 +7191,6 @@ fn cmd_serve(args: &[String]) -> i32 {
         turn.initial_output_tokens = seed.output_tokens;
         turn.initial_cost_microcents = seed.cost_microcents;
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-        if args.iter().any(|argument| argument == "--bare") {
-            tools::enable_bare_mode();
-        }
         eprintln!("Starting session {} at {}", lease.session_id(), socket);
         foreground_owner(
             orbit_cli::daemon::OwnerConfig::new(turn, cwd),

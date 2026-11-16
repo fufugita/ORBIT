@@ -1366,9 +1366,17 @@ fn worker_main_owned(
     );
     // Mods (Claude-Mods parity): loaded once at boot, toggleable at
     // runtime. The directive is rebuilt whenever the enabled set changes.
-    let mut mods = crate::mods::load_all(&config.home);
-    let mut mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
-    if crate::mods::validation_status(&config.home).is_err() {
+    let mut mods = if crate::tools::bare_mode() {
+        Vec::new()
+    } else {
+        crate::mods::load_all(&config.home)
+    };
+    let mut mods_enabled = if crate::tools::bare_mode() {
+        Vec::new()
+    } else {
+        crate::mods::initial_enabled(&config.home, &mods)
+    };
+    if !crate::tools::bare_mode() && crate::mods::validation_status(&config.home).is_err() {
         ctx.sender.send(Msg::SystemMessage("Instruction bundles or enabled metadata are malformed or unsafe. Invalid entries remain disabled; run orbit doctor. Stored files are unchanged.".into()));
     }
 
@@ -2836,25 +2844,31 @@ fn worker_main_owned(
                     }
                 }
                 WorkerCommand::RefreshMods => {
-                    mods = crate::mods::load_all(&config.home);
-                    mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
-                    let _ = orbit_engine::hooks::Hooks::load(
-                        &config.home,
-                        orbit_engine::hooks::project_trusted(&config.home),
-                    )
-                    .fire(
-                        orbit_engine::hooks::HookEvent::ConfigChange,
-                        &serde_json::json!({ "source": "mods" }),
-                    );
-                    let built =
-                        build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
-                    tool_cx.set_ext(MemoryBytes(built.memory_bytes));
-                    system_prompt = built.text;
-                    turn_sender.send(Msg::SystemMessage(format!(
-                        "mods reloaded: {} installed, {} enabled",
-                        mods.len(),
-                        mods_enabled.len()
-                    )));
+                    if crate::tools::bare_mode() {
+                        turn_sender.send(Msg::SystemMessage(
+                            "Instruction bundles are unavailable in bare mode.".into(),
+                        ));
+                    } else {
+                        mods = crate::mods::load_all(&config.home);
+                        mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
+                        let _ = orbit_engine::hooks::Hooks::load(
+                            &config.home,
+                            orbit_engine::hooks::project_trusted(&config.home),
+                        )
+                        .fire(
+                            orbit_engine::hooks::HookEvent::ConfigChange,
+                            &serde_json::json!({ "source": "mods" }),
+                        );
+                        let built =
+                            build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                        system_prompt = built.text;
+                        turn_sender.send(Msg::SystemMessage(format!(
+                            "mods reloaded: {} installed, {} enabled",
+                            mods.len(),
+                            mods_enabled.len()
+                        )));
+                    }
                 }
                 WorkerCommand::Rewind(arg) => {
                     // /rewind (phase 4): no argument lists checkpoints;
