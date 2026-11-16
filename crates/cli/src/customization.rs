@@ -1912,7 +1912,10 @@ pub fn council_from_state_file(now: f64) -> Option<CouncilSnapshot> {
 
 fn council_state_cached(now: f64) -> Option<CouncilSnapshot> {
     let path = council_state_path()?;
-    cached_parse::<CouncilSnapshot>(&path, || council_snapshot_state(&path, now))
+    // Cache only the parsed files below: the assembled snapshot depends on
+    // elapsed time and independent history updates. Wrapping it in cached_parse
+    // would also hold the cache mutex while its nested file reads lock it again.
+    council_snapshot_state(&path, now)
 }
 
 /// The bounded text fallback, from a parsed state: the phase line, one

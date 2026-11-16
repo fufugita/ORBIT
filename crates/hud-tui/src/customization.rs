@@ -1183,8 +1183,13 @@ pub fn draw_pane_at_with_council(
             "council" => {
                 // The structured state is authoritative when the session
                 // carries it; the text parser remains for frontends that
-                // have only the snapshot.
-                match council {
+                // have only the snapshot. Small panes must keep the body
+                // inside its content area, clear of frames and actions.
+                let content = Rect {
+                    height: content_height.max(0) as u16,
+                    ..inner
+                };
+                cv.clipped(content, |cv| match council {
                     Some(state) => crate::proto::ported::draw_council(
                         cv,
                         (x, y, w, content_height),
@@ -1194,7 +1199,7 @@ pub fn draw_pane_at_with_council(
                         clock.reduced,
                     ),
                     None => draw_council_cards(cv, (x, y, w, content_height), &text, clock),
-                }
+                })
             }
             "reactor" => draw_reactor_view_with_bench(
                 cv,
@@ -1706,6 +1711,75 @@ NINGNING·04  BOLD  MINIMAX    minimax-m3         ◌ 신호없음\n\
             "MAGI - DELIBERATE\nKARINA-01    LEAD  ANTHROPIC  haiku-5-5          * APPROVE\n",
         );
         assert!(frame_rows(&ascii, 80, 18, still)[3].starts_with("KARINA-01"));
+    }
+
+    #[test]
+    fn council_content_preserves_small_panel_frames_and_action_rows() {
+        use orbit_frontend_protocol::customization::CouncilSnapshot;
+        use ratatui::buffer::Buffer;
+        let mut state =
+            crate::proto::ported::CouncilState::from_snapshot(&CouncilSnapshot::default());
+        state.phase.name = "TRIAGED".into();
+        state.phase.note = "TRIAL".into();
+        let output = council_output("MAGI · 선별 TRIAGED");
+        for (width, height) in [(4, 3), (12, 5), (24, 8), (40, 12), (80, 18)] {
+            let panel = Rect::new(37, 11, width, height);
+            let canvas = Rect::new(0, 0, 140, 60);
+            let mut expected = Buffer::empty(canvas);
+            let mut cv = Cv::new(&mut expected);
+            let palette = cv.palette;
+            let inner = panel_frame(
+                &mut cv,
+                panel,
+                &FrameSpec {
+                    num: 3,
+                    title: "Council",
+                    ident: palette.cyan,
+                    focused: true,
+                    focus_fx: FocusFx::settled(true),
+                    badge: None,
+                    attention: 0.0,
+                    footer: Vec::new(),
+                    footer_parts: Vec::new(),
+                },
+            )
+            .unwrap();
+            let mut actual = Buffer::empty(canvas);
+            let mut cv = Cv::new(&mut actual);
+            draw_pane_at_with_council(
+                &mut cv,
+                panel,
+                "council",
+                Some(&output),
+                3,
+                true,
+                0,
+                Some(PaneClock {
+                    now_ms: 4_000,
+                    reduced: true,
+                }),
+                Some(&state),
+            );
+            for y in 0..canvas.height {
+                for x in 0..canvas.width {
+                    if !inner.contains((x, y).into())
+                        || (inner.height >= 2 && y == inner.bottom() - 2)
+                    {
+                        assert_eq!(
+                            actual[(x, y)],
+                            expected[(x, y)],
+                            "{width}x{height} at {x},{y}"
+                        );
+                    }
+                }
+            }
+            if inner.height >= 2 && inner.width >= 10 {
+                let actions: String = (inner.x..inner.right())
+                    .map(|x| actual[(x, inner.bottom() - 1)].symbol())
+                    .collect();
+                assert!(actions.contains("1 refresh"));
+            }
+        }
     }
 
     #[test]
