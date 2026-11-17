@@ -1129,6 +1129,203 @@ async fn openai_terminal_malformed_or_unframed_sse_fails() {
     }
 }
 
+async fn openai_stream_failure(body: String) -> (Vec<ProviderStreamEvent>, AdapterError) {
+    let adapter = adapter(Family::OpenAi);
+    let mut mock = Mock::new(body, Family::OpenAi).await;
+    let request = request(adapter.as_ref(), mock.port);
+    let mut stream = adapter
+        .invoke(&request, None, &CancelToken::new())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    let error = loop {
+        match stream.next().await {
+            Some(Ok(event)) => events.push(event),
+            Some(Err(error)) => break error,
+            None => panic!("invalid stream must fail before successful completion"),
+        }
+    };
+    assert!(
+        stream.next().await.is_none(),
+        "stream error must be terminal"
+    );
+    mock.captured().await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, ProviderEventKind::Finished { .. }))
+    );
+    (events, error)
+}
+
+#[tokio::test]
+async fn openai_null_error_fields_preserve_text_usage_and_successful_completion() {
+    let body = [
+        sse(json!({"error":null})),
+        sse(json!({"error":null,"choices":[{"index":0,"delta":{"content":"null is not failure"},"finish_reason":null}]})),
+        sse(json!({"error":null,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        sse(json!({"error":null,"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})),
+        "data: [DONE]\n\n".into(),
+    ].concat();
+    let adapter = adapter(Family::OpenAi);
+    let mut mock = Mock::new(body, Family::OpenAi).await;
+    let request = request(adapter.as_ref(), mock.port);
+    let events = drain(adapter.as_ref(), &request).await.unwrap();
+    mock.captured().await.unwrap();
+    assert_eq!(terminal(&events), Some("stop"));
+    assert!(events.iter().any(|event| matches!(&event.event, ProviderEventKind::TextDelta { bytes } if bytes == b"null is not failure")));
+    let usage = events
+        .iter()
+        .find_map(|event| match event.event {
+            ProviderEventKind::Finished { final_usage, .. } => final_usage,
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+}
+
+#[tokio::test]
+async fn openai_stream_error_categories_remain_nonretryable_and_never_echo_provider_prose() {
+    use orbit_adapter::error::AdapterRetryClass;
+    const PRIVATE: &str = "STREAM_ERROR_PRIVATE_CANARY key=sk-fixture-secret ORBIT-E0407 https://private.invalid/prompt \u{1b}[31m";
+    for (mut error, category) in [
+        (json!({"code":"rate_limit_exceeded"}), "rate limit"),
+        (json!({"type":"rate_limit_error"}), "rate limit"),
+        (json!({"code":"context_length_exceeded"}), "context limit"),
+        (json!({"code":"model_not_found"}), "model or deployment"),
+        (json!({"type":"authentication_error"}), "authentication"),
+        (json!({"code":"invalid_api_key"}), "authentication"),
+        (json!({"code":"insufficient_quota"}), "quota"),
+        (json!({"type":"overloaded_error"}), "capacity"),
+        (json!({"code":"server_error"}), "capacity"),
+        (json!({"code":429}), "rate limit"),
+        (json!({"code":502}), "capacity"),
+        (json!({"code":402}), "quota"),
+        (json!({"code":408}), "timeout"),
+        (json!({"status":429}), "rate limit"),
+        (json!({"status_code":503}), "capacity"),
+        (json!({"status":401}), "authentication"),
+        (json!({"status":403}), "permission"),
+        (json!({"status":404}), "resource not found"),
+        (json!({"status":413}), "request"),
+        (
+            json!({"code":PRIVATE,"type":"model_not_found"}),
+            "model or deployment",
+        ),
+    ] {
+        error["message"] = PRIVATE.into();
+        error["metadata"] = json!({"raw":PRIVATE,"authorization":PRIVATE});
+        let (events, failure) = openai_stream_failure(sse(json!({"error":error}))).await;
+        assert_eq!(failure.code(), "E0411");
+        assert_eq!(failure.retry_class(), AdapterRetryClass::NotRetryable);
+        let diagnostic = failure.to_string();
+        assert!(
+            diagnostic.contains(&format!("category: {category}")),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("check provider/gateway diagnostics"));
+        for rendered in [diagnostic, format!("{failure:?}"), format!("{events:?}")] {
+            for private in [
+                "STREAM_ERROR_PRIVATE_CANARY",
+                "sk-fixture-secret",
+                "private.invalid",
+                "\u{1b}",
+                "E0407",
+                "authorization",
+            ] {
+                assert!(
+                    !rendered.contains(private),
+                    "private upstream fields must not be rendered"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_nonnull_unknown_or_malformed_error_fields_fail_with_safe_generic_diagnostic() {
+    use orbit_adapter::error::AdapterRetryClass;
+    const PRIVATE: &str = "SECRET_UNKNOWN_ERROR ORBIT-E0408 \u{1b}]0;private";
+    for error in [
+        json!(false),
+        json!(0),
+        json!(PRIVATE),
+        json!([]),
+        json!({}),
+        json!({"code":PRIVATE,"type":PRIVATE,"status":PRIVATE,"message":PRIVATE}),
+        json!({"code":"RATE_LIMIT_EXCEEDED","status":999,"message":PRIVATE}),
+        json!({"status":429.5,"message":PRIVATE}),
+        json!({"code":{"message":PRIVATE},"type":["rate_limit_error"],"message":PRIVATE}),
+    ] {
+        let (events, failure) = openai_stream_failure(sse(json!({
+            "error":error,
+            "choices":[{"index":0,"delta":{"content":"must not be emitted"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}
+        }))).await;
+        assert_eq!(failure.code(), "E0411");
+        assert_eq!(failure.retry_class(), AdapterRetryClass::NotRetryable);
+        assert_eq!(
+            events.len(),
+            1,
+            "an error frame cannot emit its text or usage"
+        );
+        assert!(matches!(
+            events[0].event,
+            ProviderEventKind::ResponseStarted { .. }
+        ));
+        assert!(failure.to_string().contains("category: unrecognized"));
+        assert!(!failure.to_string().contains("SECRET_UNKNOWN_ERROR"));
+        assert!(!format!("{failure:?}").contains("E0408"));
+    }
+}
+
+#[tokio::test]
+async fn openai_stream_errors_preserve_partial_observations_without_finalizing_tools_or_usage() {
+    let prefix = [
+        openai_delta(json!({"content":"provisional text"})),
+        sse(json!({"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}})),
+        openai_delta(json!({"tool_calls":[{"index":0,"id":"call_fixture","function":{"name":"Read","arguments":json!({"path":"fixture"}).to_string()}}]})),
+    ].concat();
+    let body = format!(
+        "{prefix}{}{}data: [DONE]\n\n",
+        sse(json!({"error":{"code":"rate_limit_exceeded","message":"private error detail"}})),
+        openai_reason("tool_calls")
+    );
+    let (events, failure) = openai_stream_failure(body).await;
+    assert_eq!(failure.code(), "E0411");
+    assert!(events.iter().any(|event| matches!(&event.event, ProviderEventKind::TextDelta { bytes } if bytes == b"provisional text")));
+    assert!(events.iter().any(|event| matches!(event.event, ProviderEventKind::UsageUpdate(usage) if usage.input_tokens == 3 && usage.output_tokens == 1)));
+    assert!(!events.iter().any(|event| matches!(
+        event.event,
+        ProviderEventKind::ToolCallStarted { .. } | ProviderEventKind::ToolCallFinished { .. }
+    )));
+}
+
+#[tokio::test]
+async fn openai_error_handling_keeps_postcompletion_and_null_payload_validation_strict() {
+    for body in [
+        format!(
+            "{}{}",
+            openai_reason("stop"),
+            sse(json!({"error":{"type":"server_error"}}))
+        ),
+        format!(
+            "{}data: [DONE]\n\n{}",
+            openai_reason("stop"),
+            sse(json!({"error":{"type":"server_error"}}))
+        ),
+        format!(
+            "{}data: [DONE]\n\n{}",
+            openai_reason("stop"),
+            sse(json!({"error":null}))
+        ),
+        sse(json!({"error":null,"choices":{}})),
+    ] {
+        let (_, failure) = openai_stream_failure(body).await;
+        assert_eq!(failure.code(), "E0411");
+    }
+}
+
 fn query_route(route: &ProviderRouteBinding, query: Option<&str>) -> ProviderRouteBinding {
     let mut encoded = serde_json::to_value(route).unwrap();
     match query {

@@ -8,7 +8,7 @@
 //! - P0-3: a re-dispatched decision_id is refused E0701.
 //! - P0-5: dispatch opens one short-lived, contention-retried writer per egress-intent append (no competing flock, no round-long hold).
 
-use crate::dispatch::{DispatchEngine, DispatchOutcome, DispatchState};
+use crate::dispatch::{DetailedDispatchOutcome, DispatchEngine, DispatchOutcome, DispatchState};
 use crate::registry::ProviderRegistry;
 use crate::{new_decision_id, new_session_id};
 use orbit_adapter::adapters::{
@@ -112,6 +112,14 @@ async fn dispatch_usage_fixture(
     adapter: Arc<dyn AsyncProviderAdapter>,
     binding: ProviderRouteBinding,
 ) -> (DispatchOutcome, Vec<ProviderStreamEvent>) {
+    let (outcome, observed) = dispatch_usage_fixture_detailed(adapter, binding).await;
+    (outcome.into_legacy(), observed)
+}
+
+async fn dispatch_usage_fixture_detailed(
+    adapter: Arc<dyn AsyncProviderAdapter>,
+    binding: ProviderRouteBinding,
+) -> (DetailedDispatchOutcome, Vec<ProviderStreamEvent>) {
     use std::os::unix::fs::DirBuilderExt;
     let dir = std::env::temp_dir().join(format!("orbit-gw-usage-{}", new_decision_id().0));
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
@@ -148,7 +156,7 @@ async fn dispatch_usage_fixture(
     let mut observed = Vec::new();
     let (outcome, reservation) = tokio::time::timeout(
         Duration::from_secs(4),
-        engine.dispatch_async(
+        engine.dispatch_async_detailed(
             "test-model",
             &session,
             &decision.0,
@@ -424,6 +432,14 @@ async fn wire_usage_case(
     anthropic: bool,
     body: String,
 ) -> (DispatchOutcome, Vec<ProviderStreamEvent>) {
+    let (outcome, observed) = wire_usage_case_detailed(anthropic, body).await;
+    (outcome.into_legacy(), observed)
+}
+
+async fn wire_usage_case_detailed(
+    anthropic: bool,
+    body: String,
+) -> (DetailedDispatchOutcome, Vec<ProviderStreamEvent>) {
     let mut server = UsageWireServer::new(body).await;
     let adapter: Arc<dyn AsyncProviderAdapter> = if anthropic {
         Arc::new(
@@ -454,7 +470,7 @@ async fn wire_usage_case(
     binding.endpoint_host = "127.0.0.1".into();
     binding.endpoint_port = server.port;
     binding.endpoint_scheme = orbit_adapter::types::EndpointScheme::HttpLoopback;
-    let outcome = dispatch_usage_fixture(adapter, binding).await;
+    let outcome = dispatch_usage_fixture_detailed(adapter, binding).await;
     server.finish().await;
     outcome
 }
@@ -534,6 +550,132 @@ async fn gateway_wire_usage_accounting_openai_final_categories() {
         cache_read_tokens: 3,
         cache_write_tokens: 0,
         reasoning_tokens: 2,
+    };
+    let result = assert_usage_result(outcome, usage, UsageSource::Final, true);
+    assert_wire_text(&result, &observed);
+}
+
+#[tokio::test]
+async fn gateway_wire_openai_sse_error_before_text_keeps_unknown_failure_observation() {
+    let body = [
+        usage_sse(serde_json::json!({"error":{
+            "code":"invalid_api_key", "status":401,
+            "message":"private provider diagnostic must not escape"
+        }})),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let (outcome, observed) = wire_usage_case_detailed(false, body).await;
+    assert!(matches!(
+        outcome.observation(),
+        orbit_provider_http::adapter_trait::FailureObservation::Unknown
+    ));
+    match outcome.into_legacy() {
+        DispatchOutcome::AdapterRefused { code, message } => {
+            assert_eq!(code, "E0411");
+            assert!(!message.contains("private provider diagnostic"));
+        }
+        other => panic!("streamed error minted a completed HTTP result: {other:?}"),
+    }
+    assert!(
+        observed
+            .iter()
+            .all(|event| matches!(event.event, ProviderEventKind::ResponseStarted { .. }))
+    );
+    let inspection = orbit_adapter::stream::usage_observation_evidence_v1(&observed).unwrap();
+    assert_eq!(inspection.selected, None);
+    assert_eq!(
+        inspection.disposition,
+        orbit_adapter::types::UsageObservationDispositionV1::NoTerminal
+    );
+    assert_eq!(
+        inspection.qualification,
+        orbit_adapter::types::UsageObservationQualificationV1::MissingSnapshot
+    );
+}
+
+#[tokio::test]
+async fn gateway_wire_openai_sse_error_after_partial_usage_keeps_unknown_failure_and_counters() {
+    let body = [
+        usage_sse(serde_json::json!({"choices":[{"index":0,
+            "delta":{"content":"partial answer"},"finish_reason":null}]})),
+        usage_sse(serde_json::json!({"choices":[],"usage":{
+            "prompt_tokens":23,"completion_tokens":7,
+            "prompt_tokens_details":{"cached_tokens":4},
+            "completion_tokens_details":{"reasoning_tokens":2}
+        }})),
+        usage_sse(serde_json::json!({"error":{
+            "code":"rate_limit_exceeded", "status":429,
+            "message":"private streamed quota diagnostic"
+        }})),
+        usage_sse(serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        usage_sse(
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0}}),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let (outcome, observed) = wire_usage_case_detailed(false, body).await;
+    assert!(matches!(
+        outcome.observation(),
+        orbit_provider_http::adapter_trait::FailureObservation::Unknown
+    ));
+    match outcome.into_legacy() {
+        DispatchOutcome::AdapterRefused { code, message } => {
+            assert_eq!(code, "E0411");
+            assert!(!message.contains("private streamed quota diagnostic"));
+        }
+        other => panic!("partial streamed error minted successful billing: {other:?}"),
+    }
+    assert!(observed.iter().any(|event| matches!(
+        &event.event,
+        ProviderEventKind::TextDelta { bytes } if bytes == b"partial answer"
+    )));
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event.event, ProviderEventKind::Finished { .. }))
+    );
+    let inspection = orbit_adapter::stream::usage_observation_evidence_v1(&observed).unwrap();
+    let selected = inspection
+        .selected
+        .expect("reported partial usage remains inspectable");
+    assert_eq!(selected.source, UsageSource::Incremental);
+    assert_eq!(
+        selected.raw_usage,
+        ProviderUsage {
+            input_tokens: 19,
+            output_tokens: 7,
+            cache_read_tokens: 4,
+            cache_write_tokens: 0,
+            reasoning_tokens: 2,
+        }
+    );
+    assert_eq!(
+        inspection.disposition,
+        orbit_adapter::types::UsageObservationDispositionV1::NoTerminal
+    );
+    assert_eq!(
+        inspection.qualification,
+        orbit_adapter::types::UsageObservationQualificationV1::ProvisionalSnapshot
+    );
+}
+
+#[tokio::test]
+async fn gateway_wire_openai_null_error_keeps_successful_final_usage() {
+    let body = [
+        usage_sse(serde_json::json!({"error":null,"choices":[{"index":0,
+            "delta":{"content":"wire answer"},"finish_reason":null}]})),
+        usage_sse(serde_json::json!({"error":null,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        usage_sse(serde_json::json!({"error":null,"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}})),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let (outcome, observed) = wire_usage_case(false, body).await;
+    let usage = ProviderUsage {
+        input_tokens: 5,
+        output_tokens: 2,
+        ..Default::default()
     };
     let result = assert_usage_result(outcome, usage, UsageSource::Final, true);
     assert_wire_text(&result, &observed);
