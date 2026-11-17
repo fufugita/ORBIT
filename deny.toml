@@ -34,6 +34,16 @@ ignore = [
     # replaces the parser: https://github.com/yfedoseev/pdf_oxide/issues/2687
     # Remove this exception when that dependency is replaced.
     "RUSTSEC-2026-0192",
+    # RUSTSEC-2026-0543 (accepted 2026-11-17): chrono 0.4.45 is
+    # unmaintained across all versions; no patched release exists.
+    # Used for local cron/clock handling, ledger/export/PIB timestamps,
+    # and unconditionally by pdf_oxide 0.3.78. This accepts maintenance
+    # risk; the advisory does not identify a specific vulnerability.
+    # Replace direct uses with a maintained timezone-aware library and
+    # update the PDF backend to remove its chrono dependency, then delete
+    # this exception.
+    # Upstream: https://github.com/chronotope/chrono/issues/1768
+    "RUSTSEC-2026-0543",
 ]
 [licenses]
 allow = [

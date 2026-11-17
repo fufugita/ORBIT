@@ -387,6 +387,60 @@ fn openai_usage(
     ))
 }
 
+/// A streamed failure is not a complete HTTP rejection or evidence that
+/// generation/billing never happened. Keep E0411 and its nonretryable class;
+/// only bounded, known structured fields may improve the public diagnosis.
+fn openai_stream_error(value: &serde_json::Value) -> Option<AdapterError> {
+    let error = value.get("error").filter(|error| !error.is_null())?;
+    let named_category = |name: &str| -> Option<&'static str> {
+        match name {
+            "invalid_api_key" | "authentication_error" | "authentication_failed" => {
+                Some("authentication")
+            }
+            "permission_denied" | "permission_error" => Some("permission"),
+            "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached" => Some("quota"),
+            "rate_limit_exceeded" | "rate_limit_error" => Some("rate limit"),
+            "context_length_exceeded" | "context_window_exceeded" => Some("context limit"),
+            "model_not_found" | "deployment_not_found" => Some("model or deployment"),
+            "invalid_request_error" | "invalid_request" | "unsupported_parameter" => {
+                Some("request")
+            }
+            "server_error"
+            | "internal_server_error"
+            | "overloaded_error"
+            | "service_unavailable" => Some("capacity"),
+            _ => None,
+        }
+    };
+    let category = ["code", "type"]
+        .iter()
+        .find_map(|field| {
+            error
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .and_then(named_category)
+        })
+        .or_else(|| {
+            ["code", "status", "status_code"].iter().find_map(|field| {
+                match error.get(field).and_then(serde_json::Value::as_u64) {
+                    Some(400 | 413 | 422) => Some("request"),
+                    Some(401) => Some("authentication"),
+                    Some(402) => Some("quota"),
+                    Some(408) => Some("timeout"),
+                    Some(403) => Some("permission"),
+                    Some(404) => Some("resource not found"),
+                    Some(429) => Some("rate limit"),
+                    Some(500 | 502 | 503 | 504 | 529) => Some("capacity"),
+                    _ => None,
+                }
+            })
+        });
+    Some(crate::stream::protocol(&format!(
+        "provider streamed an error (category: {}); check provider/gateway diagnostics",
+        category.unwrap_or("unrecognized")
+    )))
+}
+
 fn openai_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
     + Unpin
@@ -452,8 +506,8 @@ fn openai_stream(
                     Ok(value) => value,
                     Err(_) => { yield Err(protocol("malformed SSE JSON")); return; }
                 };
-                if value.get("error").is_some() { yield Err(protocol("provider sent an error event")); return; }
                 if saw_done { yield Err(protocol("provider data follows completion sentinel")); return; }
+                if let Some(error) = openai_stream_error(&value) { yield Err(error); return; }
                 if let Some(choices) = value.get("choices") {
                     let Some(choices) = choices.as_array() else { yield Err(protocol("invalid choices array")); return; };
                     if choices.len() > 1 { yield Err(protocol("multiple response choices are unsupported")); return; }
