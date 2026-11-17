@@ -1594,7 +1594,9 @@ fn run_proto_inner(
 
     let mut reading = ReadState::new(&scenario);
     let mut exit_code = 0;
-    let mut builtin_panes_ms = 0u64;
+    let mut council_pane_ms = 0u64;
+    let mut reactor_pane_ms = 0u64;
+    let mut reactor_pane_dirty = true;
     // Opt-in completion bell: ORBIT_BELL=1 rings the terminal bell when a
     // turn that ran ten seconds or longer ends.
     let notify_enabled = std::env::var("ORBIT_BELL").is_ok_and(|value| value == "notify");
@@ -1607,45 +1609,14 @@ fn run_proto_inner(
             .unwrap_or(Duration::from_millis(0));
         let now_ms = boot_ms.elapsed().as_millis() as u64;
         tui.tick_ms = now_ms;
-        // Built-in panes are meters, not documents: while the layout shows
-        // one, re-read it once a second and redraw only when it changed.
-        if now_ms.saturating_sub(builtin_panes_ms) >= 1_000 {
-            builtin_panes_ms = now_ms;
-            if let Some(session) = tui.customization.as_mut() {
-                let ids = session.builtin_ids_in_layout();
-                if !ids.is_empty() {
-                    // The reactor is a pure view of the session facts: skip
-                    // its read (and the profile load behind it) when nothing
-                    // changed. The council reads a file, so it always runs.
-                    let context = pane_context(&scenario, session.context.controller);
-                    // The council state is a live file: it is read on every
-                    // beat the pane is visible, and the pane draws it as
-                    // cards rather than re-parsing the text.
-                    if let Some(state) = session.context.council.as_ref() {
-                        let drawn = crate::proto::ported::CouncilState::from_snapshot(state);
-                        if scenario.council.as_ref() != Some(&drawn) {
-                            scenario.council = Some(drawn);
-                            overlay_dirty = true;
-                        }
-                    } else if scenario.council.is_some() {
-                        scenario.council = None;
-                        overlay_dirty = true;
-                    }
-                    let unchanged = context == session.context;
-                    session.context = context;
-                    for id in &ids {
-                        if unchanged && id == "reactor" && session.outputs.contains_key(id) {
-                            continue;
-                        }
-                        let _ = session.refresh(id);
-                    }
-                    if scenario.custom_panes != session.outputs {
-                        scenario.custom_panes = session.outputs.clone();
-                        overlay_dirty = true;
-                    }
-                }
-            }
-        }
+        overlay_dirty |= refresh_builtin_panes(
+            &mut tui,
+            &mut scenario,
+            now_ms,
+            &mut council_pane_ms,
+            &mut reactor_pane_ms,
+            &mut reactor_pane_dirty,
+        );
         // A council seat that is working animates its card (about 8 fps),
         // only while the layout shows the pane and motion is not reduced.
         if !tui.reduced
@@ -1661,7 +1632,11 @@ fn run_proto_inner(
         }
         // The reactor scene moves at about 8 fps during a turn and once a
         // second at rest, under the same two conditions.
-        let reactor_beat = if scenario.turn_live { 125 } else { 1_000 };
+        let reactor_beat = if scenario.turn_live || scenario.compacting {
+            125
+        } else {
+            1_000
+        };
         if !tui.reduced
             && now_ms / reactor_beat
                 != now_ms.saturating_sub(UI_TICK.as_millis() as u64) / reactor_beat
@@ -2926,6 +2901,10 @@ fn handle_key_with_read(
                         tui.app.sidebar = true;
                         *sessions_pushed = true;
                     }
+                    if text.split_whitespace().next() == Some("/council") && scenario.ordinary_pending() {
+                        if let Some(reading) = reading.as_deref_mut() { reading.follow(); }
+                        tui.scroll_follow();
+                    }
                 } else if !composer.trim().is_empty() && !composer.starts_with('/') {
                     // The person's own prompt takes over from /goal or /loop.
                     tui.automation = None;
@@ -2949,17 +2928,7 @@ fn handle_key_with_read(
                             ..Default::default()
                         }, EditOrigin::Queued);
                     } else {
-                        push_display_line(scenario, TranscriptLine {
-                            kind: LineKind::User,
-                            text: text.clone(),
-                            time: Some(now_hhmm()),
-                            ..Default::default()
-                        }, EditOrigin::Input);
-                        scenario.turn_started_ms = now_ms;
-                        scenario.apply("round_started", 0);
-                        if scenario.transcript.len() == 1 {
-                            scenario.first_prompt_waiting = true;
-                        }
+                        begin_prompt_view(scenario, &text, now_ms);
                     }
                 } else if composer.is_empty() && scenario.can_resend_ordinary()
                     && let Some(intent) = scenario.eligible_ordinary_intent().cloned() {
@@ -4408,6 +4377,25 @@ fn skill_command_prompt(home: &std::path::Path, text: &str) -> Option<String> {
     Some(prompt)
 }
 
+fn begin_prompt_view(scenario: &mut Scenario, text: &str, now_ms: u64) {
+    push_display_line(
+        scenario,
+        TranscriptLine {
+            kind: LineKind::User,
+            text: text.into(),
+            time: Some(now_hhmm()),
+            ..Default::default()
+        },
+        EditOrigin::Input,
+    );
+    scenario.turn_started_ms = now_ms;
+    scenario.phase = 0;
+    scenario.apply("round_started", 0);
+    if scenario.transcript.len() == 1 {
+        scenario.first_prompt_waiting = true;
+    }
+}
+
 /// Commands that only read or arrange the screen, so they run while a turn
 /// is in flight. Every other command waits for the turn to end.
 fn runs_while_busy(cmd: &str) -> bool {
@@ -4419,6 +4407,7 @@ fn runs_while_busy(cmd: &str) -> bool {
             | "/models"
             | "/theme"
             | "/customize"
+            | "/reactor"
             | "/goal"
             | "/loop"
             | "/copy"
@@ -4444,7 +4433,7 @@ fn run_command(
     history_idx: &mut Option<usize>,
     focus_sessions: &mut bool,
 ) -> Option<Overlay> {
-    let _ = (composer, history, history_idx, sender, focus_sessions);
+    let _ = (history_idx, sender, focus_sessions);
     if text == "quit" || text == "exit" {
         scenario.dismiss_picker();
         return Some(Overlay::Quit);
@@ -4763,8 +4752,34 @@ fn run_command(
             }
             None
         }
-        "/theme" | "/customize" => {
+        "/theme" | "/customize" | "/reactor" => {
             *toast = Some(profile_command_toast(tui, scenario, text, now_ms));
+            None
+        }
+        "/council" => {
+            if arg.is_empty() {
+                notice(scenario, "Use /council <question> to run the configured seats and synthesis. Opening the pane makes no model request.".into());
+            } else if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                WorkerCommand::Prompt(format!("/council {arg}")),
+            ) {
+                *composer = format!("/council {arg}");
+                tui.composer_cursor = super::composer::grapheme_count(composer);
+                tui.file_completion
+                    .sync_at_cursor(composer, tui.composer_cursor);
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            } else {
+                let prompt = format!("/council {arg}");
+                tui.automation = None;
+                tui.scroll_follow();
+                history.insert(0, prompt.clone());
+                begin_prompt_view(scenario, &prompt, now_ms);
+            }
             None
         }
         // `/plan` is `/mode plan`.
@@ -5463,6 +5478,52 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
     // Every message may start a motion: keep redrawing for a second.
     scenario.motion_until_ms = now_ms + 1000;
     match msg {
+        Msg::CouncilUpdated {
+            session_id,
+            phase,
+            note,
+            seats,
+            winner_seats,
+            final_text,
+        } => {
+            if session_id != scenario.session_id {
+                return None;
+            }
+            match phase.as_str() {
+                "SYNC" => scenario.phase = 0,
+                "DELIBERATING" => scenario.phase = 1,
+                "JUDGING" => scenario.phase = 4,
+                "VERIFYING" => scenario.phase = 3,
+                "VERDICT" => scenario.phase = 4,
+                _ => {}
+            }
+            let finished = phase == "VERDICT";
+            let epoch_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let snapshot = orbit_frontend_protocol::customization::CouncilSnapshot {
+                phase,
+                note,
+                last_seats: if finished { seats.clone() } else { Vec::new() },
+                seats,
+                winner_seats,
+                last_final: final_text,
+                finished: u32::from(finished),
+                seen: u32::from(finished),
+                last_at: finished.then_some(epoch_secs),
+                published_at: Some(epoch_secs),
+                ..Default::default()
+            }
+            .sanitized_with(|text| {
+                crate::bridge::safe_text(&crate::bridge::strip_cot(&crate::bridge::terminal_safe(
+                    text,
+                )))
+            });
+            scenario.council = Some(council_for_display(&snapshot, now_ms));
+            scenario.council_snapshot = Some(snapshot);
+            scenario.council_session_id = Some(session_id);
+        }
         Msg::StatusLine(text) => {
             let clean = crate::bridge::safe_text(&crate::bridge::terminal_safe(&text));
             scenario.status_line = Some(clean).filter(|line| !line.trim().is_empty());
@@ -5522,6 +5583,9 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.invalidate_context_sample();
             scenario.frontend.dirty = true;
             scenario.routing_lines.clear();
+            scenario.council = None;
+            scenario.council_snapshot = None;
+            scenario.council_session_id = None;
             scenario.clear_namespace_view();
             scenario.transcript = lines.into_iter().map(restored_transcript_line).collect();
             scenario.input_tokens = input_tokens;
@@ -5553,6 +5617,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.turn_tools = 0;
             scenario.backoff_until_ms = None;
             for pane in scenario.custom_panes.values_mut() {
+                pane.council = None;
                 pane.state = orbit_frontend_protocol::customization::PaneState::Stale;
                 pane.text = "Session changed; refresh this pane".into();
             }
@@ -6047,6 +6112,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             // is empty today, and an empty plan must not wipe the tasks
             // TasksUpdate filled. A non-empty plan still lists state by
             // state.
+            scenario.phase = ws.phase_index.min(4);
             if !ws.plan.is_empty() {
                 let rows = ws
                     .plan
@@ -6232,6 +6298,14 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.invalidate_cost_qualification();
             scenario.invalidate_context_sample();
             if scenario.session_id != session_id {
+                scenario.council = None;
+                scenario.council_snapshot = None;
+                scenario.council_session_id = None;
+                for pane in scenario.custom_panes.values_mut() {
+                    pane.council = None;
+                    pane.state = orbit_frontend_protocol::customization::PaneState::Stale;
+                    pane.text = "Session changed; refresh this pane".into();
+                }
                 scenario.clear_namespace_view();
                 scenario.frontend.binding = None;
                 scenario.failure_reason = None;
@@ -9191,6 +9265,51 @@ mod composer_key_tests {
     }
 
     #[test]
+    fn council_command_requires_a_question_and_uses_owned_prompt_admission() {
+        let mut empty = Keyboard::new();
+        empty.type_text("/council");
+        empty.plain(KeyCode::Enter);
+        empty.no_send();
+        assert!(!empty.scenario.ordinary_pending());
+
+        let mut run = Keyboard::new();
+        run.type_text("/council review the transaction boundary");
+        run.plain(KeyCode::Enter);
+        assert!(matches!(run.received_command(), WorkerCommand::Prompt(text)
+            if text == "/council review the transaction boundary"));
+        assert!(run.scenario.ordinary_pending());
+        assert!(run.scenario.turn_live);
+        assert_eq!(run.scenario.turn_started_ms, 10_000);
+        assert_eq!(run.history[0], "/council review the transaction boundary");
+        assert!(
+            run.scenario
+                .transcript
+                .iter()
+                .any(|line| line.kind == LineKind::User
+                    && line.text == "/council review the transaction boundary")
+        );
+    }
+
+    #[test]
+    fn council_admission_failure_preserves_the_question_without_history_or_work() {
+        let mut k = Keyboard::new();
+        k.scenario.frontend.binding = None;
+        k.type_text("/council compare the two designs");
+        k.plain(KeyCode::Enter);
+        k.no_send();
+        assert_eq!(k.draft, "/council compare the two designs");
+        assert!(!k.scenario.ordinary_pending());
+        assert!(!k.scenario.turn_live);
+        assert!(k.history.is_empty());
+        assert!(
+            !k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.kind == LineKind::User)
+        );
+    }
+
+    #[test]
     fn plain_history_round_trip_restores_multiline_grapheme_draft_and_cursor() {
         let mut k = Keyboard::new();
         k.history = vec!["newest".into(), "oldest".into()];
@@ -10316,6 +10435,95 @@ mod history_persistence_tests {
     }
 }
 
+fn council_for_display(
+    snapshot: &orbit_frontend_protocol::customization::CouncilSnapshot,
+    now_ms: u64,
+) -> crate::proto::ported::CouncilState {
+    let mut state = crate::proto::ported::CouncilState::from_snapshot(snapshot);
+    // Snapshot timestamps use Unix time; animations use this process's clock.
+    // Translate only the history age, preserving the local animation timeline.
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let offset = epoch_secs - now_ms as f64 / 1_000.0;
+    state.history.last_at = state.history.last_at.map(|at| at - offset);
+    state
+}
+
+fn refresh_builtin_panes(
+    tui: &mut Tui,
+    scenario: &mut Scenario,
+    now_ms: u64,
+    council_ms: &mut u64,
+    reactor_ms: &mut u64,
+    reactor_dirty: &mut bool,
+) -> bool {
+    let Some(session) = tui.customization.as_mut() else {
+        return false;
+    };
+    let ids = session.builtin_ids_in_layout();
+    if ids.is_empty() {
+        return false;
+    }
+    let context = pane_context(scenario, session.context.controller);
+    let changed = context != session.context;
+    *reactor_dirty |= changed;
+    let identity_changed = context.session_id != session.context.session_id;
+    let native_changed = context.council != session.context.council;
+    let phase_changed = context.phase != session.context.phase;
+    let council_due = now_ms.saturating_sub(*council_ms) >= 1_000;
+    let reactor_due = now_ms.saturating_sub(*reactor_ms)
+        >= if scenario.turn_live || scenario.compacting {
+            125
+        } else {
+            1_000
+        };
+    session.context = context;
+    for id in &ids {
+        let missing = session.outputs.get(id).is_none_or(|output| {
+            output.state == orbit_frontend_protocol::customization::PaneState::Stale
+        });
+        let refresh = match id.as_str() {
+            "council" => missing || identity_changed || native_changed || council_due,
+            "reactor" => {
+                missing
+                    || identity_changed
+                    || native_changed
+                    || phase_changed
+                    || (*reactor_dirty && reactor_due)
+            }
+            _ => false,
+        };
+        if refresh {
+            let refreshed = session.refresh(id).is_ok();
+            if id == "council" {
+                *council_ms = now_ms;
+            }
+            if id == "reactor" {
+                *reactor_ms = now_ms;
+                *reactor_dirty = !refreshed;
+            }
+        }
+    }
+    let snapshot = session.context.council.as_ref().or_else(|| {
+        session
+            .outputs
+            .get("council")
+            .and_then(|output| output.council.as_ref())
+    });
+    // Avoid changing age origins every frame: a new snapshot or file read
+    // refreshes the derived state; animation ticks use the existing value.
+    if identity_changed || native_changed || council_due || scenario.council.is_none() {
+        scenario.council = snapshot.map(|snapshot| council_for_display(snapshot, now_ms));
+    }
+    let outputs_changed = scenario.custom_panes != session.outputs;
+    if outputs_changed {
+        scenario.custom_panes = session.outputs.clone();
+    }
+    outputs_changed || native_changed || phase_changed
+}
+
 fn pane_context(
     s: &Scenario,
     controller: bool,
@@ -10326,6 +10534,7 @@ fn pane_context(
         .as_ref()
         .filter(|detail| detail.0 == s.session_id);
     PaneContext {
+        session_id: (!s.session_id.is_empty()).then(|| s.session_id.clone()),
         permission_mode: s.permission_mode.clone(),
         routing: s.routing_lines.clone(),
         input_tokens: s.input_tokens,
@@ -10333,9 +10542,19 @@ fn pane_context(
         cost_microcents: s.cost_microcents,
         model: s.model_id.clone(),
         provider: s.provider.clone(),
-        phase: ["orient", "reason", "act", "verify", "respond"]
-            .get(s.phase)
-            .map(|phase| (*phase).to_string()),
+        phase: Some(
+            if s.compacting {
+                "compact"
+            } else if s.turn_live {
+                ["orient", "reason", "act", "verify", "respond"]
+                    .get(s.phase)
+                    .copied()
+                    .unwrap_or("orient")
+            } else {
+                "idle"
+            }
+            .to_string(),
+        ),
         used_tokens: (s.window_tokens > 0).then_some(s.used_tokens),
         window_tokens: (s.window_tokens > 0).then_some(s.window_tokens),
         turns: Some(s.turns),
@@ -10375,8 +10594,280 @@ fn pane_context(
                 .into(),
             })
             .collect(),
-        council: None,
+        council: s
+            .council_snapshot
+            .as_ref()
+            .filter(|_| s.council_session_id.as_deref() == Some(s.session_id.as_str()))
+            .cloned(),
         controller,
+    }
+}
+
+#[cfg(test)]
+mod live_pane_tests {
+    use super::*;
+    use orbit_frontend_protocol::customization::*;
+    use std::sync::{Arc, Mutex};
+
+    struct MeterHost {
+        calls: Mutex<Vec<String>>,
+    }
+    impl ProfileHost for MeterHost {
+        fn load(&self) -> Result<ResolvedProfile, CustomizationError> {
+            let mut profile = Profile::default();
+            profile.layout.tree = LayoutNode::Split {
+                direction: Direction::Right,
+                shares: vec![60, 40],
+                children: vec![
+                    LayoutNode::panel(View::Conversation),
+                    LayoutNode::Split {
+                        direction: Direction::Down,
+                        shares: vec![50, 50],
+                        children: vec![
+                            LayoutNode::Custom {
+                                pane_id: "council".into(),
+                            },
+                            LayoutNode::Custom {
+                                pane_id: "reactor".into(),
+                            },
+                        ],
+                    },
+                ],
+            };
+            Ok(ResolvedProfile {
+                profile,
+                revision: "fixture".into(),
+                sources: Default::default(),
+                capabilities: Default::default(),
+            })
+        }
+        fn replace(&self, _: Profile, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            unreachable!()
+        }
+        fn reset(&self, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            unreachable!()
+        }
+        fn read_pane(
+            &self,
+            id: &str,
+            context: &PaneContext,
+        ) -> Result<PaneOutput, CustomizationError> {
+            self.calls.lock().unwrap().push(id.into());
+            Ok(PaneOutput {
+                id: id.into(),
+                title: id.into(),
+                state: PaneState::Ready,
+                text: format!(
+                    "{} input={} output={}",
+                    context.phase.as_deref().unwrap_or("unknown"),
+                    context.input_tokens,
+                    context.output_tokens
+                ),
+                truncated: false,
+                actions: vec![],
+                council: context.council.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn reactor_worker_phase_stream_and_settled_totals_reach_the_live_context() {
+        let mut s = Scenario::new();
+        s.turn_live = true;
+        s.turn_started_ms = 1_000;
+        for (index, name) in [
+            (1, "reason"),
+            (2, "act"),
+            (4, "respond"),
+            (usize::MAX, "respond"),
+        ] {
+            apply_msg(
+                crate::msg::Msg::WorkspaceUpdate(crate::model::Workspace {
+                    phase_index: index,
+                    ..Default::default()
+                }),
+                &mut s,
+                1_100,
+            );
+            assert_eq!(pane_context(&s, false).phase.as_deref(), Some(name));
+        }
+        apply_msg(
+            crate::msg::Msg::TextDelta("actual streamed output".into()),
+            &mut s,
+            1_500,
+        );
+        apply_msg(
+            crate::msg::Msg::Usage {
+                used_tokens: 70,
+                window_tokens: 1_000,
+                breakdown: None,
+            },
+            &mut s,
+            1_500,
+        );
+        let context = pane_context(&s, false);
+        assert_eq!(context.used_tokens, Some(70));
+        assert!(context.live_rate_milli.is_some_and(|rate| rate > 0));
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 7,
+                output_tokens: 20,
+                cost_microcents: 3,
+            },
+            &mut s,
+            2_000,
+        );
+        let settled = pane_context(&s, false);
+        assert_eq!((settled.input_tokens, settled.output_tokens), (7, 20));
+        assert_eq!(settled.phase.as_deref(), Some("idle"));
+        assert_eq!(settled.rate_milli, Some(20_000));
+        s.compacting = true;
+        assert_eq!(pane_context(&s, false).phase.as_deref(), Some("compact"));
+    }
+
+    #[test]
+    fn reactor_refresh_keeps_deferred_stream_updates_and_reads_council_on_its_own_cadence() {
+        let host = Arc::new(MeterHost {
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut tui = Tui::new();
+        tui.customization =
+            Some(crate::customization::CustomizationSession::open(host.clone()).unwrap());
+        let mut s = Scenario::new();
+        let (mut council_ms, mut reactor_ms, mut dirty) = (0, 0, true);
+        assert!(refresh_builtin_panes(
+            &mut tui,
+            &mut s,
+            0,
+            &mut council_ms,
+            &mut reactor_ms,
+            &mut dirty
+        ));
+        s.turn_live = true;
+        s.phase = 1;
+        refresh_builtin_panes(
+            &mut tui,
+            &mut s,
+            10,
+            &mut council_ms,
+            &mut reactor_ms,
+            &mut dirty,
+        );
+        s.input_tokens = 17;
+        refresh_builtin_panes(
+            &mut tui,
+            &mut s,
+            20,
+            &mut council_ms,
+            &mut reactor_ms,
+            &mut dirty,
+        );
+        assert!(!s.custom_panes["reactor"].text.contains("input=17"));
+        refresh_builtin_panes(
+            &mut tui,
+            &mut s,
+            135,
+            &mut council_ms,
+            &mut reactor_ms,
+            &mut dirty,
+        );
+        assert!(s.custom_panes["reactor"].text.contains("input=17"));
+        assert_eq!(
+            host.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| *id == "council")
+                .count(),
+            1
+        );
+        s.turn_live = false;
+        refresh_builtin_panes(
+            &mut tui,
+            &mut s,
+            140,
+            &mut council_ms,
+            &mut reactor_ms,
+            &mut dirty,
+        );
+        assert!(s.custom_panes["reactor"].text.starts_with("idle"));
+    }
+
+    #[test]
+    fn native_council_progress_is_gated_session_bound_and_cleared_on_switch() {
+        let mut s = Scenario::new();
+        s.session_id = "session-council-fixture".into();
+        let progress = |session: &str| crate::msg::Msg::CouncilUpdated {
+            session_id: session.into(),
+            phase: "DELIBERATING".into(),
+            note: "<think>PRIVATE_REASONING</think>public\u{1b}[31m note".into(),
+            seats: vec![CouncilSeat {
+                name: "seat".into(),
+                model: "fixture/model".into(),
+                activity: "working".into(),
+                ..Default::default()
+            }],
+            winner_seats: vec![],
+            final_text: "token=ghp_0123456789abcdef0123456789abcdef0123".into(),
+        };
+        apply_msg(progress("other-session"), &mut s, 100);
+        assert!(s.council_snapshot.is_none());
+        apply_msg(progress("session-council-fixture"), &mut s, 200);
+        assert_eq!(s.phase, 1);
+        let context = pane_context(&s, false);
+        let state = context.council.unwrap();
+        assert!(!state.note.contains("PRIVATE_REASONING") && !state.note.contains('\u{1b}'));
+        assert!(!state.last_final.contains("ghp_0123"));
+        assert_eq!(s.council.as_ref().unwrap().seats.len(), 1);
+        s.custom_panes.insert(
+            "council".into(),
+            PaneOutput {
+                id: "council".into(),
+                title: "Council".into(),
+                text: "previous session payload".into(),
+                state: PaneState::Ready,
+                truncated: false,
+                actions: vec![],
+                council: Some(state),
+            },
+        );
+        apply_msg(
+            crate::msg::Msg::Identity {
+                model: "fixture".into(),
+                provider: "fixture".into(),
+                session_prefix: "new".into(),
+                session_id: "session-new".into(),
+                priced: false,
+            },
+            &mut s,
+            300,
+        );
+        assert!(pane_context(&s, false).council.is_none());
+        assert!(s.council.is_none());
+        assert!(s.custom_panes["council"].council.is_none());
+        assert!(
+            !s.custom_panes["council"]
+                .text
+                .contains("previous session payload")
+        );
+    }
+
+    #[test]
+    fn reactor_art_commands_are_local_typed_and_reject_extra_arguments() {
+        for value in ["kwangya", "shard", "spine", "globe", "rotate", "next"] {
+            assert_eq!(
+                parse_profile_command(&format!("/reactor art {value}")).unwrap(),
+                ProfileCommand::Set {
+                    key: "reactor_art".into(),
+                    value: value.into()
+                }
+            );
+        }
+        assert!(parse_profile_command("/reactor art shell-command").is_err());
+        assert!(parse_profile_command("/reactor art globe extra").is_err());
+        assert!(runs_while_busy("/reactor"));
+        assert!(!runs_while_busy("/council"));
     }
 }
 
@@ -10444,6 +10935,7 @@ fn source_affects_transcript(msg: &crate::msg::Msg) -> bool {
                 | Msg::Redacted { .. }
                 | Msg::Identity { .. }
                 | Msg::ModelChanged(_)
+                | Msg::CouncilUpdated { .. }
         ),
     }
 }
@@ -10677,6 +11169,7 @@ fn reduce_frontend_message_with_view(
         _ => true,
     };
     let capture = EditCapture::with_model_boundary(extend_model);
+    let previous_session_id = s.session_id.clone();
     let result = apply_msg(msg, s, now);
     let edits = capture.finish();
     if let Some(reading) = reading {
@@ -10686,7 +11179,9 @@ fn reduce_frontend_message_with_view(
             reading.observe_edits(s, previous_len, edits, source);
         }
     }
-    if restored && let Some(session) = tui.customization.as_mut() {
+    if (restored || previous_session_id != s.session_id)
+        && let Some(session) = tui.customization.as_mut()
+    {
         session.invalidate_session(pane_context(s, session.context.controller));
         s.custom_panes = session.outputs.clone();
     }
@@ -10736,6 +11231,9 @@ fn run_pane_action(
             }
         }
         Ok(crate::customization::ActionEffect::Refreshed) => {}
+        Ok(crate::customization::ActionEffect::CycleReactorArt) => {
+            *toast = Some(profile_command_toast(tui, s, "/reactor art next", now));
+        }
         Err(error) => {
             *toast = Some(Toast {
                 text: crate::bridge::terminal_safe(&crate::bridge::safe_text(&error.to_string())),
@@ -10792,6 +11290,19 @@ fn profile_command_toast(tui: &mut Tui, s: &mut Scenario, text: &str, now: u64) 
     let result =
         parse_profile_command(text).and_then(|command| apply_profile_command(tui, s, command));
     let (text, ok) = match result {
+        Ok(_) if text.split_whitespace().next() == Some("/reactor") => {
+            let selected = tui
+                .customization
+                .as_ref()
+                .map(|session| session.resolved.profile.reactor_art.as_str())
+                .unwrap_or("unavailable");
+            let choices = if text.split_whitespace().count() <= 2 {
+                " · kwangya | shard | spine | globe | rotate · /reactor art <name>"
+            } else {
+                ""
+            };
+            (format!("Reactor art: {selected}{choices}"), true)
+        }
         Ok(text) => (text, true),
         Err(error) => (error.to_string(), false),
     };
@@ -10844,7 +11355,10 @@ fn handle_custom_key_with_history(
         return false;
     }
     if k.code == KeyCode::Enter
-        && (composer.starts_with("/theme") || composer.starts_with("/customize"))
+        && matches!(
+            composer.split_whitespace().next(),
+            Some("/theme" | "/customize" | "/reactor")
+        )
     {
         *toast = Some(profile_command_toast(tui, s, composer, now));
         composer.clear();
@@ -10918,6 +11432,25 @@ pub fn parse_profile_command(
             Ok(C::Show)
         } else {
             Ok(C::Theme { name: rest.into() })
+        };
+    }
+    if verb == "/reactor" {
+        return match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] | ["art"] => Ok(C::Show),
+            ["art", value]
+                if matches!(
+                    *value,
+                    "kwangya" | "shard" | "spine" | "globe" | "rotate" | "next"
+                ) =>
+            {
+                Ok(C::Set {
+                    key: "reactor_art".into(),
+                    value: (*value).into(),
+                })
+            }
+            _ => Err(E::Invalid(
+                "usage: /reactor art kwangya|shard|spine|globe|rotate|next".into(),
+            )),
         };
     }
     if verb != "/customize" {
@@ -11416,6 +11949,7 @@ mod customization_review_tests {
                 title: def.title.clone(),
                 state: PaneState::Ready,
                 text,
+                council: None,
                 truncated: false,
                 actions: def.actions.clone(),
             })
@@ -13066,6 +13600,7 @@ mod bound_projection_tests {
                 title: "Usage".into(),
                 state: PaneState::Ready,
                 text: format!("input {}", context.input_tokens),
+                council: None,
                 truncated: false,
                 actions: vec![PaneAction::Refresh],
             })
@@ -14550,13 +15085,14 @@ mod palette_review_tests {
                 keys.press(KeyCode::Down);
             }
             // The last command in the list.
-            assert_eq!(keys.selected, 45);
+            let last = super::super::chrome::COMMANDS.len() - 1;
+            assert_eq!(keys.selected, last);
             let rows = keys.frame(width, height);
             let hit = keys
                 .tui
                 .hits
                 .iter()
-                .find(|hit| hit.click == Click::Palette(45))
+                .find(|hit| hit.click == Click::Palette(last))
                 .unwrap();
             assert!(
                 rows[hit.rect.y as usize].contains("▌")

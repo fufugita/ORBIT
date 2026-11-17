@@ -485,6 +485,116 @@ fn hostile_pane_text_remains_display_data_and_secret_fields_are_scanned() {
     assert!(f.calls().is_empty());
     runtime.shutdown().unwrap();
 }
+
+#[test]
+fn reactor_art_pane_action_persists_through_checked_controller_without_provider_calls() {
+    let f = Fixture::new();
+    let runtime = f.start();
+    let state = f.state(&runtime);
+    let mut controller = state.claim_controller().unwrap();
+    let revision = f.host.load().unwrap().revision;
+    let refreshed = controller
+        .send(json!({"type":"pane_refresh","pane_id":"reactor","revision":revision}))
+        .unwrap();
+    let pane = refreshed["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["id"] == "reactor")
+        .unwrap();
+    let index = pane["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|action| action["kind"] == "cycle_reactor_art")
+        .unwrap();
+    let reply = controller
+        .send(json!({
+            "type":"pane_action", "pane_id":"reactor", "action_index":index,
+            "revision":revision,
+        }))
+        .unwrap();
+    assert_eq!(reply["resolved"]["profile"]["reactor_art"], "shard");
+    assert_eq!(
+        f.host.load().unwrap().profile.reactor_art,
+        ReactorArt::Shard
+    );
+    assert_ne!(reply["resolved"]["revision"], revision);
+    let stored = f.bytes();
+    assert!(
+        controller
+            .send(json!({
+                "type":"pane_action", "pane_id":"reactor", "action_index":index,
+                "revision":revision,
+            }))
+            .is_err()
+    );
+    assert_eq!(f.bytes(), stored);
+    assert!(f.calls().is_empty());
+    drop(controller);
+    let mut next_controller = state.claim_controller().unwrap();
+    let reloaded = next_controller
+        .send(f.action(&state, ProfileCommand::Reload))
+        .unwrap();
+    assert_eq!(reloaded["resolved"]["profile"]["reactor_art"], "shard");
+    assert!(f.calls().is_empty());
+    drop(next_controller);
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn native_council_browser_actions_fail_before_any_provider_request() {
+    let f = Fixture::new();
+    let runtime = f.start();
+    let state = f.state(&runtime);
+    let mut controller = state.claim_controller().unwrap();
+    let revision = f.host.load().unwrap().revision;
+    let refreshed = controller
+        .send(json!({
+            "type":"pane_refresh", "pane_id":"council", "revision":revision,
+        }))
+        .unwrap();
+    let pane = refreshed["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["id"] == "council")
+        .unwrap();
+    let index = pane["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|action| action["kind"] == "insert_prompt")
+        .unwrap();
+    let before = state.snapshot().unwrap();
+    let stored = f.bytes();
+    let error = controller
+        .send(json!({
+            "type":"pane_action", "pane_id":"council", "action_index":index,
+            "revision":revision,
+        }))
+        .unwrap_err();
+    assert!(error.contains("terminal"));
+    let error = controller
+        .send(json!({
+            "type":"prompt", "request_id":"native-council-unavailable",
+            "text":"/council compare designs",
+        }))
+        .unwrap_err();
+    assert!(error.contains("terminal"));
+    let after = state.snapshot().unwrap();
+    assert_eq!(before.turns, after.turns);
+    assert_eq!(
+        serde_json::to_value(&before.requests).unwrap(),
+        serde_json::to_value(&after.requests).unwrap()
+    );
+    assert_eq!(before.input_tokens, after.input_tokens);
+    assert_eq!(before.output_tokens, after.output_tokens);
+    assert_eq!(stored, f.bytes());
+    assert!(f.calls().is_empty());
+    drop(controller);
+    runtime.shutdown().unwrap();
+}
 #[tokio::test]
 async fn malformed_stored_profile_returns_visible_get_error_and_preserves_bytes() {
     let f = Fixture::new();

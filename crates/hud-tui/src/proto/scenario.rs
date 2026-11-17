@@ -116,6 +116,10 @@ pub struct Scenario {
     /// The council engine's state as the pane draws it. Filled from the
     /// session's pane context; `None` when no council has published.
     pub council: Option<crate::proto::ported::CouncilState>,
+    /// Native Council progress for this session. External pane snapshots
+    /// stay in `custom_panes` so refreshing a file never reuses stale data.
+    pub council_snapshot: Option<orbit_frontend_protocol::customization::CouncilSnapshot>,
+    pub council_session_id: Option<String>,
     /// The model being waited on (M05's "waiting for {model}").
     pub model: String,
     /// The session's permission mode (S5), updated by ModeChanged and

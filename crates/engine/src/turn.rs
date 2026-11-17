@@ -685,6 +685,129 @@ impl ToolLifecycle {
     }
 }
 
+/// Inspect one exact prepared request without opening credentials, creating
+/// ledger records or contacting a provider. This is not an admission token:
+/// execution still repeats budget and current namespace spend admission.
+pub fn preflight_request(
+    config: &TurnConfig,
+    options: &TurnOptions,
+    prompt: &str,
+    history: &[ChatMessage],
+) -> Result<crate::context_budget::RequestEstimate, String> {
+    let context = crate::dispatch::request_preparation_context(
+        config,
+        options.system_directive.as_deref(),
+        &options.tools,
+    )
+    .map_err(|(code, message)| format!("{code}: {message}"))?;
+    let mut messages = history.to_vec();
+    let mut user = crate::user_message(prompt);
+    user.blocks = options.user_blocks.clone();
+    messages.push(user);
+    let request = crate::dispatch::prepare_provider_request(
+        &context,
+        prompt,
+        Some(messages),
+        &options.request_stem,
+        &options.session_id,
+    )
+    .map_err(|(code, message)| format!("{code}: {message}"))?;
+    let budget = options.selected_budget.clone().map(Ok).unwrap_or_else(|| {
+        crate::context_budget::SelectedBudget::legacy_input(
+            config,
+            options.window_tokens.unwrap_or(u64::MAX),
+        )
+    })?;
+    let estimate = crate::context_budget::estimate_prepared_request(&request, &budget)
+        .map_err(|error| error.to_string())?;
+    if !crate::context_budget::fits(&estimate, &budget) {
+        return Err("prepared request exceeds its selected context budget".into());
+    }
+    crate::compaction::admit_spend(
+        options.spend_allowance,
+        config,
+        &estimate,
+        0,
+        options.request_purpose != AttemptPurpose::Ordinary,
+    )
+    .map_err(str::to_owned)?;
+    Ok(estimate)
+}
+
+#[cfg(test)]
+mod readonly_preflight_tests {
+    use super::*;
+
+    fn config() -> TurnConfig {
+        TurnConfig {
+            provider_id: "preflight-fixture".into(),
+            gate: "http://127.0.0.1:1/v1".into(),
+            model: "fixture".into(),
+            kind: crate::dispatch::ProviderKind::OpenAiCompatible,
+            credential_env: Some("ORBIT_READONLY_PREFLIGHT_UNSET_TOKEN".into()),
+            billing: None,
+            pricing: None,
+            max_output_tokens: 64,
+            sampling: None,
+            effort: None,
+            supported_efforts: None,
+            first_byte_timeout_ms: Some(100),
+            idle_timeout_ms: Some(100),
+        }
+    }
+
+    #[test]
+    fn readonly_preflight_renders_and_rejects_context_without_dispatch_or_history_mutation() {
+        let config = config();
+        let options = TurnOptions {
+            window_tokens: Some(16000),
+            output_reserve_tokens: 64,
+            ..Default::default()
+        };
+        let history = vec![crate::user_message("earlier text")];
+        let original = history.clone();
+        let estimate = preflight_request(&config, &options, "question", &history).unwrap();
+        assert!(estimate.estimated_input_tokens > 0);
+        assert_eq!(estimate.requested_output_tokens, 64);
+        assert_eq!(history, original);
+        let options = TurnOptions {
+            window_tokens: Some(1),
+            ..options
+        };
+        assert!(preflight_request(&config, &options, "question", &history).is_err());
+        assert_eq!(history, original);
+    }
+
+    #[test]
+    fn readonly_preflight_uses_the_shared_spend_admission_for_unpriced_requests() {
+        let options = TurnOptions {
+            window_tokens: Some(16000),
+            spend_allowance: Some(SpendAllowance {
+                remaining_microcents: 1000000,
+                allow_unpriced_housekeeping: false,
+            }),
+            ..Default::default()
+        };
+        assert!(preflight_request(&config(), &options, "question", &[]).is_err());
+    }
+
+    #[test]
+    fn readonly_preflight_includes_structured_user_blocks_in_the_budget() {
+        let options = TurnOptions {
+            window_tokens: Some(256),
+            ..Default::default()
+        };
+        assert!(preflight_request(&config(), &options, "question", &[]).is_ok());
+        let options = TurnOptions {
+            user_blocks: Some(vec![orbit_adapter::types::ContentBlock::Text {
+                text: "x".repeat(8192),
+            }]),
+            ..options
+        };
+        assert!(preflight_request(&config(), &options, "question", &[]).is_err());
+    }
+}
+
 /// Run one prompt through the engine loop, updating `transcript` in
 /// place (the caller owns persistence). `cancel` is checked between
 /// rounds and during streaming (the provider layer aborts mid-stream).

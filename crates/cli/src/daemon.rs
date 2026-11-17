@@ -178,6 +178,10 @@ fn valid_request_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn terminal_council_command(text: &str) -> bool {
+    text.split_whitespace().next() == Some("/council")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerAccountingSummary {
@@ -488,6 +492,7 @@ impl OwnerHandle {
     ) -> Result<(String, orbit_frontend_protocol::customization::PaneContext), OwnerError> {
         let hub = self.lock()?;
         let context = orbit_frontend_protocol::customization::PaneContext {
+            session_id: Some(hub.snapshot.session_id.clone()),
             routing: hub
                 .snapshot
                 .last_route
@@ -648,6 +653,12 @@ impl ControllerLease {
                         state: record.state.label().into(),
                         duplicate: true,
                     });
+                }
+                if terminal_council_command(&text) {
+                    return Err(OwnerError::Invalid(
+                        "Native Council runs in the terminal; use /council QUESTION in ORBIT chat"
+                            .into(),
+                    ));
                 }
                 if hub.snapshot.state == TurnState::Running || hub.configuring {
                     return Err(OwnerError::Busy);
@@ -3146,6 +3157,25 @@ mod transport {
 #[cfg(test)]
 mod compact_wire_tests {
     use super::*;
+
+    #[test]
+    fn terminal_council_prefix_does_not_capture_ordinary_questions() {
+        for command in [
+            "/council",
+            "/council compare designs",
+            "\n /council\tquestion",
+        ] {
+            assert!(terminal_council_command(command));
+        }
+        for ordinary in [
+            "What is Council?",
+            "Review /council usage",
+            "/council-extra",
+            "council",
+        ] {
+            assert!(!terminal_council_command(ordinary));
+        }
+    }
 
     #[test]
     fn compact_owner_frames_require_exact_intent() {

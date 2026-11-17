@@ -567,9 +567,16 @@ pub(super) fn draw_with_reading(
                     }
                 } else if *view == View::Custom {
                     let id = sh.tree.custom_id_at(*i).unwrap_or_default();
-                    // The council pane draws its structured state when the
-                    // session carries one; the text snapshot is the fallback.
-                    let cards = id == "council" && s.council.is_some();
+                    let builtin = matches!(id.as_str(), "council" | "reactor")
+                        && !profile.panes.iter().any(|pane| pane.id == id);
+                    let clock = builtin.then_some(crate::customization::PaneClock {
+                        now_ms: inp.now_ms,
+                        reduced: red,
+                        reactor_art: profile.reactor_art,
+                    });
+                    // Council cards and the Reactor bench share the session's
+                    // structured state; text remains the fallback without it.
+                    let cards = builtin && s.council.is_some();
                     if cards {
                         cv.clipped(*r, |cv| {
                             crate::customization::draw_pane_at_with_council(
@@ -580,10 +587,7 @@ pub(super) fn draw_with_reading(
                                 i + 1,
                                 *i == focus,
                                 inp.scrolls.get(*i).copied().unwrap_or(0),
-                                Some(crate::customization::PaneClock {
-                                    now_ms: inp.now_ms,
-                                    reduced: inp.reduced,
-                                }),
+                                clock,
                                 s.council.as_ref(),
                             );
                         });
@@ -596,10 +600,7 @@ pub(super) fn draw_with_reading(
                             i + 1,
                             *i == focus,
                             inp.scrolls.get(*i).copied().unwrap_or(0),
-                            Some(crate::customization::PaneClock {
-                                now_ms: inp.now_ms,
-                                reduced: inp.reduced,
-                            }),
+                            clock,
                         );
                     }
                 } else {
@@ -776,9 +777,25 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn render(sh: &App, s: &Scenario, w: u16, h: u16) -> String {
+        render_profile(
+            sh,
+            s,
+            w,
+            h,
+            &orbit_frontend_protocol::customization::Profile::default(),
+        )
+    }
+
+    fn render_profile(
+        sh: &App,
+        s: &Scenario,
+        w: u16,
+        h: u16,
+        profile: &orbit_frontend_protocol::customization::Profile,
+    ) -> String {
         let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            draw(
+            draw_with_profile(
                 f,
                 &DrawIn {
                     app: sh,
@@ -800,7 +817,8 @@ mod tests {
                     toast: None,
                     overlay: None,
                 },
-            )
+                profile,
+            );
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -832,6 +850,63 @@ mod tests {
         assert!(out.contains("No commands yet"), "{out}");
         assert!(out.contains("columns"), "{out}");
         assert!(out.contains("ORBIT"), "{out}");
+    }
+
+    #[test]
+    fn profile_replacements_use_their_text_instead_of_builtin_council_or_reactor_art() {
+        use orbit_frontend_protocol::customization::{
+            CouncilSnapshot, PaneAction, PaneDef, PaneOutput, PaneSource, PaneState, Profile,
+            Surface,
+        };
+        for id in ["council", "reactor"] {
+            let mut app = App::new(std::path::PathBuf::new(), true);
+            app.tree = Node::Custom { pane_id: id.into() };
+            app.focus = 0;
+            let mut scenario = Scenario::new();
+            scenario.council = Some(crate::proto::ported::CouncilState::from_snapshot(
+                &CouncilSnapshot {
+                    phase: "DELIBERATING".into(),
+                    note: "NATIVE_DECOY".into(),
+                    ..CouncilSnapshot::default()
+                },
+            ));
+            let text = format!(
+                "{}\nCUSTOM_REPLACEMENT_TEXT",
+                if id == "council" {
+                    "MAGI · 심의 DELIBERATE"
+                } else {
+                    "REACTOR · fixture  RESPOND"
+                }
+            );
+            scenario.custom_panes.insert(
+                id.into(),
+                PaneOutput {
+                    id: id.into(),
+                    title: "My replacement".into(),
+                    state: PaneState::Ready,
+                    text: text.clone(),
+                    truncated: false,
+                    council: None,
+                    actions: vec![PaneAction::Refresh],
+                },
+            );
+            let mut profile = Profile::default();
+            profile.panes.push(PaneDef {
+                id: id.into(),
+                title: "My replacement".into(),
+                surfaces: vec![Surface::Terminal],
+                source: PaneSource::Text { text },
+                actions: vec![PaneAction::Refresh],
+            });
+            let out = render_profile(&app, &scenario, 160, 40, &profile);
+            assert!(out.contains("CUSTOM_REPLACEMENT_TEXT"), "{id}: {out}");
+            assert!(!out.contains("NATIVE_DECOY"), "{id}: {out}");
+            assert!(
+                !out.chars()
+                    .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+                "{id} used built-in art"
+            );
+        }
     }
 
     fn app_with(preset: Preset) -> App {

@@ -75,6 +75,7 @@ impl BrowserSession {
             for output in self.outputs.values_mut() {
                 output.state = PaneState::Stale;
                 output.text = "Session changed; refresh this pane".into();
+                output.council = None;
             }
         }
     }
@@ -145,6 +146,10 @@ impl BrowserSession {
             }
             output.title = def.title.clone();
             output.text = super::display_error(&output.text);
+            output.council = output
+                .council
+                .as_ref()
+                .map(|snapshot| snapshot.sanitized_with(super::display_error));
             if output.text.is_empty() && output.state == PaneState::Ready {
                 output.state = PaneState::Empty;
             }
@@ -165,6 +170,7 @@ impl BrowserSession {
                         text: super::display_error(&error.to_string()),
                         truncated: false,
                         actions: Vec::new(),
+                        council: None,
                     },
                 );
                 Ok(())
@@ -239,6 +245,42 @@ impl BrowserSession {
                 }
                 match action {
                     PaneAction::Refresh => self.refresh(&pane_id, context)?,
+                    PaneAction::InsertPrompt { ref text }
+                        if text.split_whitespace().next() == Some("/council") =>
+                    {
+                        return Err(
+                            "Native Council runs in the terminal; use /council QUESTION in ORBIT chat".into(),
+                        );
+                    }
+                    PaneAction::CycleReactorArt => {
+                        if !context.controller {
+                            return Err("changing Reactor art requires controller authority".into());
+                        }
+                        let command = ProfileCommand::Set {
+                            key: "reactor_art".into(),
+                            value: "next".into(),
+                        };
+                        applied_command =
+                            serde_json::to_value(&command).map_err(|error| error.to_string())?;
+                        let result = self
+                            .host
+                            .command_checked(command, &self.resolved.revision)
+                            .map_err(|error| error.to_string())?;
+                        let resolved = result
+                            .profile
+                            .ok_or("Reactor art change returned no profile")?;
+                        resolved
+                            .profile
+                            .validate()
+                            .map_err(|error| error.to_string())?;
+                        if resolved.revision.len() > 256 {
+                            return Err("invalid profile revision".into());
+                        }
+                        message = result.message;
+                        self.resolved = resolved;
+                        self.outputs.clear();
+                        self.refresh_all(context);
+                    }
                     PaneAction::OwnerCancel if !context.controller => {
                         return Err("owner cancellation requires controller authority".into());
                     }

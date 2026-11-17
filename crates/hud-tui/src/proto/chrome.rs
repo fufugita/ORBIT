@@ -85,7 +85,7 @@ pub fn hint_row_themed(
 }
 
 /// The completion list's stable built-in order, extended with customization and routing.
-pub const COMMANDS: [(&str, &str); 46] = [
+pub const COMMANDS: [(&str, &str); 48] = [
     (
         "/clear",
         "forget earlier turns (the model stops seeing them)",
@@ -117,6 +117,14 @@ pub const COMMANDS: [(&str, &str); 46] = [
     ("/sessions", "browse and resume earlier sessions"),
     ("/undo", "drop the last exchange from the context"),
     ("/usage", "turns, tokens and cost for this session"),
+    (
+        "/council",
+        "run configured Council seats and synthesis on a question",
+    ),
+    (
+        "/reactor",
+        "choose reactor art: kwangya, shard, spine, globe, rotate or next",
+    ),
     (
         "/customize",
         "show, validate, import, export, set, reset or reload customization",

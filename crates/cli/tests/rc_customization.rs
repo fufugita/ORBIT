@@ -1132,3 +1132,228 @@ fn council_panel_refresh_observes_time_and_history_without_blocking() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("ORBIT_COUNCIL_REFRESH_CHECKED"));
 }
+
+#[test]
+fn typed_council_transport_gates_every_field_and_bounds_foreign_state() {
+    let f = Fixture::new();
+    let token = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+    let hostile = format!("\u{1b}[31m{token}\u{1b}[0m\u{202e}");
+    let seat = CouncilSeat {
+        name: hostile.clone(),
+        number: hostile.clone(),
+        role: "prompt: foreign role-shaped content".into(),
+        lab: hostile.clone(),
+        model: hostile.clone(),
+        activity: hostile.clone(),
+        verdict: Some(hostile.clone()),
+        confidence: Some(255),
+    };
+    let snapshot = CouncilSnapshot {
+        phase: "VERDICT".into(),
+        note: hostile.clone(),
+        seats: vec![seat.clone(); 20],
+        extra_seats: vec![
+            CouncilChip {
+                name: hostile.clone(),
+                lab: hostile.clone(),
+                activity: hostile.clone(),
+            };
+            20
+        ],
+        winner_seats: vec![hostile.clone(); 20],
+        last_seats: vec![seat; 20],
+        last_final: hostile,
+        last_at: Some(f64::NAN),
+        published_at: Some(f64::INFINITY),
+        ..Default::default()
+    };
+    let context = PaneContext {
+        session_id: Some("current".into()),
+        council: Some(snapshot),
+        ..Default::default()
+    };
+    let output = read_pane(&f.home, &f.workspace, "council", &context).unwrap();
+    let safe = output.council.as_ref().unwrap();
+    assert_eq!(
+        (
+            safe.seats.len(),
+            safe.extra_seats.len(),
+            safe.winner_seats.len(),
+            safe.last_seats.len()
+        ),
+        (4, 12, 4, 4)
+    );
+    assert_eq!(safe.seats[0].confidence, Some(100));
+    assert_eq!((safe.last_at, safe.published_at), (None, None));
+    let serialized = serde_json::to_string(safe).unwrap();
+    for source in [&serialized, &output.text] {
+        assert!(!source.contains(token));
+        assert!(!source.contains("[31m"));
+        assert!(!source.contains("[0m"));
+        assert!(!source.contains("prompt:"));
+        assert!(!source.contains('\u{202e}'));
+        assert!(!source.contains("\\u001b"));
+    }
+    let reactor = read_pane(&f.home, &f.workspace, "reactor", &context).unwrap();
+    assert_eq!(reactor.council.as_ref(), Some(safe));
+    assert!(
+        !f.home.exists(),
+        "pane reads must not initialize storage or provider work"
+    );
+    assert_eq!(std::fs::read_dir(&f.workspace).unwrap().count(), 0);
+
+    let huge = CouncilSnapshot {
+        note: "x".repeat(64 * 1024 + 1),
+        ..Default::default()
+    };
+    assert_eq!(sanitize_council_snapshot(&huge).note, "[content withheld]");
+    // The whole field is gated before a smaller display limit clips it.
+    let gate_marker = format!("{}prompt: hidden after visible prefix", "x".repeat(300));
+    let gated = CouncilSnapshot {
+        note: gate_marker,
+        ..Default::default()
+    };
+    assert_eq!(
+        sanitize_council_snapshot(&gated).note,
+        "[content withheld by display policy]"
+    );
+    let obscured = token.replacen("sk-proj-", "sk-\u{1b}[31mproj-\u{1b}[0m", 1);
+    let boundary = CouncilSnapshot {
+        note: format!("{}{obscured}", "x".repeat(235)),
+        ..Default::default()
+    };
+    let bounded = sanitize_council_snapshot(&boundary).note;
+    assert_eq!(bounded.chars().count(), 240);
+    assert!(!bounded.contains("sk-"));
+    assert!(bounded.ends_with("[reda"));
+    let private = CouncilSnapshot {
+        last_final: "<think>private reasoning</think>Public conclusion".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        sanitize_council_snapshot(&private).last_final,
+        "Public conclusion"
+    );
+}
+
+#[test]
+fn external_council_state_and_history_are_gated_before_display_bounds() {
+    let f = Fixture::new();
+    let path = f.root.join("state.json");
+    let token = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+    let hostile = format!("\u{1b}[31m{token}\u{1b}[0m\u{202e}");
+    let value = serde_json::json!({"ts":1000,"phase":"IDLE","note":hostile,
+        "seats":[{"model":hostile,"status":"computing"}],"winner":{"seats":[hostile]}});
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let history = serde_json::json!({"ts":999,"final":format!("FINAL: <think>private reasoning</think>{hostile}\nnot part of the first line"),
+        "models":{"KARINA":hostile},"answers":{"KARINA":"VERDICT: APPROVE CONFIDENCE: 99"}});
+    std::fs::write(f.root.join("history.jsonl"), format!("{history}\n")).unwrap();
+    let snapshot = council_snapshot_state(&path, 1000.0).unwrap();
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    let (_, text) = council_snapshot_at(&path, 1000.0, false);
+    for source in [&serialized, &text] {
+        assert!(!source.contains(token));
+        assert!(!source.contains("[31m"));
+        assert!(!source.contains("[0m"));
+        assert!(!source.contains('\u{202e}'));
+        assert!(!source.contains("not part of the first line"));
+        assert!(!source.contains("private reasoning"));
+    }
+    assert_eq!(snapshot.last_seats[0].verdict.as_deref(), Some("approve"));
+}
+
+#[test]
+fn council_pane_uses_bound_session_and_never_falls_back_to_foreign_state() {
+    const CHILD: &str = "ORBIT_COUNCIL_BINDING_TEST_CHILD";
+    const TEST: &str = "council_pane_uses_bound_session_and_never_falls_back_to_foreign_state";
+    if let Ok(case) = std::env::var(CHILD) {
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let output = |session: Option<&str>| {
+            read_pane(
+                &home,
+                &workspace,
+                "council",
+                &PaneContext {
+                    session_id: session.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        match case.as_str() {
+            "bound" => {
+                assert_eq!(output(Some("current")).council.unwrap().note, "CURRENT");
+                for id in ["missing", "../foreign", "", "/foreign"] {
+                    let missing = output(Some(id));
+                    assert_eq!(missing.state, PaneState::Missing);
+                    assert!(missing.council.is_none());
+                    assert!(!missing.text.contains("LEGACY"));
+                    assert!(!missing.text.contains("FOREIGN"));
+                }
+            }
+            "unbound" => assert_eq!(output(None).council.unwrap().note, "LEGACY"),
+            "override" => assert_eq!(output(Some("current")).council.unwrap().note, "OVERRIDE"),
+            _ => panic!("unknown fixture case"),
+        }
+        assert!(!home.exists(), "refresh must remain a read-only operation");
+        assert_eq!(std::fs::read_dir(workspace).unwrap().count(), 0);
+        println!("ORBIT_COUNCIL_BINDING_CHECKED");
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.root.join(".local/share/magi");
+    for (name, note) in [
+        ("state.json", "LEGACY"),
+        ("sessions/current/state.json", "CURRENT"),
+        ("sessions/foreign/state.json", "FOREIGN"),
+        ("override.json", "OVERRIDE"),
+    ] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({"ts":1000,"phase":"IDLE","note":note})).unwrap(),
+        )
+        .unwrap();
+    }
+    for case in ["bound", "unbound", "override"] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .env("HOME", &f.root)
+            .env_remove("ORBIT_COUNCIL_STATE")
+            .env_remove("ORBIT_SESSION_ID")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if case == "bound" {
+            command.env("ORBIT_SESSION_ID", "foreign");
+        }
+        if case == "override" {
+            command.env("ORBIT_COUNCIL_STATE", root.join("override.json"));
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Council binding fixture exceeded its read-only deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ORBIT_COUNCIL_BINDING_CHECKED"));
+    }
+}

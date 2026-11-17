@@ -421,6 +421,7 @@ pub mod config;
 pub mod config_edit;
 pub mod configuration_ui;
 pub mod context_history;
+pub mod council;
 pub mod custom_commands;
 #[allow(unsafe_code)]
 pub mod customization;

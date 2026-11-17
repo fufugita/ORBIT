@@ -474,7 +474,10 @@ fn seat_mode(phase: &Phase, seat: &BenchSeat, verdict: Option<Verdict>) -> SeatM
     if phase.name == "DELIBERATING" {
         return match seat.activity {
             SeatActivity::Answered => SeatMode::Answered,
-            _ => SeatMode::Computing,
+            SeatActivity::Working => SeatMode::Computing,
+            SeatActivity::Resting => SeatMode::Resting,
+            SeatActivity::Wiring => SeatMode::Wiring,
+            SeatActivity::Lost => SeatMode::Lost,
         };
     }
     SeatMode::Answered
@@ -565,10 +568,20 @@ pub fn draw_council(
     row = y + 2;
     // The bench fits one row when the pane is wide, two by two when it is
     // narrow, and draws as a list only when even a pair cannot fit.
-    let (columns, rows_of_cards) = if width >= 38 {
-        (if (width - 4) / 4 >= 10 { 4 } else { 3 }, 1)
+    let seats = if state.seats.is_empty() {
+        &state.history.last_seats
+    } else {
+        &state.seats
+    };
+    let seat_count = seats.len().min(4);
+    let (columns, rows_of_cards) = if seat_count == 0 {
+        (0, 0)
+    } else if width >= 38 {
+        let columns = (if (width - 4) / 4 >= 10 { 4 } else { 3 }).min(seat_count);
+        (columns, seat_count.div_ceil(columns))
     } else if (width - 2) / 2 >= 13 && h >= 13 {
-        (2, 2)
+        let columns = 2.min(seat_count);
+        (columns, seat_count.div_ceil(columns))
     } else {
         (0, 1)
     };
@@ -588,8 +601,8 @@ pub fn draw_council(
         let card_w = ((width - 1 - (columns - 1)) / columns).clamp(1, 30);
         let used = columns * card_w + (columns - 1);
         let left = ((width - used) / 2).max(1);
-        for index in 0..(columns as usize * rows_of_cards).min(4) {
-            let seat = state.seats.get(index);
+        for index in 0..(columns as usize * rows_of_cards).min(seat_count) {
+            let seat = seats.get(index);
             let verdict = seat.and_then(|seat| resolved_verdict(state, index, seat));
             let mode = seat.map_or(SeatMode::Resting, |seat| {
                 seat_mode(&state.phase, seat, verdict)
@@ -633,8 +646,8 @@ pub fn draw_council(
         row += panel_h * rows_of_cards as i32;
     } else {
         // A narrow pane lists the bench instead.
-        for index in 0..4 {
-            let seat = state.seats.get(index);
+        for index in 0..seat_count {
+            let seat = seats.get(index);
             let verdict = seat.and_then(|seat| resolved_verdict(state, index, seat));
             let mode = seat.map_or(SeatMode::Resting, |seat| {
                 seat_mode(&state.phase, seat, verdict)
@@ -1654,6 +1667,122 @@ mod tests {
             seat_mode(&state.phase, &state.seats[0], None),
             SeatMode::Resting
         );
+    }
+
+    #[test]
+    fn deliberating_cards_only_mark_the_actual_working_seat_as_computing() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut state = bench();
+        for (seat, activity) in state.seats.iter_mut().zip([
+            SeatActivity::Working,
+            SeatActivity::Resting,
+            SeatActivity::Wiring,
+            SeatActivity::Answered,
+        ]) {
+            seat.activity = activity;
+        }
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+        let mut cv = Cv::new(&mut buffer);
+        let palette = BenchPalette::from_shell(&cv.palette);
+        assert!(draw_council(
+            &mut cv,
+            (0, 0, 100, 30),
+            &state,
+            palette,
+            4_000,
+            true
+        ));
+        let text = (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            text.matches("심의중").count(),
+            1,
+            "queued seats must not claim to be computing"
+        );
+        for label in ["대기", "SYNK", "응답완료"] {
+            assert!(text.contains(label), "{label} remains visible");
+        }
+        state.seats[1].activity = SeatActivity::Lost;
+        assert_eq!(
+            seat_mode(&state.phase, &state.seats[1], None),
+            SeatMode::Lost
+        );
+    }
+
+    fn render_council_text(state: &CouncilState, width: u16, height: u16) -> String {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut cv = Cv::new(&mut buffer);
+        let palette = BenchPalette::from_shell(&cv.palette);
+        assert!(draw_council(
+            &mut cv,
+            (0, 0, width.into(), height.into()),
+            state,
+            palette,
+            4_000,
+            true
+        ));
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn three_current_or_historical_seats_never_invent_a_fourth_card() {
+        let mut current = bench();
+        current.seats.truncate(3);
+        let mut historical = current.clone();
+        historical.phase.name = "IDLE".into();
+        historical.history.last_seats = std::mem::take(&mut historical.seats);
+        for state in [current, historical] {
+            for (width, height) in [(100, 30), (32, 24), (18, 12)] {
+                let text = render_council_text(&state, width, height);
+                for name in &COUNCIL_NAMES[..3] {
+                    assert!(text.contains(name), "{width}x{height} lost {name}");
+                }
+                assert!(
+                    !text.contains(COUNCIL_NAMES[3]),
+                    "{width}x{height} invented a fourth seat"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_restored_conclusion_without_metadata_never_fabricates_seats() {
+        let mut state = bench();
+        state.phase.name = "IDLE".into();
+        state.phase.note = "Restored saved Council conclusion; seat metadata unavailable".into();
+        state.seats.clear();
+        state.history.last_seats.clear();
+        state.history.last_final = "Saved conclusion".into();
+        for (width, height) in [(100, 30), (32, 24), (18, 12)] {
+            let text = render_council_text(&state, width, height);
+            assert!(
+                text.contains("Saved"),
+                "{width}x{height} lost the saved conclusion"
+            );
+            for name in COUNCIL_NAMES {
+                assert!(!text.contains(name), "{width}x{height} invented {name}");
+            }
+            assert!(!text.contains("LEAD"), "a role requires actual metadata");
+            assert!(
+                !text.contains(" ae "),
+                "a provider label requires actual metadata"
+            );
+        }
     }
 
     #[test]

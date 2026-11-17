@@ -134,7 +134,7 @@ function selectProfilePane(id, focus=false) {
 }
 function markCustomPanesStale() {
   if (!S.customEnabled || !S.profile) return;
-  for (const output of S.paneOutputs.values()) {output.state="stale";output.text="Session changed; refresh this pane";}
+  for (const output of S.paneOutputs.values()) {output.state="stale";output.text="Session changed; refresh this pane";delete output.council;}
   renderProfileLayout();
 }
 function focusProfileConversation() { selectProfilePane("conversation"); $("composer").focus(); }
@@ -155,7 +155,7 @@ function renderCustomPane(def, identity) {
   const refresh=el("button","","Refresh");refresh.onclick=()=>S.controlling ? send({type:"pane_refresh",pane_id:def.id,revision:S.profile.revision}) : customizationRead(S.generation);actions.appendChild(refresh);
   for (const [index,action] of (output?.actions || []).entries()) {
     if (action.kind==="refresh") continue;
-    const labels={focus_conversation:"Conversation",insert_prompt:"Insert draft",owner_cancel:"Cancel current turn"};
+    const labels={focus_conversation:"Conversation",insert_prompt:"Insert draft",owner_cancel:"Cancel current turn",cycle_reactor_art:"Next art"};
     if (!labels[action.kind]) continue;
     const button=el("button","",labels[action.kind]);button.dataset.customWrite="";button.disabled=!S.controlling;
     button.onclick=()=>paneAction(def,index);actions.appendChild(button);
