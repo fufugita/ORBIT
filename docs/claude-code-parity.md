@@ -223,11 +223,17 @@ version.
 | Matchers | Partial | Name lists and `*` wildcards; not full regular expressions |
 | `if` conditions | Present | `Tool(pattern)` on the tool and its main argument |
 | JSON output: decisions, rewritten input, added context | Partial | ORBIT's schema and Claude Code's `hookSpecificOutput` / `decision`; `ask` opens the approval card. SessionStart and UserPromptSubmit feed model context; PreToolUse, PostToolUse and PostToolUseFailure append bounded context to the tool result; SubagentStart adds context to the child input. Tool events carry the original `tool_use_id`; failure events include `is_interrupt`. Cancelled calls suppress failure hooks. Other event outcomes need individual review |
-| `SessionStart` in interactive sessions | Present | Its output becomes model context; `SessionEnd` is still headless only |
+| `SessionStart` in interactive sessions | Partial | Fires at launch and after committed clear, interactive resume and fork; context is replaced for the new owner and model costs are saved before publication. Async Prompt/Agent lifecycle handlers are refused; async command/HTTP attachment hooks remain available. `SessionEnd` runs on actual exit, not clear/resume cleanup |
 | HTTP handlers | Present | Through `curl`; blocks only via the response body |
 | Prompt, agent and MCP-tool handlers | Partial | Model checks use the `explore` role (or the hook's `model`) and durable housekeeping accounting; the agent may only Read, Grep and Glob inside the working directories. A child session without its own managed hook accounting reports an error instead of sending an untracked model request |
 | Blocking `SubagentStop`, `PreCompact`, `TeammateIdle` | Present | A blocked subagent continues, at most three times a turn; blocked compaction is skipped while the request still fits |
 | Async hooks | Present | Started and not awaited |
+
+At cold launch, the TUI currently infers `startup` versus `resume` from the saved
+turn count, so a saved zero-turn session can report `startup`. Interactive clear,
+resume and fork use explicit sources. Attachment hooks should accept the relevant
+start sources and use the current payload's session ID rather than retain a
+previous conversation's ID.
 
 ## MCP
 

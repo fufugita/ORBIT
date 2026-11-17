@@ -108,6 +108,8 @@ With the installed candidate and your chosen provider, check:
 - A short prompt and a harmless file-read task complete with truthful usage.
 - Cancelling a provider request or permission check returns control promptly.
 - The next turn works after cancellation, and resuming restores the session.
+- `/clear` keeps Council and Reactor panes attached to the fresh session, resets
+  their old live observations and preserves layout/art; the next turn works.
 - `/compact` retains recent exchanges and preserves accurate accounting.
 - Your permission rules, selected model, hooks and MCP tools behave as expected.
 

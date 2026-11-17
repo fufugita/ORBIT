@@ -64,6 +64,21 @@ fn validate_question(question: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn with_session_start_context(question: &str, context: &str) -> Result<String, String> {
+    if context.len() > 8 * 1024 + 128 {
+        return Err("Council session-start context exceeds its 8 KiB bound".into());
+    }
+    let context = crate::daemon::scan_display(&orbit_hud::strip_cot(context));
+    let context = context.trim();
+    if context.is_empty() {
+        Ok(question.to_owned())
+    } else {
+        Ok(format!(
+            "{question}\n\n<session-start-context>\n{context}\n</session-start-context>"
+        ))
+    }
+}
+
 fn settings(home: &Path) -> Result<Option<Settings>, String> {
     let path = home.join("council.toml");
     match std::fs::symlink_metadata(&path) {
@@ -504,6 +519,7 @@ pub(crate) fn run(
     session_id: &str,
     base: &TurnConfig,
     question: &str,
+    session_start_context: &str,
     transcript: &mut Vec<ChatMessage>,
     accounting: &NamespaceAccounting,
     inherited_policy: Option<NamespaceSpendPolicy>,
@@ -513,7 +529,8 @@ pub(crate) fn run(
     events: &mut dyn FnMut(orbit_frontend_protocol::FrontendEvent),
 ) -> Result<(TurnCompletion, CouncilSnapshot), String> {
     validate_question(question)?;
-    let mut plan = plan(home, session_id, base, accounting, question)?;
+    let initial = with_session_start_context(question, session_start_context)?;
+    let mut plan = plan(home, session_id, base, accounting, &initial)?;
     plan.policy = match (plan.policy, inherited_policy) {
         (Some(a), Some(b)) => Some(NamespaceSpendPolicy {
             maximum_microcents: a.maximum_microcents.min(b.maximum_microcents),
@@ -522,7 +539,7 @@ pub(crate) fn run(
         }),
         (a, b) => a.or(b),
     };
-    preflight_plan(&plan, accounting, question)?;
+    preflight_plan(&plan, accounting, &initial)?;
     let original = format!("/council {question}");
     let question = submission(plan.policy, question)?;
     if question.trim().is_empty() || question.len() > MAX_QUESTION_BYTES + 8 * 1024 + 128 {
@@ -531,6 +548,7 @@ pub(crate) fn run(
     if cancel.is_cancelled() {
         return Err("Council cancelled during submission policy".into());
     }
+    let question = with_session_start_context(&question, session_start_context)?;
     preflight_plan(&plan, accounting, &question)?;
     transcript.push(orbit_engine::user_message(original));
     let mut completed_cost = 0_u64;
@@ -1085,6 +1103,40 @@ input_tokens = 131072
     }
 
     #[test]
+    fn council_preflights_known_session_context_before_the_owner_submission_gate() {
+        let fixture = ManagedFixture::new();
+        fixture.configure(
+            "seats=['council-fixture/fixture','council-fixture/tiny']\nmax_output_tokens=64\n",
+        );
+        for context in ["lifecycle ".repeat(700), "x".repeat(8 * 1024 + 129)] {
+            let before = fixture.namespace.checkpoint_detailed().unwrap();
+            let mut transcript = Vec::new();
+            let mut submissions = 0;
+            let result = run(
+                &fixture.home,
+                "council-owner",
+                &fixture.base(),
+                "small question",
+                &context,
+                &mut transcript,
+                &fixture.namespace,
+                None,
+                &CancelToken::new(),
+                &mut |_, _| {
+                    submissions += 1;
+                    Err("owner gate must not run for a known oversized context".into())
+                },
+                &mut |_| panic!("invalid context must not publish Council progress"),
+                &mut |_| panic!("invalid context must not dispatch Council requests"),
+            );
+            assert!(result.is_err());
+            assert_eq!(submissions, 0);
+            assert!(transcript.is_empty());
+            assert_eq!(fixture.namespace.checkpoint_detailed().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn council_owner_submission_denial_precedes_every_council_request_and_transcript_append() {
         let fixture = ManagedFixture::new();
         let before = fixture.namespace.checkpoint_detailed().unwrap();
@@ -1095,6 +1147,7 @@ input_tokens = 131072
             "council-owner",
             &fixture.base(),
             "confidential question",
+            "",
             &mut transcript,
             &fixture.namespace,
             None,

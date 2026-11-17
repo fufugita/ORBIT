@@ -984,6 +984,20 @@ impl Scenario {
         "New session".into()
     }
 
+    /// Reset the Reactor's observations when the conversation namespace changes.
+    /// Profile appearance and layout are independent of the observed session.
+    pub(super) fn reset_reactor_session(&mut self) {
+        self.turn_rate_milli = None;
+        self.peak_rate_milli = None;
+        self.rate_history.clear();
+        self.meter_turn_ms = None;
+        self.meter_output_base = 0;
+        self.stream_chars = 0;
+        self.stream_started_ms = None;
+        self.stream_last_ms = 0;
+        self.phase = 0;
+    }
+
     /// Reactor meter: start counting a new turn the first time it is seen.
     pub fn mark_turn_meter(&mut self) {
         if self.meter_turn_ms != Some(self.turn_started_ms) {

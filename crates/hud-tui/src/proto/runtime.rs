@@ -5305,7 +5305,11 @@ fn apply_session_projection_with_view(
                     false
                 }
                 ManualAction::Clear => {
-                    if *outcome == ManualOutcome::Completed && *applied {
+                    // The namespace commit is authoritative even when a later hook
+                    // or accounting publication leaves the overall outcome unknown.
+                    if *applied
+                        && matches!(outcome, ManualOutcome::Completed | ManualOutcome::Unknown)
+                    {
                         if projection.binding.session_id == operation.source().session_id
                             || operation.source().generation.checked_add(1)
                                 != Some(projection.binding.generation)
@@ -5390,7 +5394,7 @@ fn apply_session_projection_with_view(
     let cleared_from = match &projection.reason {
         ProjectionReason::Manual {
             operation,
-            outcome: ManualOutcome::Completed,
+            outcome: ManualOutcome::Completed | ManualOutcome::Unknown,
             applied: true,
         } if operation.action() == ManualAction::Clear => {
             Some(operation.source().session_id.clone())
@@ -5692,6 +5696,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.council = None;
             scenario.council_snapshot = None;
             scenario.council_session_id = None;
+            scenario.reset_reactor_session();
             scenario.clear_namespace_view();
             scenario.transcript = lines.into_iter().map(restored_transcript_line).collect();
             scenario.input_tokens = input_tokens;
@@ -6407,6 +6412,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 scenario.council = None;
                 scenario.council_snapshot = None;
                 scenario.council_session_id = None;
+                scenario.reset_reactor_session();
                 for pane in scenario.custom_panes.values_mut() {
                     pane.council = None;
                     pane.state = orbit_frontend_protocol::customization::PaneState::Stale;
@@ -10765,11 +10771,11 @@ fn pane_context(
         cache_write_tokens: usage_detail.map(|detail| detail.2),
         reasoning_tokens: usage_detail.map(|detail| detail.3),
         cost_uncertain: !s.priced
-            || !matches!(
-                s.cost_qualification(),
-                crate::msg::CostQualification::Known { .. }
-                    | crate::msg::CostQualification::Unavailable
-            ),
+            || match s.cost_qualification() {
+                crate::msg::CostQualification::Known { .. } => false,
+                crate::msg::CostQualification::Unavailable => s.session_binding().is_some(),
+                _ => true,
+            },
         rate_milli: s.turn_rate_milli,
         peak_rate_milli: s.peak_rate_milli,
         live_rate_milli: s.live_rate_milli(),
@@ -11051,6 +11057,328 @@ mod live_pane_tests {
                 .text
                 .contains("previous session payload")
         );
+    }
+
+    fn pane_projection(
+        session_id: &str,
+        generation: u64,
+        reason: crate::msg::ProjectionReason,
+    ) -> crate::msg::SessionProjection {
+        crate::msg::SessionProjection {
+            binding: crate::worker::SessionBinding {
+                session_id: session_id.into(),
+                generation,
+            },
+            model: "fixture".into(),
+            provider: "fixture".into(),
+            priced: true,
+            lines: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microcents: 0,
+            turns: 0,
+            cost: crate::msg::CostQualification::Known { revision: 0 },
+            context: crate::msg::ContextProjection::Unavailable,
+            reason,
+        }
+    }
+
+    fn finished_reactor(s: &mut Scenario) {
+        s.turn_started_ms = 1_000;
+        s.turn_live = true;
+        s.meter_stream(40, 1_500);
+        s.settle_turn_rate(20, 2_000);
+        s.turn_live = false;
+        s.input_tokens = 7;
+        s.output_tokens = 20;
+        s.turns = 1;
+        s.phase = 4;
+        assert!(s.turn_rate_milli.is_some());
+        assert!(!s.rate_history.is_empty());
+    }
+
+    #[test]
+    fn clear_rebinds_council_and_reactor_without_carrying_the_previous_session() {
+        use crate::msg::{CostQualification, ManualOutcome, Msg, ProjectionReason};
+        use crate::worker::ManualAction;
+
+        for (outcome, cost) in [
+            (
+                ManualOutcome::Completed,
+                CostQualification::Known { revision: 0 },
+            ),
+            (
+                ManualOutcome::Unknown,
+                CostQualification::Uncertain { revision: 2 },
+            ),
+            (ManualOutcome::Unknown, CostQualification::Unavailable),
+        ] {
+            let host = Arc::new(MeterHost {
+                calls: Mutex::new(Vec::new()),
+            });
+            let mut tui = Tui::new();
+            let mut customization =
+                crate::customization::CustomizationSession::open(host.clone()).unwrap();
+            customization.resolved.profile.reactor_art = ReactorArt::Globe;
+            customization.context.controller = true;
+            tui.profile = customization.resolved.profile.clone();
+            tui.app.tree = crate::customization::profile_tree(&tui.profile).unwrap();
+            tui.customization = Some(customization);
+            let tree = tui.app.tree.clone();
+            let profile = tui.profile.clone();
+            let attached_host = tui.customization.as_ref().unwrap().host.clone();
+            let mut s = Scenario::new();
+            reduce_frontend_message(
+                Msg::SessionProjection(pane_projection(
+                    "session-before-clear",
+                    1,
+                    ProjectionReason::Initial,
+                )),
+                &mut tui,
+                &mut s,
+                0,
+            );
+            finished_reactor(&mut s);
+            let council = |session: &str, phase: &str, text: &str| Msg::CouncilUpdated {
+                session_id: session.into(),
+                phase: phase.into(),
+                note: "fixture".into(),
+                seats: vec![CouncilSeat {
+                    name: "seat".into(),
+                    model: "fixture/model".into(),
+                    activity: "working".into(),
+                    ..Default::default()
+                }],
+                winner_seats: Vec::new(),
+                final_text: text.into(),
+            };
+            reduce_frontend_message(
+                council("session-before-clear", "VERDICT", "OLD_COUNCIL_PAYLOAD"),
+                &mut tui,
+                &mut s,
+                2_000,
+            );
+            let (mut council_ms, mut reactor_ms, mut dirty) = (0, 0, true);
+            refresh_builtin_panes(
+                &mut tui,
+                &mut s,
+                2_000,
+                &mut council_ms,
+                &mut reactor_ms,
+                &mut dirty,
+            );
+            assert_eq!(host.calls.lock().unwrap().len(), 2);
+            assert!(s.custom_panes["council"].council.is_some());
+            let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+            assert!(s.admit_manual(operation.clone()));
+            let mut cleared = pane_projection(
+                "session-after-clear",
+                2,
+                ProjectionReason::Manual {
+                    operation,
+                    outcome,
+                    applied: true,
+                },
+            );
+            cleared.cost = cost;
+            reduce_frontend_message(Msg::SessionProjection(cleared), &mut tui, &mut s, 2_100);
+            assert_eq!(s.cost_qualification(), cost);
+            assert_eq!(s.cleared_from.as_deref(), Some("session-before-clear"));
+            let session = tui.customization.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&attached_host, &session.host));
+            assert_eq!(
+                session.context.session_id.as_deref(),
+                Some("session-after-clear")
+            );
+            assert!(session.context.controller);
+            assert_eq!(tui.app.tree, tree);
+            assert_eq!(tui.profile, profile);
+            assert_eq!(session.resolved.profile.reactor_art, ReactorArt::Globe);
+            for pane in ["council", "reactor"] {
+                assert_eq!(session.outputs[pane].state, PaneState::Stale);
+                assert!(session.outputs[pane].council.is_none());
+            }
+            let context = pane_context(&s, true);
+            assert_eq!(context.phase.as_deref(), Some("idle"));
+            assert_eq!(
+                context.cost_uncertain,
+                !matches!(cost, CostQualification::Known { .. })
+            );
+            assert_eq!(
+                (context.turns, context.input_tokens, context.output_tokens),
+                (Some(0), 0, 0)
+            );
+            assert!(context.council.is_none());
+            assert_eq!(
+                (
+                    context.rate_milli,
+                    context.peak_rate_milli,
+                    context.live_rate_milli
+                ),
+                (None, None, None)
+            );
+            assert!(context.rate_history.is_empty());
+            assert_eq!((s.meter_turn_ms, s.stream_started_ms), (None, None));
+            assert_eq!(
+                (
+                    s.meter_output_base,
+                    s.stream_chars,
+                    s.stream_last_ms,
+                    s.phase
+                ),
+                (0, 0, 0, 0)
+            );
+            // Invalidation refreshes both panes immediately, before their idle timer.
+            refresh_builtin_panes(
+                &mut tui,
+                &mut s,
+                2_101,
+                &mut council_ms,
+                &mut reactor_ms,
+                &mut dirty,
+            );
+            assert_eq!(host.calls.lock().unwrap().len(), 4);
+            for pane in ["council", "reactor"] {
+                assert_eq!(s.custom_panes[pane].state, PaneState::Ready);
+                assert!(s.custom_panes[pane].council.is_none());
+            }
+            reduce_frontend_message(
+                council("session-before-clear", "VERDICT", "LATE_OLD_COUNCIL"),
+                &mut tui,
+                &mut s,
+                2_200,
+            );
+            assert!(pane_context(&s, true).council.is_none());
+            let (sink, receiver) = std::sync::mpsc::channel();
+            submit_foreground(
+                &mut s,
+                &sink,
+                WorkerCommand::Prompt("/council fresh question".into()),
+            )
+            .unwrap();
+            let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+                panic!("new Council must be bound");
+            };
+            assert_eq!(operation.source().session_id, "session-after-clear");
+            assert_eq!(operation.source().generation, 2);
+            assert!(matches!(*command, WorkerCommand::Prompt(_)));
+            s.turn_started_ms = 3_000;
+            s.apply("round_started", 3_000);
+            reduce_frontend_message(
+                council("session-after-clear", "DELIBERATING", ""),
+                &mut tui,
+                &mut s,
+                3_100,
+            );
+            s.meter_stream(40, 3_200);
+            refresh_builtin_panes(
+                &mut tui,
+                &mut s,
+                3_200,
+                &mut council_ms,
+                &mut reactor_ms,
+                &mut dirty,
+            );
+            let context = &tui.customization.as_ref().unwrap().context;
+            assert_eq!(context.session_id.as_deref(), Some("session-after-clear"));
+            assert_eq!(context.phase.as_deref(), Some("reason"));
+            assert_eq!(context.council.as_ref().unwrap().phase, "DELIBERATING");
+            assert!(context.live_rate_milli.is_some_and(|rate| rate > 0));
+            assert_eq!(s.stream_chars, 40);
+            assert_eq!(tui.app.tree, tree);
+            assert_eq!(tui.profile.reactor_art, ReactorArt::Globe);
+        }
+        let mut unbound = Scenario::new();
+        unbound.priced = true;
+        assert_eq!(unbound.cost_qualification(), CostQualification::Unavailable);
+        assert!(!pane_context(&unbound, true).cost_uncertain);
+    }
+
+    #[test]
+    fn reactor_rates_survive_compaction_and_reset_on_resume_or_legacy_identity() {
+        use crate::msg::{ManualOutcome, Msg, ProjectionReason};
+        use crate::worker::{ForegroundKind, ManualAction};
+
+        let mut s = Scenario::new();
+        apply_session_projection(
+            pane_projection("session-rate-source", 1, ProjectionReason::Initial),
+            &mut s,
+            0,
+        );
+        finished_reactor(&mut s);
+        let rates = (s.turn_rate_milli, s.peak_rate_milli, s.rate_history.clone());
+        let operation = s.new_manual_operation(ManualAction::Compact).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        let mut compacted = pane_projection(
+            "session-rate-source",
+            1,
+            ProjectionReason::Manual {
+                operation,
+                outcome: ManualOutcome::Completed,
+                applied: true,
+            },
+        );
+        compacted.turns = s.turns;
+        compacted.input_tokens = s.input_tokens;
+        compacted.output_tokens = s.output_tokens;
+        assert!(apply_session_projection(compacted, &mut s, 2_100));
+        assert_eq!(
+            (s.turn_rate_milli, s.peak_rate_milli, s.rate_history.clone()),
+            rates
+        );
+
+        let operation = s.new_foreground_operation(ForegroundKind::Resume).unwrap();
+        assert!(s.admit_foreground(operation.clone()));
+        let registration = operation
+            .start(&WorkerCommand::ResumeSession("session-rate-next".into()))
+            .unwrap();
+        drop(registration);
+        assert!(apply_session_projection(
+            pane_projection(
+                "session-rate-next",
+                2,
+                ProjectionReason::Operation { operation }
+            ),
+            &mut s,
+            2_200,
+        ));
+        assert!(
+            s.turn_rate_milli.is_none() && s.peak_rate_milli.is_none() && s.rate_history.is_empty()
+        );
+        assert_eq!(s.phase, 0);
+
+        finished_reactor(&mut s);
+        apply_msg(
+            Msg::Identity {
+                model: "another-model".into(),
+                provider: "fixture".into(),
+                session_prefix: "rate-next".into(),
+                session_id: "session-rate-next".into(),
+                priced: true,
+            },
+            &mut s,
+            2_300,
+        );
+        assert!(
+            s.turn_rate_milli.is_some(),
+            "same-session model selection retains observed rates"
+        );
+        apply_msg(
+            Msg::Identity {
+                model: "fixture".into(),
+                provider: "fixture".into(),
+                session_prefix: "legacy-next".into(),
+                session_id: "session-legacy-next".into(),
+                priced: true,
+            },
+            &mut s,
+            2_400,
+        );
+        assert!(
+            s.turn_rate_milli.is_none() && s.peak_rate_milli.is_none() && s.rate_history.is_empty()
+        );
+        assert_eq!((s.meter_turn_ms, s.stream_started_ms), (None, None));
+        assert_eq!(s.phase, 0);
     }
 
     #[test]
@@ -13227,7 +13555,7 @@ mod bound_projection_tests {
     }
 
     #[test]
-    fn clear_acknowledgement_requires_completed_applied_result() {
+    fn clear_acknowledgement_requires_a_committed_applied_result() {
         for outcome in [
             ManualOutcome::Completed,
             ManualOutcome::Failed,
@@ -13244,7 +13572,8 @@ mod bound_projection_tests {
                     outcome,
                     applied,
                 });
-                let successful = outcome == ManualOutcome::Completed && applied;
+                let successful =
+                    applied && matches!(outcome, ManualOutcome::Completed | ManualOutcome::Unknown);
                 if successful {
                     result.binding.session_id = "session-next".into();
                     result.binding.generation = 2;
@@ -13262,6 +13591,10 @@ mod bound_projection_tests {
                 );
                 if applied && !successful {
                     assert_eq!(format!("{s:?}"), before);
+                }
+                if !applied {
+                    assert_eq!(s.session_binding(), Some(&binding()));
+                    assert_eq!(s.session_id, "session-bound-test");
                 }
             }
         }
