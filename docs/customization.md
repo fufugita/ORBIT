@@ -223,6 +223,20 @@ The browser can display Council state, but native Council execution currently
 requires terminal chat. Browser Council run actions return that guidance before
 submitting a provider request.
 
+`/clear` starts a fresh saved session and keeps the pane layout, selected art and
+configuration. Council switches to the new session; its previous verdict and
+Reactor's measured rates are cleared from the live view. The next Council runs
+against the new binding, while the previous saved conversation remains available.
+
+Outside bare mode, session-start hooks receive the current `session_id` and
+`transcript_path` after clear, interactive resume or fork. Hook-based attachments
+should use those values on every start and include `clear` in their matcher.
+Current session-start context reaches Council after the owner submission policy's
+rewrite and is included in request preflight; it does not import earlier chat or
+grant tools. Asynchronous model lifecycle handlers are refused with a diagnostic.
+If a model hook or its accounting has not settled, further work waits while the
+panes stay bound to the committed session and show unverified cost information.
+
 ### Switch Reactor art
 
 Use `/reactor art kwangya|shard|spine|globe|rotate`, or select the Reactor pane's

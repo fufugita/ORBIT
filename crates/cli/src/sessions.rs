@@ -966,9 +966,9 @@ mod leased_storage {
         lock: File,
         owner_pid: u32,
         #[cfg(test)]
-        fail_before_rename: std::cell::Cell<bool>,
+        fail_before_rename: std::sync::atomic::AtomicBool,
         #[cfg(test)]
-        fail_directory_sync: std::cell::Cell<bool>,
+        fail_directory_sync: std::sync::atomic::AtomicBool,
     }
 
     impl Drop for Storage {
@@ -1400,9 +1400,9 @@ mod leased_storage {
                 lock,
                 owner_pid: std::process::id(),
                 #[cfg(test)]
-                fail_before_rename: std::cell::Cell::new(false),
+                fail_before_rename: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
-                fail_directory_sync: std::cell::Cell::new(false),
+                fail_directory_sync: std::sync::atomic::AtomicBool::new(false),
             };
             storage.verify_location(id)?;
             let metadata = serde_json::json!({"session_id":id,"kind":kind,"pid":storage.owner_pid});
@@ -1533,7 +1533,10 @@ mod leased_storage {
                 file.sync_all().map_err(io)?;
                 self.verify_location(id)?;
                 #[cfg(test)]
-                if self.fail_before_rename.replace(false) {
+                if self
+                    .fail_before_rename
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
                     return Err(SessionLeaseError::Io(
                         "injected pre-publication failure".into(),
                     ));
@@ -1588,7 +1591,10 @@ mod leased_storage {
                     published = true;
                 }
                 #[cfg(test)]
-                if self.fail_directory_sync.replace(false) {
+                if self
+                    .fail_directory_sync
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
                     return Err(SessionLeaseError::PublicationUncertain(
                         "injected post-rename directory sync failure".into(),
                     ));
@@ -1616,12 +1622,14 @@ mod leased_storage {
 
         #[cfg(test)]
         pub(super) fn inject_prepublication_failure(&self) {
-            self.fail_before_rename.set(true);
+            self.fail_before_rename
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         #[cfg(test)]
         pub(super) fn inject_directory_sync_failure(&self) {
-            self.fail_directory_sync.set(true);
+            self.fail_directory_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }

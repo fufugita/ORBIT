@@ -46,6 +46,335 @@ fn configured_turn(config: &TuiTurnConfig) -> Result<orbit_engine::TurnConfig, S
     Ok(turn)
 }
 
+struct SessionStartHookResult {
+    context: String,
+    notices: Vec<String>,
+    accounting_changed: bool,
+    unfinished_models: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+struct HookCompletion(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for HookCompletion {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+type SessionEndHookBinding = (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<orbit_engine::hooks::HandlerRunner>,
+);
+
+#[derive(Default)]
+struct SessionEndHookState {
+    fired: bool,
+    current: Option<SessionEndHookBinding>,
+}
+
+fn session_end_hook_state() -> &'static std::sync::Mutex<SessionEndHookState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<SessionEndHookState>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(Default::default)
+}
+
+fn model_hook(hook: &orbit_engine::hooks::HookConfig) -> bool {
+    matches!(
+        hook.handler,
+        Some(
+            orbit_engine::hooks::HookHandler::Prompt { .. }
+                | orbit_engine::hooks::HookHandler::Agent { .. }
+        )
+    )
+}
+
+fn unsettled_session_end_outcome() -> orbit_engine::hooks::HookOutcome {
+    let problem = "model SessionEnd hook skipped while session hook accounting is unsettled";
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "orbit: {problem}");
+    orbit_engine::hooks::HookOutcome {
+        exit_code: 1,
+        stderr: problem.into(),
+        ..Default::default()
+    }
+}
+
+fn session_end_dispatch_runner(
+    state: &SessionEndHookState,
+) -> Option<std::sync::Arc<orbit_engine::hooks::HandlerRunner>> {
+    let (ready, delegate) = state.current.as_ref()?;
+    if ready.load(std::sync::atomic::Ordering::Acquire) {
+        return Some(delegate.clone());
+    }
+    let delegate = delegate.clone();
+    Some(std::sync::Arc::new(move |hook, payload| {
+        // An async hook queued while unsafe cannot acquire authority later
+        // just because the active session has since finished settling.
+        if model_hook(hook) {
+            unsettled_session_end_outcome()
+        } else {
+            delegate(hook, payload)
+        }
+    }))
+}
+
+/// Bind lifecycle and configuration hooks to this committed identity. A hook
+/// must not borrow the provider or accounting context left by another session.
+fn bind_session_hooks(
+    config: &TuiTurnConfig,
+    tool_cx: &orbit_tools::ToolContext,
+    end_models_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    if tool_cx.session_id != config.session_id {
+        return Err("session hook context belongs to another session".into());
+    }
+    tool_cx.set_ext(crate::auto_mode::ClassifierAccounting {
+        owner_session_id: config.session_id.clone(),
+        spend_policy: None,
+    });
+    tool_cx.set_ext(crate::auto_mode::OperatorContext::default());
+    orbit_engine::hooks::set_permission_mode(config.scope.mode.config_name());
+    orbit_engine::hooks::set_session_context(
+        &config.session_id,
+        Some(
+            &crate::sessions::sessions_dir(&config.home)
+                .join(format!("{}.json", config.session_id)),
+        ),
+    );
+    let configured = configured_turn(config);
+    if let Ok(turn) = &configured {
+        crate::tool_runtime::remember_turn_config(tool_cx, turn);
+    }
+    crate::tools::install_round_notes();
+    let home = config.home.clone();
+    let current = tool_cx.clone();
+    let ready = end_models_ready.clone();
+    let guarded: std::sync::Arc<orbit_engine::hooks::HandlerRunner> =
+        std::sync::Arc::new(move |hook, payload| {
+            if hook.event == "SessionEnd"
+                && !ready.load(std::sync::atomic::Ordering::Acquire)
+                && model_hook(hook)
+            {
+                unsettled_session_end_outcome()
+            } else {
+                // This global exit runner uses the current cancellation scope;
+                // only the scoped lifecycle runner freezes its operation token.
+                crate::hook_handlers::run(&home, &current, hook, payload)
+            }
+        });
+    let mut exit = session_end_hook_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    exit.current = Some((end_models_ready.clone(), guarded.clone()));
+    orbit_engine::hooks::set_handler_runner(Some(guarded));
+    configured.map(|_| ())
+}
+
+fn session_start_hook_context(
+    config: &TuiTurnConfig,
+    tool_cx: &orbit_tools::ToolContext,
+    accounting: &RootSessionAccounting,
+    lease: &std::sync::Arc<crate::sessions::SessionLease>,
+    end_models_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    source: &str,
+    cancel: &orbit_provider_http::CancelToken,
+) -> SessionStartHookResult {
+    use orbit_engine::hooks::{HookEvent, HookHandler, HookOutcome, Hooks};
+    end_models_ready.store(false, std::sync::atomic::Ordering::Release);
+    let before = accounting.namespace().checkpoint_detailed();
+    let model_error = bind_session_hooks(config, tool_cx, end_models_ready).err();
+    if tool_cx.session_id != config.session_id {
+        return SessionStartHookResult {
+            context: String::new(),
+            notices: vec!["Session start hooks refused a mismatched session context".into()],
+            accounting_changed: false,
+            unfinished_models: Vec::new(),
+        };
+    }
+    let _cancel_scope = ToolCancelScope::new(tool_cx, cancel);
+    let delegate = crate::hook_handlers::runner(&config.home, tool_cx);
+    let token = cancel.clone();
+    let runner = std::sync::Arc::new(
+        move |hook: &orbit_engine::hooks::HookConfig, payload: &serde_json::Value| {
+            let problem = if token.is_cancelled() {
+                Some("session start hook cancelled".to_owned())
+            } else if matches!(
+                hook.handler,
+                Some(HookHandler::Prompt { .. } | HookHandler::Agent { .. })
+            ) {
+                model_error
+                    .as_ref()
+                    .map(|error| format!("session hook model configuration unavailable: {error}"))
+            } else {
+                None
+            };
+            match problem {
+                Some(stderr) => HookOutcome {
+                    exit_code: 1,
+                    stderr,
+                    ..Default::default()
+                },
+                None => delegate(hook, payload),
+            }
+        },
+    );
+    let _handler_scope = orbit_engine::hooks::handler_runner_scope(runner.clone());
+    let hooks = Hooks::load(
+        &config.home,
+        orbit_engine::hooks::project_trusted(&config.home),
+    );
+    let mut notices = Vec::new();
+    let mut unfinished_models = Vec::new();
+    let mut fire = |event: HookEvent, payload: &serde_json::Value| {
+        let mut outcomes = Vec::new();
+        for hook in hooks
+            .hooks
+            .iter()
+            .filter(|hook| hook.event == event.as_str())
+        {
+            if cancel.is_cancelled() {
+                if notices.len() < 8 {
+                    notices.push(format!(
+                        "Session start ({source}) cancelled after identity publication; the current session is retained"
+                    ));
+                }
+                break;
+            }
+            let model_handler = matches!(
+                hook.handler,
+                Some(HookHandler::Prompt { .. } | HookHandler::Agent { .. })
+            );
+            let reject_async_model = hook.run_async && model_handler;
+            let mut selected = hook.clone();
+            let refusal_scope = reject_async_model.then(|| {
+                // A detached paid request cannot be reconciled before this
+                // identity is published. Async command/HTTP producers remain
+                // supported; model checks must finish under this owner.
+                selected.run_async = false;
+                orbit_engine::hooks::handler_runner_scope(std::sync::Arc::new(|_, _| {
+                    HookOutcome {
+                        exit_code: 1,
+                        stderr: "asynchronous model session-start hooks are unsupported; use a synchronous prompt or agent handler".into(),
+                        ..Default::default()
+                    }
+                }))
+            });
+            let selected = Hooks {
+                hooks: vec![selected],
+                project_trusted: hooks.project_trusted,
+            };
+            // Allocate before dispatch: a timeout may happen while the runner
+            // thread has not reached its first instruction or journal write.
+            let completion = (model_handler && !reject_async_model).then(|| {
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = done.clone();
+                let runner = runner.clone();
+                let lease = lease.clone();
+                let scope = orbit_engine::hooks::handler_runner_scope(std::sync::Arc::new(
+                    move |hook, payload| {
+                        let _lease = &lease;
+                        let _completion = HookCompletion(observed.clone());
+                        runner(hook, payload)
+                    },
+                ));
+                (done, scope)
+            });
+            let result = selected.fire(event, payload);
+            if let Some((done, scope)) = completion {
+                drop(scope);
+                if result.is_empty() {
+                    // A matcher/condition/bare suppression selected no runner.
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if result.iter().any(|outcome| outcome.exit_code == -2) {
+                    cancel.cancel();
+                    // Give cooperative cancellation a short bounded chance to
+                    // settle. The acknowledgement, never a checkpoint delta,
+                    // decides whether later work can use this namespace.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    while !done.load(std::sync::atomic::Ordering::Acquire)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+                if !done.load(std::sync::atomic::Ordering::Acquire) {
+                    unfinished_models.push(done);
+                }
+            }
+            drop(refusal_scope);
+            for outcome in &result {
+                if outcome.exit_code != 0 && notices.len() < 8 {
+                    let detail: String = crate::daemon::scan_display(&outcome.stderr)
+                        .chars()
+                        .take(512)
+                        .collect();
+                    notices.push(format!(
+                        "{} hook did not complete for {source}: {}",
+                        event.as_str(),
+                        if detail.is_empty() {
+                            "inspect the configured handler"
+                        } else {
+                            &detail
+                        }
+                    ));
+                }
+            }
+            outcomes.extend(result);
+        }
+        outcomes
+    };
+    let transcript_path =
+        crate::sessions::sessions_dir(&config.home).join(format!("{}.json", config.session_id));
+    if hooks
+        .hooks
+        .iter()
+        .any(|hook| hook.event == "InstructionsLoaded")
+    {
+        for (path, bytes) in
+            orbit_engine::context::instruction_files(&config.home, &tool_cx.working_dir)
+        {
+            let _ = fire(
+                HookEvent::InstructionsLoaded,
+                &serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "bytes": bytes,
+                    "load_reason": "session_start",
+                    "session_id": config.session_id,
+                    "transcript_path": transcript_path,
+                    "cwd": tool_cx.cwd(),
+                    "permission_mode": config.scope.mode.config_name(),
+                }),
+            );
+        }
+    }
+    let outcomes = fire(
+        HookEvent::SessionStart,
+        &serde_json::json!({
+            "frontend": "tui",
+            "source": source,
+            "session_id": config.session_id,
+            "transcript_path": transcript_path,
+            "cwd": tool_cx.cwd(),
+            "permission_mode": config.scope.mode.config_name(),
+        }),
+    );
+    let context = orbit_engine::hooks::prompt_context(&outcomes)
+        .map(|context| format!("\n\n## Session start hook output\n{context}"))
+        .unwrap_or_default();
+    let after = accounting.namespace().checkpoint_detailed();
+    SessionStartHookResult {
+        context,
+        notices,
+        unfinished_models,
+        accounting_changed: match (&before, &after) {
+            (Ok(before), Ok(after)) => before != after,
+            _ => true,
+        },
+    }
+}
+
 struct PendingCouncilFinal {
     session_id: String,
     cancel: orbit_provider_http::CancelToken,
@@ -1539,10 +1868,21 @@ fn worker_main(
 
 fn worker_main_owned(
     ctx: WorkerCtx,
+    config: TuiTurnConfig,
+    cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
+    lease: crate::sessions::SessionLease,
+) {
+    worker_main_initialized(ctx, config, cancel_slot, lease, |_| {});
+}
+
+fn worker_main_initialized(
+    ctx: WorkerCtx,
     mut config: TuiTurnConfig,
     cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
-    mut lease: crate::sessions::SessionLease,
+    lease: crate::sessions::SessionLease,
+    initialize: impl FnOnce(&orbit_tools::ToolContext),
 ) {
+    let mut lease = std::sync::Arc::new(lease);
     config.home = lease.home().to_path_buf();
     let mut selection_origin =
         match crate::sessions::read_selection_origin(lease.home(), lease.session_id()) {
@@ -1611,6 +1951,7 @@ fn worker_main_owned(
     let mut turns: u64 = config.initial_turns;
     let mut tool_cx = session_tool_context(&config, &ctx.sender);
     tool_cx.working_dir = workspace.clone();
+    initialize(&tool_cx);
     // The ledger chip's total: the records already in the chain.
     orbit_hud_tui::emit_ledger_appended(
         &ctx.sender,
@@ -1665,71 +2006,67 @@ fn worker_main_owned(
     let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
     tool_cx.set_ext(MemoryBytes(built.memory_bytes));
     let mut system_prompt = built.text;
-    // SessionStart hooks run for interactive sessions too. What they print
-    // (or return as additionalContext) becomes context for the model, kept
-    // apart from the system prompt so rebuilding that never drops it.
     let _ = SANDBOX_HOME.set(config.home.clone());
-    orbit_engine::hooks::set_permission_mode(config.scope.mode.config_name());
-    orbit_engine::hooks::set_session_context(
-        &config.session_id,
-        Some(
-            &crate::sessions::sessions_dir(&config.home)
-                .join(format!("{}.json", config.session_id)),
-        ),
-    );
-    let session_hook_context = {
-        let hooks = orbit_engine::hooks::Hooks::load(
-            &config.home,
-            orbit_engine::hooks::project_trusted(&config.home),
-        );
-        // InstructionsLoaded: one event per instruction or rule file the
-        // prompt was built from. Skipped entirely when nothing listens.
-        if hooks
-            .hooks
-            .iter()
-            .any(|hook| hook.event == "InstructionsLoaded")
-        {
-            let working_dir = std::env::current_dir().unwrap_or_default();
-            for (path, bytes) in
-                orbit_engine::context::instruction_files(&config.home, &working_dir)
-            {
-                let _ = hooks.fire(
-                    orbit_engine::hooks::HookEvent::InstructionsLoaded,
-                    &serde_json::json!({
-                        "file_path": path.to_string_lossy(),
-                        "bytes": bytes,
-                        "load_reason": "session_start",
-                    }),
-                );
-            }
-        }
-        let outcomes = hooks.fire(
-            orbit_engine::hooks::HookEvent::SessionStart,
-            &serde_json::json!({
-                "frontend": "tui",
-                "source": if config.initial_turns > 0 { "resume" } else { "startup" },
-                "session_id": config.session_id,
-            }),
-        );
-        orbit_engine::hooks::prompt_context(&outcomes)
-            .map(|context| format!("\n\n## Session start hook output\n{context}"))
-            .unwrap_or_default()
-    };
-
     let mut binding = SessionBinding {
         session_id: config.session_id.clone(),
         generation: 1,
     };
     let mut qualification = checked_cost(&accounting, &seed, true);
-    // The auto-mode classifier reads the operator's recent messages and
-    // bills to this session's housekeeping. Both are refreshed as turns
-    // run; the accounting binding never changes for the session.
-    tool_cx.set_ext(crate::auto_mode::ClassifierAccounting {
-        owner_session_id: config.session_id.clone(),
-        spend_policy: None,
-    });
-    tool_cx.set_ext(crate::auto_mode::OperatorContext::default());
-    crate::hook_handlers::install(&config.home, &tool_cx);
+    // Lifecycle hooks start only after their provider and managed accounting
+    // owner exist. Their token remains reachable while startup is in flight.
+    let startup_cancel = orbit_provider_http::CancelToken::new();
+    let session_end_models_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut slot) = cancel_slot.lock() {
+        *slot = Some(startup_cancel.clone());
+    }
+    let mut startup_hooks = session_start_hook_context(
+        &config,
+        &tool_cx,
+        &accounting,
+        &lease,
+        &session_end_models_ready,
+        if config.initial_turns > 0 {
+            "resume"
+        } else {
+            "startup"
+        },
+        &startup_cancel,
+    );
+    let mut session_hook_context = std::mem::take(&mut startup_hooks.context);
+    let mut session_hook_publication_pending = false;
+    if startup_hooks.accounting_changed
+        && !save_turn(
+            &config,
+            &lease,
+            &accounting,
+            &transcript,
+            turns,
+            &mut cum_input,
+            &mut cum_output,
+            &mut cum_cost,
+            selection_origin,
+            &ctx.sender,
+            &mut qualification,
+            true,
+        )
+    {
+        session_hook_publication_pending = true;
+        qualification = CostQualification::Unavailable;
+        startup_hooks
+            .notices
+            .push("Session start hook accounting needs inspection before further requests".into());
+    }
+    if let Ok(mut slot) = cancel_slot.lock() {
+        *slot = None;
+    }
+    let mut unfinished_session_hooks = startup_hooks.unfinished_models;
+    if !unfinished_session_hooks.is_empty() {
+        qualification = CostQualification::Unavailable;
+    }
+    session_end_models_ready.store(
+        unfinished_session_hooks.is_empty() && !session_hook_publication_pending,
+        std::sync::atomic::Ordering::Release,
+    );
     // A terminal session fires queued events when idle, and `--channels`
     // servers are listened to from here on.
     crate::tools::enable_idle_delivery();
@@ -1775,6 +2112,9 @@ fn worker_main_owned(
         ProjectionReason::Initial,
         ContextProjection::Unavailable,
     );
+    for notice in startup_hooks.notices {
+        ctx.sender.send(Msg::SystemMessage(notice));
+    }
     restore_council(&ctx.sender, &config.session_id, &transcript, &qualification);
     orbit_hud_tui::emit_readiness(
         &ctx.sender,
@@ -1786,6 +2126,9 @@ fn worker_main_owned(
 
     // Locally-queued commands (mod commands re-enter the Prompt flow).
     let mut pending: Vec<WorkerCommand> = Vec::new();
+    // Only a freshly created fork carries this annotation into its pending
+    // identity handoff. A later explicit resume is a separate lifecycle event.
+    let mut pending_session_starts = std::collections::BTreeMap::new();
     // Said once the interface shows the copy a blocked session went on in.
     let mut copy_notice: Option<String> = None;
     // `--fallback-model` has been used in this chat.
@@ -1836,6 +2179,75 @@ fn worker_main_owned(
             };
             cmd = *command;
             foreground = Some((operation, registration));
+        }
+        if !unfinished_session_hooks.is_empty() || session_hook_publication_pending {
+            let acknowledged = unfinished_session_hooks
+                .iter()
+                .all(|done| done.load(std::sync::atomic::Ordering::Acquire));
+            if acknowledged
+                && save_turn(
+                    &config,
+                    &lease,
+                    &accounting,
+                    &transcript,
+                    turns,
+                    &mut cum_input,
+                    &mut cum_output,
+                    &mut cum_cost,
+                    selection_origin,
+                    &ctx.sender,
+                    &mut qualification,
+                    true,
+                )
+            {
+                unfinished_session_hooks.clear();
+                session_hook_publication_pending = false;
+                session_end_models_ready.store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                session_hook_publication_pending |= acknowledged;
+                // No new hook, request, configuration mutation or identity
+                // handoff can overtake a detached lifecycle handler. Its
+                // runner also retains the lease until actual completion,
+                // even if this worker/front end has already gone away.
+                qualification = CostQualification::Unavailable;
+                let reason = if let Some((operation, registration)) = foreground.take() {
+                    drop(registration);
+                    ProjectionReason::Operation { operation }
+                } else if let WorkerCommand::Compact(operation)
+                | WorkerCommand::ClearSession(operation) = &cmd
+                {
+                    let _ = operation.finish_unstarted();
+                    ProjectionReason::Manual {
+                        operation: operation.clone(),
+                        outcome: ManualOutcome::Failed,
+                        applied: false,
+                    }
+                } else {
+                    ProjectionReason::Refresh
+                };
+                emit_session_projection(
+                    &ctx.sender,
+                    &config,
+                    &binding,
+                    &transcript,
+                    turns,
+                    cum_input,
+                    cum_output,
+                    cum_cost,
+                    qualification,
+                    reason,
+                    ContextProjection::PreserveUnchanged,
+                );
+                ctx.sender.send(Msg::SystemMessage(
+                    if acknowledged {
+                        "Session-start hook accounting could not be saved; requests remain paused"
+                    } else {
+                        "A cancelled session-start model hook is still settling; requests remain paused"
+                    }
+                    .into(),
+                ));
+                continue;
+            }
         }
         // A bound mod intent owns the ordinary prompt it expands to, without
         // releasing ownership or trying to consume its ticket a second time.
@@ -1906,7 +2318,7 @@ fn worker_main_owned(
         let mut view_journal = ordinary_view
             .as_ref()
             .map(|_| OrdinaryViewJournal::new(&transcript));
-        let project_after = matches!(
+        let mut project_after = matches!(
             &cmd,
             WorkerCommand::Prompt(_)
                 | WorkerCommand::PlanPrompt(_)
@@ -1917,6 +2329,7 @@ fn worker_main_owned(
         ) || matches!(&cmd, WorkerCommand::Route(value) if value.trim() == "auto");
         let context_projection_command = context_projection_command(&cmd);
         let mut context_projection = ContextProjection::Unavailable;
+        let mut accounting_publication_saved = true;
         let mut projection_reason = ProjectionReason::Refresh;
         let manual_action = match &cmd {
             WorkerCommand::Compact(_) => Some(ManualAction::Compact),
@@ -2112,6 +2525,7 @@ fn worker_main_owned(
                         match fork_id {
                             Some(id) => {
                                 copy_notice = Some(notice);
+                                pending_session_starts.insert(id.clone(), "fork");
                                 pending.push(WorkerCommand::ResumeSession(id));
                             }
                             None => orbit_hud_tui::emit_status(&turn_sender, &notice),
@@ -2192,7 +2606,7 @@ fn worker_main_owned(
                         ),
                     );
                     let directive = if council_prompt {
-                        String::new()
+                        session_hook_context.clone()
                     } else {
                         format!(
                             "{system_prompt}{session_hook_context}{}{}{}",
@@ -2288,6 +2702,7 @@ fn worker_main_owned(
                         match fork_id {
                             Some(id) => {
                                 copy_notice = Some(notice);
+                                pending_session_starts.insert(id.clone(), "fork");
                                 pending.push(WorkerCommand::ResumeSession(id));
                             }
                             None => orbit_hud_tui::emit_status(&turn_sender, &notice),
@@ -2428,6 +2843,7 @@ fn worker_main_owned(
                                 // select the fallback model, ask again.
                                 pending.push(WorkerCommand::Prompt(prompt.clone()));
                                 pending.push(WorkerCommand::SetModel(spec));
+                                pending_session_starts.insert(fork.session_id.clone(), "fork");
                                 pending.push(WorkerCommand::ResumeSession(fork.session_id));
                             }
                             Err(error) => orbit_hud_tui::emit_status(
@@ -2660,6 +3076,9 @@ fn worker_main_owned(
                 }
                 WorkerCommand::ResumeSession(id) => {
                     let same_id = id.strip_suffix(".json").unwrap_or(&id) == lease.session_id();
+                    let session_source = pending_session_starts
+                        .remove(id.strip_suffix(".json").unwrap_or(&id))
+                        .unwrap_or("resume");
                     let target = if same_id {
                         lease.load().map(|saved| (None, saved))
                     } else {
@@ -2758,12 +3177,16 @@ fn worker_main_owned(
                                 tool_cx.working_dir.clone(),
                             );
                             let previous = binding.clone();
+                            if !same_id {
+                                session_end_models_ready
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                            }
                             qualification = checked_cost(&candidate_accounting, &saved, true);
                             accounting = candidate_accounting;
                             transcript_log = Some(candidate_log);
                             config = candidate;
                             if let Some(candidate_lease) = candidate_lease {
-                                lease = candidate_lease;
+                                lease = std::sync::Arc::new(candidate_lease);
                             }
                             transcript = saved.to_transcript();
                             turns = saved.turns;
@@ -2779,6 +3202,53 @@ fn worker_main_owned(
                                 projection_reason = ProjectionReason::Resume { previous };
                             }
                             binding = candidate_binding;
+                            if !same_id {
+                                let token = orbit_provider_http::CancelToken::new();
+                                if let Ok(mut slot) = cancel_slot.lock() {
+                                    *slot = Some(token.clone());
+                                }
+                                let mut started = session_start_hook_context(
+                                    &config,
+                                    &tool_cx,
+                                    &accounting,
+                                    &lease,
+                                    &session_end_models_ready,
+                                    session_source,
+                                    &token,
+                                );
+                                session_hook_context = std::mem::take(&mut started.context);
+                                if started.accounting_changed
+                                    && !save_turn(
+                                        &config,
+                                        &lease,
+                                        &accounting,
+                                        &transcript,
+                                        turns,
+                                        &mut cum_input,
+                                        &mut cum_output,
+                                        &mut cum_cost,
+                                        selection_origin,
+                                        &turn_sender,
+                                        &mut qualification,
+                                        true,
+                                    )
+                                {
+                                    accounting_publication_saved = false;
+                                    session_hook_publication_pending = true;
+                                    started.notices.push(
+                                        "Resumed session hook accounting needs inspection; the resumed identity is retained".into(),
+                                    );
+                                }
+                                if let Ok(mut slot) = cancel_slot.lock() {
+                                    *slot = None;
+                                }
+                                unfinished_session_hooks = started.unfinished_models;
+                                if !unfinished_session_hooks.is_empty() {
+                                    qualification = CostQualification::Unavailable;
+                                    accounting_publication_saved = false;
+                                }
+                                after_projection.extend(started.notices);
+                            }
                         }
                         Err(error) => {
                             if same_id {
@@ -2948,8 +3418,10 @@ fn worker_main_owned(
                                         );
                                     } else {
                                         // All fallible candidate work is complete before this identity swap.
+                                        session_end_models_ready
+                                            .store(false, std::sync::atomic::Ordering::Release);
                                         config = candidate.config;
-                                        lease = candidate.lease;
+                                        lease = std::sync::Arc::new(candidate.lease);
                                         accounting = candidate.accounting;
                                         qualification = candidate.cost;
                                         binding = candidate.binding;
@@ -2962,8 +3434,68 @@ fn worker_main_owned(
                                         cum_input = 0;
                                         cum_output = 0;
                                         cum_cost = 0;
+                                        shell_notes.clear();
+                                        watched_files.clear();
+                                        command_grants = None;
+                                        command_skill = None;
+                                        command_model = None;
+                                        fallback_used = false;
+                                        copy_notice = None;
                                         applied = true;
-                                        outcome = ManualOutcome::Completed;
+                                        let built = build_session_prompt(
+                                            &config.home,
+                                            &config.model,
+                                            &mods,
+                                            &mods_enabled,
+                                        );
+                                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                                        system_prompt = built.text;
+                                        let mut started = session_start_hook_context(
+                                            &config,
+                                            &tool_cx,
+                                            &accounting,
+                                            &lease,
+                                            &session_end_models_ready,
+                                            "clear",
+                                            &token,
+                                        );
+                                        session_hook_context = std::mem::take(&mut started.context);
+                                        let published = !started.accounting_changed
+                                            || save_turn(
+                                                &config,
+                                                &lease,
+                                                &accounting,
+                                                &transcript,
+                                                turns,
+                                                &mut cum_input,
+                                                &mut cum_output,
+                                                &mut cum_cost,
+                                                selection_origin,
+                                                &turn_sender,
+                                                &mut qualification,
+                                                true,
+                                            );
+                                        if !published {
+                                            qualification = CostQualification::Unavailable;
+                                            session_hook_publication_pending = true;
+                                        }
+                                        unfinished_session_hooks = started.unfinished_models;
+                                        if !unfinished_session_hooks.is_empty() {
+                                            qualification = CostQualification::Unavailable;
+                                        }
+                                        outcome = if !published
+                                            || token.is_cancelled()
+                                            || matches!(
+                                                qualification,
+                                                CostQualification::Uncertain { .. }
+                                                    | CostQualification::Unavailable
+                                            ) {
+                                            started.notices.push("The new session is active, but its session-start hooks or accounting need inspection".into());
+                                            ManualOutcome::Unknown
+                                        } else {
+                                            ManualOutcome::Completed
+                                        };
+                                        after_projection.extend(started.notices);
                                         orbit_hud_tui::emit_status(
                                             &turn_sender,
                                             &format!(
@@ -3000,6 +3532,11 @@ fn worker_main_owned(
                         } else {
                             ContextProjection::Unavailable
                         };
+                        session_end_models_ready.store(
+                            unfinished_session_hooks.is_empty()
+                                && !session_hook_publication_pending,
+                            std::sync::atomic::Ordering::Release,
+                        );
                         emit_session_projection(
                             &turn_sender,
                             &config,
@@ -3291,6 +3828,13 @@ fn worker_main_owned(
                     turn_sender.send(Msg::SystemMessage(text));
                 }
                 WorkerCommand::Inspect(what) => {
+                    session_end_models_ready.store(false, std::sync::atomic::Ordering::Release);
+                    // Configuration hooks are owner actions outside an engine
+                    // turn, so they need this worker's current managed runner.
+                    let _hook_scope = orbit_engine::hooks::handler_runner_scope(
+                        crate::hook_handlers::runner(&config.home, &tool_cx),
+                    );
+                    let hook_accounting_before = accounting.namespace().checkpoint_detailed();
                     let words: Vec<&str> = what.split_whitespace().collect();
                     let owned = |words: &[&str]| -> Vec<String> {
                         words.iter().map(|word| (*word).to_owned()).collect()
@@ -3457,6 +4001,7 @@ fn worker_main_owned(
                                         short_session_id(&binding.session_id),
                                         binding.session_id
                                     );
+                                    pending_session_starts.insert(fork.session_id.clone(), "fork");
                                     pending.push(WorkerCommand::ResumeSession(fork.session_id));
                                     text
                                 }
@@ -3727,9 +4272,43 @@ fn worker_main_owned(
                             words.first().copied().unwrap_or(""),
                         ),
                     };
+                    let hook_accounting_after = accounting.namespace().checkpoint_detailed();
+                    let hook_accounting_changed =
+                        match (&hook_accounting_before, &hook_accounting_after) {
+                            (Ok(before), Ok(after)) => before != after,
+                            _ => true,
+                        };
+                    if hook_accounting_changed {
+                        accounting_publication_saved = save_turn(
+                            &config,
+                            &lease,
+                            &accounting,
+                            &transcript,
+                            turns,
+                            &mut cum_input,
+                            &mut cum_output,
+                            &mut cum_cost,
+                            selection_origin,
+                            &turn_sender,
+                            &mut qualification,
+                            true,
+                        );
+                        if !accounting_publication_saved {
+                            session_hook_publication_pending = true;
+                            qualification = CostQualification::Unavailable;
+                            after_projection.push(
+                                "Configuration hook accounting could not be published; inspect the saved session before further requests".into(),
+                            );
+                        }
+                        project_after = true;
+                    }
                     // A command that answered another way has no line.
                     if !text.is_empty() {
-                        turn_sender.send(Msg::SystemMessage(text));
+                        if hook_accounting_changed {
+                            after_projection.push(text);
+                        } else {
+                            turn_sender.send(Msg::SystemMessage(text));
+                        }
                     }
                 }
                 WorkerCommand::ShellBang(command) => {
@@ -3850,6 +4429,10 @@ fn worker_main_owned(
                 },
             }
         }
+        session_end_models_ready.store(
+            unfinished_session_hooks.is_empty() && !session_hook_publication_pending,
+            std::sync::atomic::Ordering::Release,
+        );
         if let Some((operation, registration)) = foreground {
             let mut view = crate::sessions::SessionFile::from_chat(
                 &config.session_id,
@@ -3868,7 +4451,7 @@ fn worker_main_owned(
                 cum_input = view.input_tokens;
                 cum_output = view.output_tokens;
                 cum_cost = view.cost_microcents;
-                qualification = checked_cost(&accounting, &view, true);
+                qualification = checked_cost(&accounting, &view, accounting_publication_saved);
             } else {
                 qualification = CostQualification::Unavailable;
             }
@@ -3964,13 +4547,14 @@ pub fn fire_session_end(home: &std::path::Path) {
     // Held while the hooks run: whichever caller comes second waits for
     // the first to finish, so the process does not end under a hook that
     // the worker has only just started.
-    static FIRED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
-    let mut fired = FIRED
+    let mut state = session_end_hook_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if std::mem::replace(&mut *fired, true) {
+    if std::mem::replace(&mut state.fired, true) {
         return;
     }
+    let _dispatch_scope =
+        session_end_dispatch_runner(&state).map(orbit_engine::hooks::handler_runner_scope);
     let _ = orbit_engine::hooks::Hooks::load(home, orbit_engine::hooks::project_trusted(home))
         .fire(
             orbit_engine::hooks::HookEvent::SessionEnd,
@@ -6818,6 +7402,7 @@ fn run_tui_turn_observed(
             &config.session_id,
             &base_turn_config,
             question,
+            mods_directive,
             transcript,
             accounting,
             tool_cx
@@ -9921,6 +10506,1046 @@ reasoning_rate_policy = "output_rate"
         assert!(phases.iter().any(|phase| phase == "JUDGING"));
         assert_eq!(phases.last().map(String::as_str), Some("VERDICT"));
         assert_eq!(final_count, 1);
+    }
+
+    fn session_start_recorder(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let script = home.join("record-session-hooks.py");
+        let events = home.join("session-hook-events.jsonl");
+        let producer = home.join("pane-producer-binding.json");
+        std::fs::write(
+            &script,
+            r#"import json, pathlib, sys
+event = json.load(sys.stdin)
+if event["hook_event_name"] == "UserPromptSubmit":
+    print(json.dumps({"hookSpecificOutput": {"updatedInput": {"prompt": "/council sanitized question"}}}))
+    sys.exit(0)
+record = {key: event.get(key) for key in ("hook_event_name", "session_id", "source", "transcript_path")}
+with pathlib.Path(sys.argv[1]).open("a") as output:
+    output.write(json.dumps(record) + "\n")
+if event["hook_event_name"] == "SessionStart":
+    pathlib.Path(sys.argv[2]).write_text(json.dumps(record))
+    marker = "SESSION_HOOK_CONTEXT[" + event["session_id"] + "][" + event["source"] + "]"
+    print(json.dumps({"hookSpecificOutput": {"additionalContext": marker}}))
+"#,
+        )
+        .unwrap();
+        let quote =
+            |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let command = format!(
+            "python3 {} {} {}",
+            quote(&script),
+            quote(&events),
+            quote(&producer)
+        );
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"SessionStart\"\ncommand = {command:?}\ntimeout_secs = 2\n\n[[hooks]]\nevent = \"ConfigChange\"\ncommand = {command:?}\ntimeout_secs = 2\n\n[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = {command:?}\ntimeout_secs = 2\n"
+            ),
+        )
+        .unwrap();
+        (events, producer)
+    }
+
+    fn recorded_session_hooks(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn isolated_council_clear_case(name: &str) -> bool {
+        const CHILD_CASE: &str = "ORBIT_COUNCIL_CLEAR_TEST_CHILD";
+        if std::env::var(CHILD_CASE).as_deref() == Ok(name) {
+            return true;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_CASE, name)
+            .env("ORBIT_CLAUDE_COMPAT", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "isolated Council clear case failed:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return false;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "isolated Council clear case exceeded its deadline:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    struct SessionHookWorker {
+        bus: orbit_hud_tui::bus::Bus,
+        notices: Vec<String>,
+        commands: Option<mpsc::Sender<WorkerCommand>>,
+        cancel: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SessionHookWorker {
+        fn start(config: TuiTurnConfig) -> (Self, SessionProjection) {
+            Self::initialized(config, |_| {})
+        }
+
+        fn initialized(
+            config: TuiTurnConfig,
+            initialize: impl FnOnce(&orbit_tools::ToolContext) + Send + 'static,
+        ) -> (Self, SessionProjection) {
+            let lease = fresh_council_worker_lease(&config);
+            let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+            let (commands, command_rx) = mpsc::channel();
+            let cancel = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let worker_cancel = cancel.clone();
+            let thread = std::thread::spawn(move || {
+                worker_main_initialized(
+                    WorkerCtx {
+                        sender,
+                        approvals: ApprovalRegistry::new(),
+                        command_rx,
+                    },
+                    config,
+                    worker_cancel,
+                    lease,
+                    initialize,
+                );
+            });
+            let mut worker = Self {
+                bus,
+                notices: Vec::new(),
+                commands: Some(commands),
+                cancel,
+                thread: Some(thread),
+            };
+            let initial =
+                worker.projection(|view| matches!(view.reason, ProjectionReason::Initial));
+            (worker, initial)
+        }
+
+        fn projection(
+            &mut self,
+            expected: impl Fn(&SessionProjection) -> bool,
+        ) -> SessionProjection {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match self.bus.try_recv() {
+                    Some(Msg::SessionProjection(view)) if expected(&view) => return view,
+                    Some(Msg::BackendError(error) | Msg::BackendNotice(error)) => {
+                        panic!("session hook worker failed: {error}")
+                    }
+                    Some(Msg::SystemMessage(text)) => self.notices.push(text),
+                    _ => {}
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "session hook projection absent"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        fn command(
+            &mut self,
+            binding: &SessionBinding,
+            command: WorkerCommand,
+            id: u64,
+        ) -> SessionProjection {
+            let operation =
+                ForegroundOperation::new(binding.clone(), command.foreground_kind().unwrap(), id)
+                    .unwrap();
+            self.commands
+                .as_ref()
+                .unwrap()
+                .send(WorkerCommand::Bound {
+                    operation: operation.clone(),
+                    command: Box::new(command),
+                })
+                .unwrap();
+            self.projection(|view| {
+                matches!(&view.reason, ProjectionReason::Operation { operation: observed } if observed == &operation)
+            })
+        }
+
+        fn clear(&mut self, binding: &SessionBinding, id: u64) -> SessionProjection {
+            let operation = orbit_hud_tui::worker::ManualOperation::new(
+                binding.clone(),
+                ManualAction::Clear,
+                id,
+            )
+            .unwrap();
+            self.commands
+                .as_ref()
+                .unwrap()
+                .send(WorkerCommand::ClearSession(operation.clone()))
+                .unwrap();
+            self.projection(|view| {
+                matches!(&view.reason, ProjectionReason::Manual { operation: observed, .. } if observed == &operation)
+            })
+        }
+    }
+
+    impl Drop for SessionHookWorker {
+        fn drop(&mut self) {
+            if let Ok(slot) = self.cancel.lock()
+                && let Some(token) = slot.as_ref()
+            {
+                token.cancel();
+            }
+            self.commands.take();
+            if let Some(thread) = self.thread.take() {
+                // Each caller is protected by the isolated process watchdog.
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn lifecycle_fixture(home: &std::path::Path, mock: &MockProvider) -> TuiTurnConfig {
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config(&mock.endpoint, &mock.endpoint),
+        )
+        .unwrap();
+        let mut initial = config(home);
+        initial.provider_id = "first".into();
+        initial.model = "shared-notools".into();
+        initial.gate = mock.endpoint.clone();
+        initial
+    }
+
+    #[test]
+    fn session_start_clear_and_config_hooks_bill_only_the_current_managed_owner() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::session_start_clear_and_config_hooks_bill_only_the_current_managed_owner",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        std::fs::write(home.join("settings.toml"),
+            "[[hooks]]\nevent = \"SessionStart\"\nprompt = \"Check fixture $ARGUMENTS\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 2\n\n[[hooks]]\nevent = \"ConfigChange\"\nprompt = \"Check fixture $ARGUMENTS\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 2\n").unwrap();
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        let amounts = |view: &SessionProjection| {
+            (
+                view.turns,
+                view.input_tokens,
+                view.output_tokens,
+                view.cost_microcents,
+            )
+        };
+        assert_eq!(amounts(&startup), (0, 3, 2, 15));
+        assert_eq!(startup.cost, CostQualification::Known { revision: 2 });
+        let old_path = home
+            .join("sessions")
+            .join(format!("{}.json", startup.binding.session_id));
+        let old_accounting = home
+            .join("context-history")
+            .join(&startup.binding.session_id)
+            .join("accounting.json");
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        let old_journal = std::fs::read(&old_accounting).unwrap();
+        let cleared = worker.clear(&startup.binding, 1);
+        assert_ne!(cleared.binding.session_id, startup.binding.session_id);
+        assert_eq!(cleared.binding.generation, startup.binding.generation + 1);
+        assert!(matches!(
+            cleared.reason,
+            ProjectionReason::Manual {
+                outcome: ManualOutcome::Completed,
+                applied: true,
+                ..
+            }
+        ));
+        assert_eq!(amounts(&cleared), (0, 3, 2, 15));
+        assert_eq!(cleared.cost, CostQualification::Known { revision: 2 });
+        assert_eq!(mock.request_count(), 2);
+        let inspected = worker.command(
+            &cleared.binding,
+            WorkerCommand::Inspect("statusline off".into()),
+            2,
+        );
+        assert_eq!(amounts(&inspected), (0, 6, 4, 30));
+        assert_eq!(inspected.cost, CostQualification::Known { revision: 4 });
+        assert_eq!(mock.request_count(), 3);
+        let body = mock.last_request().to_string();
+        assert!(body.contains(&cleared.binding.session_id), "{body}");
+        assert!(!body.contains(&startup.binding.session_id), "{body}");
+        drop(worker);
+        assert_eq!(std::fs::read(old_path).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(old_accounting).unwrap(), old_journal);
+        for (id, cost) in [
+            (&startup.binding.session_id, 15),
+            (&cleared.binding.session_id, 30),
+        ] {
+            let saved = crate::sessions::load_session(&home, id).unwrap();
+            assert_eq!(saved.cost_microcents, cost);
+            assert!(saved.transcript.is_empty());
+            let checkpoint = crate::context_history::context_journal(&home, id, None)
+                .unwrap()
+                .accounting_checkpoint_detailed()
+                .unwrap();
+            assert_eq!(checkpoint.totals().ordinary.cost_microcents, Some(0));
+            assert_eq!(checkpoint.totals().housekeeping.cost_microcents, Some(cost));
+            assert!(checkpoint.pending().is_none());
+        }
+    }
+
+    #[test]
+    fn session_start_rebinds_resume_and_fork_without_repeating_noop_or_failed_resumes() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::session_start_rebinds_resume_and_fork_without_repeating_noop_or_failed_resumes",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let (events, producer) = session_start_recorder(&home);
+        let mut target = initial.clone();
+        target.session_id = "resume-target".into();
+        drop(fresh_council_worker_lease(&target));
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        let resumed = worker.command(
+            &startup.binding,
+            WorkerCommand::ResumeSession(target.session_id.clone()),
+            1,
+        );
+        assert_eq!(resumed.binding.session_id, target.session_id);
+        assert_eq!(resumed.binding.generation, 2);
+        let noop = worker.command(
+            &resumed.binding,
+            WorkerCommand::ResumeSession(target.session_id.clone()),
+            2,
+        );
+        assert_eq!(noop.binding, resumed.binding);
+        let failed = worker.command(
+            &resumed.binding,
+            WorkerCommand::ResumeSession("missing-fixture".into()),
+            3,
+        );
+        assert_eq!(failed.binding, resumed.binding);
+        assert_eq!(recorded_session_hooks(&events).len(), 2);
+        worker.command(&resumed.binding, WorkerCommand::Inspect("fork".into()), 4);
+        let forked = worker.projection(|view| matches!(&view.reason, ProjectionReason::Resume { previous } if previous == &resumed.binding));
+        assert_ne!(forked.binding.session_id, target.session_id);
+        assert_eq!(forked.binding.generation, 3);
+        let again = worker.command(
+            &forked.binding,
+            WorkerCommand::ResumeSession(target.session_id.clone()),
+            5,
+        );
+        assert_eq!(again.binding.session_id, target.session_id);
+        assert_eq!(again.binding.generation, 4);
+        let records = recorded_session_hooks(&events);
+        assert_eq!(records.len(), 4, "{records:?}");
+        for (record, source, id) in [
+            (&records[0], "startup", &startup.binding.session_id),
+            (&records[1], "resume", &resumed.binding.session_id),
+            (&records[2], "fork", &forked.binding.session_id),
+            (&records[3], "resume", &again.binding.session_id),
+        ] {
+            assert_eq!(record["source"], source);
+            assert_eq!(record["session_id"], *id);
+            assert_eq!(
+                record["transcript_path"],
+                home.join("sessions")
+                    .join(format!("{id}.json"))
+                    .to_string_lossy()
+                    .as_ref()
+            );
+        }
+        let attached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(producer).unwrap()).unwrap();
+        assert_eq!(attached["session_id"], again.binding.session_id);
+        assert_eq!(attached["source"], "resume");
+        assert_eq!(mock.request_count(), 0);
+    }
+
+    #[test]
+    fn timed_out_session_model_hooks_block_controls_and_hold_ownership_until_acknowledged() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::timed_out_session_model_hooks_block_controls_and_hold_ownership_until_acknowledged",
+        ) {
+            return;
+        }
+        struct Release(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        for exit_before_ack in [false, true] {
+            let mock = MockProvider::start();
+            let home = TestHome::new();
+            let initial = lifecycle_fixture(&home, &mock);
+            let (events, producer) = session_start_recorder(&home);
+            // Keep only the ConfigChange producer, so a blocked control can
+            // prove it ran neither a hook nor its configuration mutation.
+            let text = std::fs::read_to_string(home.join("settings.toml")).unwrap();
+            let config_change = text
+                .split("[[hooks]]")
+                .find(|part| part.contains("ConfigChange"))
+                .unwrap();
+            std::fs::write(home.join("settings.toml"), format!("[[hooks]]{config_change}\n[[hooks]]\nevent = \"SessionStart\"\nprompt = \"Check fixture\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 1\n")).unwrap();
+            let cleanup = home.join("exit-cleanup");
+            use std::io::Write;
+            let cleanup_command = format!(
+                "printf cleaned > '{}'",
+                cleanup.display().to_string().replace('\'', "'\\''")
+            );
+            std::fs::OpenOptions::new().append(true).open(home.join("settings.toml")).unwrap().write_all(format!("\n[[hooks]]\nevent = \"SessionEnd\"\nprompt = \"must not dispatch while pending\"\nasync = true\nmodel = \"first/shared-notools\"\ntimeout_secs = 1\n\n[[hooks]]\nevent = \"SessionEnd\"\nagent = \"must not dispatch while pending\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 1\n\n[[hooks]]\nevent = \"SessionEnd\"\ncommand = {cleanup_command:?}\ntimeout_secs = 1\n").as_bytes()).unwrap();
+            let gate =
+                std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let release = Release(gate.clone());
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let judge_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = judge_calls.clone();
+            let (mut worker, startup) = SessionHookWorker::initialized(initial, move |cx| {
+                cx.set_ext(crate::hook_handlers::HookJudge(std::sync::Arc::new(
+                    move |_| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        let (lock, wake) = &*gate;
+                        let (_released, timeout) = wake
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                std::time::Duration::from_secs(8),
+                                |released| !*released,
+                            )
+                            .unwrap();
+                        assert!(
+                            !timeout.timed_out(),
+                            "fixture judge release deadline exceeded"
+                        );
+                        done_tx.send(()).unwrap();
+                        Ok("{\"decision\":\"allow\"}".into())
+                    },
+                )));
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(startup.cost, CostQualification::Unavailable);
+            if !exit_before_ack {
+                // The process-level caller can win the once-only exit hook
+                // race while the worker's old delegate is still running.
+                fire_session_end(&home);
+                assert_eq!(std::fs::read_to_string(&cleanup).unwrap(), "cleaned");
+                assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            let checkpoint =
+                crate::context_history::context_journal(&home, &startup.binding.session_id, None)
+                    .unwrap()
+                    .accounting_checkpoint_detailed()
+                    .unwrap();
+            assert_eq!(
+                checkpoint.revision().0,
+                0,
+                "the judge paused before admission"
+            );
+            assert!(checkpoint.pending().is_none());
+            let settings_before = std::fs::read(home.join("settings.toml")).unwrap();
+            let blocked = worker.command(
+                &startup.binding,
+                WorkerCommand::Inspect("statusline off".into()),
+                1,
+            );
+            assert_eq!(blocked.binding, startup.binding);
+            assert_eq!(blocked.cost, CostQualification::Unavailable);
+            assert_eq!(
+                std::fs::read(home.join("settings.toml")).unwrap(),
+                settings_before
+            );
+            assert!(!producer.exists());
+            assert!(!events.exists());
+            assert_eq!(mock.request_count(), 0);
+            let acquire = || {
+                crate::sessions::SessionLease::acquire(
+                    &home,
+                    &startup.binding.session_id,
+                    "ownership-probe",
+                )
+            };
+            if exit_before_ack {
+                drop(worker);
+                assert!(
+                    acquire().is_err(),
+                    "delegate must retain lease after worker exit"
+                );
+                drop(release);
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if acquire().is_ok() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "acknowledged delegate retained lease"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            } else {
+                drop(release);
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                // Wait for the actual runner return, which follows the judge's
+                // notification and is the only acknowledgement the worker uses.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let settled = loop {
+                    let view = worker.command(
+                        &startup.binding,
+                        WorkerCommand::Inspect("statusline off".into()),
+                        2,
+                    );
+                    if view.cost != CostQualification::Unavailable {
+                        break view;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "delegate settlement absent"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                };
+                assert_eq!(settled.cost, CostQualification::Known { revision: 0 });
+                assert_eq!(mock.request_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_session_end_dispatch_retains_refusal_after_async_model_readiness_changes() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::unsafe_session_end_dispatch_retains_refusal_after_async_model_readiness_changes",
+        ) {
+            return;
+        }
+        struct Release(Option<mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let home = TestHome::new();
+        std::fs::write(home.join("settings.toml"), "[[hooks]]\nevent = \"SessionEnd\"\nprompt = \"must never acquire authority\"\nasync = true\ntimeout_secs = 2\n").unwrap();
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = dispatches.clone();
+        let state = SessionEndHookState {
+            fired: false,
+            current: Some((
+                ready.clone(),
+                std::sync::Arc::new(move |_, _| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    orbit_engine::hooks::HookOutcome::default()
+                }),
+            )),
+        };
+        let refused_at_dispatch = session_end_dispatch_runner(&state).unwrap();
+        let (entered, at_delegate) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let release = Release(Some(release));
+        let released = std::sync::Mutex::new(released);
+        let (finished, completed) = mpsc::channel();
+        let _scope =
+            orbit_engine::hooks::handler_runner_scope(std::sync::Arc::new(move |hook, payload| {
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let result = refused_at_dispatch(hook, payload);
+                finished.send(result.clone()).unwrap();
+                result
+            }));
+        let result = orbit_engine::hooks::Hooks::load(&home, false).fire(
+            orbit_engine::hooks::HookEvent::SessionEnd,
+            &serde_json::json!({"reason":"exit"}),
+        );
+        assert!(
+            result.is_empty(),
+            "the model handler was queued asynchronously"
+        );
+        at_delegate
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        ready.store(true, std::sync::atomic::Ordering::Release);
+        drop(release);
+        let outcome = completed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.stderr.contains("accounting is unsettled"));
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lifecycle_hooks_refuse_async_models_but_allow_command_producers_and_bare_suppresses_all() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::lifecycle_hooks_refuse_async_models_but_allow_command_producers_and_bare_suppresses_all",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let (events, producer) = session_start_recorder(&home);
+        let configured = std::fs::read_to_string(home.join("settings.toml")).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            configured.replacen("timeout_secs = 2", "timeout_secs = 2\nasync = true", 1),
+        )
+        .unwrap();
+        let mut settings = std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.join("settings.toml"))
+            .unwrap();
+        use std::io::Write;
+        settings.write_all(b"\n[[hooks]]\nevent = \"SessionStart\"\nprompt = \"must not dispatch\"\nmodel = \"first/shared-notools\"\nasync = true\ntimeout_secs = 1\n\n[[hooks]]\nevent = \"SessionStart\"\nagent = \"must not dispatch\"\nmodel = \"first/shared-notools\"\nasync = true\ntimeout_secs = 1\n").unwrap();
+        drop(settings);
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        let wait_attachment = |sid: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let attachment = std::fs::read(&producer)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if attachment
+                    .as_ref()
+                    .is_some_and(|value| value["session_id"] == sid)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "async command producer did not attach"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        wait_attachment(&startup.binding.session_id);
+        let cleared = worker.clear(&startup.binding, 1);
+        wait_attachment(&cleared.binding.session_id);
+        assert_eq!(cleared.cost, CostQualification::Known { revision: 0 });
+        assert_eq!(mock.request_count(), 0);
+        assert!(worker.notices.iter().any(|text| text.contains("asynchronous model session-start hooks are unsupported")), "{:?}", worker.notices);
+        let records = recorded_session_hooks(&events);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["source"], "clear");
+        let attached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(producer).unwrap()).unwrap();
+        assert_eq!(attached["session_id"], cleared.binding.session_id);
+    }
+
+    #[test]
+    fn bare_session_start_suppresses_producers_and_model_handlers() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::bare_session_start_suppresses_producers_and_model_handlers",
+        ) {
+            return;
+        }
+        crate::tools::enable_bare_mode();
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let (events, producer) = session_start_recorder(&home);
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(home.join("settings.toml")).unwrap().write_all(b"\n[[hooks]]\nevent = \"SessionStart\"\nprompt = \"must not dispatch\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 1\n").unwrap();
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        let cleared = worker.clear(&startup.binding, 1);
+        assert_ne!(cleared.binding.session_id, startup.binding.session_id);
+        assert_eq!(cleared.cost, CostQualification::Known { revision: 0 });
+        assert_eq!(mock.request_count(), 0);
+        assert!(!events.exists());
+        assert!(!producer.exists());
+    }
+
+    #[test]
+    fn postcommit_clear_hook_publication_failure_retains_new_identity_and_qualified_charges() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::postcommit_clear_hook_publication_failure_retains_new_identity_and_qualified_charges",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let script = home.join("fail-clear-publication.py");
+        std::fs::write(&script, "import json,pathlib,sys\np=json.load(sys.stdin)\nt=pathlib.Path(p['transcript_path'])\nt.rename(t.with_suffix('.retained'))\nt.mkdir()\nprint(json.dumps({'hookSpecificOutput':{'additionalContext':'COMMITTED_CLEAR_CONTEXT'}}))\n").unwrap();
+        let command = format!(
+            "python3 '{}'",
+            script.display().to_string().replace('\'', "'\\''")
+        );
+        std::fs::write(home.join("settings.toml"), format!("[[hooks]]\nevent = \"SessionStart\"\nprompt = \"Check fixture $ARGUMENTS\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 2\n\n[[hooks]]\nevent = \"SessionStart\"\nmatcher = \"clear\"\ncommand = {command:?}\ntimeout_secs = 2\n")).unwrap();
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        assert_eq!(startup.cost, CostQualification::Known { revision: 2 });
+        let old_path = home
+            .join("sessions")
+            .join(format!("{}.json", startup.binding.session_id));
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        let cleared = worker.clear(&startup.binding, 1);
+        assert_ne!(cleared.binding.session_id, startup.binding.session_id);
+        assert_eq!(cleared.binding.generation, startup.binding.generation + 1);
+        assert!(matches!(
+            cleared.reason,
+            ProjectionReason::Manual {
+                applied: true,
+                outcome: ManualOutcome::Unknown,
+                ..
+            }
+        ));
+        assert_eq!(cleared.cost, CostQualification::Unavailable);
+        assert_eq!(
+            (
+                cleared.turns,
+                cleared.input_tokens,
+                cleared.output_tokens,
+                cleared.cost_microcents
+            ),
+            (0, 3, 2, 15)
+        );
+        assert_eq!(mock.request_count(), 2);
+        let checkpoint =
+            crate::context_history::context_journal(&home, &cleared.binding.session_id, None)
+                .unwrap()
+                .accounting_checkpoint_detailed()
+                .unwrap();
+        assert_eq!(checkpoint.totals().housekeeping.cost_microcents, Some(15));
+        assert!(checkpoint.pending().is_none());
+        assert_eq!(std::fs::read(old_path).unwrap(), old_bytes);
+        let blocked = worker.command(
+            &cleared.binding,
+            WorkerCommand::Inspect("statusline off".into()),
+            2,
+        );
+        assert_eq!(blocked.binding, cleared.binding);
+        assert_eq!(blocked.cost, CostQualification::Unavailable);
+        assert_eq!(mock.request_count(), 2);
+        let failed_path = home
+            .join("sessions")
+            .join(format!("{}.json", cleared.binding.session_id));
+        std::fs::remove_dir(&failed_path).unwrap();
+        std::fs::rename(failed_path.with_extension("retained"), &failed_path).unwrap();
+        let recovered = worker.command(
+            &cleared.binding,
+            WorkerCommand::Inspect("statusline off".into()),
+            3,
+        );
+        assert_eq!(recovered.binding, cleared.binding);
+        assert_eq!(recovered.cost, CostQualification::Known { revision: 2 });
+        assert_eq!(recovered.cost_microcents, 15);
+        assert_eq!(mock.request_count(), 2);
+        drop(worker);
+    }
+
+    #[test]
+    fn native_council_clear_rebinds_fresh_owner_and_preserves_prior_accounting() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::native_council_clear_rebinds_fresh_owner_and_preserves_prior_accounting",
+        ) {
+            return;
+        }
+        fn projection(
+            bus: &orbit_hud_tui::bus::Bus,
+            verdicts: &mut Vec<(String, String)>,
+            expected: impl Fn(&SessionProjection) -> bool,
+        ) -> SessionProjection {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match bus.try_recv() {
+                    Some(Msg::SessionProjection(view)) if expected(&view) => return view,
+                    Some(Msg::CouncilUpdated {
+                        session_id,
+                        phase,
+                        final_text,
+                        ..
+                    }) if phase == "VERDICT" => {
+                        assert!(!final_text.is_empty());
+                        verdicts.push((session_id, final_text));
+                    }
+                    Some(Msg::BackendError(error) | Msg::BackendNotice(error)) => {
+                        panic!("Council clear fixture backend failure: {error}")
+                    }
+                    _ => {}
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "expected Council clear projection was not published"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config(&mock.endpoint, "http://127.0.0.1:1"),
+        )
+        .unwrap();
+        let mut initial = config(&home);
+        initial.model = "shared-notools".into();
+        initial.provider_id = "first".into();
+        initial.gate = mock.endpoint.clone();
+        let original_id = initial.session_id.clone();
+        let (hook_events, producer_binding) = session_start_recorder(&home);
+        let lease = fresh_council_worker_lease(&initial);
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                lease,
+            );
+        });
+        let mut verdicts = Vec::new();
+        let initial = projection(&bus, &mut verdicts, |view| {
+            matches!(view.reason, ProjectionReason::Initial)
+        });
+        let first =
+            ForegroundOperation::new(initial.binding.clone(), ForegroundKind::Prompt, 1).unwrap();
+        let first_question = "/council review the original session";
+        commands
+            .send(WorkerCommand::Bound {
+                operation: first.clone(),
+                command: Box::new(WorkerCommand::Prompt(first_question.into())),
+            })
+            .unwrap();
+        let first_view = projection(
+            &bus,
+            &mut verdicts,
+            |view| matches!(&view.reason, ProjectionReason::Operation { operation } if operation == &first),
+        );
+        assert_eq!(mock.request_count(), 4);
+        assert_eq!(first_view.binding, initial.binding);
+        assert_eq!(first_view.turns, 1);
+        let original_marker = format!("SESSION_HOOK_CONTEXT[{original_id}][startup]");
+        let original_request = mock.last_request().to_string();
+        assert!(original_request.contains(&original_marker));
+        assert!(original_request.contains("sanitized question"));
+        assert!(!original_request.contains("review the original session"));
+        let started = recorded_session_hooks(&hook_events);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["source"], "startup");
+        assert_eq!(started[0]["session_id"], original_id);
+        let old_path = home.join("sessions").join(format!("{original_id}.json"));
+        let old_accounting_path = home
+            .join("context-history")
+            .join(&original_id)
+            .join("accounting.json");
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        let old_accounting = std::fs::read(&old_accounting_path).unwrap();
+        let cancelled = orbit_hud_tui::worker::ManualOperation::new(
+            first_view.binding.clone(),
+            ManualAction::Clear,
+            90,
+        )
+        .unwrap();
+        cancelled.cancel().unwrap();
+        commands
+            .send(WorkerCommand::ClearSession(cancelled.clone()))
+            .unwrap();
+        let cancelled_view = projection(
+            &bus,
+            &mut verdicts,
+            |view| matches!(&view.reason, ProjectionReason::Manual { operation, applied: false, .. } if operation == &cancelled),
+        );
+        assert_eq!(cancelled_view.binding, first_view.binding);
+        assert_eq!(recorded_session_hooks(&hook_events).len(), 1);
+        assert_eq!(mock.request_count(), 4);
+
+        // The old log stays open, but candidate transcript creation cannot
+        // replace a regular file standing where its directory belongs.
+        let projects = home.join("projects");
+        let retained_projects = home.join("retained-projects");
+        std::fs::rename(&projects, &retained_projects).unwrap();
+        std::fs::write(&projects, "candidate transcript storage unavailable").unwrap();
+        let refused = orbit_hud_tui::worker::ManualOperation::new(
+            first_view.binding.clone(),
+            ManualAction::Clear,
+            91,
+        )
+        .unwrap();
+        commands
+            .send(WorkerCommand::ClearSession(refused.clone()))
+            .unwrap();
+        let refused_view = projection(
+            &bus,
+            &mut verdicts,
+            |view| matches!(&view.reason, ProjectionReason::Manual { operation, applied: false, .. } if operation == &refused),
+        );
+        assert_eq!(refused_view.binding, first_view.binding);
+        assert_eq!(recorded_session_hooks(&hook_events).len(), 1);
+        assert_eq!(mock.request_count(), 4);
+        std::fs::remove_file(&projects).unwrap();
+        std::fs::rename(&retained_projects, &projects).unwrap();
+        let clear = orbit_hud_tui::worker::ManualOperation::new(
+            first_view.binding.clone(),
+            ManualAction::Clear,
+            2,
+        )
+        .unwrap();
+        commands
+            .send(WorkerCommand::ClearSession(clear.clone()))
+            .unwrap();
+        let cleared = projection(
+            &bus,
+            &mut verdicts,
+            |view| matches!(&view.reason, ProjectionReason::Manual { operation, .. } if operation == &clear),
+        );
+        assert!(matches!(
+            cleared.reason,
+            ProjectionReason::Manual {
+                outcome: ManualOutcome::Completed,
+                applied: true,
+                ..
+            }
+        ));
+        assert_ne!(cleared.binding.session_id, original_id);
+        assert_eq!(
+            cleared.binding.generation,
+            first_view.binding.generation + 1
+        );
+        assert_eq!(cleared.cost, CostQualification::Known { revision: 0 });
+        assert!(cleared.lines.is_empty());
+        assert_eq!(
+            (
+                cleared.turns,
+                cleared.input_tokens,
+                cleared.output_tokens,
+                cleared.cost_microcents
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(mock.request_count(), 4, "clear submitted model work");
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(&old_accounting_path).unwrap(), old_accounting);
+        let fresh = crate::sessions::load_session(&home, &cleared.binding.session_id).unwrap();
+        assert!(fresh.transcript.is_empty());
+        assert_eq!(
+            (fresh.model.as_str(), fresh.provider.as_str()),
+            ("shared-notools", "first")
+        );
+        assert_eq!(fresh.gate, mock.endpoint);
+        let producer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&producer_binding).unwrap()).unwrap();
+        assert_eq!(producer["session_id"], cleared.binding.session_id);
+        assert_eq!(producer["source"], "clear");
+        assert_eq!(
+            producer["transcript_path"],
+            home.join("sessions")
+                .join(format!("{}.json", cleared.binding.session_id))
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        let second =
+            ForegroundOperation::new(cleared.binding.clone(), ForegroundKind::Prompt, 3).unwrap();
+        let second_question = "/council review the new session";
+        commands
+            .send(WorkerCommand::Bound {
+                operation: second.clone(),
+                command: Box::new(WorkerCommand::Prompt(second_question.into())),
+            })
+            .unwrap();
+        let second_view = projection(
+            &bus,
+            &mut verdicts,
+            |view| matches!(&view.reason, ProjectionReason::Operation { operation } if operation == &second),
+        );
+        let new_marker = format!(
+            "SESSION_HOOK_CONTEXT[{}][clear]",
+            cleared.binding.session_id
+        );
+        let current_request = mock.last_request().to_string();
+        assert!(current_request.contains(&new_marker), "{current_request}");
+        assert!(!current_request.contains(&original_marker));
+        assert!(current_request.contains("sanitized question"));
+        assert!(!current_request.contains("review the new session"));
+        let inspect =
+            ForegroundOperation::new(cleared.binding.clone(), ForegroundKind::Control, 4).unwrap();
+        commands
+            .send(WorkerCommand::Bound {
+                operation: inspect.clone(),
+                command: Box::new(WorkerCommand::Inspect("statusline off".into())),
+            })
+            .unwrap();
+        let inspected = projection(
+            &bus,
+            &mut verdicts,
+            |view| matches!(&view.reason, ProjectionReason::Operation { operation } if operation == &inspect),
+        );
+        assert_eq!(inspected.binding, cleared.binding);
+        let events = recorded_session_hooks(&hook_events);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1]["source"], "clear");
+        assert_eq!(events[2]["hook_event_name"], "ConfigChange");
+        assert_eq!(events[2]["session_id"], cleared.binding.session_id);
+        drop(commands);
+        worker.join().unwrap();
+        assert_eq!(second_view.binding, cleared.binding);
+        assert_eq!(mock.request_count(), 8);
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0].0, original_id);
+        assert_eq!(verdicts[1].0, cleared.binding.session_id);
+        for (id, question) in [
+            (original_id.as_str(), first_question),
+            (cleared.binding.session_id.as_str(), second_question),
+        ] {
+            let saved = crate::sessions::load_session(&home, id).unwrap();
+            assert_eq!(
+                (
+                    saved.turns,
+                    saved.input_tokens,
+                    saved.output_tokens,
+                    saved.cost_microcents
+                ),
+                (1, 12, 8, 60)
+            );
+            assert_eq!(saved.transcript.len(), 2);
+            assert_eq!(saved.transcript[0].content, question);
+            assert_eq!(saved.transcript[1].role, ChatRole::Assistant);
+            let checkpoint = crate::context_history::context_journal(&home, id, None)
+                .unwrap()
+                .accounting_checkpoint_detailed()
+                .unwrap();
+            assert!(checkpoint.pending().is_none());
+            assert_eq!(checkpoint.totals().ordinary.cost_microcents, Some(60));
+            assert_eq!(checkpoint.totals().housekeeping.cost_microcents, Some(0));
+        }
+        assert_eq!(std::fs::read(old_path).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(old_accounting_path).unwrap(), old_accounting);
     }
 
     #[test]
