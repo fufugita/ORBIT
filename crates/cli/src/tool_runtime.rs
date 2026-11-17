@@ -1406,7 +1406,8 @@ fn execute_call_decided(
             let verdict = approval.ask(&request, false);
             !tool_cx.is_cancelled() && verdict != ApprovalVerdict::Deny
         };
-        let (output, file_change) = execute_wave1(home, scope, call, &args, tool_cx, &mut confirm);
+        let (mut output, file_change) =
+            execute_wave1(home, scope, call, &args, tool_cx, &mut confirm);
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -1418,17 +1419,25 @@ fn execute_call_decided(
         // PostToolUse fires inside execute_wave1 with ok=true/false).
         // A denial (status "denied") is not a failure — the tool never
         // ran (D9), and PermissionRequest already covered the moment.
-        if status == "error" && !tool_cx.is_cancelled() {
-            let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
-            let _ = hooks.fire(
-                orbit_engine::hooks::HookEvent::PostToolUseFailure,
-                &serde_json::json!({
-                    "tool": call.name,
-                    "arguments": args,
-                    "ok": false,
-                    "error": output.chars().take(4_000).collect::<String>(),
-                }),
-            );
+        if status == "error" {
+            let interrupted = tool_cx.is_cancelled();
+            if !interrupted {
+                let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+                let outcomes = hooks.fire(
+                    orbit_engine::hooks::HookEvent::PostToolUseFailure,
+                    &serde_json::json!({
+                        "tool": call.name,
+                        "tool_use_id": call.id,
+                        "arguments": args,
+                        "ok": false,
+                        "error": output.chars().take(4_000).collect::<String>(),
+                        "is_interrupt": interrupted,
+                    }),
+                );
+                if let Some(context) = orbit_engine::hooks::added_context(&outcomes) {
+                    output = append_hook_feedback(output, &[context]);
+                }
+            }
         }
         record_result(
             home,
@@ -2937,6 +2946,77 @@ fn tool_denial(msg: &str) -> String {
     serde_json::json!({ "ok": false, "denied": true, "error": msg }).to_string()
 }
 
+/// Attach bounded hook context without changing a tool's result or denial fields.
+/// Later event handlers retain feedback already added around the actual call.
+fn append_hook_feedback(output: String, feedback: &[String]) -> String {
+    if feedback.is_empty() {
+        return output;
+    }
+    let Ok(serde_json::Value::Object(mut body)) = serde_json::from_str(&output) else {
+        return output;
+    };
+    let previous = body
+        .get("hook_feedback")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let mut text = previous
+        .into_iter()
+        .chain(feedback.iter().map(String::as_str).map(str::trim))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return output;
+    }
+    const MAX_BYTES: usize = 8 * 1024;
+    if text.len() > MAX_BYTES {
+        let mut cut = MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    body.insert("hook_feedback".into(), text.into());
+    serde_json::Value::Object(body).to_string()
+}
+
+#[cfg(test)]
+mod hook_feedback_tests {
+    use super::append_hook_feedback;
+
+    #[test]
+    fn later_hook_context_preserves_result_fields_and_bounds_utf8_feedback() {
+        let original = serde_json::json!({
+            "ok": false,
+            "denied": true,
+            "error": "original failure",
+            "hook_feedback": "pre context\npost context",
+        })
+        .to_string();
+        let output = append_hook_feedback(
+            original.clone(),
+            &[format!("failure context {}", "界".repeat(4_000))],
+        );
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["denied"], true);
+        assert_eq!(value["error"], "original failure");
+        let feedback = value["hook_feedback"].as_str().unwrap();
+        assert!(feedback.starts_with("pre context\npost context\nfailure context "));
+        assert!(feedback.len() <= 8 * 1024);
+        assert!(feedback.len() > 8 * 1024 - 3);
+        assert!(orbit_tools::result_is_denial(&output));
+        assert_eq!(append_hook_feedback(original.clone(), &[]), original);
+        for output in ["plain result", "[1,2]", "null"] {
+            assert_eq!(
+                append_hook_feedback(output.into(), &["context".into()]),
+                output
+            );
+        }
+    }
+}
+
 /// Execute one Wave 1 call through the orbit-tools registry with the
 /// live permission layer: modes, pattern rules, folder trust, deny-read
 /// and the secret scanner. The verdict above (whole-tool rules +
@@ -2965,6 +3045,7 @@ fn execute_wave1(
         orbit_engine::hooks::HookEvent::PreToolUse,
         &serde_json::json!({
             "tool": call.name,
+            "tool_use_id": call.id,
             "arguments": args,
         }),
     );
@@ -3248,6 +3329,7 @@ fn execute_wave1(
         orbit_engine::hooks::HookEvent::PostToolUse,
         &serde_json::json!({
             "tool": call.name,
+            "tool_use_id": call.id,
             "arguments": args,
             "ok": !result.is_error,
             "tool_response": tool_response,
@@ -3298,21 +3380,7 @@ fn execute_wave1(
 
     // A path-scoped rule arrives with the first successful Read, Edit or
     // Write of a file it covers, once per session.
-    let mut payload = result.payload;
-    if !hook_feedback.is_empty()
-        && let Ok(serde_json::Value::Object(mut body)) = serde_json::from_str(&payload)
-    {
-        let mut text = hook_feedback.join("\n");
-        if text.len() > 8 * 1024 {
-            let mut cut = 8 * 1024;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            text.truncate(cut);
-        }
-        body.insert("hook_feedback".into(), text.into());
-        payload = serde_json::Value::Object(body).to_string();
-    }
+    let mut payload = append_hook_feedback(result.payload, &hook_feedback);
     if !result.is_error
         && matches!(call.name.as_str(), "Read" | "Edit" | "Write")
         && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
@@ -5838,6 +5906,108 @@ mod grant_tests {
         assert_eq!(events, ["intent", "verdict", "result"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failure_hook_context_reaches_only_failed_tool_results_and_the_ledger() {
+        let (home, project) = dirs("failure-hook-context");
+        let marker = home.join("failure-events");
+        let marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let context_command = |context: &str, expected_event: &str| {
+            let script = format!(
+                "import json,sys\nevent=json.load(sys.stdin)\n\
+                 assert event['hook_event_name']=={expected_event:?}\n\
+                 assert event['tool_name']=='Read'\n\
+                 assert event['tool_use_id'] in ('c1','success')\n\
+                 assert event['hook_event_name']!='PostToolUseFailure' or event['is_interrupt'] is False\n\
+                 print(json.dumps({{'hookSpecificOutput':{{'additionalContext':{context:?}}}}}))"
+            );
+            format!("python3 -c '{}'", script.replace('\'', "'\\''"))
+        };
+        let mut settings = String::new();
+        for (event, command) in [
+            ("PreToolUse", context_command("pre context", "PreToolUse")),
+            (
+                "PostToolUse",
+                context_command("post context", "PostToolUse"),
+            ),
+            (
+                "PostToolUseFailure",
+                format!(
+                    "printf x >> '{marker}'; {}",
+                    context_command("failure context", "PostToolUseFailure")
+                ),
+            ),
+        ] {
+            settings.push_str(&format!(
+                "[[hooks]]\nevent = {event:?}\ncommand = {command:?}\n"
+            ));
+        }
+        std::fs::write(home.join("settings.toml"), settings).unwrap();
+        let scope = PermissionScope::from_flags(Some("bypass"), Some("Read"), None);
+        let mut channel = Scripted::new(&[]);
+        let mut grants = AutoGrants::new();
+        let failed = call("Read", br#"{"file_path":"missing.txt"}"#);
+        let output = run(&home, &project, &failed, &mut channel, &mut grants, &scope);
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(orbit_tools::result_is_error(&output));
+        assert!(!orbit_tools::result_is_denial(&output));
+        assert_eq!(
+            value["hook_feedback"],
+            "pre context\npost context\nfailure context",
+            "{}",
+            output.chars().take(2_000).collect::<String>()
+        );
+        assert_eq!(std::fs::read(home.join("failure-events")).unwrap(), b"x");
+        assert_call_ledger(&home, &failed, &output, true, "error");
+
+        std::fs::write(project.join("available.txt"), "fixture").unwrap();
+        let mut success = call("Read", br#"{"file_path":"available.txt"}"#);
+        success.id = "success".into();
+        let output = run(&home, &project, &success, &mut channel, &mut grants, &scope);
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(!orbit_tools::result_is_error(&output));
+        assert_eq!(value["hook_feedback"], "pre context\npost context");
+        assert_call_ledger(&home, &success, &output, true, "ok");
+
+        let mut denied = call("Read", br#"{"file_path":"missing.txt"}"#);
+        denied.id = "denied".into();
+        let denied_scope = PermissionScope::from_flags(Some("bypass"), Some("Read"), Some("Read"));
+        let output = run(
+            &home,
+            &project,
+            &denied,
+            &mut channel,
+            &mut grants,
+            &denied_scope,
+        );
+        assert!(orbit_tools::result_is_denial(&output));
+        assert_call_ledger(&home, &denied, &output, false, "denied");
+
+        let cx = orbit_tools::ToolContext::new(home.clone(), "s1".into(), project.clone());
+        let token = orbit_provider_http::CancelToken::new();
+        begin_cancel_scope(&cx, &token);
+        token.cancel();
+        let mut cancelled = call("Read", br#"{"file_path":"missing.txt"}"#);
+        cancelled.id = "cancelled".into();
+        let (output, _) = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &cancelled,
+            false,
+            true,
+            &mut channel,
+            &mut grants,
+            &scope,
+            &cx,
+        )
+        .unwrap();
+        assert!(output.contains("cancelled"));
+        assert_eq!(std::fs::read(home.join("failure-events")).unwrap(), b"x");
+        assert!(channel.asked.is_empty());
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn pinned_registry_scope_beats_native_rules_and_convenience_grants() {
         for tool in ["Write", "Bash"] {
@@ -7152,6 +7322,58 @@ mod agent_lifecycle_tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subagent_start_context_reaches_the_managed_request_and_saved_child() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        mock.configure(&fixture.home);
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        let script = r#"import json,sys
+event=json.load(sys.stdin)
+assert event["hook_event_name"]=="SubagentStart"
+assert event["agent_type"]=="Explore"
+assert event["agent_id"]
+print(json.dumps({"hookSpecificOutput":{"additionalContext":"START_CONTEXT_FOR:"+event["agent_id"]}}))
+"#;
+        let path = fixture.home.join("subagent-start.py");
+        std::fs::write(&path, script).unwrap();
+        let command = format!(
+            "python3 '{}'",
+            path.to_string_lossy().replace('\'', "'\\''")
+        );
+        assert!(!command.contains(['"', '\n', '\\']));
+        std::fs::write(
+            fixture.home.join("settings.toml"),
+            format!("[[hooks]]\nevent = \"SubagentStart\"\nmatcher = \"Explore\"\ncommand = \"{command}\"\n"),
+        )
+        .unwrap();
+        let result = fixture.task(json!({"agent":"Explore","prompt":"original task"}));
+        assert_eq!(result["ok"], true, "{result}");
+        let agent_id = id(&result);
+        let expected = format!(
+            "original task\n\n<hook-context>\nSTART_CONTEXT_FOR:{agent_id}\n</hook-context>"
+        );
+        let saved = fixture.store().load(agent_id).unwrap();
+        assert!(
+            saved.transcript.iter().any(|message| {
+                message.role == orbit_adapter::types::ChatRole::User && message.content == expected
+            }),
+            "{:?}",
+            saved.transcript
+        );
+        let body = mock.body();
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| { message["role"] == "user" && message["content"] == expected }),
+            "{body}"
+        );
+        assert_eq!(mock.requests(), 1);
     }
 
     #[test]

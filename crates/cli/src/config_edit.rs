@@ -294,6 +294,19 @@ fn load_settings(path: &Path) -> Result<toml_edit::DocumentMut, String> {
 
 /// `/config set <key> <value…>`.
 pub fn config_set(home: &Path, key: &str, value: &str) -> Result<String, String> {
+    config_set_value(home, key, value, false)
+}
+
+/// The status-line command is a raw shell tail, including its own quoting.
+/// `None` is the explicit off setting; an absent `set` value is still refused.
+pub fn status_line_set(home: &Path, command: Option<&str>) -> Result<String, String> {
+    if command.is_some_and(|command| command.trim().is_empty()) {
+        return Err("status_line needs one line of text; use /statusline off to disable it".into());
+    }
+    config_set_value(home, "status_line", command.unwrap_or(""), true)
+}
+
+fn config_set_value(home: &Path, key: &str, value: &str, raw_text: bool) -> Result<String, String> {
     let kind = setting(key).ok_or_else(|| format!("/config set changes: {KEYS}"))?;
     let value = value.trim();
     let item = match kind {
@@ -303,8 +316,19 @@ pub fn config_set(home: &Path, key: &str, value: &str) -> Result<String, String>
             _ => return Err(format!("{key} is true or false")),
         },
         Setting::Text => {
-            let text = value.trim_matches('"');
-            if text.is_empty() || text.chars().any(char::is_control) || text.len() > 1_000 {
+            let text = if raw_text {
+                value.to_owned()
+            } else {
+                // Decode only one complete quoted literal. A quoted executable
+                // followed by arguments is a shell command, not outer quoting.
+                serde_json::from_str::<String>(value).unwrap_or_else(|_| value.to_owned())
+            };
+            // The explicit quoted empty status command is the off sentinel.
+            // Missing values and every other text setting still require text.
+            if (text.is_empty() && !(key == "status_line" && (value == "\"\"" || raw_text)))
+                || text.chars().any(char::is_control)
+                || text.len() > 1_000
+            {
                 return Err(format!("{key} needs one line of text"));
             }
             toml_edit::value(text)
@@ -355,7 +379,7 @@ pub fn config_unset(home: &Path, key: &str) -> Result<String, String> {
 
 fn applies(key: &str) -> &'static str {
     match key {
-        "status_line" => "used by sessions started after this one",
+        "status_line" => "read at the next terminal status refresh",
         "output_style" => "used from the next session; /output-style changes this one",
         _ => "read again at the next prompt",
     }
@@ -681,6 +705,34 @@ mod tests {
             Some("~/bin/line.sh --short")
         );
         assert!(parsed["permissions"].is_table());
+
+        config_set(&home, "status_line", r#"printf "%s" "line""#).unwrap();
+        let parsed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            parsed["status_line"].as_str(),
+            Some(r#"printf "%s" "line""#)
+        );
+        let quoted_command = r#""printf" "%s" "line""#;
+        config_set(&home, "status_line", quoted_command).unwrap();
+        let parsed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(parsed["status_line"].as_str(), Some(quoted_command));
+        let quoted_path = r#""/path with spaces/status""#;
+        status_line_set(&home, Some(quoted_path)).unwrap();
+        let parsed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(parsed["status_line"].as_str(), Some(quoted_path));
+        assert!(status_line_set(&home, Some(" ")).is_err());
+        status_line_set(&home, None).unwrap();
+        let parsed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(parsed["status_line"].as_str(), Some(""));
+        config_set(&home, "status_line", "\"\"").unwrap();
+        let parsed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(parsed["status_line"].as_str(), Some(""));
+        assert!(config_set(&home, "output_style", "\"\"").is_err());
 
         config_unset(&home, "status_line").unwrap();
         let text = std::fs::read_to_string(&settings).unwrap();

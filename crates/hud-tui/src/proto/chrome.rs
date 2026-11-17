@@ -85,7 +85,7 @@ pub fn hint_row_themed(
 }
 
 /// The completion list's stable built-in order, extended with customization and routing.
-pub const COMMANDS: [(&str, &str); 48] = [
+pub const COMMANDS: [(&str, &str); 52] = [
     (
         "/clear",
         "forget earlier turns (the model stops seeing them)",
@@ -117,6 +117,22 @@ pub const COMMANDS: [(&str, &str); 48] = [
     ("/sessions", "browse and resume earlier sessions"),
     ("/undo", "drop the last exchange from the context"),
     ("/usage", "turns, tokens and cost for this session"),
+    (
+        "/stats",
+        "session turns, tokens, cost and context (same as /usage)",
+    ),
+    (
+        "/diff",
+        "focus the Changes or Review pane; run again to return to chat",
+    ),
+    (
+        "/feedback",
+        "show the issue link and build details; attaches nothing",
+    ),
+    (
+        "/statusline",
+        "show, set, disable or reset the custom status-line command",
+    ),
     (
         "/council",
         "run configured Council seats and synthesis on a question",

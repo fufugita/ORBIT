@@ -793,6 +793,10 @@ fn agent_control_definitions() -> Vec<ToolDefinition> {
         ),
     ]
     .into_iter()
+    .filter(|(name, _, _)| {
+        cfg!(feature = "tui")
+            || !matches!(*name, "CronCreate" | "CronList" | "CronDelete" | "ScheduleWakeup")
+    })
     .map(|(name, description, parameters)| {
         BuiltinTool {
             name,
@@ -985,23 +989,31 @@ pub fn enable_idle_delivery() {
 /// with its next tool round; only otherwise does it wait in the schedule
 /// queue for a terminal session that is open and idle here. `kind` names
 /// the job (`monitor`, `channel`).
-pub(crate) fn deliver_event(home: &std::path::Path, cwd: &str, kind: &str, prompt: String) {
+pub(crate) fn deliver_event(
+    home: &std::path::Path,
+    cwd: &str,
+    kind: &str,
+    prompt: String,
+) -> Result<(), String> {
     if offer_to_running_turn(&prompt) {
-        return;
+        return Ok(());
     }
     // Only a terminal session reads the queue. A headless run or the plain
     // chat would leave the event behind for some later session to act on,
     // long after it mattered: there it is dropped.
     if !IDLE_DELIVERY.load(std::sync::atomic::Ordering::SeqCst) {
-        return;
+        return Ok(());
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    orbit_hud_tui::schedule::locked(home, || {
-        let mut jobs = orbit_hud_tui::schedule::load(home);
-        // A full queue means nobody is reading: drop this one.
-        if jobs.len() < orbit_hud_tui::schedule::MAX_JOBS {
+    #[cfg(feature = "tui")]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        orbit_hud_tui::schedule::locked(home, || {
+            let mut jobs = orbit_hud_tui::schedule::load_checked(home)?;
+            if jobs.len() >= orbit_hud_tui::schedule::MAX_JOBS {
+                return Err("the scheduled event queue is full".into());
+            }
             jobs.push(orbit_hud_tui::schedule::Job {
                 id: format!("{kind}-{}", ulid::Ulid::new().to_string().to_lowercase()),
                 cwd: cwd.to_owned(),
@@ -1012,9 +1024,29 @@ pub(crate) fn deliver_event(home: &std::path::Path, cwd: &str, kind: &str, promp
                 last: None,
                 durable: false,
             });
-            let _ = orbit_hud_tui::schedule::save(home, &jobs);
-        }
-    });
+            orbit_hud_tui::schedule::save(home, &jobs)
+        })
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = (home, cwd, kind);
+        Err("scheduled event delivery requires terminal UI support".into())
+    }
+}
+
+/// Event workers have no terminal bus; report a failed delivery without
+/// printing untrusted prompt contents or letting a closed stderr panic.
+pub(crate) fn report_event_delivery_error(kind: &str, error: &str) {
+    use std::io::Write;
+    let kind: String = orbit_hud::safe_text(kind).chars().take(32).collect();
+    let error: String = orbit_hud::safe_text(error.lines().next().unwrap_or(""))
+        .chars()
+        .take(200)
+        .collect();
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{kind} event was not delivered: {error}"
+    );
 }
 
 /// `Monitor {task_id, pattern?}`: watch a background command's log and tell
@@ -1108,7 +1140,10 @@ fn start_monitor(
                 if (!pending.is_empty() && gap_over) || ended {
                     let prompt = monitor_event(&watched, &command, &pending, ended);
                     pending.clear();
-                    deliver_event(&home, &cwd, "monitor", prompt);
+                    if let Err(error) = deliver_event(&home, &cwd, "monitor", prompt) {
+                        report_event_delivery_error("monitor", &error);
+                        return;
+                    }
                     events += 1;
                     last_event = Some(std::time::Instant::now());
                 }
@@ -1146,9 +1181,17 @@ pub(crate) fn schedule_tool(
         return start_monitor(home, working_dir, args);
     }
     // The same lock an open session takes before it fires what is due.
-    orbit_hud_tui::schedule::locked(home, || schedule_tool_locked(home, working_dir, name, args))
+    #[cfg(feature = "tui")]
+    {
+        orbit_hud_tui::schedule::locked(home, || {
+            schedule_tool_locked(home, working_dir, name, args)
+        })
+    }
+    #[cfg(not(feature = "tui"))]
+    Err("Scheduled prompts require a build with terminal UI support".into())
 }
 
+#[cfg(feature = "tui")]
 fn schedule_tool_locked(
     home: &std::path::Path,
     working_dir: &std::path::Path,
@@ -1161,7 +1204,7 @@ fn schedule_tool_locked(
         .map_err(|_| "the clock is unavailable".to_string())?
         .as_secs();
     let cwd = working_dir.to_string_lossy().into_owned();
-    let mut jobs = schedule::load(home);
+    let mut jobs = schedule::load_checked(home)?;
     let prompt = || -> Result<String, String> {
         let prompt = args
             .get("prompt")
@@ -1958,7 +2001,7 @@ pub(crate) fn execute_task_resolved(
     .filter(|tool| crate::plugin_content::exposed(parent_cx, &tool.name))
     .collect();
     let hooks = orbit_engine::hooks::Hooks::load(home, trusted);
-    let _ = hooks.fire(
+    let started = hooks.fire(
         orbit_engine::hooks::HookEvent::SubagentStart,
         &serde_json::json!({
             "agent": agent.name,
@@ -1967,6 +2010,9 @@ pub(crate) fn execute_task_resolved(
             "prompt_bytes": prompt.len(),
         }),
     );
+    if let Some(context) = orbit_engine::hooks::added_context(&started) {
+        input.push_str(&format!("\n\n<hook-context>\n{context}\n</hook-context>"));
+    }
     let cancel = orbit_provider_http::CancelToken::new();
     // A background agent also stops when AgentStop raises its flag.
     let parent_cancel = match BACKGROUND_STOP.with(|slot| slot.borrow().clone()) {
@@ -3251,6 +3297,33 @@ mod link_tests {
 mod tool_search_tests {
     use super::*;
 
+    #[cfg(not(feature = "tui"))]
+    #[test]
+    fn builds_without_a_terminal_scheduler_refuse_unserviceable_jobs() {
+        let names: Vec<_> = agent_control_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "Monitor"));
+        for name in ["CronCreate", "CronList", "CronDelete", "ScheduleWakeup"] {
+            assert!(!names.iter().any(|advertised| advertised == name));
+            let home =
+                std::env::temp_dir().join(format!("orbit-no-scheduler-{}", ulid::Ulid::new()));
+            let error = schedule_tool(
+                &home,
+                std::path::Path::new("/work"),
+                name,
+                &serde_json::json!({}),
+            )
+            .unwrap_err();
+            assert!(error.contains("require a build with terminal UI support"));
+            assert!(
+                !home.exists(),
+                "an unavailable scheduler must not write job state"
+            );
+        }
+    }
+
     fn tool(name: &str, description: &str) -> ToolDefinition {
         plain_definition(
             name,
@@ -3418,6 +3491,7 @@ mod tool_search_tests {
             .retain(|(handle, _)| handle != "bg-stop-test");
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn schedule_tools_create_list_and_delete_for_their_project() {
         let home = std::env::temp_dir().join(format!("orbit-sched-tools-{}", std::process::id()));
@@ -3489,6 +3563,83 @@ mod tool_search_tests {
                 .is_empty()
         );
         assert_eq!(orbit_hud_tui::schedule::load(&home).len(), 1);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn schedule_tools_refuse_a_failed_lock_without_changing_the_queue() {
+        let home = std::env::temp_dir().join(format!("orbit-sched-lock-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&home).unwrap();
+        let cwd = std::path::Path::new("/work");
+        let created = schedule_tool(
+            &home,
+            cwd,
+            "ScheduleWakeup",
+            &serde_json::json!({"delay_seconds": 600, "prompt": "keep this prompt"}),
+        )
+        .unwrap();
+        let before = std::fs::read(orbit_hud_tui::schedule::path(&home)).unwrap();
+        std::fs::remove_file(home.join("schedules.lock")).unwrap();
+        std::fs::create_dir(home.join("schedules.lock")).unwrap();
+        for (name, args) in [
+            (
+                "CronCreate",
+                serde_json::json!({"cron": "* * * * *", "prompt": "must not be added"}),
+            ),
+            (
+                "ScheduleWakeup",
+                serde_json::json!({"delay_seconds": 60, "prompt": "must not be added"}),
+            ),
+            ("CronList", serde_json::json!({})),
+            ("CronDelete", serde_json::json!({"id": created["id"]})),
+        ] {
+            let error = schedule_tool(&home, cwd, name, &args).unwrap_err();
+            assert!(
+                error.starts_with("schedules lock could not be opened:"),
+                "{name}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(orbit_hud_tui::schedule::path(&home)).unwrap(),
+                before
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn schedule_tools_refuse_invalid_queues_without_overwriting_them() {
+        for kind in ["corrupt", "directory", "oversized"] {
+            let home =
+                std::env::temp_dir().join(format!("orbit-sched-invalid-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&home).unwrap();
+            let path = orbit_hud_tui::schedule::path(&home);
+            match kind {
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                "oversized" => std::fs::write(&path, vec![b' '; 1024 * 1024]).unwrap(),
+                _ => std::fs::write(&path, b"{invalid schedule data").unwrap(),
+            }
+            let before = std::fs::read(&path).ok();
+            for (name, args) in [
+                (
+                    "CronCreate",
+                    serde_json::json!({"cron": "* * * * *", "prompt": "must not replace data"}),
+                ),
+                (
+                    "ScheduleWakeup",
+                    serde_json::json!({"delay_seconds": 60, "prompt": "must not replace data"}),
+                ),
+                ("CronList", serde_json::json!({})),
+                ("CronDelete", serde_json::json!({"id": "existing-job"})),
+            ] {
+                let error =
+                    schedule_tool(&home, std::path::Path::new("/work"), name, &args).unwrap_err();
+                assert!(error.starts_with("schedules "), "{kind} {name}: {error}");
+                assert_eq!(std::fs::read(&path).ok(), before, "{kind} {name}");
+                assert_eq!(path.is_dir(), kind == "directory");
+            }
+            std::fs::remove_dir_all(home).unwrap();
+        }
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! `status_line = "<command>"` at the top of `settings.toml` (or of the file
 //! named with `--settings`). With the Claude Code switch on, the
 //! `statusLine` command of `~/.claude/settings.json` is used when ORBIT's
-//! own setting is absent, so an existing script keeps working.
+//! own setting is absent, so an existing script keeps working. An explicit
+//! empty native setting disables that fallback; removing it restores inheritance.
 //!
 //! The command gets one JSON object on standard input and the first line it
 //! prints is shown. It runs after each command the session handles, off the
@@ -29,7 +30,6 @@ fn top_level(text: &str, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
         .map(str::to_owned)
 }
 
@@ -47,11 +47,46 @@ fn claude_command(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The status-line command configured for this home, if any.
-pub fn command(home: &Path) -> Option<String> {
-    if crate::tools::bare_mode() {
-        return None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    SettingsFlag,
+    OrbitHome,
+    ClaudeCompatibility,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SettingsFlag => "--settings",
+            Self::OrbitHome => "ORBIT home settings.toml",
+            Self::ClaudeCompatibility => "Claude compatibility settings",
+        }
     }
+}
+
+/// Effective configuration before bare-mode suppression. Empty means disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Configuration {
+    pub command: String,
+    pub source: Source,
+}
+
+fn from_sources(
+    flag: Option<String>,
+    native: Option<String>,
+    compatibility: Option<String>,
+) -> Option<Configuration> {
+    [
+        (flag, Source::SettingsFlag),
+        (native, Source::OrbitHome),
+        (compatibility, Source::ClaudeCompatibility),
+    ]
+    .into_iter()
+    .find_map(|(command, source)| command.map(|command| Configuration { command, source }))
+}
+
+/// Inspect configuration without executing a command, including in bare mode.
+pub fn configured(home: &Path) -> Option<Configuration> {
     let flag = orbit_tools::executor::extra_settings_file();
     let read = |path: &Path| {
         std::fs::metadata(path)
@@ -59,27 +94,34 @@ pub fn command(home: &Path) -> Option<String> {
             .filter(|meta| meta.is_file() && meta.len() <= 256 * 1024)
             .and_then(|_| std::fs::read_to_string(path).ok())
     };
-    if let Some(file) = &flag
-        && let Some(text) = read(file)
-        && let Some(found) = if orbit_tools::executor::is_json(file) {
+    let flag_command = flag.as_ref().and_then(|file| {
+        let text = read(file)?;
+        if orbit_tools::executor::is_json(file) {
             claude_command(&text)
         } else {
             top_level(&text, "status_line")
         }
-    {
-        return Some(found);
-    }
-    if let Some(found) =
-        read(&home.join("settings.toml")).and_then(|text| top_level(&text, "status_line"))
-    {
-        return Some(found);
-    }
-    if orbit_engine::hooks::claude_compat(home) {
-        return orbit_engine::hooks::claude_config_dir()
+    });
+    let native_command =
+        read(&home.join("settings.toml")).and_then(|text| top_level(&text, "status_line"));
+    let compatibility_command = if orbit_engine::hooks::claude_compat(home) {
+        orbit_engine::hooks::claude_config_dir()
             .and_then(|dir| read(&dir.join("settings.json")))
-            .and_then(|text| claude_command(&text));
+            .and_then(|text| claude_command(&text))
+    } else {
+        None
+    };
+    from_sources(flag_command, native_command, compatibility_command)
+}
+
+/// The command to run now. Bare mode and an explicit off setting run nothing.
+pub fn command(home: &Path) -> Option<String> {
+    if crate::tools::bare_mode() {
+        return None;
     }
-    None
+    configured(home)
+        .map(|configuration| configuration.command)
+        .filter(|command| !command.is_empty())
 }
 
 /// What the session looks like to the command.
@@ -169,7 +211,7 @@ pub fn clean(output: &str) -> String {
 /// Run the command once and return what it wants shown. Empty when it
 /// failed, timed out or printed nothing.
 pub fn run(command: &str, snapshot: &Snapshot) -> String {
-    if crate::tools::bare_mode() {
+    if command.trim().is_empty() || crate::tools::bare_mode() {
         return String::new();
     }
     use std::os::unix::process::CommandExt;
@@ -248,7 +290,10 @@ mod tests {
             top_level("[x]\nstatus_line = \"late\"\n", "status_line"),
             None
         );
-        assert_eq!(top_level("status_line = \"\"\n", "status_line"), None);
+        assert_eq!(
+            top_level("status_line = \"\"\n", "status_line"),
+            Some(String::new())
+        );
         assert_eq!(top_level("# status_line = \"off\"\n", "status_line"), None);
         // Real TOML: a trailing comment and an escaped quote mean what they say.
         assert_eq!(
@@ -275,6 +320,39 @@ mod tests {
             None
         );
         assert_eq!(claude_command("{}"), None);
+    }
+
+    #[test]
+    fn explicit_off_stops_compatibility_fallback_and_reset_restores_inheritance() {
+        let compatibility = Some("compatibility-script".to_owned());
+        let native_off = top_level("status_line = \"\"\n", "status_line");
+        assert_eq!(
+            from_sources(None, native_off, compatibility.clone()),
+            Some(Configuration {
+                command: String::new(),
+                source: Source::OrbitHome
+            })
+        );
+        assert_eq!(
+            from_sources(None, None, compatibility.clone()),
+            Some(Configuration {
+                command: "compatibility-script".into(),
+                source: Source::ClaudeCompatibility
+            })
+        );
+        // An explicit --settings value keeps its normal higher priority.
+        assert_eq!(
+            from_sources(
+                Some("flag-script".into()),
+                Some(String::new()),
+                compatibility
+            ),
+            Some(Configuration {
+                command: "flag-script".into(),
+                source: Source::SettingsFlag
+            })
+        );
+        assert_eq!(run("", &Snapshot::default()), "");
     }
 
     #[test]

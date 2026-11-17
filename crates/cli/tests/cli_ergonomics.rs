@@ -70,6 +70,129 @@ fn help_exposes_supported_migration_and_session_controls() {
 }
 
 #[cfg(unix)]
+struct OutputFixture {
+    root: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OutputFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("orbit-cli-output-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self { root }
+    }
+
+    fn run(&self, args: &[&str], stdout: std::process::Stdio) -> Output {
+        use std::process::Stdio;
+
+        Command::new(env!("CARGO_BIN_EXE_orbit"))
+            .args(args)
+            .current_dir(&self.root)
+            .env_clear()
+            .env("HOME", &self.root)
+            .env("ORBIT_HOME", self.root.join("home"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .output()
+            .expect("isolated CLI starts")
+    }
+
+    fn assert_no_session_setup(&self) {
+        assert!(
+            std::fs::read_dir(&self.root).unwrap().next().is_none(),
+            "local output commands must not set up a provider or session"
+        );
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OutputFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(unix)]
+fn readerless_stdout() -> std::process::Stdio {
+    use std::os::fd::OwnedFd;
+    use std::process::Stdio;
+
+    // Wait for the pipe's only reader to exit BEFORE starting ORBIT. Unlike
+    // `orbit --help | head`, this cannot pass merely because the entire help
+    // fit in the pipe before the consumer stopped reading.
+    let mut reader = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let writer = reader.stdin.take().unwrap();
+    assert!(reader.wait().unwrap().success());
+    let writer: OwnedFd = writer.into();
+    Stdio::from(writer)
+}
+
+#[cfg(unix)]
+#[test]
+fn local_cli_output_tolerates_a_consumer_that_already_closed_stdout() {
+    let fixture = OutputFixture::new();
+    for args in [
+        vec!["--help"],
+        vec!["provider", "--help"],
+        vec!["--version"],
+        vec!["help", "--json"],
+        vec!["completions", "bash"],
+        vec!["version"],
+    ] {
+        let output = fixture.run(&args, readerless_stdout());
+        assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+        assert!(output.stderr.is_empty(), "{args:?}: {:?}", output.stderr);
+    }
+    fixture.assert_no_session_setup();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_does_not_hide_failed_command_status() {
+    let fixture = OutputFixture::new();
+    let args = ["doctor", "--json"];
+    let ordinary = fixture.run(&args, std::process::Stdio::piped());
+    let report: serde_json::Value = serde_json::from_slice(&ordinary.stdout).unwrap();
+    assert_eq!(report["report"]["ready"], false);
+    assert_eq!(ordinary.status.code(), Some(1));
+    let closed = fixture.run(&args, readerless_stdout());
+    assert_eq!(closed.status.code(), ordinary.status.code());
+    assert!(closed.stderr.is_empty(), "{:?}", closed.stderr);
+    fixture.assert_no_session_setup();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_cli_output_reports_real_io_errors_without_a_print_panic() {
+    let fixture = OutputFixture::new();
+    for args in [vec!["--help"], vec!["completions", "bash"]] {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let output = fixture.run(&args, std::process::Stdio::from(full));
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("cannot write stdout"), "{args:?}: {error}");
+        assert!(!error.contains("panicked"), "{args:?}: {error}");
+    }
+    fixture.assert_no_session_setup();
+}
+
+#[cfg(unix)]
 struct SetupFixture {
     root: std::path::PathBuf,
     home: std::path::PathBuf,

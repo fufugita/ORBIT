@@ -693,12 +693,15 @@ fn theme_choice_with_preview(theme: &str, current: &str) -> SetupChoice<'static>
         "kwangya-ice" => "kwangya-ice",
         _ => "orbit",
     };
+    #[cfg(feature = "tui")]
     let profile = Profile {
         theme: owned.to_owned(),
         ..Profile::default()
     };
+    #[cfg(feature = "tui")]
     let palette = orbit_hud_tui::proto::shell::pal::Palette::from_profile(&profile);
     let mut detail = String::new();
+    #[cfg(feature = "tui")]
     for (name, rgb) in [
         ("app", palette.app),
         ("accent", palette.magenta),
@@ -710,6 +713,8 @@ fn theme_choice_with_preview(theme: &str, current: &str) -> SetupChoice<'static>
         let (r, g, b) = rgb;
         detail.push_str(&format!("\x1b[48;2;{r};{g};{b}m      \x1b[0m {name}  "));
     }
+    #[cfg(not(feature = "tui"))]
+    detail.push_str("Color preview requires a build with terminal UI support. ");
     if theme == current {
         detail.push_str("(current)");
     }
@@ -936,7 +941,7 @@ pub fn edit_appearance<T: SetupTerminal>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tui"))]
 mod theme_preview_tests {
     use super::*;
 

@@ -1541,6 +1541,7 @@ fn run_proto_inner(
     // Queued prompts (§11.4): sent while a turn runs, shown as a
     // queued row until their TurnStarted.
     let mut queued: Vec<String> = Vec::new();
+    let mut last_schedule_error: Option<String> = None;
     // Composer history (§11.3), newest first. Persisted per session
     // (`sessions/<id>.history`): the caller supplies the same session id
     // the worker saves under, so a resumed session's memory loads before input.
@@ -2044,20 +2045,39 @@ fn run_proto_inner(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
                 if let Ok(cwd) = std::env::current_dir() {
-                    for prompt in
-                        crate::schedule::fire_due(&tui.app.home, &cwd.to_string_lossy(), unix)
-                    {
-                        push_display_line(
-                            &mut scenario,
-                            TranscriptLine {
-                                kind: LineKind::Queued,
-                                text: prompt.clone(),
-                                ..Default::default()
-                            },
-                            EditOrigin::Local,
-                        );
-                        queued.push(prompt);
-                        bus_dirty = true;
+                    match crate::schedule::fire_due(&tui.app.home, &cwd.to_string_lossy(), unix) {
+                        Ok(prompts) => {
+                            last_schedule_error = None;
+                            for prompt in prompts {
+                                push_display_line(
+                                    &mut scenario,
+                                    TranscriptLine {
+                                        kind: LineKind::Queued,
+                                        text: prompt.clone(),
+                                        ..Default::default()
+                                    },
+                                    EditOrigin::Local,
+                                );
+                                queued.push(prompt);
+                                bus_dirty = true;
+                            }
+                        }
+                        Err(error) => {
+                            let error: String = error
+                                .chars()
+                                .filter(|ch| !ch.is_control())
+                                .take(200)
+                                .collect();
+                            if last_schedule_error.as_ref() != Some(&error) {
+                                toast = Some(Toast {
+                                    text: format!("Scheduled prompts paused: {error}"),
+                                    ok: false,
+                                    shown_ms: now_ms,
+                                });
+                                last_schedule_error = Some(error);
+                                overlay_dirty = true;
+                            }
+                        }
                     }
                 }
             }
@@ -4403,6 +4423,9 @@ fn runs_while_busy(cmd: &str) -> bool {
         cmd,
         "/help"
             | "/usage"
+            | "/stats"
+            | "/diff"
+            | "/feedback"
             | "/sessions"
             | "/models"
             | "/theme"
@@ -4414,6 +4437,55 @@ fn runs_while_busy(cmd: &str) -> bool {
             | "/export"
             | "/find"
     )
+}
+
+/// Move between recorded diffs and the composer without replacing the layout.
+/// A new side pane is persisted through the same checked host as the picker.
+fn focus_diff_panel(tui: &mut Tui) -> Result<(), String> {
+    use super::layout::{Direction, View};
+    let leaves = tui.app.tree.leaves();
+    let conversation = leaves
+        .iter()
+        .position(|(_, view)| *view == View::Conversation)
+        .ok_or("the layout has no conversation pane")?;
+    if matches!(tui.app.focused_view(), View::Changes | View::Review) {
+        tui.app.focus = conversation;
+    } else if let Some(index) = [View::Review, View::Changes]
+        .into_iter()
+        .find_map(|target| leaves.iter().position(|(_, view)| *view == target))
+    {
+        tui.app.focus = index;
+    } else {
+        if tui.app.panel_count() >= 9 {
+            return Err("No diff pane is open and all nine pane slots are in use. Change or close a pane first.".into());
+        }
+        let previous_tree = tui.app.tree.clone();
+        let previous_focus = tui.app.focus;
+        if !tui
+            .app
+            .tree
+            .split(conversation, Direction::Right, View::Review)
+        {
+            return Err("the diff pane could not be added to this layout".into());
+        }
+        let result = if let Some(session) = tui.customization.as_mut() {
+            session
+                .persist_tree(&tui.app.tree)
+                .map_err(|error| error.to_string())
+        } else {
+            tui.app.save_yours()
+        };
+        if let Err(error) = result {
+            tui.app.tree = previous_tree;
+            tui.app.focus = previous_focus;
+            return Err(format!("Diff pane layout was not saved: {error}"));
+        }
+        tui.app.focus = conversation + 1;
+    }
+    tui.app.arranging = false;
+    tui.app.picker = None;
+    tui.sync_focus();
+    Ok(())
 }
 
 /// Run a `/command` or bare `quit`/`exit` (§11.6). TUI-local ones
@@ -4485,7 +4557,7 @@ fn run_command(
             request_picker(scenario, command_sink, PickerKind::Sessions, toast, now_ms);
             None
         }
-        "/usage" => {
+        "/usage" | "/stats" => {
             let cost = scenario.cost_status_text();
             notice(
                 scenario,
@@ -4499,6 +4571,40 @@ fn run_command(
                 notice(scenario, line);
             } else {
                 notice(scenario, "context unknown".into());
+            }
+            None
+        }
+        "/diff" => {
+            if !arg.is_empty() {
+                notice(
+                    scenario,
+                    "usage: /diff · toggle focus between recorded changes and chat".into(),
+                );
+            } else if let Err(message) = focus_diff_panel(tui) {
+                *toast = Some(Toast {
+                    text: message,
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
+            None
+        }
+        "/feedback" => {
+            if !arg.is_empty() {
+                notice(
+                    scenario,
+                    "usage: /feedback · shows a link; no message or files are sent".into(),
+                );
+            } else {
+                notice(
+                    scenario,
+                    format!(
+                        "ORBIT {} · {} / {}\nReport feedback: https://github.com/fufugita/ORBIT/issues/new\nNo transcript, configuration or logs are attached. Choose what to include when you open the link.",
+                        env!("CARGO_PKG_VERSION"),
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    ),
+                );
             }
             None
         }
@@ -4678,7 +4784,7 @@ fn run_command(
         }
         "/hooks" | "/skills" | "/agents" | "/mcp" | "/memory" | "/config" | "/btw" | "/rename"
         | "/add-dir" | "/tasks" | "/sandbox" | "/status" | "/output-style" | "/fork" | "/cd"
-        | "/plugin" | "/doctor" => {
+        | "/plugin" | "/doctor" | "/statusline" => {
             if let Err(message) = submit_foreground(
                 scenario,
                 command_sink,
@@ -10162,6 +10268,100 @@ mod composer_key_tests {
     }
 
     #[test]
+    fn stats_and_feedback_are_local_while_busy_and_preserve_cost_qualifications() {
+        for qualification in [
+            crate::msg::CostQualification::Known { revision: 3 },
+            crate::msg::CostQualification::UnknownHistory { revision: 3 },
+            crate::msg::CostQualification::UnknownUsage { revision: 3 },
+            crate::msg::CostQualification::Unpriced { revision: 3 },
+            crate::msg::CostQualification::Uncertain { revision: 3 },
+        ] {
+            let mut k = Keyboard::new();
+            k.scenario.turns = 7;
+            k.scenario.input_tokens = 12;
+            k.scenario.output_tokens = 34;
+            k.scenario.cost_microcents = 1234;
+            k.scenario.frontend.cost = qualification;
+            k.scenario.turn_live = true;
+            let cost = k.scenario.cost_status_text();
+            k.type_text("/stats");
+            k.plain(KeyCode::Enter);
+            let answer = &k.scenario.transcript[k.scenario.transcript.len() - 2].text;
+            assert!(answer.contains("turns 7 · in 12 · out 34"), "{answer}");
+            assert!(answer.contains(&cost), "{answer}");
+            k.type_text("/feedback");
+            k.plain(KeyCode::Enter);
+            let answer = &k.scenario.transcript.last().unwrap().text;
+            assert!(answer.contains("https://github.com/fufugita/ORBIT/issues/new"));
+            assert!(answer.contains(env!("CARGO_PKG_VERSION")));
+            assert!(answer.contains("No transcript, configuration or logs are attached"));
+            assert!(k.scenario.pending_foreground().is_none());
+            assert_eq!(k.scenario.frontend.cost, qualification);
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn statusline_uses_owned_control_and_waits_for_active_work() {
+        let mut k = Keyboard::new();
+        k.type_text("/statusline set printf '%s' fixture");
+        k.plain(KeyCode::Enter);
+        assert_eq!(
+            k.received_command(),
+            WorkerCommand::Inspect("statusline set printf '%s' fixture".into())
+        );
+        let mut busy = Keyboard::new();
+        busy.scenario.turn_live = true;
+        busy.type_text("/statusline off");
+        busy.plain(KeyCode::Enter);
+        assert_eq!(busy.draft, "/statusline off");
+        busy.no_send();
+    }
+
+    #[test]
+    fn diff_command_adds_only_a_checked_side_pane_and_refuses_full_layout() {
+        let mut k = Keyboard::new();
+        k.tui.app.tree = super::super::layout::Node::Panel {
+            view: super::super::layout::View::Conversation,
+            agent: String::new(),
+        };
+        k.tui.app.focus = 0;
+        k.type_text("/diff");
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.tui.app.panel_count(), 2);
+        assert_eq!(k.tui.app.focused_view(), super::super::layout::View::Review);
+        let tree = k.tui.app.tree.clone();
+        focus_diff_panel(&mut k.tui).unwrap();
+        assert_eq!(
+            k.tui.app.focused_view(),
+            super::super::layout::View::Conversation
+        );
+        assert_eq!(k.tui.app.tree, tree);
+        k.no_send();
+        let mut full = Keyboard::new();
+        full.tui.app.tree = super::super::layout::Node::Panel {
+            view: super::super::layout::View::Conversation,
+            agent: String::new(),
+        };
+        for _ in 1..9 {
+            assert!(full.tui.app.tree.split(
+                0,
+                super::super::layout::Direction::Right,
+                super::super::layout::View::Activity
+            ));
+        }
+        let before = full.tui.app.tree.clone();
+        assert!(
+            focus_diff_panel(&mut full.tui)
+                .unwrap_err()
+                .contains("nine pane slots")
+        );
+        assert_eq!(full.tui.app.tree, before);
+        assert!(!full.root.join("tui.toml").exists());
+        full.no_send();
+    }
+
+    #[test]
     fn modified_enter_in_an_open_file_picker_adds_a_newline() {
         for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
             let mut k = Keyboard::new();
@@ -15030,6 +15230,50 @@ mod palette_review_tests {
     }
 
     #[test]
+    fn diff_palette_keyboard_and_click_return_from_review_without_changing_layout() {
+        for click in [false, true] {
+            let mut keys = Keys::new("/diff");
+            keys.tui.app.tree =
+                crate::proto::layout::Node::profile_preset(crate::proto::layout::Preset::Review);
+            assert!(
+                keys.tui
+                    .app
+                    .tree
+                    .leaves()
+                    .iter()
+                    .any(|(_, view)| *view == crate::proto::layout::View::Conversation)
+            );
+            keys.tui.app.focus = keys
+                .tui
+                .app
+                .tree
+                .leaves()
+                .iter()
+                .position(|(_, view)| *view == crate::proto::layout::View::Review)
+                .unwrap();
+            keys.tui.sync_focus();
+            let before = keys.tui.app.tree.clone();
+            let rows = keys.frame(110, 30);
+            assert!(rows.iter().any(|row| row.contains("/diff")));
+            if click {
+                let click = keys.click("/diff", 110, 30).unwrap();
+                assert!(keys.activate(click));
+            } else {
+                keys.press(KeyCode::Enter);
+            }
+            assert_eq!(
+                keys.tui.app.focused_view(),
+                crate::proto::layout::View::Conversation,
+                "palette route: {}",
+                if click { "click" } else { "keyboard" }
+            );
+            assert_eq!(keys.tui.app.tree, before);
+            assert_eq!(keys.overlay, None);
+            keys.no_worker_command();
+        }
+    }
+
+    #[test]
     fn palette_mouse_runs_the_actual_drawn_row() {
         for (width, height) in [(110, 30), (40, 11)] {
             let mut keys = Keys::new("me");
@@ -15081,7 +15325,7 @@ mod palette_review_tests {
                 rows[hit.rect.y as usize].contains("▌")
                     && rows[hit.rect.y as usize].contains("/resume")
             );
-            for _ in 0..50 {
+            for _ in 0..super::super::chrome::COMMANDS.len() {
                 keys.press(KeyCode::Down);
             }
             // The last command in the list.
@@ -15105,7 +15349,7 @@ mod palette_review_tests {
                     .filter(|hit| matches!(hit.click, Click::Palette(_)))
                     .all(|hit| hit.rect.bottom() <= height)
             );
-            for _ in 0..50 {
+            for _ in 0..super::super::chrome::COMMANDS.len() {
                 keys.press(KeyCode::Up);
             }
             assert_eq!(keys.selected, 0);

@@ -1339,6 +1339,24 @@ pub fn added_context(outcomes: &[HookOutcome]) -> Option<String> {
     Some(joined)
 }
 
+/// Decode one complete quoted TOML value without changing the legacy line grammar.
+/// A malformed or unquoted value keeps its old interpretation at the call site;
+/// a parse failure must not remove an operator's guard.
+fn quoted_hook_setting(raw: &str) -> Option<String> {
+    const MAX_QUOTED_BYTES: usize = 1024 * 1024;
+    if raw.len() > MAX_QUOTED_BYTES || !raw.starts_with(['"', '\'']) {
+        return None;
+    }
+    let parsed = toml::from_str::<toml::Table>(&format!("value = {raw}")).ok()?;
+    if parsed.len() != 1 {
+        return None;
+    }
+    parsed
+        .get("value")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Parse `[[hooks]]` entries from the settings TOML subset: lines
 /// event = "..." / command = "..." inside hooks tables.
 fn parse_hooks_toml(text: &str) -> Vec<HookConfig> {
@@ -1382,7 +1400,8 @@ fn parse_hooks_toml(text: &str) -> Vec<HookConfig> {
         if let Some(eq) = line.find('=') {
             let key = line[..eq].trim();
             let raw = line[eq + 1..].trim();
-            let value = raw.trim_matches('"');
+            let decoded = quoted_hook_setting(raw);
+            let value = decoded.as_deref().unwrap_or_else(|| raw.trim_matches('"'));
             if let Some(c) = current.as_mut() {
                 match key {
                     // A model check, an agent check, or an MCP tool:
@@ -1423,9 +1442,14 @@ fn parse_hooks_toml(text: &str) -> Vec<HookConfig> {
                             "mcp_server" => server = value.to_owned(),
                             "mcp_tool" => tool = value.to_owned(),
                             _ => {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(
-                                    raw.trim_matches('\''),
-                                ) && parsed.is_object()
+                                let legacy = raw.trim_matches('\'');
+                                let parsed = match decoded.as_deref() {
+                                    Some(text) => serde_json::from_str::<serde_json::Value>(text)
+                                        .or_else(|_| serde_json::from_str(legacy)),
+                                    None => serde_json::from_str(legacy),
+                                };
+                                if let Ok(parsed) = parsed
+                                    && parsed.is_object()
                                 {
                                     input = parsed;
                                 }
@@ -1831,6 +1855,88 @@ timeout_secs = 5
             &serde_json::json!({ "tool": "Bash", "arguments": { "command": "ls" } }),
         );
         assert_eq!(outcomes[0].exit_code, 2, "tool_name reached the hook");
+    }
+
+    #[test]
+    fn native_quoted_values_decode_without_dropping_legacy_hook_guards() {
+        assert_eq!(
+            quoted_hook_setting(r#""a\"b\\c\n\t\u0041\U0001F600""#).as_deref(),
+            Some("a\"b\\c\n\tA😀")
+        );
+        assert_eq!(quoted_hook_setting(r#"'a\b\n'"#).as_deref(), Some(r"a\b\n"));
+        for invalid in [
+            "echo unquoted",
+            "\"quoted\" trailing",
+            "\"quoted\"\nother = 1",
+        ] {
+            assert!(quoted_hook_setting(invalid).is_none(), "{invalid}");
+        }
+        let hooks = parse_hooks_toml(
+            r#"
+[[hooks]]
+event = "PreToolUse"
+command = "printf \"quoted\"; printf 'one\\two\nnext'; exit 2"
+matcher = "R\u0065ad"
+if = "Read(./src\\*)"
+[[hooks]]
+event = 'PostToolUse'
+command = 'printf "\n"; exit 2'
+[[hooks]]
+event = Stop
+command = echo legacy >&2; exit 2
+[[hooks]]
+event = "Stop"
+command = "echo incomplete >&2; exit 2
+[[hooks]]
+event = "Stop"
+mcp_server = "scanner"
+mcp_tool = "scan"
+mcp_input = "{\"path\":\"C:\\\\tmp\"}"
+mcp_input = "{"allow":false}"
+[[hooks]]
+event = "Stop"
+mcp_server = "scanner-bad"
+mcp_tool = "scan"
+mcp_input = "{"allow":false}"
+"#,
+        );
+        assert_eq!(hooks.len(), 6);
+        assert_eq!(hooks[0].event, "PreToolUse");
+        assert_eq!(
+            hooks[0].command,
+            "printf \"quoted\"; printf 'one\\two\nnext'; exit 2"
+        );
+        assert_eq!(hooks[0].matcher.as_deref(), Some("Read"));
+        assert_eq!(hooks[0].condition.as_deref(), Some(r"Read(./src\*)"));
+        assert_eq!(hooks[1].event, "PostToolUse");
+        assert_eq!(hooks[1].command, r#"printf "\n"; exit 2"#);
+        assert_eq!(hooks[2].event, "Stop");
+        assert_eq!(hooks[2].command, "echo legacy >&2; exit 2");
+        assert_eq!(hooks[3].event, "Stop");
+        assert_eq!(hooks[3].command, "echo incomplete >&2; exit 2");
+        assert!(matches!(
+            hooks[4].handler.as_ref(),
+            Some(HookHandler::McpTool { server, tool, input })
+                if server == "scanner" && tool == "scan"
+                    && input["path"] == r"C:\tmp" && input.get("allow").is_none()
+        ));
+        assert!(matches!(
+            hooks[5].handler.as_ref(),
+            Some(HookHandler::McpTool { server, tool, input })
+                if server == "scanner-bad" && tool == "scan" && input == &serde_json::json!({})
+        ));
+        let oversized = format!("\"{}; exit 2\"", "x".repeat(1024 * 1024));
+        assert!(quoted_hook_setting(&oversized).is_none());
+        let retained = parse_hooks_toml(&format!(
+            "[[hooks]]\nevent = \"Stop\"\ncommand = {oversized}\n"
+        ));
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].command, oversized.trim_matches('"'));
+        let guards = Hooks {
+            hooks: hooks[2..4].to_vec(),
+            project_trusted: false,
+        };
+        assert_eq!(guards.matching(HookEvent::Stop, None).len(), 2);
     }
 
     #[test]

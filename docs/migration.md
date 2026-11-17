@@ -54,6 +54,11 @@ their path arguments; identical text does not imply identical coverage. Keep
 omitted rules out until their intended scope has been expressed and tested with
 ORBIT's tools.
 
+`WebFetch(domain:...)` rules also require manual migration. Claude's domain
+normalization and wildcard rules can affect its shell sandbox network policy;
+an ORBIT selector for one tool does not establish equivalent network access.
+Matching the initial URL alone is insufficient evidence of equivalent policy.
+
 ## Check instructions, commands, skills and hooks
 
 ORBIT reads project instructions such as `CLAUDE.md` and `AGENTS.md`. Claude
@@ -84,6 +89,12 @@ Use `orbit provider list` and `orbit doctor` to inspect configured providers and
 credential bindings. If credentials need setup, use `orbit provider login NAME`
 or the declared environment variable for that provider. Keep credentials in the
 supported credential store rather than copying another harness's auth files.
+
+Council works with the model already selected in terminal chat. `/council QUESTION`
+runs three reviewer perspectives and a judge using that model: four managed
+requests, with no extra model configuration required. A mixed-model roster is
+optional; see [Council configuration](customization.md#run-a-native-council) for
+the bounded `council.toml` settings. Opening its pane starts no requests.
 
 Use `orbit mcp list` to inspect MCP configuration. Then test the harmless read
 operations you need in a trial chat. OAuth sign-in, remote integrations and

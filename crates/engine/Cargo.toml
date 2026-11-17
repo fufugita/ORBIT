@@ -16,6 +16,7 @@ orbit-frontend-protocol = { path = "../frontend-protocol" }
 orbit-plugin-compat = { path = "../plugin-compat" }
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 sha2.workspace = true
 hex.workspace = true
 ulid.workspace = true

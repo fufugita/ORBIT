@@ -12,6 +12,7 @@ use orbit_ledger::event::{
 };
 use orbit_ledger::{LedgerWriter, verify_ledger};
 use orbit_reactor::{CancelOrigin, CancelTarget, CancellationToken, Reactor};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use orbit_cli::session_accounting::{self, FullCostStatus, NamespaceSpendPolicy, RootOrigin};
@@ -170,6 +171,29 @@ static CHAT_FIRST_PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new
 static FALLBACK_CHAT: std::sync::Mutex<Option<(String, String, String)>> =
     std::sync::Mutex::new(None);
 
+/// A finished local command may outlive its output consumer (for example,
+/// `orbit --help | head`). Only a closed pipe is quiet; other write failures
+/// remain errors, and losing the consumer never changes a failed command to
+/// success. Streaming provider work uses its own cancellation/save boundary.
+fn write_cli_output(
+    command_exit: i32,
+    render: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+) -> i32 {
+    let mut output = std::io::stdout().lock();
+    let result = render(&mut output).and_then(|()| output.flush());
+    match result {
+        Ok(()) => command_exit,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => command_exit,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "orbit: cannot write stdout: {error}"
+            );
+            if command_exit == 0 { 1 } else { command_exit }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = match take_setup_flags(std::env::args().skip(1).collect()) {
         Ok(args) => args,
@@ -248,25 +272,33 @@ fn main() {
         && !args.iter().any(|a| a == "--json")
         && args.iter().any(|a| a == "--help" || a == "-h")
     {
-        println!("{PROVIDER_USAGE}");
-        std::process::exit(0);
+        std::process::exit(write_cli_output(0, |output| {
+            writeln!(output, "{PROVIDER_USAGE}")
+        }));
     }
     if first_word != Some("plugin") && args.iter().any(|a| a == "--help" || a == "-h") {
-        if args.iter().any(|a| a == "--json") {
+        let code = if args.iter().any(|a| a == "--json") {
             let value = dispatch(&["help".into(), "--json".into()]).expect("static help command");
-            println!("{}", serde_json::to_string(&value).unwrap_or_default());
+            write_cli_output(0, |output| {
+                writeln!(
+                    output,
+                    "{}",
+                    serde_json::to_string(&value).unwrap_or_default()
+                )
+            })
         } else {
-            print_human_help();
-        }
-        std::process::exit(0);
+            write_cli_output(0, print_human_help)
+        };
+        std::process::exit(code);
     }
     if args
         .first()
         .map(|a| a == "--version" || a == "-V")
         .unwrap_or(false)
     {
-        println!("orbit {}", env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
+        std::process::exit(write_cli_output(0, |output| {
+            writeln!(output, "orbit {}", env!("CARGO_PKG_VERSION"))
+        }));
     }
     if positionals(&args).first().copied() == Some("web") {
         let mut tail = match command_tail(&args) {
@@ -307,19 +339,19 @@ fn main() {
                 || (command == "init"
                     && v.get("interactive").and_then(serde_json::Value::as_bool) == Some(true)))
                 && !args.iter().any(|arg| arg == "--json");
-            if command == "config"
+            let text = if command == "config"
                 && v["command"] == "config import-claude"
                 && !args.iter().any(|arg| arg == "--json")
             {
-                print!("{}", orbit_cli::claude_permissions::human_report(&v));
+                orbit_cli::claude_permissions::human_report(&v)
             } else if command == "migrate" && !args.iter().any(|arg| arg == "--json") {
-                print!("{}", orbit_cli::migration::human_report(&v));
+                orbit_cli::migration::human_report(&v)
             } else if command == "completions" && !args.iter().any(|arg| arg == "--json") {
-                print!("{}", v["script"].as_str().unwrap_or_default());
+                v["script"].as_str().unwrap_or_default().to_owned()
             } else if command == "config" && !args.iter().any(|arg| arg == "--json") {
-                print!("{}", orbit_cli::configuration_ui::human_report(&v));
+                orbit_cli::configuration_ui::human_report(&v)
             } else if command == "plugin" && !args.iter().any(|arg| arg == "--json") {
-                print!("{}", orbit_cli::plugin_commands::human_report(&v));
+                orbit_cli::plugin_commands::human_report(&v)
             } else if command == "mcp"
                 // After `--` the words are the server's command line.
                 && !args
@@ -327,20 +359,27 @@ fn main() {
                     .take_while(|arg| *arg != "--")
                     .any(|arg| arg == "--json")
             {
-                print!("{}", orbit_cli::mcp_commands::human_report(&v));
+                orbit_cli::mcp_commands::human_report(&v)
             } else if human {
-                print!("{}", orbit_cli::cli_release_commands::human_report(&v));
+                orbit_cli::cli_release_commands::human_report(&v)
             } else {
-                println!(
-                    "{}",
+                format!(
+                    "{}\n",
                     serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
-                );
-            }
-            if v.pointer("/report/ready")
+                )
+            };
+            let command_exit = if v
+                .pointer("/report/ready")
                 .and_then(serde_json::Value::as_bool)
                 == Some(false)
             {
-                std::process::exit(1);
+                1
+            } else {
+                0
+            };
+            let code = write_cli_output(command_exit, |output| write!(output, "{text}"));
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Err((code, msg)) => {
@@ -364,17 +403,22 @@ fn main() {
 
 /// Human help for `--help`/`-h` (C1): plain text to stdout, exit 0. The
 /// JSON vocabulary stays available at `orbit help --json` / `orbit help`.
-fn print_human_help() {
-    println!(
+fn print_human_help(output: &mut dyn Write) -> std::io::Result<()> {
+    macro_rules! line {
+        () => { writeln!(output)? };
+        ($($args:tt)*) => { writeln!(output, $($args)*)? };
+    }
+
+    line!(
         "orbit {} — the harness that orbits around you",
         env!("CARGO_PKG_VERSION")
     );
-    println!();
-    println!("USAGE:");
-    println!("    orbit [chat] [--model <M>] [--gate <URL>]    interactive TUI harness");
-    println!("    orbit <command> [args]                       run a command");
-    println!();
-    println!("COMMANDS:");
+    line!();
+    line!("USAGE:");
+    line!("    orbit [chat] [--model <M>] [--gate <URL>]    interactive TUI harness");
+    line!("    orbit <command> [args]                       run a command");
+    line!();
+    line!("COMMANDS:");
     for (name, desc) in [
         ("chat", "start the interactive harness (default when bare)"),
         (
@@ -480,41 +524,39 @@ fn print_human_help() {
         ),
         ("help [--json]", "this help (JSON vocabulary with --json)"),
     ] {
-        println!("    {name:<28} {desc}");
+        line!("    {name:<28} {desc}");
     }
-    println!();
-    println!("SETUP:");
-    println!(
+    line!();
+    line!("SETUP:");
+    line!(
         "    orbit setup                                 choose a provider, authentication, models and default"
     );
-    println!(
+    line!(
         "    orbit provider add                          add another provider with the same wizard"
     );
-    println!("    Model source: manual makes no request; discover fetches a filterable catalog.");
-    println!(
+    line!("    Model source: manual makes no request; discover fetches a filterable catalog.");
+    line!(
         "    Refresh schema: generic, openrouter, anthropic or ollama; existing manual limits stay authoritative."
     );
-    println!(
+    line!(
         "    Browser login: supported OpenRouter endpoint only. Other providers accept key or ENV."
     );
-    println!(
+    line!(
         "    Login --no-browser: open the authorization URL manually; --headless: privately paste the displayed code."
     );
-    println!(
+    line!(
         "    Login is terminal-only; logout needs --yes for JSON or redirected use. No key is accepted in argv."
     );
-    println!(
-        "    orbit setup --no-provider [--json]           offline identity setup for automation"
-    );
-    println!("    orbit setup --provider NAME --gate URL --model ID [--credential-env ENV_NAME]");
-    println!(
+    line!("    orbit setup --no-provider [--json]           offline identity setup for automation");
+    line!("    orbit setup --provider NAME --gate URL --model ID [--credential-env ENV_NAME]");
+    line!(
         "    orbit setup --guided                        older offline ENV-name prompts (terminal only)"
     );
-    println!(
+    line!(
         "    orbit setup repair --dry-run [--json]        inspect recovery without replacing identity"
     );
-    println!();
-    println!("CHAT FLAGS:");
+    line!();
+    line!("CHAT FLAGS:");
     for (name, desc) in [
         ("--model <M>", "model id (providers.toml)"),
         (
@@ -578,11 +620,12 @@ fn print_human_help() {
             "allow uncovered tools; explicit ask/deny rules still apply",
         ),
     ] {
-        println!("    {name:<28} {desc}");
+        line!("    {name:<28} {desc}");
     }
-    println!();
-    println!("    --version                    print the version and exit");
-    println!("    --help | -h                 this help");
+    line!();
+    line!("    --version                    print the version and exit");
+    line!("    --help | -h                 this help");
+    Ok(())
 }
 
 /// The commit this binary was built from, as honestly as it can be known.
