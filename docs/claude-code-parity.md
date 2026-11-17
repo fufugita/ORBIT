@@ -1,6 +1,6 @@
 # Claude Code parity audit
 
-Compatibility inventory for ORBIT 0.2.1, reviewed 15 November 2026.
+Compatibility inventory for ORBIT 0.2.1, reviewed 16 November 2026.
 
 This answers one question: if you move your daily work from Claude Code to
 ORBIT today, what stops working? It is narrower and more granular than
@@ -11,7 +11,10 @@ harnesses and dates from 15 Oct.
 
 - The Claude Code side comes from its published documentation as fetched on
   11 Nov 2026: the docs index, and the tools, commands, hooks, interactive-mode
-  and CLI reference pages.
+  and CLI reference pages. Selected command contracts were rechecked against
+  an installed Claude Code 2.1.326 artifact with REA and an isolated `--help`
+  terminal capture. Static interface descriptors establish the declared
+  contract, not availability for every account or a successful remote run.
 - The ORBIT side comes from reading and searching this repository. "Present"
   means the code path exists, not that it behaves like Claude Code's. A few
   paths have since been run in the terminal chat under a scripted
@@ -20,6 +23,10 @@ harnesses and dates from 15 Oct.
   next`, `/memory edit`, `/config edit`, the channel permission relay).
   This inventory does not certify live-provider or remote-MCP interoperability;
   validate those with the providers and integrations you intend to use.
+- Native Council and Reactor have passed an isolated terminal journey against
+  a local fabricated provider, including four actual Council requests, saved
+  accounting, live pane updates and art changes. This is functional local
+  acceptance, not evidence that a particular upstream provider or roster works.
 - Statuses: **Present**, **Partial** (exists but narrower), **Missing** (no code
   found), **Unverified** (a search hit I did not confirm), **Out of scope**
   (tied to Anthropic's cloud, apps or account system).
@@ -122,9 +129,9 @@ from other tools, plugins and skills, subagents.
 | Queue messages during a turn | Partial | A pending prompt is held; no "send now", no take-back |
 | Background Bash | Partial | `run_in_background` and `TaskStop`; `TaskOutput` reads the log; no `Ctrl+B` for a running command |
 | Task checklist | Present | `TaskCreate/List/Update`, Plan panel |
-| Diff review | Present | Changes and Review panels; ORBIT's layouts go further |
+| Diff review | Present | `/diff` focuses a recorded Changes/Review pane, or adds a side pane when space permits; a second invocation returns to the conversation. It is not a scan of untracked or pre-existing worktree changes |
 | Themes | Present | Three themes plus colour overrides; no plugin-shipped themes |
-| Status line | Present | Built-in chips can be shown, hidden and width-bounded; `status_line = "<command>"` adds the operator's own line (Claude Code's `statusLine` with the compatibility switch). Plain text, no colour |
+| Status line | Present | Built-in chips can be shown, hidden and width-bounded; `status_line = "<command>"` adds the operator's own line (Claude Code's `statusLine` with the compatibility switch). `/statusline` inspects it; `set`, `off` and `reset` change the native setting. An explicit `--settings` value has priority. Plain text, no colour |
 | Vim mode, keybindings file | Partial | `ORBIT_VIM=1`: single-line motions and edits, no counts or visual mode. `keybindings.toml` remaps keys to keys or slash commands; no per-context bindings or chords |
 | External editor, prompt stash, input undo | Partial | `Ctrl+G`, `Ctrl+S`; no input undo outside vim mode |
 | `/btw` side questions | Partial | Between turns only; tokens billed to the session's housekeeping subtotal in a managed session, uncounted otherwise |
@@ -146,15 +153,32 @@ a simpler form: `/goal`, `/loop`.
 Also present: `/copy`, `/export`, and custom command files.
 
 ORBIT only: `/mode`, `/models`, `/sessions`, `/undo`, `/customize`, `/route`,
-`/mods`, `/mod`.
+`/mods`, `/mod`, `/council`, `/reactor`.
 
 Also present: `/init`, `/memory`, `/config`, `/context`, `/rename`, `/add-dir`,
 `/btw`, `/find`, `/tasks`, `/status`, `/sandbox`, `/plan`, `/vim`,
-`/keybindings`, `/output-style`, `/recap`, `/review`, `/security-review`.
+`/keybindings`, `/output-style`, `/recap`, `/review`, `/security-review`,
+`/diff`, `/stats`, `/feedback`, `/statusline`.
+
+`/stats` is a session-scoped alias of `/usage`; it does not report an upstream
+subscription quota or global activity history. `/feedback` displays the issue
+URL and local version/platform information, and attaches or sends nothing.
+`/statusline set COMMAND`, `/statusline off` and `/statusline reset` use the
+normal configuration controls. ConfigChange hooks still apply outside bare
+mode; a configured model hook uses managed housekeeping accounting.
 
 Missing from ORBIT's chat:
-`/diff` (use the Changes and Review panels), `/background`, `/stop`,
-`/schedule`, `/pr-comments`, `/statusline`, `/stats`, `/feedback`.
+`/background`, `/stop`, `/schedule`, `/pr-comments`.
+
+These names are not interchangeable with existing primitives. Claude Code
+2.1.326 declares `/background` as moving the current session into the
+background, and `/schedule` as managing remote agents. ORBIT's background
+subagents and local schedules are narrower capabilities. ORBIT's attached
+session already has `/stop`, which stops its owner; the main terminal chat
+does not expose that command. `/stats` is an alias of `/usage` in the checked
+Claude artifact. `/pr-comments` was not observed there, so its absence from
+ORBIT is a requested workflow gap rather than confirmed parity with that
+version.
 
 ## Tools
 
@@ -171,7 +195,9 @@ Missing from ORBIT's chat:
 | Monitor | Present | Watches a background Bash task; output reaches a running turn with its next tool round, else arrives as a prompt when a terminal session is idle |
 | EnterWorktree, ExitWorktree | Present | Offered inside a git repository. The worktree is `.orbit/worktrees/<name>` on `orbit/<name>`; the session's files stay in the workspace it started in. `--worktree` at launch still exists |
 | ListMcpResourcesTool, ReadMcpResourceTool | Present | `ListMcpResources`, `ReadMcpResource` |
-| SendMessage, Workflow, PushNotification | Missing | |
+| SendMessage | Missing | `AgentSendMessage` queues a child agent message for its next explicit resume. It does not provide Claude's running-agent, teammate, peer-session or control-message delivery contract |
+| Workflow | Missing | The checked reference declares a script/DSL execution surface with agent, parallel, pipeline and phase operations, resumable run IDs and background execution. Skill prompts and task checklists are not substitutes |
+| PushNotification | Missing | ORBIT can issue an opt-in local terminal notification after a turn. It does not have a model-callable notification tool or a configured remote push transport |
 | Artifact, RemoteTrigger, PowerShell | Out of scope | |
 
 ## Permissions and safety
@@ -182,6 +208,7 @@ Missing from ORBIT's chat:
 | Deny and ask rules hold in bypass mode | Present | A deny rule denies and a rule that asks still asks in `bypass`; only what no rule speaks about runs unasked (changed 12 Nov, it used to skip settings rules) |
 | Auto mode | Partial | `/mode auto`: the classifier sees the call and the operator's recent messages (never tool results); high-risk calls always ask; its requests bill to the session's housekeeping subtotal |
 | Allow, ask and deny rules with patterns | Present | Five scopes, typed grants, deny-read defaults |
+| Import Claude permission rules | Partial | Preview and guarded apply are available. Read/Edit operation groups, settings-relative path anchors, resolved symlink checks and WebFetch domain/sandbox semantics require manual migration; an unsupported restrictive rule blocks the entire apply |
 | Rules that match tool arguments | Unverified | MCP grants are per tool, not per argument |
 | Folder trust | Present | ORBIT only |
 | Sandboxed Bash | Unverified | `crates/sandbox` exists; boundary not reviewed |
@@ -193,9 +220,9 @@ Missing from ORBIT's chat:
 |---|---|---|
 | Events | Present | All 33. `Setup` fires for `--init`, `--init-only` and `--maintenance`; `TeammateIdle` when a background agent finishes a turn |
 | Command handlers, exit code 2 blocks | Present | 60 s default timeout |
-| Matchers | Present | Name lists and `*` wildcards; not full regular expressions |
+| Matchers | Partial | Name lists and `*` wildcards; not full regular expressions |
 | `if` conditions | Present | `Tool(pattern)` on the tool and its main argument |
-| JSON output: decisions, rewritten input, added context | Partial | ORBIT's schema and Claude Code's `hookSpecificOutput` / `decision`; `ask` opens the approval card; context only for SessionStart and UserPromptSubmit |
+| JSON output: decisions, rewritten input, added context | Partial | ORBIT's schema and Claude Code's `hookSpecificOutput` / `decision`; `ask` opens the approval card. SessionStart and UserPromptSubmit feed model context; PreToolUse, PostToolUse and PostToolUseFailure append bounded context to the tool result; SubagentStart adds context to the child input. Tool events carry the original `tool_use_id`; failure events include `is_interrupt`. Cancelled calls suppress failure hooks. Other event outcomes need individual review |
 | `SessionStart` in interactive sessions | Present | Its output becomes model context; `SessionEnd` is still headless only |
 | HTTP handlers | Present | Through `curl`; blocks only via the response body |
 | Prompt, agent and MCP-tool handlers | Partial | Model checks use the `explore` role (or the hook's `model`) and durable housekeeping accounting; the agent may only Read, Grep and Glob inside the working directories. A child session without its own managed hook accounting reports an error instead of sending an untracked model request |

@@ -68,16 +68,8 @@ impl Tool for WebFetchTool {
             return ToolResult::err("invalid URL");
         };
 
-        // Rules: https only, no localhost/private hosts.
-        if url.scheme() != "https" {
-            return ToolResult::err("WebFetch is HTTPS only");
-        }
-        if let Some(host) = url.host_str() {
-            if refused_host(host) {
-                return ToolResult::err("WebFetch refuses localhost and private addresses");
-            }
-        } else {
-            return ToolResult::err("URL has no host");
+        if let Err(message) = validate_fetch_url(&url) {
+            return ToolResult::err(message);
         }
 
         // Egress grant: a record per new domain, in the session dir
@@ -139,11 +131,14 @@ impl Tool for WebFetchTool {
                 if status.is_redirection()
                     && let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok())
                 {
-                    let next = fetch_url.join(loc).map_err(|e| e.to_string())?;
-                    if next.host_str() != fetch_url.host_str() {
-                        return Ok((format!("{next}"), String::new(), true));
-                    }
-                    // same-host redirect: one follow is enough
+                    let next = match redirect_target(&fetch_url, loc)? {
+                        RedirectTarget::Surface(next) => {
+                            return Ok((next.to_string(), String::new(), true));
+                        }
+                        RedirectTarget::Follow(next) => next,
+                    };
+                    // Same-host targets passed the initial URL guards again.
+                    // One follow is enough; the client never follows implicitly.
                     let resp2 = client
                         .get(next.clone())
                         .send()
@@ -201,6 +196,35 @@ impl Tool for WebFetchTool {
             "prompt": prompt
         }))
     }
+}
+
+/// Apply the same transport and host guards before every contacted URL.
+fn validate_fetch_url(url: &url::Url) -> Result<(), &'static str> {
+    if url.scheme() != "https" {
+        return Err("WebFetch is HTTPS only");
+    }
+    let host = url.host_str().ok_or("URL has no host")?;
+    if refused_host(host) {
+        return Err("WebFetch refuses localhost and private addresses");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum RedirectTarget {
+    Follow(url::Url),
+    Surface(url::Url),
+}
+
+/// Cross-host redirects stay visible data and require a separate tool call.
+/// A same-host redirect is contacted only after the original guards pass again.
+fn redirect_target(from: &url::Url, location: &str) -> Result<RedirectTarget, String> {
+    let next = from.join(location).map_err(|error| error.to_string())?;
+    if next.host_str() != from.host_str() {
+        return Ok(RedirectTarget::Surface(next));
+    }
+    validate_fetch_url(&next).map_err(|message| format!("redirect refused: {message}"))?;
+    Ok(RedirectTarget::Follow(next))
 }
 
 /// Hosts WebFetch never contacts: localhost names and any literal address
@@ -343,7 +367,7 @@ pub fn html_to_markdown(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod refused_host_tests {
-    use super::refused_host;
+    use super::{RedirectTarget, redirect_target, refused_host, validate_fetch_url};
 
     #[test]
     fn local_private_and_metadata_addresses_are_refused_in_every_form() {
@@ -385,5 +409,60 @@ mod refused_host_tests {
         ] {
             assert!(!refused_host(host), "{host} must be allowed");
         }
+    }
+
+    #[test]
+    fn initial_and_same_host_redirect_targets_share_transport_and_host_guards() {
+        for raw in [
+            "http://example.com/start",
+            "https://localhost/start",
+            "https://127.0.0.1/start",
+            "https://[::1]/start",
+            "https://169.254.169.254/start",
+            "https://100.64.0.1/start",
+        ] {
+            let target = url::Url::parse(raw).unwrap();
+            assert!(validate_fetch_url(&target).is_err(), "{raw}");
+            assert!(redirect_target(&target, "/next").is_err(), "{raw}");
+        }
+        let public = url::Url::parse("https://example.com/start").unwrap();
+        assert!(validate_fetch_url(&public).is_ok());
+        let downgrade = redirect_target(&public, "http://example.com/next").unwrap_err();
+        assert!(downgrade.contains("HTTPS only"));
+    }
+
+    #[test]
+    fn same_host_https_redirects_preserve_relative_protocol_relative_and_port_targets() {
+        let from = url::Url::parse("https://example.com/start/page").unwrap();
+        for (location, expected) in [
+            ("../next", "https://example.com/next"),
+            ("//example.com/next", "https://example.com/next"),
+            (
+                "https://EXAMPLE.com:8443/next",
+                "https://example.com:8443/next",
+            ),
+        ] {
+            match redirect_target(&from, location).unwrap() {
+                RedirectTarget::Follow(next) => assert_eq!(next.as_str(), expected),
+                RedirectTarget::Surface(_) => panic!("same-host HTTPS target was not followed"),
+            }
+        }
+    }
+
+    #[test]
+    fn cross_host_redirects_remain_uncontacted_targets_for_a_separate_call() {
+        let from = url::Url::parse("https://example.com/start").unwrap();
+        for (location, expected) in [
+            ("//other.example/next", "https://other.example/next"),
+            ("https://other.example/next", "https://other.example/next"),
+            ("http://other.example/next", "http://other.example/next"),
+            ("https://127.0.0.1/next", "https://127.0.0.1/next"),
+        ] {
+            match redirect_target(&from, location).unwrap() {
+                RedirectTarget::Surface(next) => assert_eq!(next.as_str(), expected),
+                RedirectTarget::Follow(_) => panic!("cross-host target was admitted for contact"),
+            }
+        }
+        assert!(redirect_target(&from, "https://[invalid").is_err());
     }
 }

@@ -1739,25 +1739,25 @@ fn worker_main_owned(
         orbit_hud_tui::emit_status(&ctx.sender, &line);
     }
     // The operator's own status line, when they configured a command.
+    let status_line_publication = std::sync::Arc::new(StatusLinePublication::default());
     let status_command = crate::status_line::command(&config.home);
-    if let Some(command) = &status_command {
-        refresh_status_line(
-            command,
-            &ctx.sender,
-            crate::status_line::Snapshot {
-                session_id: config.session_id.clone(),
-                model: config.model.clone(),
-                provider: config.provider_id.clone(),
-                permission_mode: config.scope.mode.config_name().to_owned(),
-                current_dir: tool_cx.cwd().to_string_lossy().into_owned(),
-                project_dir: workspace.to_string_lossy().into_owned(),
-                turns,
-                input_tokens: cum_input,
-                output_tokens: cum_output,
-                cost_microdollars: cum_cost,
-            },
-        );
-    }
+    let _ = refresh_status_line(
+        &status_line_publication,
+        status_command.as_deref(),
+        &ctx.sender,
+        crate::status_line::Snapshot {
+            session_id: config.session_id.clone(),
+            model: config.model.clone(),
+            provider: config.provider_id.clone(),
+            permission_mode: config.scope.mode.config_name().to_owned(),
+            current_dir: tool_cx.cwd().to_string_lossy().into_owned(),
+            project_dir: workspace.to_string_lossy().into_owned(),
+            turns,
+            input_tokens: cum_input,
+            output_tokens: cum_output,
+            cost_microdollars: cum_cost,
+        },
+    );
     orbit_hud_tui::emit_status(
         &ctx.sender,
         &format!("session {}", short_session_id(&config.session_id)),
@@ -3613,7 +3613,7 @@ fn worker_main_owned(
                         ["memory", "edited", scope] => {
                             crate::config_edit::memory_edited(&config.home, &workspace, scope)
                         }
-                        ["config", "edit"] => {
+                        ["config", "edit"] | ["statusline", "edit"] => {
                             match crate::config_edit::config_edit_target(&config.home) {
                                 Ok(path) => {
                                     turn_sender.send(Msg::EditFile {
@@ -3678,6 +3678,11 @@ fn worker_main_owned(
                             crate::config_edit::config_unset(&config.home, key)
                                 .unwrap_or_else(|error| error)
                         }
+                        ["statusline", ..] => statusline_control(
+                            &config.home,
+                            what.strip_prefix("statusline").unwrap_or("").trim(),
+                        )
+                        .unwrap_or_else(|error| error),
                         ["config", "set"] | ["config", "unset"] => {
                             "usage: /config set <key> <value> · /config unset <key> · /config edit · keys: claude_compat, output_style, status_line".into()
                         }
@@ -3925,25 +3930,28 @@ fn worker_main_owned(
         }
         // The operator's status line follows what just happened. The
         // command runs off this thread: a slow one delays nothing.
-        if let Some(command) = &status_command {
-            refresh_status_line(
-                command,
-                &ctx.sender,
-                crate::status_line::Snapshot {
-                    session_id: binding.session_id.clone(),
-                    model: config.model.clone(),
-                    provider: config.provider_id.clone(),
-                    permission_mode: config.scope.mode.config_name().to_owned(),
-                    current_dir: tool_cx.cwd().to_string_lossy().into_owned(),
-                    project_dir: workspace.to_string_lossy().into_owned(),
-                    turns,
-                    input_tokens: cum_input,
-                    output_tokens: cum_output,
-                    cost_microdollars: cum_cost,
-                },
-            );
-        }
+        let status_command = crate::status_line::command(&config.home);
+        let _ = refresh_status_line(
+            &status_line_publication,
+            status_command.as_deref(),
+            &ctx.sender,
+            crate::status_line::Snapshot {
+                session_id: binding.session_id.clone(),
+                model: config.model.clone(),
+                provider: config.provider_id.clone(),
+                permission_mode: config.scope.mode.config_name().to_owned(),
+                current_dir: tool_cx.cwd().to_string_lossy().into_owned(),
+                project_dir: workspace.to_string_lossy().into_owned(),
+                turns,
+                input_tokens: cum_input,
+                output_tokens: cum_output,
+                cost_microdollars: cum_cost,
+            },
+        );
     }
+    // Old scripts may finish after the frontend has closed; they no longer own
+    // publication. Do not clear a successor frontend's bar on this old bus.
+    status_line_publication.clear(|| {});
     // The front end went away: the interactive session is over.
     fire_session_end(&config.home);
 }
@@ -3970,21 +3978,118 @@ pub fn fire_session_end(home: &std::path::Path) {
         );
 }
 
+fn statusline_description(home: &std::path::Path) -> String {
+    let mut text = match crate::status_line::configured(home) {
+        Some(configuration) if configuration.command.is_empty() => {
+            format!("Status line disabled by {}.", configuration.source.label())
+        }
+        Some(configuration) => format!(
+            "Status line command from {}: {}{}",
+            configuration.source.label(),
+            crate::status_line::clean(&configuration.command),
+            if configuration.source == crate::status_line::Source::SettingsFlag {
+                "\n--settings takes precedence over changes to the ORBIT home setting."
+            } else {
+                ""
+            }
+        ),
+        None => "No custom status line is configured.".into(),
+    };
+    if crate::tools::bare_mode() {
+        text.push_str("\nBare mode suppresses status-line execution for this session.");
+    }
+    text
+}
+
+fn statusline_control(home: &std::path::Path, specification: &str) -> Result<String, String> {
+    const HELP: &str = "usage: /statusline · /statusline set <command> · /statusline off · /statusline reset · /statusline edit\nset/off change the ORBIT home; reset removes that setting and restores normal inheritance.";
+    let changed = match specification {
+        "" => return Ok(format!("{}\n{HELP}", statusline_description(home))),
+        "off" => crate::config_edit::status_line_set(home, None)?,
+        "reset" => crate::config_edit::config_unset(home, "status_line")?,
+        input if input.starts_with("set ") => {
+            crate::config_edit::status_line_set(home, Some(&input[4..]))?
+        }
+        _ => return Err(HELP.into()),
+    };
+    let _ = orbit_engine::hooks::Hooks::load(home, orbit_engine::hooks::project_trusted(home))
+        .fire(
+            orbit_engine::hooks::HookEvent::ConfigChange,
+            &serde_json::json!({ "source": "status_line" }),
+        );
+    Ok(format!("{changed}\n{}", statusline_description(home)))
+}
+
+/// One worker's status bar has one publication owner. Checking that ownership
+/// and publishing share a lock with disabling/clearing the bar. Script execution
+/// never holds this lock, and independent workers have independent owners.
+#[derive(Default)]
+struct StatusLinePublication {
+    current: std::sync::Mutex<Option<std::sync::Arc<()>>>,
+}
+
+impl StatusLinePublication {
+    fn begin(&self) -> std::sync::Arc<()> {
+        let owner = std::sync::Arc::new(());
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(owner.clone());
+        owner
+    }
+
+    fn clear(&self, publish: impl FnOnce()) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *current = None;
+        publish();
+    }
+
+    fn publish(&self, owner: &std::sync::Arc<()>, publish: impl FnOnce()) -> bool {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, owner))
+        {
+            publish();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Run the status-line command for this snapshot and post what it printed.
 /// Runs overlap when commands come quickly: only the newest one's line is
 /// shown, so a slow earlier run cannot overwrite a later one.
-fn refresh_status_line(command: &str, sender: &BusSender, snapshot: crate::status_line::Snapshot) {
-    static NEWEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let run = NEWEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+fn refresh_status_line(
+    publication: &std::sync::Arc<StatusLinePublication>,
+    command: Option<&str>,
+    sender: &BusSender,
+    snapshot: crate::status_line::Snapshot,
+) -> Option<std::thread::JoinHandle<()>> {
+    let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
+        // Invalidate older, still-running commands before clearing the line.
+        publication.clear(|| sender.send(Msg::StatusLine(String::new())));
+        return None;
+    };
+    let owner = publication.begin();
+    let publication = publication.clone();
     let (command, sender) = (command.to_owned(), sender.clone());
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("orbit-status-line".into())
         .spawn(move || {
             let line = crate::status_line::run(&command, &snapshot);
-            if NEWEST.load(std::sync::atomic::Ordering::SeqCst) == run {
+            publication.publish(&owner, || {
                 sender.send(Msg::StatusLine(line));
-            }
-        });
+            });
+        })
+        .ok()
 }
 
 struct ToolCancelScope(orbit_tools::ToolContext);
@@ -9482,6 +9587,181 @@ reasoning_rate_policy = "output_rate"
         // to the worker. An absent snapshot alone is deliberately legacy.
         session_accounting::prepare_root(&lease, &mut seed, RootOrigin::FreshCandidate).unwrap();
         lease
+    }
+
+    #[test]
+    fn statusline_controls_persist_without_a_prompt_or_accounting_intent() {
+        let home = TestHome::new();
+        std::fs::write(home.join("settings.toml"), "claude_compat = false\n").unwrap();
+        let initial = config(&home);
+        let session_id = initial.session_id.clone();
+        let lease = fresh_council_worker_lease(&initial);
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        for command in [
+            "statusline",
+            "statusline set \"printf\" \"%s\" \"fixture\"",
+            "statusline off",
+            "statusline reset",
+        ] {
+            commands
+                .send(WorkerCommand::Inspect(command.into()))
+                .unwrap();
+        }
+        drop(commands);
+        orbit_engine::hooks::without_hooks(|| {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                lease,
+            );
+        });
+        let settings: toml::Table =
+            toml::from_str(&std::fs::read_to_string(home.join("settings.toml")).unwrap()).unwrap();
+        assert!(!settings.contains_key("status_line"));
+        assert_eq!(settings["claude_compat"].as_bool(), Some(false));
+        let saved = crate::sessions::load_session(&home, &session_id).unwrap();
+        assert_eq!(
+            (
+                saved.turns,
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(saved.transcript.is_empty());
+        let checkpoint = crate::context_history::context_journal(&home, &session_id, None)
+            .unwrap()
+            .accounting_checkpoint_detailed()
+            .unwrap();
+        assert_eq!(checkpoint.revision().0, 0);
+        assert!(checkpoint.pending().is_none());
+        let mut messages = Vec::new();
+        while let Some(message) = bus.try_recv() {
+            if let Msg::SystemMessage(text) = message {
+                messages.push(text);
+            }
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("Status line command from ORBIT home")
+                    && text.contains("\"printf\" \"%s\" \"fixture\""))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("Status line disabled by ORBIT home"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("status_line removed"))
+        );
+    }
+
+    #[test]
+    fn disabling_statusline_clears_the_bar_and_rejects_an_older_running_result() {
+        let home = TestHome::new();
+        let ready = home.join("ready");
+        let release = home.join("release");
+        let done = home.join("done");
+        let quote =
+            |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let command = format!(
+            "printf ready > {}; while [ ! -f {} ]; do sleep 0.01; done; printf OLD_STATUS; printf done > {}",
+            quote(&ready),
+            quote(&release),
+            quote(&done)
+        );
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let publication = std::sync::Arc::new(StatusLinePublication::default());
+        let running =
+            refresh_status_line(&publication, Some(&command), &sender, Default::default())
+                .expect("status runner starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the older status command actually started");
+        assert!(refresh_status_line(&publication, None, &sender, Default::default()).is_none());
+        assert!(matches!(bus.try_recv(), Some(Msg::StatusLine(text)) if text.is_empty()));
+        std::fs::write(&release, "release").unwrap();
+        while !done.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(done.exists(), "the older command finished");
+        running.join().unwrap();
+        while let Some(message) = bus.try_recv() {
+            assert!(!matches!(message, Msg::StatusLine(text) if text.contains("OLD_STATUS")));
+        }
+    }
+
+    #[test]
+    fn statusline_off_is_serialized_with_the_accepted_publication_boundary() {
+        let publication = std::sync::Arc::new(StatusLinePublication::default());
+        let owner = publication.begin();
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (at_boundary, boundary) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let old = {
+            let publication = publication.clone();
+            let owner = owner.clone();
+            let messages = messages.clone();
+            std::thread::spawn(move || {
+                assert!(publication.publish(&owner, || {
+                    at_boundary.send(()).unwrap();
+                    resume.recv().unwrap();
+                    messages.lock().unwrap().push("old");
+                }));
+            })
+        };
+        boundary
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // The old result has been accepted but has not reached the bus. Off
+        // must share this critical section, not race between check and send.
+        assert!(matches!(
+            publication.current.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        let off = {
+            let publication = publication.clone();
+            let messages = messages.clone();
+            std::thread::spawn(move || publication.clear(|| messages.lock().unwrap().push("clear")))
+        };
+        release.send(()).unwrap();
+        old.join().unwrap();
+        off.join().unwrap();
+        assert_eq!(*messages.lock().unwrap(), ["old", "clear"]);
+        assert!(!publication.publish(&owner, || messages.lock().unwrap().push("stale")));
+        assert_eq!(*messages.lock().unwrap(), ["old", "clear"]);
+
+        let other = StatusLinePublication::default();
+        let other_owner = other.begin();
+        publication.clear(|| {});
+        assert!(other.publish(&other_owner, || {
+            messages.lock().unwrap().push("other owner")
+        }));
+        assert_eq!(messages.lock().unwrap().last(), Some(&"other owner"));
+
+        let poisoned = StatusLinePublication::default();
+        let poisoned_owner = poisoned.begin();
+        let _ =
+            std::panic::catch_unwind(|| poisoned.clear(|| panic!("injected publisher failure")));
+        let mut cleared = false;
+        poisoned.clear(|| cleared = true);
+        assert!(
+            cleared,
+            "off still clears the display after a poisoned publication lock"
+        );
+        assert!(!poisoned.publish(&poisoned_owner, || panic!("stale publication")));
     }
 
     #[test]

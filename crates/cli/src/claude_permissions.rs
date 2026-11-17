@@ -57,8 +57,14 @@ pub fn translate(rule: &str, tools: &[String]) -> Result<String, String> {
     }
     match (tool, pattern) {
         ("Read" | "Edit", None) => Err(format!(
-            "ORBIT handles {tool} tool grouping differently; write this rule by hand"
+            "Claude {tool} rules group several file operations; ORBIT selects individual tools, so migrate this policy manually"
         )),
+        ("Read" | "Edit", Some(_)) => Err(format!(
+            "Claude {tool} path rules require grouped operation coverage, settings-dependent anchors and resolved symlink checks; migrate this policy manually"
+        )),
+        ("WebFetch", Some(pattern)) if pattern.starts_with("domain:") => Err(
+            "Claude WebFetch domain rules normalize hostnames and also change sandbox network policy; translating only the tool selector cannot preserve this policy, so migrate it manually".into(),
+        ),
         ("Bash", Some("" | "*")) => Ok("Bash".to_owned()),
         // `npm run test:*` is Claude Code's older spelling of a prefix.
         ("Bash", Some(pattern)) => Ok(format!(
@@ -545,9 +551,63 @@ mod tests {
     }
 
     #[test]
+    fn preview_explains_grouped_paths_and_sandbox_domain_policy_without_guessing_rules() {
+        let root = private_fixture();
+        let source = root.join("source.json");
+        let target = root.join("settings.toml");
+        let raw_rules = [
+            "Read",
+            "Edit",
+            "Read(./private/**)",
+            "Edit(/src/**)",
+            "WebFetch(domain:EXAMPLE.com.)",
+            "Write",
+        ];
+        std::fs::write(
+            &source,
+            json!({"permissions":{"allow":raw_rules}}).to_string(),
+        )
+        .unwrap();
+        let preview =
+            import_sources(vec![("user", source, target.clone())], &tools(), false).unwrap();
+        let rules = preview["files"][0]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), raw_rules.len());
+        for (index, rule) in rules.iter().take(5).enumerate() {
+            assert!(rule["orbit"].is_null());
+            let reason = rule["not_carried"].as_str().unwrap();
+            if index >= 2 {
+                assert!(!reason.contains(raw_rules[index]));
+            }
+            if index < 2 {
+                assert!(reason.contains("group"));
+                assert!(reason.contains("individual tools"));
+            } else if index < 4 {
+                assert!(reason.contains("group"));
+                assert!(reason.contains("settings-dependent anchors"));
+                assert!(reason.contains("resolved symlink"));
+            } else {
+                assert!(reason.contains("normalize hostnames"));
+                assert!(reason.contains("sandbox network policy"));
+            }
+        }
+        assert_eq!(rules[5]["orbit"], "Write");
+        let report = human_report(&preview);
+        assert!(report.contains("settings-dependent anchors"));
+        assert!(report.contains("sandbox network policy"));
+        assert!(!target.exists());
+        assert!(!root.join(".permissions-import.lock").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unsupported_protections_block_every_source_before_apply() {
         for effect in ["ask", "deny"] {
-            for rule in ["Edit", "Read(private/**)"] {
+            for rule in [
+                "Edit",
+                "Read(private/**)",
+                "WebFetch(domain:EXAMPLE.com.)",
+                "WebFetch(domain:*.example.com)",
+            ] {
                 let root = private_fixture();
                 let first_source = root.join("user.json");
                 let later_source = root.join("project.json");

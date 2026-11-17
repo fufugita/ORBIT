@@ -256,6 +256,7 @@ pub(crate) fn frame(
 // through `clip`, so nothing a label carries can move the cursor or hide,
 // and no line is wider than the terminal less one column.
 
+#[cfg(feature = "tui")]
 use orbit_hud_tui::proto::shell::pal;
 
 /// How many colours the terminal takes.
@@ -290,6 +291,7 @@ pub(crate) fn depth_from_env() -> Depth {
 
 /// What a piece of the screen is, which decides its colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "tui")]
 enum Tone {
     /// The mark's ring and the accents.
     Brand,
@@ -306,9 +308,11 @@ enum Tone {
     Warn,
 }
 
+#[cfg(feature = "tui")]
 const RESET: &str = "\x1b[0m";
 
 /// The escape sequence that selects `tone` as the text colour.
+#[cfg(feature = "tui")]
 fn tone(depth: Depth, tone: Tone) -> String {
     let (rgb, basic) = match tone {
         Tone::Brand => (pal::MAGENTA, 35),
@@ -329,6 +333,7 @@ fn tone(depth: Depth, tone: Tone) -> String {
 
 /// The background of the row the list's cursor is on. The named colours
 /// have no quiet background, so there the row is shown in reverse.
+#[cfg(feature = "tui")]
 fn selected_background(depth: Depth) -> String {
     let rgb = pal::RAISE2;
     match depth {
@@ -339,6 +344,7 @@ fn selected_background(depth: Depth) -> String {
 }
 
 /// The nearest entry of the 256-colour cube (or its grey ramp).
+#[cfg(feature = "tui")]
 fn cube(rgb: (u8, u8, u8)) -> u8 {
     let (r, g, b) = (u16::from(rgb.0), u16::from(rgb.1), u16::from(rgb.2));
     let spread = r.max(g).max(b) - r.min(g).min(b);
@@ -352,12 +358,14 @@ fn cube(rgb: (u8, u8, u8)) -> u8 {
 }
 
 /// One line being put together: styled text and how many cells it takes.
+#[cfg(feature = "tui")]
 struct Line {
     text: String,
     cells: usize,
     limit: usize,
 }
 
+#[cfg(feature = "tui")]
 impl Line {
     fn new(limit: usize, margin: usize) -> Self {
         let margin = margin.min(limit);
@@ -397,6 +405,7 @@ impl Line {
 
 /// The mark, as the terminal chat's welcome draws it: the ring in the
 /// brand colour, the star in its own, the letters in ink.
+#[cfg(feature = "tui")]
 fn mark_rows(depth: Depth, limit: usize, margin: usize) -> Vec<String> {
     const RING: &str = "⣠⠖⠋⠙⠒⠤⠴";
     orbit_hud_tui::proto::mark::MARK_ROWS
@@ -419,6 +428,7 @@ fn mark_rows(depth: Depth, limit: usize, margin: usize) -> Vec<String> {
 }
 
 /// What opens a first setup in the scroll-back: the mark and its tagline.
+#[cfg(feature = "tui")]
 pub(crate) fn banner(depth: Depth, columns: usize) -> String {
     let limit = columns.clamp(1, 240).saturating_sub(1);
     let margin = if limit >= 64 { 2 } else { 0 };
@@ -441,6 +451,7 @@ pub(crate) fn banner(depth: Depth, columns: usize) -> String {
 }
 
 /// A paragraph of the scroll-back in the quiet text colour.
+#[cfg(feature = "tui")]
 pub(crate) fn note(depth: Depth, columns: usize, text: &str) -> String {
     let limit = columns.clamp(1, 240).saturating_sub(1);
     let margin = if limit >= 64 { 2 } else { 0 };
@@ -457,6 +468,7 @@ pub(crate) fn note(depth: Depth, columns: usize, text: &str) -> String {
 /// Words of the setup in the scroll-back, under the margin and in the
 /// quiet colour, with nothing cut (an address to copy stays whole) and
 /// control characters made harmless.
+#[cfg(feature = "tui")]
 pub(crate) fn plain_note(depth: Depth, columns: usize, text: &str) -> String {
     let margin = if columns.clamp(1, 240) > 64 { "  " } else { "" };
     let colour = tone(depth, Tone::Soft);
@@ -474,6 +486,7 @@ pub(crate) fn plain_note(depth: Depth, columns: usize, text: &str) -> String {
 
 /// A question asked in the scroll-back (a name, a key): marked like the
 /// choice screen's input line. Line breaks before it are kept.
+#[cfg(feature = "tui")]
 pub(crate) fn question(depth: Depth, columns: usize, prompt: &str) -> String {
     let margin = if columns.clamp(1, 240) > 64 { "  " } else { "" };
     let text = prompt.trim_start_matches('\n');
@@ -488,6 +501,7 @@ pub(crate) fn question(depth: Depth, columns: usize, prompt: &str) -> String {
 
 /// A step of the setup in the scroll-back: where it is among the steps,
 /// its name, and one line on what it asks.
+#[cfg(feature = "tui")]
 pub(crate) fn stage_header(
     depth: Depth,
     columns: usize,
@@ -523,6 +537,7 @@ pub(crate) fn stage_header(
 /// brackets — the answers' names, the default, which key does what — that
 /// the panel shows in other ways. What they hold of state (a page, a count)
 /// stays, after the name: `Models · page 1/4 · 0 selected`.
+#[cfg(feature = "tui")]
 fn panel_title(prompt: &str) -> String {
     let Some(open) = prompt.find(" (") else {
         return prompt
@@ -562,6 +577,7 @@ pub(crate) const SCREEN_MIN: (usize, usize) = (40, 12);
 /// on stands out, what a choice means is said under the list, and what was
 /// typed and the keys that work are at the foot.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "tui")]
 pub(crate) fn screen(
     title: &str,
     choices: &[SetupChoice<'_>],
@@ -764,11 +780,78 @@ pub(crate) fn screen(
     Screen { lines, page }
 }
 
+#[cfg(not(feature = "tui"))]
+pub(crate) use plain::{banner, note, plain_note, question, screen, stage_header};
+
+/// Builds without the graphical frontend retain the bounded setup workflow.
+#[cfg(not(feature = "tui"))]
+mod plain {
+    use super::*;
+
+    pub(crate) fn banner(depth: Depth, columns: usize) -> String {
+        note(depth, columns, "ORBIT / SETUP")
+    }
+
+    pub(crate) fn note(_depth: Depth, columns: usize, text: &str) -> String {
+        text.lines()
+            .map(|row| clip(row, columns.clamp(1, 240).saturating_sub(1)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub(crate) fn plain_note(_depth: Depth, _columns: usize, text: &str) -> String {
+        text.split('\n').map(safe).collect::<Vec<_>>().join("\n")
+    }
+
+    pub(crate) fn question(depth: Depth, columns: usize, prompt: &str) -> String {
+        plain_note(depth, columns, prompt)
+    }
+
+    pub(crate) fn stage_header(
+        depth: Depth,
+        columns: usize,
+        number: usize,
+        total: usize,
+        title: &str,
+        detail: &str,
+    ) -> String {
+        let total = total.clamp(1, 12);
+        note(
+            depth,
+            columns,
+            &format!("{}/{} {}\n{}", number.clamp(1, total), total, title, detail),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn screen(
+        title: &str,
+        choices: &[SetupChoice<'_>],
+        menu: &Menu,
+        typed: &[u8],
+        error: &str,
+        columns: usize,
+        rows: usize,
+        allow_back: bool,
+        _depth: Depth,
+    ) -> Screen {
+        let mut frame = frame(title, choices, menu, typed, columns, rows, allow_back);
+        if !error.is_empty() {
+            frame.lines[2] = clip(error, columns.clamp(1, 240).saturating_sub(1));
+        }
+        Screen {
+            lines: frame.lines,
+            page: frame.page,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// What a styled line shows, without its colours.
+    #[cfg(feature = "tui")]
     fn shown(line: &str) -> String {
         let mut out = String::new();
         let mut chars = line.chars();
@@ -808,6 +891,7 @@ mod tests {
 
     /// The rich screen at an ordinary size: the mark, a panel named for
     /// the question, the cursor's row marked, its meaning under the list.
+    #[cfg(feature = "tui")]
     #[test]
     fn the_rich_screen_is_a_panel_under_the_mark() {
         let choices = providers();
@@ -890,6 +974,7 @@ mod tests {
     /// is wider than the terminal less a column, nothing hidden or
     /// controlling gets through, the screen fits the rows, and the cursor's
     /// row is on it.
+    #[cfg(feature = "tui")]
     #[test]
     fn the_rich_screen_fits_and_stays_safe() {
         let ids: Vec<String> = (0..40)
@@ -982,6 +1067,7 @@ mod tests {
     }
 
     /// The scroll-back pieces: the banner, a step's header, a note.
+    #[cfg(feature = "tui")]
     #[test]
     fn the_scroll_back_pieces_are_drawn_in_the_same_hand() {
         let wide: Vec<String> = banner(Depth::Indexed, 100).lines().map(shown).collect();
@@ -1105,6 +1191,7 @@ mod tests {
         assert_eq!(key(&[27; 16]), Some(Key::Ignore));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn panel_titles_keep_state_and_drop_reminders() {
         for (prompt, title) in [
@@ -1120,5 +1207,35 @@ mod tests {
         ] {
             assert_eq!(panel_title(prompt), title, "{prompt}");
         }
+    }
+
+    #[cfg(not(feature = "tui"))]
+    #[test]
+    fn setup_without_graphical_frontend_keeps_choices_notices_and_copyable_text() {
+        let choices = providers();
+        let rendered = screen(
+            "Provider\x1b[2J",
+            &choices,
+            &Menu::new(choices.len(), Some(1)),
+            b"anth",
+            "Choose an offered provider.",
+            80,
+            24,
+            true,
+            Depth::True,
+        );
+        let text = rendered.lines.join("\n");
+        assert!(text.contains("> 2. anthropic"));
+        assert!(text.contains("Choose an offered provider."));
+        assert!(!text.contains('\x1b'));
+        assert!(rendered.page > 0);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) < 80)
+        );
+        let address = format!("https://example.test/{}", "x".repeat(300));
+        assert_eq!(plain_note(Depth::True, 80, &address), address);
     }
 }

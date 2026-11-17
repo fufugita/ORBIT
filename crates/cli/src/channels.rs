@@ -445,9 +445,20 @@ pub fn start(home: &Path, cx: &orbit_tools::ToolContext) -> Vec<String> {
             let (home, cwd) = (home.clone(), cwd.clone());
             // Delivery can wait for a running turn's next round: not on the
             // thread that reads the server.
-            let _ = std::thread::Builder::new()
+            if let Err(error) = std::thread::Builder::new()
                 .name("orbit-channel-event".into())
-                .spawn(move || crate::tools::deliver_event(&home, &cwd, "channel", prompt));
+                .spawn(move || {
+                    if let Err(error) = crate::tools::deliver_event(&home, &cwd, "channel", prompt)
+                    {
+                        crate::tools::report_event_delivery_error("channel", &error);
+                    }
+                })
+            {
+                crate::tools::report_event_delivery_error(
+                    "channel",
+                    &format!("could not start event delivery: {error}"),
+                );
+            }
         }),
     )));
     // Which of them may also answer approval prompts: named for it, and

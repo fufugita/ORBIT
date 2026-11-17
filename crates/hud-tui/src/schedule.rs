@@ -19,6 +19,8 @@ const MAX_FILE_BYTES: u64 = 512 * 1024;
 const EXPIRY_SECS: u64 = 7 * 24 * 3600;
 /// A recurring fire later than this is skipped, not delivered late.
 const LATE_SECS: u64 = 10 * 60;
+const LOCK_BUSY: &str =
+    "schedules lock is busy; retry after the other scheduler operation finishes";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
@@ -50,18 +52,75 @@ pub fn path(home: &Path) -> PathBuf {
     home.join("schedules.json")
 }
 
+/// A best-effort listing for read-only displays. Mutators and claimers use
+/// `load_checked` so an invalid file cannot be mistaken for an empty queue.
 pub fn load(home: &Path) -> Vec<Job> {
-    let path = path(home);
-    let usable = std::fs::symlink_metadata(&path)
-        .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_FILE_BYTES);
-    if !usable {
-        return Vec::new();
+    load_checked(home).unwrap_or_default()
+}
+
+fn queue_metadata(home: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path(home)) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("schedules could not be inspected: {error}")),
     }
-    std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<File>(&bytes).ok())
+}
+
+fn validate_queue_metadata(metadata: &std::fs::Metadata) -> Result<(), String> {
+    if !metadata.is_file() {
+        return Err("schedules must be a regular file".into());
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(format!("schedules exceed the {MAX_FILE_BYTES}-byte limit"));
+    }
+    Ok(())
+}
+
+/// Read a bounded regular queue file. Only a missing file is an empty queue;
+/// a damaged or inaccessible queue must be inspected before it is changed.
+pub fn load_checked(home: &Path) -> Result<Vec<Job>, String> {
+    use std::io::Read;
+    let Some(metadata) = queue_metadata(home)? else {
+        return Ok(Vec::new());
+    };
+    validate_queue_metadata(&metadata)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    let file = match options.open(path(home)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("schedules could not be opened: {error}")),
+    };
+    validate_queue_metadata(
+        &file
+            .metadata()
+            .map_err(|error| format!("schedules could not be inspected: {error}"))?,
+    )?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("schedules could not be read: {error}"))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("schedules exceed the {MAX_FILE_BYTES}-byte limit"));
+    }
+    serde_json::from_slice::<File>(&bytes)
         .map(|file| file.jobs)
-        .unwrap_or_default()
+        .map_err(|error| {
+            // A serde type error can quote the malformed value. Do not echo
+            // prompt text or other file contents into an operator diagnostic.
+            format!(
+                "schedules contain invalid job data at line {}, column {}",
+                error.line(),
+                error.column()
+            )
+        })
 }
 
 pub fn save(home: &Path, jobs: &[Job]) -> Result<(), String> {
@@ -235,41 +294,76 @@ pub fn take_due(jobs: Vec<Job>, cwd: &str, now: u64) -> (Vec<String>, Vec<Job>, 
 /// Run `work` while holding the schedule file's lock, so two sessions (or a
 /// session and a tool call) never read, decide and write at the same time.
 /// The lock is an advisory `flock` on `schedules.lock`, held only for the
-/// call. If the lock file cannot be opened the work still runs, unlocked.
-pub fn locked<T>(home: &Path, work: impl FnOnce() -> T) -> T {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(home.join("schedules.lock"))
-        .ok();
-    if let Some(file) = &file {
-        let _ = rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive);
+/// call. Failure to open or acquire the lock never runs `work`; a busy
+/// lock returns immediately so polling cannot stall the terminal.
+pub fn locked<T>(home: &Path, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    locked_with(
+        home,
+        |file| {
+            rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+                |error| {
+                    if error == rustix::io::Errno::WOULDBLOCK {
+                        LOCK_BUSY.into()
+                    } else {
+                        format!("schedules lock could not be acquired: {error}")
+                    }
+                },
+            )
+        },
+        work,
+    )
+}
+
+fn locked_with<T>(
+    home: &Path,
+    acquire: impl FnOnce(&std::fs::File) -> Result<(), String>,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A lock must be an ordinary file, not a link or
+        // a special file whose open could block before the lock is acquired.
+        options.mode(0o600).custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
     }
-    let out = work();
+    let file = options
+        .open(home.join("schedules.lock"))
+        .map_err(|error| format!("schedules lock could not be opened: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("schedules lock could not be inspected: {error}"))?;
+    if !metadata.is_file() {
+        return Err("schedules lock is not a regular file".into());
+    }
+    acquire(&file)?;
+    let result = work();
     // Closing the descriptor releases the lock.
     drop(file);
-    out
+    result
 }
 
 /// Load, take what is due for `cwd`, and save if anything changed. A job
 /// fires in exactly one session: the whole step runs under the file lock,
 /// and a fire that could not be recorded is not delivered.
-pub fn fire_due(home: &Path, cwd: &str, now: u64) -> Vec<String> {
-    if !path(home).exists() {
-        return Vec::new();
+pub fn fire_due(home: &Path, cwd: &str, now: u64) -> Result<Vec<String>, String> {
+    if queue_metadata(home)?.is_none() {
+        return Ok(Vec::new());
     }
     locked(home, || {
-        let jobs = load(home);
+        let jobs = load_checked(home)?;
         if jobs.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let (prompts, kept, changed) = take_due(jobs, cwd, now);
-        if changed && save(home, &kept).is_err() {
+        if changed {
             // Not recorded as handled: firing now would repeat on every poll.
-            return Vec::new();
+            save(home, &kept)?;
         }
-        prompts
+        Ok(prompts)
     })
 }
 
@@ -451,6 +545,176 @@ mod tests {
         assert!(load(&home).is_empty());
     }
 
+    fn failure_home(label: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "orbit-sched-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn checked_load_and_claim_refuse_invalid_queues_without_changing_them() {
+        for kind in ["corrupt", "directory", "oversized"] {
+            let home = failure_home(kind);
+            assert!(load_checked(&home).unwrap().is_empty());
+            match kind {
+                "directory" => std::fs::create_dir(path(&home)).unwrap(),
+                "oversized" => {
+                    std::fs::write(path(&home), vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap()
+                }
+                _ => std::fs::write(path(&home), b"{not valid schedule data").unwrap(),
+            }
+            let before = std::fs::read(path(&home)).ok();
+            assert!(load_checked(&home).is_err(), "{kind}");
+            assert!(fire_due(&home, "/work", 180).is_err(), "{kind}");
+            assert_eq!(std::fs::read(path(&home)).ok(), before, "{kind}");
+            assert_eq!(path(&home).is_dir(), kind == "directory");
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_values_are_not_repeated_in_queue_diagnostics() {
+        let home = failure_home("diagnostic");
+        std::fs::write(
+            path(&home),
+            br#"{"jobs":[{"id":"one","cwd":"/work","prompt":"run","created":"PRIVATE_PROMPT_MARKER"}]}"#,
+        )
+        .unwrap();
+        let error = load_checked(&home).unwrap_err();
+        assert!(error.starts_with("schedules contain invalid job data at line "));
+        assert!(!error.contains("PRIVATE_PROMPT_MARKER"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_queue_symlink_is_not_an_empty_queue() {
+        let home = failure_home("queue-link");
+        let target = home.join("missing-target");
+        std::os::unix::fs::symlink(&target, path(&home)).unwrap();
+        assert!(load_checked(&home).is_err());
+        assert!(fire_due(&home, "/work", 180).is_err());
+        assert_eq!(std::fs::read_link(path(&home)).unwrap(), target);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_unopenable_lock_never_mutates_or_fires_jobs() {
+        let home = failure_home("lock-open");
+        save(&home, &[job("once", None, Some(120), 60)]).unwrap();
+        let before = std::fs::read(path(&home)).unwrap();
+        // Unlike chmod, this fails even when the test runs as root.
+        std::fs::create_dir(home.join("schedules.lock")).unwrap();
+        let called = std::cell::Cell::new(false);
+        let error = locked(&home, || {
+            called.set(true);
+            save(&home, &[])
+        })
+        .unwrap_err();
+        assert!(error.starts_with("schedules lock could not be opened:"));
+        assert!(!called.get());
+        assert!(fire_due(&home, "/work", 180).is_err());
+        assert_eq!(std::fs::read(path(&home)).unwrap(), before);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_failed_flock_never_runs_the_read_decide_write_step() {
+        let home = failure_home("flock");
+        save(&home, &[job("once", None, Some(120), 60)]).unwrap();
+        let before = std::fs::read(path(&home)).unwrap();
+        let called = std::cell::Cell::new(false);
+        let error = locked_with(
+            &home,
+            |_| Err("injected flock failure".into()),
+            || {
+                called.set(true);
+                save(&home, &[])
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "injected flock failure");
+        assert!(!called.get());
+        assert_eq!(std::fs::read(path(&home)).unwrap(), before);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_busy_lock_returns_before_the_holder_releases_it_and_leaves_jobs_pending() {
+        let home = failure_home("lock-busy");
+        save(&home, &[job("once", None, Some(120), 60)]).unwrap();
+        let before = std::fs::read(path(&home)).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join("schedules.lock"))
+            .unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let other_home = home.clone();
+        let poll = std::thread::spawn(move || {
+            sent.send(fire_due(&other_home, "/work", 180)).unwrap();
+        });
+        // The holder stays locked until after receiving the poll's result.
+        // Release even after a timeout so a blocking regression can exit.
+        let result = received.recv_timeout(std::time::Duration::from_secs(2));
+        let while_held = std::fs::read(path(&home)).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::Unlock).unwrap();
+        poll.join().unwrap();
+        assert_eq!(
+            result
+                .expect("poll waited for the lock holder")
+                .unwrap_err(),
+            LOCK_BUSY
+        );
+        assert_eq!(while_held, before);
+        assert_eq!(fire_due(&home, "/work", 180).unwrap(), ["run once"]);
+        assert!(fire_due(&home, "/work", 180).unwrap().is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_without_delivering_or_consuming_the_prompt() {
+        let home = failure_home("save");
+        save(&home, &[job("once", None, Some(120), 60)]).unwrap();
+        let before = std::fs::read(path(&home)).unwrap();
+        let temp = path(&home).with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        assert!(
+            fire_due(&home, "/work", 180)
+                .unwrap_err()
+                .starts_with("schedules:")
+        );
+        assert_eq!(std::fs::read(path(&home)).unwrap(), before);
+        std::fs::remove_dir(temp).unwrap();
+        assert_eq!(fire_due(&home, "/work", 180).unwrap(), ["run once"]);
+        assert!(fire_due(&home, "/work", 180).unwrap().is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_stand_in_for_the_schedule_lock() {
+        let home = failure_home("lock-link");
+        save(&home, &[job("once", None, Some(120), 60)]).unwrap();
+        let before = std::fs::read(path(&home)).unwrap();
+        let target = home.join("different-file");
+        std::fs::write(&target, b"leave intact").unwrap();
+        std::os::unix::fs::symlink(&target, home.join("schedules.lock")).unwrap();
+        assert!(fire_due(&home, "/work", 180).is_err());
+        assert_eq!(std::fs::read(path(&home)).unwrap(), before);
+        assert_eq!(std::fs::read(target).unwrap(), b"leave intact");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn two_sessions_polling_at_once_fire_a_job_once() {
         let home = std::env::temp_dir().join(format!(
@@ -475,7 +739,13 @@ mod tests {
             .collect();
         let mut fired: Vec<String> = sessions
             .into_iter()
-            .flat_map(|session| session.join().unwrap())
+            .flat_map(|session| match session.join().unwrap() {
+                Ok(prompts) => prompts,
+                Err(error) => {
+                    assert_eq!(error, LOCK_BUSY);
+                    Vec::new()
+                }
+            })
             .collect();
         fired.sort();
         let expected: Vec<String> = (0..8).map(|n| format!("run j{n}")).collect();
