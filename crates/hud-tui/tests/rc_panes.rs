@@ -126,6 +126,7 @@ impl ProfileHost for Host {
             text: self.text.lock().unwrap().clone(),
             truncated: false,
             actions: pane.actions.clone(),
+            council: None,
         })
     }
 }

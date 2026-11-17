@@ -142,26 +142,30 @@ Two panes exist without a profile entry, so the default profile keeps
 `"reactor"`) in a layout tree, or pick them in the terminal: while arranging,
 `v`/`s`/`p` opens "Show what?", where `9` is Council and `0` is Reactor. A
 profile pane that reuses either id replaces the built-in. While the terminal
-layout shows a built-in pane it is re-read once a second; other panes refresh
+layout shows a built-in pane Council state is refreshed once a second;
+Reactor follows live turn updates at the animation cadence. Other panes refresh
 on `r`. The browser renders them as text and refreshes on demand. In the
 terminal they are coloured from the active palette: seat identity, verdicts,
 and the meters. When the council pane is wide and tall enough (about 15
 columns per seat, up to four seats) it draws one card per seat: lab, model, an
 equaliser while the seat deliberates, and its verdict. When the reactor pane
-is at least 50 columns wide it draws the Kwangya scene beside the meters, with
+is at least 50 columns wide it draws the selected scene beside the meters, with
 the output rate in large digits when they fit; the scene moves faster during a
 turn. `reduced_motion` holds both still; `glyphs: ascii` keeps the plain text.
 
-- `council` (snapshot `council`) shows the MAGI council: phase, one row per
-  seat with its model and verdict, and the latest note. It reads one file,
-  `$ORBIT_COUNCIL_STATE` (absolute path) or `~/.local/share/magi/state.json`.
-  This is the only pane source outside the workspace. The location comes from
-  the environment or the built-in default, never from profile data. The read
-  is read-only, capped at 64 KiB, and refuses symlinks and non-regular files.
-  A missing file shows "No council has run"; a state older than 120 seconds
-  shows as an idle council. While the council is idle, the pane also shows the
-  last conclusion from `history.jsonl` beside the state file (same read rules,
-  last 256 KiB only).
+- `council` (snapshot `council`) shows phase, seats, configured models and
+  verdicts for the current session. In the terminal, run `/council QUESTION` to
+  start a native deliberation; its pane action inserts `/council ` into the draft. Opening or
+  refreshing the pane makes no provider request. Native state takes priority
+  over an external MAGI feed. An explicit `$ORBIT_COUNCIL_STATE` absolute path
+  can provide that feed; otherwise a bound session reads
+  `~/.local/share/magi/sessions/SESSION_ID/state.json`. The legacy
+  `~/.local/share/magi/state.json` is used only without a bound session.
+  These external reads are read-only, capped at 64 KiB, and refuse symlinks and
+  non-regular files. Missing state shows "No council has run"; external state
+  older than 420 seconds appears idle. The matching `history.jsonl` contributes
+  the last conclusion (same read rules, last 256 KiB only). Structured state and
+  text both pass display scanning before rendering.
 - `reactor` (snapshot `reactor`) shows the ORBIT session's own token flow:
   model, phase, input and output totals, context fill, cost, turns, and tools
   this turn. It reads session state only. A value the session did not report
@@ -175,7 +179,70 @@ turn. `reduced_motion` holds both still; `glyphs: ascii` keeps the plain text.
 
 With `glyphs: ascii` both panes print ASCII marks and English labels.
 
-Actions are `refresh`, `focus_conversation`, `insert_prompt`, and `owner_cancel`.
+### Run a native Council
+
+In terminal chat, `/council QUESTION` runs bounded, tool-free seat requests followed by a judge's
+synthesis. The default is three named perspectives using the selected model,
+with the same model as judge; the pane shows those configured bindings rather
+than claiming different upstream models. Each request uses ordinary managed
+accounting. Provider usage can incur charges; no automatic retry or automatic
+run occurs when a pane opens. `Esc` cancels the foreground Council and prevents
+later seats from starting. The completed answer is saved in the conversation.
+
+In a normal session, the owner's `UserPromptSubmit` policy runs once before
+deliberation. A denial stops seat requests; accepted prompt rewrites and context
+apply to every participant. Command, HTTP and managed tool-free prompt handlers
+are supported for this gate. Asynchronous, agent and MCP submission handlers are
+refused before execution. `--bare` suppresses this gate as it does other hooks.
+Generated seat and judge requests do not trigger the hooks again.
+
+Council accepts a text question. Attachments and automatic plan prompts receive
+an explicit refusal before deliberation. On resume, a saved reply may be shown
+with an execution-metadata-unavailable label; ORBIT does not reconstruct past
+seat identities or claim a verified Council run from conversation text alone.
+
+For a roster of two to four declared models, create `council.toml` in the ORBIT
+home:
+
+```toml
+seats = ["provider/model-a", "provider/model-b", "provider/model-c"]
+judge = "provider/model-c"
+max_output_tokens = 1024
+# Optional budget for the whole Council, in microdollars:
+# max_cost_microdollars = 500000
+```
+
+Every model must already exist in the provider registry. The roster is resolved
+before any request; invalid configuration starts no deliberation. Omit `judge`
+to use the selected model. `max_output_tokens` accepts 64 through 4096 per
+request. The optional whole-Council budget refuses work when historical cost
+cannot be established. Council does not launch the external MAGI script or
+read Claude credentials.
+
+The browser can display Council state, but native Council execution currently
+requires terminal chat. Browser Council run actions return that guidance before
+submitting a provider request.
+
+### Switch Reactor art
+
+Use `/reactor art kwangya|shard|spine|globe|rotate`, or select the Reactor pane's
+`next art` action to cycle scenes. `/reactor art next` cycles the same sequence.
+`rotate` changes among the four scenes every 40 seconds. Reduced motion freezes
+the scene and rotation; ASCII mode keeps the text-only meter.
+
+The selection is a portable profile setting, so it survives reopening ORBIT
+and profile export/import. The command-line equivalent is:
+
+```sh
+orbit customize set reactor_art globe
+orbit customize set reactor_art next
+orbit customize reset reactor_art
+```
+
+Changing art is a checked appearance update and sends no provider request.
+
+Actions are `refresh`, `focus_conversation`, `insert_prompt`, `owner_cancel`, and
+`cycle_reactor_art`.
 An inserted prompt changes the draft only; sending remains your action.
 Cancellation requires the current controller. Profile data cannot execute shell
 commands, JavaScript, hooks, or network requests.

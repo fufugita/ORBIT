@@ -9,7 +9,8 @@ use crate::proto::{
 };
 use orbit_frontend_protocol::customization::{
     BUILTIN_PANE_IDS, CustomizationError, LayoutNode, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES,
-    PaneAction, PaneContext, PaneOutput, PaneState, Profile, ProfileHost, ResolvedProfile, Surface,
+    PaneAction, PaneContext, PaneOutput, PaneState, Profile, ProfileHost, ReactorArt,
+    ResolvedProfile, Surface,
 };
 use ratatui::layout::Rect;
 use std::{collections::BTreeMap, sync::Arc};
@@ -26,6 +27,7 @@ pub enum ActionEffect {
     FocusConversation,
     InsertDraft(String),
     OwnerCancel,
+    CycleReactorArt,
 }
 
 impl CustomizationSession {
@@ -34,6 +36,7 @@ impl CustomizationSession {
         for pane in self.outputs.values_mut() {
             pane.state = PaneState::Stale;
             pane.text = "Session changed; refresh this pane".into();
+            pane.council = None;
         }
     }
     pub fn open(host: Arc<dyn ProfileHost>) -> Result<Self, CustomizationError> {
@@ -73,6 +76,7 @@ impl CustomizationSession {
                     state: PaneState::Error,
                     text: "This pane does not support the terminal surface".into(),
                     truncated: false,
+                    council: None,
                     actions: Vec::new(),
                 },
             );
@@ -95,6 +99,13 @@ impl CustomizationSession {
                 }
                 output.title = def.title.clone();
                 output.text = safe_pane_text(&output.text)?;
+                output.council = output.council.map(|snapshot| {
+                    snapshot.sanitized_with(|text| {
+                        crate::bridge::terminal_safe(&crate::bridge::safe_text(
+                            &crate::bridge::strip_cot(text),
+                        ))
+                    })
+                });
                 if output.text.is_empty() && output.state == PaneState::Ready {
                     output.state = PaneState::Empty;
                 }
@@ -116,6 +127,7 @@ impl CustomizationSession {
                             &error.to_string(),
                         )),
                         truncated: false,
+                        council: None,
                         actions: vec![PaneAction::Refresh],
                     },
                 );
@@ -195,6 +207,12 @@ impl CustomizationSession {
             PaneAction::OwnerCancel if self.context.controller => Ok(ActionEffect::OwnerCancel),
             PaneAction::OwnerCancel => Err(CustomizationError::Invalid(
                 "owner cancellation requires controller authority".into(),
+            )),
+            PaneAction::CycleReactorArt if self.context.controller => {
+                Ok(ActionEffect::CycleReactorArt)
+            }
+            PaneAction::CycleReactorArt => Err(CustomizationError::Invalid(
+                "art changes require controller authority".into(),
             )),
         }
     }
@@ -276,6 +294,7 @@ fn seat_colour(tag: &str, palette: &crate::proto::shell::pal::Palette) -> Option
 pub struct PaneClock {
     pub now_ms: u64,
     pub reduced: bool,
+    pub reactor_art: ReactorArt,
 }
 
 /// One parsed seat row of the council text.
@@ -835,6 +854,236 @@ fn kwangya_scene(buf: &mut DotBuf, t: f32, energy: f32, ice: Rgb, white: Rgb) {
     }
 }
 
+/// Shards orbit a turning star above a faint reflection. The seeded shape
+/// stays stable across frames; activity changes its pace rather than its data.
+fn shard_scene(buf: &mut DotBuf, t: f32, energy: f32, teal: Rgb, white: Rgb) {
+    let (w, h) = (buf.width() as f32, buf.height() as f32);
+    let (cx, cy) = (w / 2.0, h * 0.42);
+    let radius = (w * 0.47).min(h * 0.95);
+    let water = h * 0.74;
+    let rotation = t * (0.12 + 0.7 * energy);
+    for y in (water as i32 + 2..buf.height()).step_by(3) {
+        for x in 0..buf.width() {
+            if (x + (t * 9.0) as i32 + y * 3) % 7 == 0 {
+                buf.dot(x as f32, y as f32, teal, 0.22);
+            }
+        }
+    }
+    for i in 0..120u32 {
+        let fraction = 0.72 + 0.28 * star_noise(i, 1, 11);
+        let angle =
+            star_noise(i, 0, 11) * std::f32::consts::TAU + rotation * (1.5 - 0.7 * fraction);
+        let (sine, cosine) = angle.sin_cos();
+        let x = cx + radius * fraction * cosine;
+        let y = cy + radius * fraction * 0.3 * sine + (star_noise(i, 2, 11) - 0.5) * 0.12 * h;
+        let depth = (sine + 1.0) / 2.0;
+        let bright = 0.3 + 0.7 * depth;
+        let length = 1.5 + star_noise(i, 3, 11) * 2.5;
+        let tilt = angle + std::f32::consts::FRAC_PI_2 + (star_noise(i, 4, 11) - 0.5) * 1.3;
+        let (dy, dx) = tilt.sin_cos();
+        let (dx, dy) = (dx * length / 2.0, dy * length * 0.4);
+        buf.line(
+            x - dx,
+            y - dy,
+            x + dx,
+            y + dy,
+            mix(teal, white, depth * 0.55),
+            bright,
+            bright,
+            0,
+        );
+        if i.is_multiple_of(6)
+            && (t * 2.4 + star_noise(i, 5, 11) * 6.3 + rotation * 2.0).sin() > 0.82
+        {
+            for (gx, gy) in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                buf.dot(x + dx + gx, y + dy + gy, white, 1.0);
+            }
+        }
+        let reflection = 2.0 * water - y;
+        if reflection > water + 1.0 && reflection < h {
+            buf.dot(
+                x + (reflection * 0.8 + t * 3.0).sin() * 1.3,
+                reflection,
+                teal,
+                bright * 0.45,
+            );
+        }
+    }
+    for ray in 0..8 {
+        let angle = -rotation * 1.8 + ray as f32 * std::f32::consts::FRAC_PI_4;
+        let length =
+            h * 0.22 * (1.0 + 0.12 * (t * 3.0).sin()) * if ray % 2 == 0 { 1.0 } else { 0.42 };
+        buf.line(
+            cx,
+            cy,
+            cx + angle.cos() * length * 1.2,
+            cy + angle.sin() * length * 0.85,
+            white,
+            1.0,
+            0.45,
+            0,
+        );
+    }
+    for i in 0..46u32 {
+        let x = star_noise(i, 0, 17) * w + (t + i as f32).sin() * 2.0;
+        let y = (star_noise(i, 1, 17) - t * (0.03 + star_noise(i, 2, 17) * 0.06)).rem_euclid(1.0)
+            * water;
+        buf.dot(x, y, teal, 0.45);
+    }
+}
+
+/// Three chrome spines carry travelling waves and thorns through drifting dust.
+fn spine_scene(buf: &mut DotBuf, t: f32, energy: f32, ice: Rgb, white: Rgb) {
+    let (w, h) = (buf.width(), buf.height());
+    let (wf, hf) = (w as f32, h as f32);
+    let bayer = bayer8();
+    for i in 0..30u32 {
+        buf.dot(
+            star_noise(i, 0, 5) * wf + (t * 0.7 + i as f32).sin() * 2.0,
+            (star_noise(i, 1, 5) - t * (0.02 + star_noise(i, 2, 5) * 0.05)).rem_euclid(1.0) * hf,
+            ice,
+            0.35,
+        );
+    }
+    for (base, amplitude, waves, speed, phase, radius) in [
+        (0.22, 0.08, 1.1, 0.8, 0.0, 0.045),
+        (0.52, 0.11, 0.8, -0.6, 1.9, 0.062),
+        (0.81, 0.07, 1.35, 1.1, 3.6, 0.04),
+    ] {
+        for x in 0..w {
+            let u = x as f32 / (wf - 1.0).max(1.0);
+            let taper = (u / 0.1)
+                .sqrt()
+                .min(((1.0 - u).max(0.0) / 0.1).sqrt())
+                .min(1.0);
+            let centre = hf
+                * (base
+                    + amplitude
+                        * (waves * std::f32::consts::TAU * u
+                            + speed * (0.5 + 1.6 * energy) * t
+                            + phase)
+                            .sin()
+                    + 0.025 * (5.0 * std::f32::consts::TAU * u - t * 1.3 + phase).sin());
+            let radius = hf * radius * taper * (1.0 + 0.1 * (u * 40.0 - t * 3.0 + phase).sin());
+            if radius < 0.6 {
+                continue;
+            }
+            let (top, bottom) = (centre - radius, centre + radius);
+            for y in (top as i32).max(0)..=(bottom as i32).min(h - 1) {
+                let v = (y as f32 - centre) / radius;
+                let intensity = 0.05 + 0.25 * (-((v - 0.55) / 0.25).powi(2)).exp();
+                let index = (y * w + x) as usize;
+                buf.on[index] = false;
+                if intensity > bayer[(y & 7) as usize][(x & 7) as usize] {
+                    buf.dot(x as f32, y as f32, ice, 0.45);
+                }
+            }
+            buf.dot(x as f32, top, mix(ice, white, 0.5), 0.95);
+            buf.dot(x as f32, bottom, ice, 0.6);
+            let specular = (u * 7.0 - t * 1.4 + phase).sin().max(0.0).powi(6);
+            if radius > 1.6 && (specular > 0.15 || x % 3 != 1) {
+                buf.dot(
+                    x as f32,
+                    centre - radius * 0.42,
+                    white,
+                    0.55 + 0.45 * specular,
+                );
+            }
+            if x % 8 == 0 && taper > 0.6 {
+                let pulse = 0.5 + 0.5 * (x as f32 * 0.22 - t * (2.5 + 5.0 * energy) + phase).sin();
+                let thorn = radius * (0.35 + pulse * pulse);
+                buf.line(
+                    x as f32,
+                    top,
+                    x as f32 - 1.2,
+                    top - thorn,
+                    mix(ice, white, pulse),
+                    0.5 + 0.5 * pulse,
+                    0.5 + 0.5 * pulse,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// Latitude rings and meridians form a rotating, activity-reactive globe.
+fn globe_scene(buf: &mut DotBuf, t: f32, energy: f32, ice: Rgb, white: Rgb) {
+    let (w, h) = (buf.width() as f32, buf.height() as f32);
+    let radius = (w / 2.0).min(h / 2.0) * 0.92;
+    let (sine, cosine) = (t * (0.35 + 2.6 * energy)).sin_cos();
+    let (tilt_sine, tilt_cosine) = (0.45 + 0.15 * (t * 0.4).sin()).sin_cos();
+    let mut point = |x: f32, y: f32, z: f32, index: usize| {
+        let wobble = 1.0
+            + energy * 0.13 * (3.0 * y * std::f32::consts::PI + t * 6.0 + x * 4.0).sin()
+            + energy * 0.06 * (t * 9.0 + index as f32).sin();
+        let (x, y, z) = (x * wobble, y * wobble, z * wobble);
+        let (x, z) = (x * cosine + z * sine, -x * sine + z * cosine);
+        let (y, z) = (
+            y * tilt_cosine - z * tilt_sine,
+            y * tilt_sine + z * tilt_cosine,
+        );
+        if z >= -0.35 {
+            let brightness = 0.35 + 0.65 * (z + 1.0) / 2.0;
+            buf.dot(
+                w / 2.0 + x * radius,
+                h / 2.0 + y * radius,
+                mix(ice, white, ((z + 1.0) / 2.0).clamp(0.0, 1.0)),
+                brightness,
+            );
+        }
+    };
+    for latitude in 1..8 {
+        let phi = -std::f32::consts::FRAC_PI_2 + latitude as f32 * std::f32::consts::PI / 8.0;
+        for j in 0..70 {
+            let angle = j as f32 * std::f32::consts::TAU / 70.0;
+            point(
+                phi.cos() * angle.cos(),
+                phi.sin(),
+                phi.cos() * angle.sin(),
+                latitude * 70 + j,
+            );
+        }
+    }
+    for longitude in 0..9 {
+        let angle = longitude as f32 * std::f32::consts::PI / 9.0;
+        for j in 0..70 {
+            let phi = j as f32 * std::f32::consts::TAU / 70.0;
+            point(
+                phi.cos() * angle.cos(),
+                phi.sin(),
+                phi.cos() * angle.sin(),
+                560 + longitude * 70 + j,
+            );
+        }
+    }
+}
+
+fn reactor_art_at(art: ReactorArt, now_ms: u64, reduced: bool) -> ReactorArt {
+    match art {
+        ReactorArt::Rotate => [
+            ReactorArt::Kwangya,
+            ReactorArt::Shard,
+            ReactorArt::Spine,
+            ReactorArt::Globe,
+        ][if reduced {
+            0
+        } else {
+            (now_ms / 40_000 % 4) as usize
+        }],
+        selected => selected,
+    }
+}
+
+fn reactor_scene(buf: &mut DotBuf, art: ReactorArt, t: f32, energy: f32, ice: Rgb, white: Rgb) {
+    match art {
+        ReactorArt::Kwangya | ReactorArt::Rotate => kwangya_scene(buf, t, energy, ice, white),
+        ReactorArt::Shard => shard_scene(buf, t, energy, ice, white),
+        ReactorArt::Spine => spine_scene(buf, t, energy, ice, white),
+        ReactorArt::Globe => globe_scene(buf, t, energy, ice, white),
+    }
+}
+
 /// The Reactor's 3x5 digit font.
 fn big_glyph(c: char) -> [&'static str; 5] {
     match c {
@@ -886,9 +1135,10 @@ fn draw_reactor_view_with_bench(
     let streaming = rate_line.is_some_and(|line| line.contains(" live"));
     let energy = if streaming {
         1.0
-    } else if ["REASON", "ACT", "VERIFY"]
+    } else if ["ORIENT", "REASON", "ACT", "VERIFY", "RESPOND", "COMPACT"]
         .iter()
         .any(|phase| header.ends_with(phase))
+        || bench.as_ref().is_some_and(|bench| bench.phase != "VERDICT")
     {
         0.6
     } else {
@@ -903,19 +1153,34 @@ fn draw_reactor_view_with_bench(
     // so much that the meters lose their column, and all of it when the
     // pane is too narrow for both. The dot canvas follows the same math, so
     // the picture fills whatever rectangle it is given.
-    let room = h - 1;
     let meters_min = 22;
     let scene_w = if w - meters_min >= 18 {
         ((w * 45) / 100).clamp(18, (w - meters_min - 4).max(18))
     } else {
         (w - 2).max(1)
     };
+    let (right, right_w) = (x + 1 + scene_w + 2, w - scene_w - 4);
+    // Even a scene-only narrow pane keeps its live rate visible below the art.
+    let room = h - 1 - i32::from(right_w < 12);
     let mut scene = DotBuf::new(scene_w.max(1), room.max(1));
-    kwangya_scene(&mut scene, t, energy, palette.cyan, palette.white);
+    reactor_scene(
+        &mut scene,
+        reactor_art_at(clock.reactor_art, clock.now_ms, clock.reduced),
+        t,
+        energy,
+        palette.cyan,
+        palette.white,
+    );
     scene.blit(cv, x + 1, y + 1);
     // The meters, when there is a column left for them.
-    let (right, right_w) = (x + 1 + scene_w + 2, w - scene_w - 4);
     if right_w < 12 {
+        if let Some(rate) = rate_line {
+            let rate = clip_text(rate, (w - 2).max(1));
+            let mut at = x + 1;
+            for (segment, colour) in builtin_segments("reactor", &rate, &palette) {
+                at = cv.text(at, y + h - 1, segment, colour, None);
+            }
+        }
         return true;
     }
     let mut row = y + 1;
@@ -1201,15 +1466,26 @@ pub fn draw_pane_at_with_council(
                     None => draw_council_cards(cv, (x, y, w, content_height), &text, clock),
                 })
             }
-            "reactor" => draw_reactor_view_with_bench(
-                cv,
-                (x, y, w, content_height),
-                &text,
-                clock,
-                council.as_ref().and_then(|state| {
-                    crate::proto::ported::CouncilBench::of(state, clock.now_ms as f64 / 1_000.0)
-                }),
-            ),
+            "reactor" => {
+                let content = Rect {
+                    height: content_height.max(0) as u16,
+                    ..inner
+                };
+                cv.clipped(content, |cv| {
+                    draw_reactor_view_with_bench(
+                        cv,
+                        (x, y, w, content_height),
+                        &text,
+                        clock,
+                        council.as_ref().and_then(|state| {
+                            crate::proto::ported::CouncilBench::of(
+                                state,
+                                clock.now_ms as f64 / 1_000.0,
+                            )
+                        }),
+                    )
+                })
+            }
             _ => false,
         });
     if !cards {
@@ -1234,6 +1510,7 @@ pub fn draw_pane_at_with_council(
                 PaneAction::FocusConversation => "conversation",
                 PaneAction::InsertPrompt { .. } => "insert draft",
                 PaneAction::OwnerCancel => "cancel turn",
+                PaneAction::CycleReactorArt => "next art",
             };
             let label = clip_text(&format!("{} {label}  ", i + 1), (x + w - at).max(0));
             if label.is_empty() {
@@ -1272,10 +1549,13 @@ mod tests {
     use orbit_frontend_protocol::customization::{
         CustomizationCapabilities, LayoutNode, PaneDef, PaneSource, Surface,
     };
-    struct Host(String);
+    struct Host(
+        String,
+        Option<orbit_frontend_protocol::customization::CouncilSnapshot>,
+    );
     impl Host {
         fn new(text: impl Into<String>) -> Self {
-            Self(text.into())
+            Self(text.into(), None)
         }
     }
     impl ProfileHost for Host {
@@ -1320,6 +1600,7 @@ mod tests {
                 state: PaneState::Ready,
                 text: self.0.clone(),
                 truncated: false,
+                council: self.1.clone(),
                 actions: vec![PaneAction::Refresh],
             })
         }
@@ -1413,6 +1694,80 @@ mod tests {
     }
 
     #[test]
+    fn refresh_sanitizes_and_bounds_typed_council_state_from_an_untrusted_host() {
+        use orbit_frontend_protocol::customization::{CouncilSeat, CouncilSnapshot};
+        let token = "ghp_0123456789abcdef0123456789abcdef0123";
+        let secret = format!("\u{1b}]0;hidden title\u{7}token={token}");
+        let mut host = Host::new("Council ready");
+        host.1 = Some(CouncilSnapshot {
+            phase: "DELIBERATING".into(),
+            note: format!("{secret}<think>private unclosed reasoning"),
+            last_final: "<think>private reasoning</think>Public conclusion".into(),
+            seats: vec![
+                CouncilSeat {
+                    model: secret.clone(),
+                    ..CouncilSeat::default()
+                };
+                20
+            ],
+            winner_seats: vec![secret; 20],
+            ..CouncilSnapshot::default()
+        });
+        let mut session = CustomizationSession::open(Arc::new(host)).unwrap();
+        session.refresh("council").unwrap();
+        let state = session.outputs["council"].council.as_ref().unwrap();
+        let encoded = serde_json::to_string(state).unwrap();
+        assert!(!encoded.contains(token));
+        assert!(!encoded.contains("hidden title"));
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("think"));
+        assert!(!encoded.contains("\\u001b"));
+        assert!(state.note.contains("[redacted:github token]"));
+        assert_eq!(state.last_final, "Public conclusion");
+        assert_eq!(state.seats.len(), 4);
+        assert_eq!(state.winner_seats.len(), 4);
+    }
+
+    #[test]
+    fn reactor_art_action_requires_controller_and_does_not_mutate_on_open() {
+        let mut session = CustomizationSession::open(Arc::new(Host::new("Reactor ready"))).unwrap();
+        session.refresh("reactor").unwrap();
+        assert_eq!(session.resolved.profile.reactor_art, ReactorArt::Kwangya);
+        session.outputs.get_mut("reactor").unwrap().actions = vec![PaneAction::CycleReactorArt];
+        assert!(session.action("reactor", 0).is_err());
+        session.context.controller = true;
+        assert_eq!(
+            session.action("reactor", 0).unwrap(),
+            ActionEffect::CycleReactorArt
+        );
+        assert_eq!(session.resolved.profile.reactor_art, ReactorArt::Kwangya);
+    }
+
+    #[test]
+    fn session_invalidation_clears_typed_council_before_any_refresh() {
+        use orbit_frontend_protocol::customization::CouncilSnapshot;
+        let mut host = Host::new("Council ready");
+        host.1 = Some(CouncilSnapshot {
+            phase: "VERDICT".into(),
+            note: "old session conclusion".into(),
+            ..CouncilSnapshot::default()
+        });
+        let mut session = CustomizationSession::open(Arc::new(host)).unwrap();
+        session.context.session_id = Some("old-session".into());
+        session.refresh("council").unwrap();
+        assert!(session.outputs["council"].council.is_some());
+        session.invalidate_session(PaneContext {
+            session_id: Some("new-session".into()),
+            ..PaneContext::default()
+        });
+        assert_eq!(session.context.session_id.as_deref(), Some("new-session"));
+        let pane = &session.outputs["council"];
+        assert!(pane.council.is_none());
+        assert_eq!(pane.state, PaneState::Stale);
+        assert!(!pane.text.contains("old session conclusion"));
+    }
+
+    #[test]
     fn refresh_preserves_raw_and_visible_content_gate_refusals() {
         for text in [
             "first\nprompt: hidden\nlast",
@@ -1463,6 +1818,7 @@ mod tests {
             state: PaneState::Ready,
             text: "\u{1b}[31malpha\u{1b}[0m\n\u{1b}]0;hidden\ntext\u{7}omega\n".into(),
             truncated: false,
+            council: None,
             actions: Vec::new(),
         };
         let area = Rect::new(0, 0, 40, 9);
@@ -1492,6 +1848,7 @@ mod tests {
                 state: PaneState::Ready,
                 text: text.into(),
                 truncated: false,
+                council: None,
                 actions: Vec::new(),
             };
             let area = Rect::new(0, 0, 60, 9);
@@ -1525,6 +1882,7 @@ mod tests {
                 state: PaneState::Ready,
                 text,
                 truncated: false,
+                council: None,
                 actions: vec![PaneAction::Refresh],
             };
             let area = Rect::new(0, 0, 80, 9);
@@ -1625,6 +1983,7 @@ mod tests {
             state: PaneState::Ready,
             text: text.into(),
             truncated: false,
+            council: None,
             actions: vec![PaneAction::Refresh],
         }
     }
@@ -1655,6 +2014,7 @@ NINGNING·04  BOLD  MINIMAX    minimax-m3         ◌ 신호없음\n\
         let still = Some(PaneClock {
             now_ms: 4_000,
             reduced: true,
+            reactor_art: ReactorArt::Kwangya,
         });
         let rows = frame_rows(&output, 80, 18, still);
         let all = rows.join("\n");
@@ -1682,6 +2042,7 @@ NINGNING·04  BOLD  MINIMAX    minimax-m3         ◌ 신호없음\n\
         let later = Some(PaneClock {
             now_ms: 9_999,
             reduced: true,
+            reactor_art: ReactorArt::Kwangya,
         });
         assert_eq!(frame_rows(&output, 80, 18, later), rows);
         // With motion the equaliser moves.
@@ -1693,6 +2054,7 @@ NINGNING·04  BOLD  MINIMAX    minimax-m3         ◌ 신호없음\n\
                 Some(PaneClock {
                     now_ms,
                     reduced: false,
+                    reactor_art: ReactorArt::Kwangya,
                 }),
             )
         };
@@ -1757,6 +2119,7 @@ NINGNING·04  BOLD  MINIMAX    minimax-m3         ◌ 신호없음\n\
                 Some(PaneClock {
                     now_ms: 4_000,
                     reduced: true,
+                    reactor_art: ReactorArt::Kwangya,
                 }),
                 Some(&state),
             );
@@ -1797,6 +2160,7 @@ cost    $0.8400  turns 12  tools 3\n";
             state: PaneState::Ready,
             text: text.into(),
             truncated: false,
+            council: None,
             actions: vec![PaneAction::Refresh],
         };
         let render = |width: u16, height: u16, clock: Option<PaneClock>| {
@@ -1811,6 +2175,7 @@ cost    $0.8400  turns 12  tools 3\n";
         let still = Some(PaneClock {
             now_ms: 2_000,
             reduced: true,
+            reactor_art: ReactorArt::Kwangya,
         });
         let rows = render(100, 22, still);
         let all = rows.join("\n");
@@ -1837,7 +2202,17 @@ cost    $0.8400  turns 12  tools 3\n";
             assert!(all.contains(word), "{word} is shown");
         }
         // Reduced motion holds the frame; with motion the scene moves.
-        let at = |now_ms, reduced| render(100, 22, Some(PaneClock { now_ms, reduced }));
+        let at = |now_ms, reduced| {
+            render(
+                100,
+                22,
+                Some(PaneClock {
+                    now_ms,
+                    reduced,
+                    reactor_art: ReactorArt::Kwangya,
+                }),
+            )
+        };
         assert_eq!(at(9_000, true), rows);
         assert_ne!(at(1_000, false), at(1_500, false));
         // Too small, or no clock: the text. 48 columns still carries the
@@ -1857,6 +2232,235 @@ cost    $0.8400  turns 12  tools 3\n";
                 .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
             "a narrow pane still draws the scene"
         );
+        assert!(
+            narrow.contains("tok/s   42.7"),
+            "the narrow scene keeps its rate"
+        );
+    }
+
+    fn reactor_test_output(ascii: bool) -> PaneOutput {
+        PaneOutput {
+            id: "reactor".into(),
+            title: "Reactor".into(),
+            state: PaneState::Ready,
+            text: format!(
+                "REACTOR {} fixture  RESPOND\ntok/s   42.7 live    peak 118.0\nout     24      in  100\nctx     1 / 100  1%\ncost    $0.0000  turns 1  tools 0\n",
+                if ascii { "-" } else { "·" }
+            ),
+            truncated: false,
+            council: None,
+            actions: vec![PaneAction::Refresh, PaneAction::CycleReactorArt],
+        }
+    }
+
+    fn render_reactor_art(art: ReactorArt, now_ms: u64, reduced: bool, ascii: bool) -> Vec<String> {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut cv = Cv::new(&mut buffer);
+        draw_pane_at(
+            &mut cv,
+            area,
+            "reactor",
+            Some(&reactor_test_output(ascii)),
+            3,
+            true,
+            0,
+            Some(PaneClock {
+                now_ms,
+                reduced,
+                reactor_art: art,
+            }),
+        );
+        (0..area.height)
+            .map(|row| buffer_row(&buffer, row))
+            .collect()
+    }
+
+    #[test]
+    fn reactor_art_choices_draw_distinct_graphics_and_keep_live_meters() {
+        let palette = crate::proto::shell::pal::Palette::from_profile(&Profile::default());
+        let mut shapes = Vec::new();
+        for art in [
+            ReactorArt::Kwangya,
+            ReactorArt::Shard,
+            ReactorArt::Spine,
+            ReactorArt::Globe,
+        ] {
+            let mut dots = DotBuf::new(42, 20);
+            reactor_scene(&mut dots, art, 4.0, 1.0, palette.cyan, palette.white);
+            assert!(
+                dots.on.iter().filter(|on| **on).count() > 50,
+                "{art:?} paints its scene"
+            );
+            for prior in &shapes {
+                assert_ne!(
+                    &dots.on, prior,
+                    "the graphic itself changes, not only a label"
+                );
+            }
+            shapes.push(dots.on);
+            let painted = render_reactor_art(art, 4_000, false, false).join("\n");
+            for label in ["42.7", "peak 118.0", "100", "next art"] {
+                assert!(painted.contains(label), "{art:?} keeps {label}");
+            }
+            assert_ne!(
+                render_reactor_art(art, 4_000, false, false),
+                render_reactor_art(art, 4_500, false, false),
+                "{art:?} animates"
+            );
+        }
+    }
+
+    #[test]
+    fn reactor_waiting_for_output_and_live_council_move_at_working_pace() {
+        let render = |phase: &str, bench| {
+            let area = Rect::new(0, 0, 80, 18);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let text =
+                format!("REACTOR · fixture  {phase}\ntok/s   —   peak —\nout     0      in  0\n");
+            assert!(draw_reactor_view_with_bench(
+                &mut Cv::new(&mut buffer),
+                (0, 0, 80, 18),
+                &text,
+                PaneClock {
+                    now_ms: 4_000,
+                    reduced: false,
+                    reactor_art: ReactorArt::Kwangya
+                },
+                bench,
+            ));
+            // Exclude labels, meters and the right-aligned Council bench:
+            // only the art's activity should differ.
+            (1..area.height)
+                .map(|row| {
+                    (1..=32)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let resting = render("IDLE", None);
+        assert_ne!(resting, render("ORIENT", None));
+        assert_ne!(resting, render("RESPOND", None));
+        assert_ne!(resting, render("COMPACT", None));
+        assert_ne!(
+            resting,
+            render(
+                "IDLE",
+                Some(crate::proto::ported::CouncilBench {
+                    phase: "DELIBERATING".into(),
+                    ..crate::proto::ported::CouncilBench::default()
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn reactor_rotation_reduced_motion_and_ascii_follow_the_selected_art() {
+        let choices = [
+            ReactorArt::Kwangya,
+            ReactorArt::Shard,
+            ReactorArt::Spine,
+            ReactorArt::Globe,
+        ];
+        for (index, art) in choices.into_iter().enumerate() {
+            let time = index as u64 * 40_000 + 2_000;
+            assert_eq!(reactor_art_at(ReactorArt::Rotate, time, false), art);
+            assert_eq!(
+                render_reactor_art(ReactorArt::Rotate, time, false, false),
+                render_reactor_art(art, time, false, false)
+            );
+        }
+        assert_eq!(
+            reactor_art_at(ReactorArt::Rotate, 160_000, false),
+            ReactorArt::Kwangya
+        );
+        for art in choices.into_iter().chain([ReactorArt::Rotate]) {
+            assert_eq!(
+                render_reactor_art(art, 4_000, true, false),
+                render_reactor_art(art, 99_999, true, false),
+                "{art:?} stays still with reduced motion"
+            );
+            let ascii = render_reactor_art(art, 4_000, false, true).join("\n");
+            assert!(ascii.contains("REACTOR - fixture  RESPOND"));
+            assert!(ascii.contains("tok/s   42.7"));
+            assert!(
+                !ascii
+                    .chars()
+                    .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+            );
+        }
+    }
+
+    #[test]
+    fn every_reactor_art_stays_inside_small_offset_panels_and_keeps_actions() {
+        use ratatui::buffer::Buffer;
+        for art in [
+            ReactorArt::Kwangya,
+            ReactorArt::Shard,
+            ReactorArt::Spine,
+            ReactorArt::Globe,
+            ReactorArt::Rotate,
+        ] {
+            for (width, height) in [(4, 3), (24, 8), (48, 12), (100, 22)] {
+                let canvas = Rect::new(0, 0, 160, 60);
+                let panel = Rect::new(37, 11, width, height);
+                let mut expected = Buffer::empty(canvas);
+                let mut cv = Cv::new(&mut expected);
+                let palette = cv.palette;
+                let inner = panel_frame(
+                    &mut cv,
+                    panel,
+                    &FrameSpec {
+                        num: 3,
+                        title: "Reactor",
+                        ident: palette.cyan,
+                        focused: true,
+                        focus_fx: FocusFx::settled(true),
+                        badge: None,
+                        attention: 0.0,
+                        footer: Vec::new(),
+                        footer_parts: Vec::new(),
+                    },
+                )
+                .unwrap();
+                let mut actual = Buffer::empty(canvas);
+                let mut cv = Cv::new(&mut actual);
+                draw_pane_at(
+                    &mut cv,
+                    panel,
+                    "reactor",
+                    Some(&reactor_test_output(false)),
+                    3,
+                    true,
+                    0,
+                    Some(PaneClock {
+                        now_ms: 4_000,
+                        reduced: false,
+                        reactor_art: art,
+                    }),
+                );
+                for y in 0..canvas.height {
+                    for x in 0..canvas.width {
+                        if !inner.contains((x, y).into())
+                            || (inner.height >= 2 && y == inner.bottom() - 2)
+                        {
+                            assert_eq!(
+                                actual[(x, y)],
+                                expected[(x, y)],
+                                "{art:?} {width}x{height} at {x},{y}"
+                            );
+                        }
+                    }
+                }
+                if inner.height >= 2 && inner.width >= 10 {
+                    let actions: String = (inner.x..inner.right())
+                        .map(|x| actual[(x, inner.bottom() - 1)].symbol())
+                        .collect();
+                    assert!(actions.contains("1 refresh"));
+                }
+            }
+        }
     }
 
     #[test]

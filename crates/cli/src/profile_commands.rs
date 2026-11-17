@@ -188,6 +188,13 @@ fn set(profile: &mut Profile, key: &str, value: &str) -> Result<(), Error> {
         "density" => profile.density = string_enum(value)?,
         "glyphs" => profile.glyphs = string_enum(value)?,
         "color_mode" => profile.color_mode = string_enum(value)?,
+        "reactor_art" => {
+            profile.reactor_art = if value == "next" {
+                profile.reactor_art.next()
+            } else {
+                string_enum(value)?
+            };
+        }
         "reduced_motion" => {
             profile.reduced_motion = match value {
                 "true" => true,
@@ -313,6 +320,7 @@ fn reset_key(profile: &mut Profile, key: &str) -> Result<(), Error> {
         "density" => profile.density = defaults.density,
         "glyphs" => profile.glyphs = defaults.glyphs,
         "color_mode" => profile.color_mode = defaults.color_mode,
+        "reactor_art" => profile.reactor_art = defaults.reactor_art,
         "reduced_motion" => profile.reduced_motion = defaults.reduced_motion,
         "browser.font_family" => profile.browser.font_family = defaults.browser.font_family,
         "browser.font_size_px" => profile.browser.font_size_px = defaults.browser.font_size_px,
@@ -662,6 +670,69 @@ mod tests {
                 value: value.into(),
             },
         )
+    }
+
+    #[test]
+    fn reactor_art_changes_persist_cycle_export_import_and_reject_invalid_updates() {
+        use orbit_frontend_protocol::customization::ReactorArt;
+        let f = Fixture::new();
+        assert_eq!(
+            f.host.load().unwrap().profile.reactor_art,
+            ReactorArt::Kwangya
+        );
+        set(&f.host, "theme", "paper").unwrap();
+        set(&f.host, "reactor_art", "globe").unwrap();
+        assert_eq!(
+            f.host.load().unwrap().profile.reactor_art,
+            ReactorArt::Globe
+        );
+        let path = f.host.home.join("customization.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(set(&f.host, "reactor_art", "unknown").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        set(&f.host, "reactor_art", "next").unwrap();
+        assert_eq!(
+            f.host.load().unwrap().profile.reactor_art,
+            ReactorArt::Rotate
+        );
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "art.json".into(),
+            },
+        )
+        .unwrap();
+        execute(
+            &f.host,
+            ProfileCommand::Reset {
+                key: Some("reactor_art".into()),
+            },
+        )
+        .unwrap();
+        let reset = f.host.load().unwrap();
+        assert_eq!(reset.profile.reactor_art, ReactorArt::Kwangya);
+        assert_eq!(reset.profile.theme, "paper");
+        execute(
+            &f.host,
+            ProfileCommand::Import {
+                path: "art.json".into(),
+            },
+        )
+        .unwrap();
+        let reopened = LocalProfileHost {
+            home: f.host.home.clone(),
+            workspace: f.host.workspace.clone(),
+            scope: f.host.scope.clone(),
+        }
+        .load()
+        .unwrap();
+        assert_eq!(reopened.profile.reactor_art, ReactorArt::Rotate);
+        assert_eq!(reopened.profile.theme, "paper");
+        set(&f.host, "reactor_art", "next").unwrap();
+        assert_eq!(
+            f.host.load().unwrap().profile.reactor_art,
+            ReactorArt::Kwangya
+        );
     }
     fn private_write(path: &Path, bytes: &[u8]) {
         use std::io::Write;

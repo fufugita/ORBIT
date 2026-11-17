@@ -29,6 +29,8 @@ pub struct Profile {
     pub density: Density,
     pub glyphs: Glyphs,
     pub reduced_motion: bool,
+    /// The terminal Reactor scene. Older profiles keep the original scene.
+    pub reactor_art: ReactorArt,
     pub color_mode: ColorMode,
     pub browser: BrowserStyle,
     pub layout: Layout,
@@ -63,6 +65,7 @@ impl Default for Profile {
             density: Density::Comfortable,
             glyphs: Glyphs::Auto,
             reduced_motion: false,
+            reactor_art: ReactorArt::default(),
             color_mode: ColorMode::Auto,
             browser: BrowserStyle::default(),
             layout: Layout::default(),
@@ -81,6 +84,38 @@ macro_rules! values {
 }
 values!(Density, Comfortable, Compact);
 values!(Glyphs, Auto, Unicode, Ascii);
+/// Declarative Reactor scenes; selecting one never starts a provider request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactorArt {
+    #[default]
+    Kwangya,
+    Shard,
+    Spine,
+    Globe,
+    Rotate,
+}
+impl ReactorArt {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kwangya => "kwangya",
+            Self::Shard => "shard",
+            Self::Spine => "spine",
+            Self::Globe => "globe",
+            Self::Rotate => "rotate",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Kwangya => Self::Shard,
+            Self::Shard => Self::Spine,
+            Self::Spine => Self::Globe,
+            Self::Globe => Self::Rotate,
+            Self::Rotate => Self::Kwangya,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorMode {
     #[default]
@@ -290,12 +325,18 @@ pub enum SnapshotKind {
 pub enum PaneAction {
     Refresh,
     FocusConversation,
-    InsertPrompt { text: String },
+    InsertPrompt {
+        text: String,
+    },
     OwnerCancel,
+    /// Persist the next built-in Reactor scene without submitting a prompt.
+    CycleReactorArt,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PaneContext {
+    /// The currently bound durable session, never an ambient process override.
+    pub session_id: Option<String>,
     pub permission_mode: Option<String>,
     pub routing: Vec<String>,
     pub input_tokens: u64,
@@ -363,6 +404,145 @@ pub struct CouncilSnapshot {
     pub last_tie: bool,
 }
 
+impl CouncilSnapshot {
+    /// Canonicalize and gate a complete foreign field before clipping it.
+    pub fn sanitized_text_with(
+        source: &str,
+        maximum: usize,
+        mut sanitize: impl FnMut(&str) -> String,
+    ) -> String {
+        fn plain(source: &str) -> String {
+            let mut out = String::with_capacity(source.len());
+            let mut chars = source.chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\u{1b}' => match chars.next() {
+                        Some('[') => {
+                            for next in chars.by_ref() {
+                                if ('\u{40}'..='\u{7e}').contains(&next) {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(']' | 'P' | '_' | '^' | 'X') => {
+                            while let Some(next) = chars.next() {
+                                if next == '\u{7}'
+                                    || (next == '\u{1b}' && chars.next() == Some('\\'))
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    '\u{9b}' => {
+                        for next in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => {
+                        while let Some(next) = chars.next() {
+                            if next == '\u{7}'
+                                || next == '\u{9c}'
+                                || (next == '\u{1b}' && chars.next() == Some('\\'))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
+                    '\u{061c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{feff}' => {}
+                    ch if ch.is_control() => {}
+                    ch => out.push(ch),
+                }
+            }
+            out
+        }
+        // An oversized foreign field is withheld whole: clipping before
+        // the gate could expose only the unrecognizable prefix of a key.
+        const MAX_FIELD_BYTES: usize = 64 * 1024;
+        if source.len() > MAX_FIELD_BYTES {
+            return "[content withheld]".chars().take(maximum).collect();
+        }
+        let clean = sanitize(&plain(source));
+        if clean.len() > MAX_FIELD_BYTES {
+            return "[content withheld]".chars().take(maximum).collect();
+        }
+        plain(&clean).chars().take(maximum).collect()
+    }
+
+    /// Bound every field and apply the frontend's display gate before any
+    /// truncation. This is shared by file readers and native message ingress.
+    pub fn sanitized_with(&self, mut sanitize: impl FnMut(&str) -> String) -> Self {
+        fn text(source: &str, maximum: usize, sanitize: &mut impl FnMut(&str) -> String) -> String {
+            CouncilSnapshot::sanitized_text_with(source, maximum, sanitize)
+        }
+        fn seat(value: &CouncilSeat, sanitize: &mut impl FnMut(&str) -> String) -> CouncilSeat {
+            CouncilSeat {
+                name: text(&value.name, 32, sanitize),
+                number: text(&value.number, 8, sanitize),
+                role: text(&value.role, 24, sanitize),
+                lab: text(&value.lab, 32, sanitize),
+                model: text(&value.model, 96, sanitize),
+                activity: text(&value.activity, 16, sanitize),
+                verdict: value
+                    .verdict
+                    .as_ref()
+                    .map(|value| text(value, 16, sanitize)),
+                confidence: value.confidence.map(|value| value.min(100)),
+            }
+        }
+        Self {
+            phase: text(&self.phase, 24, &mut sanitize),
+            note: text(&self.note, 240, &mut sanitize),
+            seats: self
+                .seats
+                .iter()
+                .take(4)
+                .map(|value| seat(value, &mut sanitize))
+                .collect(),
+            extra_seats: self
+                .extra_seats
+                .iter()
+                .take(12)
+                .map(|value| CouncilChip {
+                    name: text(&value.name, 32, &mut sanitize),
+                    lab: text(&value.lab, 32, &mut sanitize),
+                    activity: text(&value.activity, 16, &mut sanitize),
+                })
+                .collect(),
+            winner_seats: self
+                .winner_seats
+                .iter()
+                .take(4)
+                .map(|value| text(value, 32, &mut sanitize))
+                .collect(),
+            last_seats: self
+                .last_seats
+                .iter()
+                .take(4)
+                .map(|value| seat(value, &mut sanitize))
+                .collect(),
+            last_final: text(&self.last_final, 240, &mut sanitize),
+            finished: self.finished,
+            seen: self.seen,
+            last_at: self
+                .last_at
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            published_at: self
+                .published_at
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            last_tie: self.last_tie,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CouncilSeat {
@@ -403,7 +583,7 @@ pub enum PaneState {
     Stale,
     Error,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneOutput {
     pub id: String,
     pub title: String,
@@ -411,6 +591,9 @@ pub struct PaneOutput {
     pub text: String,
     pub truncated: bool,
     pub actions: Vec<PaneAction>,
+    /// Bounded, display-scanned Council state from the current session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub council: Option<CouncilSnapshot>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -447,6 +630,7 @@ impl Default for CustomizationCapabilities {
                 "focus_conversation".into(),
                 "insert_prompt".into(),
                 "owner_cancel".into(),
+                "cycle_reactor_art".into(),
             ],
             surfaces: vec![Surface::Terminal, Surface::Browser],
             terminal_font: "Font family and size are controlled by the terminal host".into(),
@@ -539,14 +723,18 @@ pub fn builtin_pane(id: &str) -> Option<PaneDef> {
                 PaneAction::Refresh,
                 PaneAction::FocusConversation,
                 PaneAction::InsertPrompt {
-                    text: "Convene the council on: ".into(),
+                    text: "/council ".into(),
                 },
             ],
         ),
         "reactor" => (
             "Reactor",
             SnapshotKind::Reactor,
-            vec![PaneAction::Refresh, PaneAction::FocusConversation],
+            vec![
+                PaneAction::Refresh,
+                PaneAction::FocusConversation,
+                PaneAction::CycleReactorArt,
+            ],
         ),
         _ => return None,
     };
@@ -822,6 +1010,26 @@ fn unique_tokens<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod builtin_pane_tests {
     use super::*;
+
+    #[test]
+    fn reactor_art_defaults_for_old_profiles_and_cycles_all_declared_scenes() {
+        let profile: Profile = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
+        assert_eq!(profile.reactor_art, ReactorArt::Kwangya);
+        let mut art = profile.reactor_art;
+        for expected in ["kwangya", "shard", "spine", "globe", "rotate"] {
+            assert_eq!(art.as_str(), expected);
+            assert_eq!(serde_json::to_value(art).unwrap(), expected);
+            art = art.next();
+        }
+        assert_eq!(art, ReactorArt::Kwangya);
+        assert!(serde_json::from_str::<ReactorArt>(r#""shell:command""#).is_err());
+        let reactor = builtin_pane("reactor").unwrap();
+        assert!(reactor.actions.contains(&PaneAction::CycleReactorArt));
+        let council = builtin_pane("council").unwrap();
+        assert!(council.actions.contains(&PaneAction::InsertPrompt {
+            text: "/council ".into(),
+        }));
+    }
 
     #[test]
     fn default_profile_is_unchanged_and_builtin_panes_resolve_in_layouts() {

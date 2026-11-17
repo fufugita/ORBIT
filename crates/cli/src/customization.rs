@@ -417,13 +417,14 @@ fn optional(dir: &Directory, name: &str, private: bool) -> Result<Option<Vec<u8>
         Err(e) => Err(io_error(e)),
     }
 }
-const FIELDS: [&str; 11] = [
+const FIELDS: [&str; 12] = [
     "name",
     "theme",
     "token_overrides",
     "density",
     "glyphs",
     "reduced_motion",
+    "reactor_art",
     "color_mode",
     "browser.font_family",
     "browser.font_size_px",
@@ -900,6 +901,7 @@ pub fn read_pane_scoped(
         .pane_def(id)
         .ok_or_else(|| Error::Invalid("unknown pane id".into()))?;
     let (mut state, mut text, mut truncated) = (PaneState::Ready, String::new(), false);
+    let mut council = None;
     match &pane.source {
         PaneSource::Text { text: content } => text = content.clone(),
         PaneSource::MarkdownFile { path } => match workspace_file(home, workspace, path, scope)? {
@@ -977,13 +979,21 @@ pub fn read_pane_scoped(
                 truncated = counts.truncated;
             }
             SnapshotKind::Council => {
-                // One cached read feeds both the structured state (seat
-                // cards, riding on the context) and the text fallback.
+                // Native state belongs to this bound session. The external
+                // bridge is consulted only when native state is absent.
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0.0, |elapsed| elapsed.as_secs_f64());
-                let snapshot_state = council_from_state_file(now);
-                (state, text) = match &snapshot_state {
+                council = context
+                    .council
+                    .as_ref()
+                    .map(sanitize_council_snapshot)
+                    .or_else(|| {
+                        council_from_state_file_for_session(context.session_id.as_deref(), now)
+                            .as_ref()
+                            .map(sanitize_council_snapshot)
+                    });
+                (state, text) = match &council {
                     Some(snapshot) => {
                         council_text_snapshot(snapshot, resolved.profile.glyphs == Glyphs::Ascii)
                     }
@@ -992,6 +1002,7 @@ pub fn read_pane_scoped(
             }
             SnapshotKind::Reactor => {
                 text = reactor_snapshot(context, resolved.profile.glyphs == Glyphs::Ascii);
+                council = context.council.as_ref().map(sanitize_council_snapshot);
             }
         },
     }
@@ -1007,6 +1018,7 @@ pub fn read_pane_scoped(
         state,
         text,
         truncated,
+        council,
         actions: pane
             .actions
             .iter()
@@ -1031,24 +1043,27 @@ const COUNCIL_SEATS: [&str; 4] = ["KARINA", "GISELLE", "WINTER", "NINGNING"];
 /// state lives at `sessions/<id>/state.json`. The legacy root file is only
 /// the fallback for runs without a session, and is never preferred.
 fn council_state_path() -> Option<PathBuf> {
+    council_state_path_for_session(None)
+}
+
+fn council_state_path_for_session(session_id: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ORBIT_COUNCIL_STATE").filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
         return path.is_absolute().then_some(path);
     }
     let home = PathBuf::from(std::env::var_os("HOME").filter(|home| !home.is_empty())?);
     let root = home.join(".local/share/magi");
-    if let Some(session) = std::env::var("ORBIT_SESSION_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        let session = session
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .take(64)
-            .collect::<String>();
-        if !session.is_empty() {
-            return Some(root.join("sessions").join(session).join("state.json"));
+    let ambient = std::env::var("ORBIT_SESSION_ID").ok();
+    if let Some(session) = session_id.or(ambient.as_deref()) {
+        if session.is_empty()
+            || session.len() > 64
+            || !session
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        {
+            return None;
         }
+        return Some(root.join("sessions").join(session).join("state.json"));
     }
     Some(root.join("state.json"))
 }
@@ -1118,13 +1133,7 @@ pub fn council_snapshot_at(path: &Path, now: f64, ascii: bool) -> (PaneState, St
 fn council_text(state: &serde_json::Value, stale: bool, ascii: bool) -> Option<String> {
     // State text is foreign input: printable characters only, bounded.
     let clean = |value: Option<&serde_json::Value>, max: usize| -> String {
-        value
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(max)
-            .collect()
+        safe_council_text(value.and_then(serde_json::Value::as_str).unwrap_or(""), max)
     };
     let phase = clean(state.get("phase"), 16);
     if phase.is_empty() {
@@ -1409,13 +1418,7 @@ fn council_last_final(path: &Path) -> Option<String> {
         if first.is_empty() {
             continue;
         }
-        return Some(
-            first
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(120)
-                .collect(),
-        );
+        return Some(safe_council_text(first, 120));
     }
     None
 }
@@ -1910,6 +1913,27 @@ pub fn council_from_state_file(now: f64) -> Option<CouncilSnapshot> {
     council_state_cached(now)
 }
 
+/// Resolve external state against the current frontend session, never an
+/// unrelated legacy file. Explicit ORBIT_COUNCIL_STATE remains intentional.
+pub fn council_from_state_file_for_session(
+    session_id: Option<&str>,
+    now: f64,
+) -> Option<CouncilSnapshot> {
+    let path = council_state_path_for_session(session_id)?;
+    council_snapshot_state(&path, now)
+}
+
+/// Typed Council transport uses the same secret/content gate as pane text.
+pub fn sanitize_council_snapshot(snapshot: &CouncilSnapshot) -> CouncilSnapshot {
+    snapshot.sanitized_with(|text| safe_output(&orbit_hud::strip_cot(text)).0)
+}
+
+fn safe_council_text(text: &str, maximum: usize) -> String {
+    CouncilSnapshot::sanitized_text_with(text, maximum, |text| {
+        safe_output(&orbit_hud::strip_cot(text)).0
+    })
+}
+
 fn council_state_cached(now: f64) -> Option<CouncilSnapshot> {
     let path = council_state_path()?;
     // Cache only the parsed files below: the assembled snapshot depends on
@@ -2028,13 +2052,7 @@ const BENCH: [(&str, &str); 4] = [
 
 fn council_parse(value: &serde_json::Value, now: f64) -> CouncilSnapshot {
     let clean = |value: Option<&serde_json::Value>, max: usize| -> String {
-        value
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(max)
-            .collect()
+        safe_council_text(value.and_then(serde_json::Value::as_str).unwrap_or(""), max)
     };
     let published_at = value.get("ts").and_then(serde_json::Value::as_f64);
     // The engine's own quiet rule: a state older than two minutes is idle.
@@ -2077,7 +2095,7 @@ fn council_parse(value: &serde_json::Value, now: f64) -> CouncilSnapshot {
             seats
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .map(|name| name.chars().filter(|c| !c.is_control()).take(24).collect())
+                .map(|name| safe_council_text(name, 24))
                 .take(COUNCIL_SEATS.len())
                 .collect()
         })
@@ -2235,7 +2253,8 @@ fn council_last_record(path: &Path) -> Option<(CouncilHistoryRecord, Option<f64>
             seats
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
+                .take(4)
+                .map(|name| safe_council_text(name, 32))
                 .collect()
         })
         .unwrap_or_default();
@@ -2251,12 +2270,13 @@ fn council_last_record(path: &Path) -> Option<(CouncilHistoryRecord, Option<f64>
                 .and_then(|models| models.get(*name))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            let model = safe_council_text(model, 96);
             CouncilSeat {
                 name: (*name).into(),
                 number: format!("{:02}", index + 1),
                 role: (*role).into(),
-                lab: council_lab(model),
-                model: model.to_owned(),
+                lab: council_lab(&model),
+                model,
                 activity: "resting".into(),
                 verdict: verdict_word(answer),
                 confidence: confidence_value(answer),
@@ -2276,11 +2296,7 @@ fn council_last_record(path: &Path) -> Option<(CouncilHistoryRecord, Option<f64>
             finished,
             seen: recent.len() as u32,
             last_seats,
-            last_final: first
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(160)
-                .collect(),
+            last_final: safe_council_text(first, 160),
             tie: winner_names.is_empty() && any_verdict,
             winner_names,
         },

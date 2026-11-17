@@ -192,6 +192,9 @@ impl BridgeController {
                         json!({"kind":"owner_cancel"})
                     }
                     PaneAction::Refresh => Value::Null,
+                    // This is applied atomically by BrowserSession; it never
+                    // becomes a provider or owner action.
+                    PaneAction::CycleReactorArt => Value::Null,
                 };
             }
             return Ok(reply);

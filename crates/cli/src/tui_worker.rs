@@ -46,6 +46,276 @@ fn configured_turn(config: &TuiTurnConfig) -> Result<orbit_engine::TurnConfig, S
     Ok(turn)
 }
 
+struct PendingCouncilFinal {
+    session_id: String,
+    cancel: orbit_provider_http::CancelToken,
+    snapshot: std::sync::Mutex<Option<orbit_frontend_protocol::customization::CouncilSnapshot>>,
+}
+
+fn council_submission_policy(
+    home: &std::path::Path,
+    base: &orbit_engine::TurnConfig,
+    parent: &orbit_tools::ToolContext,
+    policy: Option<crate::session_accounting::NamespaceSpendPolicy>,
+    question: &str,
+    cancel: &orbit_provider_http::CancelToken,
+) -> Result<String, String> {
+    use orbit_engine::hooks::{HookDecision, HookEvent, HookHandler, HookOutcome, Hooks};
+    if cancel.is_cancelled() || parent.is_cancelled() {
+        return Err("Council cancelled before submission policy".into());
+    }
+    let inherited = parent.ext::<crate::auto_mode::ClassifierAccounting>();
+    if inherited
+        .as_ref()
+        .is_some_and(|binding| binding.owner_session_id != parent.session_id)
+    {
+        return Err("Council submission accounting belongs to another session".into());
+    }
+    let inherited_policy = inherited.as_ref().and_then(|binding| binding.spend_policy);
+    let policy = match (policy, inherited_policy) {
+        (Some(a), Some(b)) => Some(crate::session_accounting::NamespaceSpendPolicy {
+            maximum_microcents: a.maximum_microcents.min(b.maximum_microcents),
+            allow_unpriced_housekeeping: a.allow_unpriced_housekeeping
+                && b.allow_unpriced_housekeeping,
+        }),
+        (a, b) => a.or(b),
+    };
+    // The policy runner has no tool authority. Prompt handlers use NoTools;
+    // agent/MCP handlers below fail closed instead of acquiring fresh/default
+    // permissions. Its fixed accounting/cancel context survives a hook timeout.
+    let mut hook_cx = orbit_tools::ToolContext::new(
+        home.into(),
+        parent.session_id.clone(),
+        parent.working_dir.clone(),
+    );
+    hook_cx.working_dirs = parent.working_dirs.clone();
+    hook_cx.set_cwd(Some(parent.cwd()));
+    hook_cx.set_ext(crate::auto_mode::ClassifierAccounting {
+        owner_session_id: parent.session_id.clone(),
+        spend_policy: policy,
+    });
+    crate::tool_runtime::remember_turn_config(&hook_cx, base);
+    let token = cancel.clone();
+    let inherited_cancel = parent.cancel_check();
+    hook_cx.push_cancel_check(std::sync::Arc::new(move || {
+        token.is_cancelled() || inherited_cancel.as_ref().is_some_and(|check| check())
+    }));
+    let delegate = crate::hook_handlers::runner(home, &hook_cx);
+    let runner = std::sync::Arc::new(
+        move |hook: &orbit_engine::hooks::HookConfig, payload: &serde_json::Value| {
+            if matches!(
+                hook.handler.as_ref(),
+                Some(HookHandler::Agent { .. } | HookHandler::McpTool { .. })
+            ) {
+                let reason = "Council cannot run an agent or MCP submission gate without inherited tool authorization; submission refused".to_string();
+                HookOutcome {
+                    exit_code: 2,
+                    stderr: reason.clone(),
+                    decision: Some(HookDecision::Deny { reason }),
+                    ..Default::default()
+                }
+            } else {
+                delegate(hook, payload)
+            }
+        },
+    );
+    let _handler_scope = orbit_engine::hooks::handler_runner_scope(runner);
+    let hooks = Hooks::load(home, orbit_engine::hooks::project_trusted(home));
+    if hooks
+        .hooks
+        .iter()
+        .any(|hook| hook.event == "UserPromptSubmit" && hook.run_async)
+    {
+        return Err("Council requires synchronous UserPromptSubmit policy; an async submission hook is configured".into());
+    }
+    let effort = base.effort.as_ref().map(|effort| match effort {
+        orbit_adapter::types::EffortValue::Level(level) => level.clone(),
+        orbit_adapter::types::EffortValue::Bool(value) => value.to_string(),
+    });
+    orbit_engine::hooks::begin_prompt(effort.as_deref());
+    let prompt = format!("/council {question}");
+    let mut outcomes = Vec::new();
+    // Short-circuit a deny: a later configured paid policy is not allowed to
+    // receive a question that an earlier owner policy has already refused.
+    for hook in hooks
+        .hooks
+        .iter()
+        .filter(|hook| hook.event == "UserPromptSubmit")
+    {
+        if cancel.is_cancelled() {
+            return Err("Council cancelled during submission policy".into());
+        }
+        let selected = Hooks {
+            hooks: vec![hook.clone()],
+            project_trusted: hooks.project_trusted,
+        };
+        let submitted = selected.fire(
+            HookEvent::UserPromptSubmit,
+            &serde_json::json!({"prompt": prompt}),
+        );
+        if let Some(reason) = orbit_engine::hooks::blocked(&submitted) {
+            return Err(format!("prompt blocked by hook: {reason}"));
+        }
+        if submitted.iter().any(|outcome| outcome.exit_code != 0) {
+            cancel.cancel();
+            return Err(
+                "Council submission policy did not complete; no Council request was sent".into(),
+            );
+        }
+        if submitted
+            .iter()
+            .any(|outcome| matches!(&outcome.decision, Some(HookDecision::Ask { .. })))
+        {
+            return Err(
+                "Council submission policy requires explicit approval; no Council request was sent"
+                    .into(),
+            );
+        }
+        outcomes.extend(submitted);
+    }
+    if cancel.is_cancelled() {
+        return Err("Council cancelled during submission policy".into());
+    }
+    let rewritten = match orbit_engine::hooks::rewritten_input(&outcomes) {
+        Some(input) => input
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Council submission rewrite must provide a text prompt")?
+            .to_owned(),
+        None => prompt,
+    };
+    let rewritten = crate::council::question(&rewritten)
+        .unwrap_or(&rewritten)
+        .trim();
+    if rewritten.is_empty() || rewritten.len() > 16 * 1024 {
+        return Err("Council submission policy returned an empty or oversized question".into());
+    }
+    Ok(match orbit_engine::hooks::prompt_context(&outcomes) {
+        Some(context) => format!("{rewritten}\n\n<hook-context>\n{context}\n</hook-context>"),
+        None => rewritten.to_owned(),
+    })
+}
+
+fn publish_council(
+    sender: &BusSender,
+    session_id: &str,
+    snapshot: &orbit_frontend_protocol::customization::CouncilSnapshot,
+) {
+    let clean = |text: &str, maximum: usize| {
+        let mut cot = orbit_hud_tui::CotStripper::new();
+        crate::daemon::scan_display(&cot.push(text))
+            .chars()
+            .take(maximum)
+            .collect::<String>()
+    };
+    let seats = snapshot
+        .seats
+        .iter()
+        .take(4)
+        .cloned()
+        .map(|mut seat| {
+            seat.name = clean(&seat.name, 64);
+            seat.number = clean(&seat.number, 8);
+            seat.role = clean(&seat.role, 64);
+            seat.lab = clean(&seat.lab, 128);
+            seat.model = clean(&seat.model, 512);
+            seat
+        })
+        .collect();
+    sender.send(Msg::CouncilUpdated {
+        session_id: session_id.into(),
+        phase: snapshot.phase.clone(),
+        note: clean(&snapshot.note, 512),
+        seats,
+        winner_seats: snapshot
+            .winner_seats
+            .iter()
+            .take(4)
+            .map(|name| clean(name, 64))
+            .collect(),
+        final_text: if matches!(snapshot.phase.as_str(), "VERDICT" | "IDLE") {
+            clean(&snapshot.last_final, 16 * 1024)
+        } else {
+            String::new()
+        },
+    });
+}
+
+fn restore_council(
+    sender: &BusSender,
+    session_id: &str,
+    transcript: &[ChatMessage],
+    qualification: &CostQualification,
+) {
+    if matches!(
+        qualification,
+        CostQualification::Unavailable | CostQualification::Uncertain { .. }
+    ) {
+        return;
+    }
+    let final_text = transcript.windows(2).rev().find_map(|pair| {
+        (pair[0].role == ChatRole::User
+            && crate::council::question(&pair[0].content).is_some()
+            && pair[1].role == ChatRole::Assistant
+            && pair[1].tool_calls.is_none()
+            && pair[1].blocks.is_none()
+            && !pair[1].content.trim().is_empty())
+        .then_some(pair[1].content.as_str())
+    });
+    if let Some(final_text) = final_text {
+        publish_council(
+            sender,
+            session_id,
+            &orbit_frontend_protocol::customization::CouncilSnapshot {
+                phase: "IDLE".into(),
+                note: "Saved reply to /council; execution metadata unavailable".into(),
+                last_final: format!("Saved reply (execution metadata unavailable): {final_text}"),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+fn finish_council(
+    tool_cx: &orbit_tools::ToolContext,
+    sender: &BusSender,
+    session_id: &str,
+    saved: bool,
+    completed: bool,
+    qualification: &CostQualification,
+) {
+    let Some(pending) = tool_cx.ext::<PendingCouncilFinal>() else {
+        return;
+    };
+    if pending.session_id != session_id {
+        return;
+    }
+    let Some(mut snapshot) = pending
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|mut value| value.take())
+    else {
+        return;
+    };
+    if completed
+        && saved
+        && !pending.cancel.is_cancelled()
+        && !tool_cx.is_cancelled()
+        && !matches!(
+            qualification,
+            CostQualification::Unavailable | CostQualification::Uncertain { .. }
+        )
+    {
+        snapshot.phase = "VERDICT".into();
+        snapshot.note = "Council result and accounting saved".into();
+    } else if completed {
+        snapshot.phase = "FAIL".into();
+        snapshot.note = "Council result publication or accounting requires inspection".into();
+    }
+    publish_council(sender, session_id, &snapshot);
+}
+
 fn checked_cost(
     accounting: &RootSessionAccounting,
     saved: &crate::sessions::SessionFile,
@@ -1505,6 +1775,7 @@ fn worker_main_owned(
         ProjectionReason::Initial,
         ContextProjection::Unavailable,
     );
+    restore_council(&ctx.sender, &config.session_id, &transcript, &qualification);
     orbit_hud_tui::emit_readiness(
         &ctx.sender,
         vec![(
@@ -1684,7 +1955,10 @@ fn worker_main_owned(
                     session_tool_cx.set_cwd(Some(tool_cx.cwd()));
                     // FileChanged: files a hook asked to have watched are
                     // compared with how they were at the previous prompt.
-                    fire_file_changes(&config.home, &tool_cx.working_dir, &mut watched_files);
+                    if !matches!(&cmd, WorkerCommand::Prompt(prompt) | WorkerCommand::PlanPrompt(prompt) if crate::council::question(prompt).is_some())
+                    {
+                        fire_file_changes(&config.home, &tool_cx.working_dir, &mut watched_files);
+                    }
                     // Fall through to the turn itself below.
                 }
                 _ => {}
@@ -1897,16 +2171,9 @@ fn worker_main_owned(
                     // same as to a Read call. The transcript logs the
                     // ORIGINAL prompt (what the operator typed); the
                     // expansion is what the model sees.
-                    let expanded = expand_file_mentions(&prompt, &session_tool_cx);
-                    let (expanded_prompt, user_blocks) = expanded.into_prompt();
-                    let expanded_prompt = if shell_notes.is_empty() {
-                        expanded_prompt
-                    } else {
-                        format!(
-                            "{OPERATOR_SHELL_OPEN}\n{}\n{OPERATOR_SHELL_CLOSE}\n\n{expanded_prompt}",
-                            std::mem::take(&mut shell_notes).join("\n")
-                        )
-                    };
+                    let council_prompt = crate::council::question(&prompt).is_some();
+                    let (expanded_prompt, user_blocks) =
+                        prepare_prompt_input(&prompt, &session_tool_cx, &mut shell_notes);
                     if let Some(log) = &transcript_log {
                         let _ =
                             log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
@@ -1924,12 +2191,16 @@ fn worker_main_owned(
                                 .join(format!("{}.json", binding.session_id)),
                         ),
                     );
-                    let directive = format!(
-                        "{system_prompt}{session_hook_context}{}{}{}",
-                        crate::worktree::prompt_note(&tool_cx, &workspace),
-                        crate::channels::prompt_note(),
-                        crate::tools::mcp_instructions_note(&config.home, &tool_cx)
-                    );
+                    let directive = if council_prompt {
+                        String::new()
+                    } else {
+                        format!(
+                            "{system_prompt}{session_hook_context}{}{}{}",
+                            crate::worktree::prompt_note(&tool_cx, &workspace),
+                            crate::channels::prompt_note(),
+                            crate::tools::mcp_instructions_note(&config.home, &tool_cx)
+                        )
+                    };
                     // Said now, and again once the finished turn has been
                     // drawn from the saved session, which holds no notices.
                     for notice in crate::tools::take_mcp_failure_notices() {
@@ -1955,7 +2226,9 @@ fn worker_main_owned(
                         view_journal.as_mut(),
                     );
                     config.scope = scope;
-                    if let Ok(mut guard) = cancel_slot.lock() {
+                    // Council publishes only after its canonical save. Keep
+                    // its foreground token reachable during that save too.
+                    if !council_prompt && let Ok(mut guard) = cancel_slot.lock() {
                         *guard = None;
                     }
                     match &completion {
@@ -2034,6 +2307,20 @@ fn worker_main_owned(
                                 scan.command, scan.exit_code
                             ),
                         );
+                    }
+                    finish_council(
+                        &tool_cx,
+                        &turn_sender,
+                        &config.session_id,
+                        saved,
+                        completion.as_ref().is_ok_and(|(completion, _)| {
+                            completion.end == orbit_engine::TurnEnd::Completed
+                                && completion.report.ok
+                        }),
+                        &qualification,
+                    );
+                    if council_prompt && let Ok(mut guard) = cancel_slot.lock() {
+                        *guard = None;
                     }
                     emit_ordinary_result(
                         &turn_sender,
@@ -3623,6 +3910,9 @@ fn worker_main_owned(
                 projection_reason,
                 context_projection,
             );
+        }
+        if switching_session {
+            restore_council(&ctx.sender, &config.session_id, &transcript, &qualification);
         }
         for text in after_projection
             .into_iter()
@@ -6374,6 +6664,87 @@ fn run_tui_turn_observed(
     // is the session's now, so the turn boundary is marked here.
     tool_cx.reset_turn_checkpoint();
     let base_turn_config = configured_turn(config)?;
+    if let Some(question) = crate::council::question(prompt) {
+        tool_cx.set_ext(PendingCouncilFinal {
+            session_id: config.session_id.clone(),
+            cancel: cancel.clone(),
+            snapshot: std::sync::Mutex::new(None),
+        });
+        if plan_mode {
+            return Err("Council is an explicit ordinary operation; leave plan mode before running /council".into());
+        }
+        if user_blocks.is_some() {
+            return Err("Council accepts a text question; attachments are not supported".into());
+        }
+        let accounting = accounting.ok_or("Council requires managed session accounting")?;
+        let mut cot = orbit_hud_tui::CotStripper::new();
+        let mut round_sender = sender.clone();
+        let mut events = |event: orbit_frontend_protocol::FrontendEvent| {
+            if let Some(journal) = view_journal.as_deref_mut() {
+                journal.observe(&event);
+            }
+            match event {
+                orbit_frontend_protocol::FrontendEvent::RoundStarted { round } => {
+                    sender.view_round_started(round);
+                    round_sender = sender.with_view_round(round);
+                }
+                orbit_frontend_protocol::FrontendEvent::TextDelta { text } => {
+                    orbit_hud_tui::emit_text(&mut cot, &round_sender, text.as_bytes())
+                }
+                orbit_frontend_protocol::FrontendEvent::CostUpdated { total_microcents } => {
+                    orbit_hud_tui::emit_turn_cost(&round_sender, total_microcents)
+                }
+                _ => {}
+            }
+        };
+        let mut progress = |snapshot| publish_council(sender, &config.session_id, &snapshot);
+        let mut submission = |policy, question: &str| {
+            council_submission_policy(
+                &config.home,
+                &base_turn_config,
+                tool_cx,
+                policy,
+                question,
+                cancel,
+            )
+        };
+        let result = crate::council::run(
+            &config.home,
+            &config.session_id,
+            &base_turn_config,
+            question,
+            transcript,
+            accounting,
+            tool_cx
+                .ext::<crate::auto_mode::ClassifierAccounting>()
+                .and_then(|binding| binding.spend_policy),
+            cancel,
+            &mut submission,
+            &mut progress,
+            &mut events,
+        );
+        let (completion, snapshot) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                publish_council(
+                    sender,
+                    &config.session_id,
+                    &orbit_frontend_protocol::customization::CouncilSnapshot {
+                        phase: "FAIL".into(),
+                        note: format!("Council could not start: {error}"),
+                        ..Default::default()
+                    },
+                );
+                return Err(error);
+            }
+        };
+        if let Some(pending) = tool_cx.ext::<PendingCouncilFinal>()
+            && let Ok(mut value) = pending.snapshot.lock()
+        {
+            *value = Some(snapshot);
+        }
+        return Ok((completion, ContextProjection::Unavailable));
+    }
     crate::telemetry::turn_started(&config.home);
     let origin = crate::sessions::read_selection_origin(&config.home, &config.session_id)?;
     // A command file may name the model for the one turn it starts
@@ -9086,6 +9457,637 @@ reasoning_rate_policy = "output_rate"
         }
     }
 
+    fn fresh_council_worker_lease(config: &TuiTurnConfig) -> crate::sessions::SessionLease {
+        let lease = crate::sessions::SessionLease::acquire(
+            &config.home,
+            &config.session_id,
+            "council-fixture",
+        )
+        .unwrap();
+        let mut seed = crate::sessions::SessionFile::from_chat(
+            &config.session_id,
+            &config.model,
+            &config.gate,
+            &config.provider_id,
+            &config.initial_transcript,
+            config.initial_turns,
+            config.initial_input_tokens,
+            config.initial_output_tokens,
+            config.initial_cost_microcents,
+        )
+        .with_effort(config.effort.clone())
+        .in_workspace(&crate::sessions::current_workspace().unwrap())
+        .unwrap();
+        // Real startup establishes fresh provenance before handing ownership
+        // to the worker. An absent snapshot alone is deliberately legacy.
+        session_accounting::prepare_root(&lease, &mut seed, RootOrigin::FreshCandidate).unwrap();
+        lease
+    }
+
+    #[test]
+    fn council_worker_fixture_preserves_fresh_and_legacy_accounting_provenance() {
+        for fresh in [true, false] {
+            let home = TestHome::new();
+            let initial = config(&home);
+            let session_id = initial.session_id.clone();
+            let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+            let (commands, command_rx) = mpsc::channel();
+            drop(commands);
+            let ctx = WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            };
+            if fresh {
+                let lease = fresh_council_worker_lease(&initial);
+                worker_main_owned(ctx, initial, Default::default(), lease);
+            } else {
+                worker_main(ctx, initial, Default::default());
+            }
+            let checkpoint = crate::context_history::context_journal(&home, &session_id, None)
+                .unwrap()
+                .accounting_checkpoint_detailed()
+                .unwrap();
+            assert!(checkpoint.pending().is_none());
+            assert_eq!(checkpoint.revision().0, 0);
+            assert_eq!(checkpoint.totals().ordinary.input_tokens, 0);
+            assert_eq!(checkpoint.totals().housekeeping.input_tokens, 0);
+            if fresh {
+                assert_eq!(
+                    checkpoint.baseline(),
+                    orbit_engine::AccountingBaseline::FreshKnownZero
+                );
+                assert_eq!(
+                    checkpoint.totals().knownness,
+                    orbit_engine::AccountingKnownness::Known
+                );
+                assert_eq!(checkpoint.totals().ordinary.cost_microcents, Some(0));
+                assert_eq!(checkpoint.totals().housekeeping.cost_microcents, Some(0));
+            } else {
+                assert_eq!(
+                    checkpoint.baseline(),
+                    orbit_engine::AccountingBaseline::UnknownLegacy
+                );
+                assert_eq!(
+                    checkpoint.totals().knownness,
+                    orbit_engine::AccountingKnownness::UnknownLegacy
+                );
+                assert_eq!(checkpoint.totals().ordinary.cost_microcents, None);
+                assert_eq!(checkpoint.totals().housekeeping.cost_microcents, None);
+            }
+            drop(bus);
+        }
+    }
+
+    #[test]
+    fn native_council_runs_three_seats_and_judge_through_managed_worker_accounting() {
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config(&mock.endpoint, "http://127.0.0.1:1"),
+        )
+        .unwrap();
+        let mut initial = config(&home);
+        initial.model = "shared-notools".into();
+        initial.provider_id = "first".into();
+        initial.gate = mock.endpoint.clone();
+        let session_id = initial.session_id.clone();
+        let lease = fresh_council_worker_lease(&initial);
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        commands
+            .send(WorkerCommand::Prompt(
+                "/council review the proposed design".into(),
+            ))
+            .unwrap();
+        drop(commands);
+        worker_main_owned(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            initial,
+            Default::default(),
+            lease,
+        );
+        assert_eq!(mock.request_count(), 4);
+        assert!(
+            mock.last_request()
+                .get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+        );
+        let saved = crate::sessions::load_session(&home, &session_id).unwrap();
+        assert_eq!(saved.turns, 1);
+        assert_eq!(
+            (
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (12, 8, 60)
+        );
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(
+            saved.transcript[0].content,
+            "/council review the proposed design"
+        );
+        assert_eq!(saved.transcript[1].role, ChatRole::Assistant);
+        assert!(
+            saved
+                .transcript
+                .iter()
+                .all(|message| message.blocks.is_none() && message.tool_calls.is_none())
+        );
+        let checkpoint = crate::context_history::context_journal(&home, &session_id, None)
+            .unwrap()
+            .accounting_checkpoint_detailed()
+            .unwrap();
+        assert!(checkpoint.pending().is_none());
+        assert_eq!(
+            checkpoint.baseline(),
+            orbit_engine::AccountingBaseline::FreshKnownZero
+        );
+        assert_eq!(
+            checkpoint.totals().knownness,
+            orbit_engine::AccountingKnownness::Known
+        );
+        assert_eq!(checkpoint.totals().ordinary.input_tokens, 12);
+        assert_eq!(checkpoint.totals().ordinary.output_tokens, 8);
+        assert_eq!(checkpoint.totals().ordinary.cost_microcents, Some(60));
+        assert_eq!(checkpoint.totals().housekeeping.input_tokens, 0);
+        let mut phases = Vec::new();
+        let mut final_count = 0;
+        while let Some(message) = bus.try_recv() {
+            if let Msg::CouncilUpdated {
+                session_id: owner,
+                phase,
+                final_text,
+                ..
+            } = message
+            {
+                assert_eq!(owner, session_id);
+                if phase == "VERDICT" {
+                    final_count += 1;
+                    assert_eq!(final_text, saved.transcript[1].content);
+                } else {
+                    assert!(final_text.is_empty());
+                }
+                phases.push(phase);
+            }
+        }
+        assert!(phases.iter().any(|phase| phase == "DELIBERATING"));
+        assert!(phases.iter().any(|phase| phase == "JUDGING"));
+        assert_eq!(phases.last().map(String::as_str), Some("VERDICT"));
+        assert_eq!(final_count, 1);
+    }
+
+    #[test]
+    fn council_raw_submission_is_not_reclassified_by_files_or_pending_shell_notes() {
+        let home = TestHome::new();
+        std::fs::write(
+            home.join("source.txt"),
+            "FIXTURE_AMBIENT_TEXT_MUST_NOT_ENTER_COUNCIL",
+        )
+        .unwrap();
+        let tool_cx = orbit_tools::ToolContext::new(
+            home.to_path_buf(),
+            "council-guard".into(),
+            home.to_path_buf(),
+        );
+        let mut notes = vec!["operator ran pwd and saw /fixture".to_string()];
+        let before = notes.clone();
+        let (prompt, blocks) =
+            prepare_prompt_input("/council review @source.txt", &tool_cx, &mut notes);
+        assert_eq!(prompt, "/council review @source.txt");
+        assert_eq!(
+            crate::council::question(&prompt),
+            Some("review @source.txt")
+        );
+        assert!(blocks.is_none());
+        assert_eq!(notes, before);
+        assert!(!prompt.contains("FIXTURE_AMBIENT_TEXT"));
+    }
+
+    #[test]
+    fn council_plan_and_attachment_rejections_clear_pending_state_before_accounting_or_requests() {
+        use orbit_frontend_protocol::customization::CouncilSnapshot;
+        let home = TestHome::new();
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config("http://127.0.0.1:1", "http://127.0.0.1:2"),
+        )
+        .unwrap();
+        let mut config = config(&home);
+        config.provider_id = "first".into();
+        config.model = "shared-notools".into();
+        config.gate = "http://127.0.0.1:1".into();
+        let tool_cx = orbit_tools::ToolContext::new(
+            home.to_path_buf(),
+            config.session_id.clone(),
+            home.to_path_buf(),
+        );
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        for (plan_mode, blocks, expected) in [
+            (true, None, "plan mode"),
+            (
+                false,
+                Some(vec![ContentBlock::Text {
+                    text: "attachment".into(),
+                }]),
+                "attachments",
+            ),
+        ] {
+            tool_cx.set_ext(PendingCouncilFinal {
+                session_id: config.session_id.clone(),
+                cancel: orbit_provider_http::CancelToken::new(),
+                snapshot: std::sync::Mutex::new(Some(CouncilSnapshot {
+                    phase: "VERIFYING".into(),
+                    last_final: "stale result".into(),
+                    ..Default::default()
+                })),
+            });
+            let mut transcript = Vec::new();
+            let result = run_tui_turn_observed(
+                &config,
+                &mut transcript,
+                "/council question",
+                blocks,
+                &sender,
+                &ApprovalRegistry::new(),
+                &orbit_provider_http::CancelToken::new(),
+                0,
+                &mut crate::tool_runtime::AutoGrants::new(),
+                "",
+                plan_mode,
+                &mut crate::tool_runtime::PermissionScope::default(),
+                &tool_cx,
+                None,
+                None,
+            );
+            assert!(result.unwrap_err().contains(expected));
+            assert!(transcript.is_empty());
+            assert!(
+                tool_cx
+                    .ext::<PendingCouncilFinal>()
+                    .unwrap()
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            );
+            finish_council(
+                &tool_cx,
+                &sender,
+                &config.session_id,
+                true,
+                true,
+                &CostQualification::Known { revision: 1 },
+            );
+            assert!(bus.try_recv().is_none());
+        }
+    }
+
+    #[test]
+    fn council_verdict_requires_saved_accounting_and_restore_does_not_invent_seats() {
+        use orbit_frontend_protocol::customization::CouncilSnapshot;
+        let home = TestHome::new();
+        let tool_cx = orbit_tools::ToolContext::new(
+            home.to_path_buf(),
+            "council-final".into(),
+            home.to_path_buf(),
+        );
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        tool_cx.set_ext(PendingCouncilFinal {
+            session_id: "council-final".into(),
+            cancel: orbit_provider_http::CancelToken::new(),
+            snapshot: std::sync::Mutex::new(Some(CouncilSnapshot {
+                phase: "VERIFYING".into(),
+                last_final: "unsaved result".into(),
+                ..Default::default()
+            })),
+        });
+        let qualification = CostQualification::Known { revision: 1 };
+        finish_council(
+            &tool_cx,
+            &sender,
+            "council-final",
+            false,
+            true,
+            &qualification,
+        );
+        assert!(
+            matches!(bus.try_recv(), Some(Msg::CouncilUpdated { phase, final_text, .. }) if phase == "FAIL" && final_text.is_empty())
+        );
+        finish_council(
+            &tool_cx,
+            &sender,
+            "council-final",
+            true,
+            true,
+            &qualification,
+        );
+        assert!(bus.try_recv().is_none());
+        let transcript = vec![
+            orbit_engine::user_message("/council question"),
+            orbit_engine::assistant_message("Saved conclusion"),
+        ];
+        restore_council(&sender, "restored-owner", &transcript, &qualification);
+        assert!(
+            matches!(bus.try_recv(), Some(Msg::CouncilUpdated { session_id, phase, note, seats, winner_seats, final_text })
+            if session_id == "restored-owner" && phase == "IDLE" && note == "Saved reply to /council; execution metadata unavailable" && seats.is_empty() && winner_seats.is_empty() && final_text == "Saved reply (execution metadata unavailable): Saved conclusion")
+        );
+        restore_council(
+            &sender,
+            "restored-owner",
+            &transcript,
+            &CostQualification::Uncertain { revision: 1 },
+        );
+        restore_council(&sender, "restored-owner", &transcript[..1], &qualification);
+        assert!(bus.try_recv().is_none());
+    }
+
+    #[test]
+    fn council_cancelled_final_publication_preserves_known_accounting_without_a_verdict() {
+        use orbit_frontend_protocol::customization::CouncilSnapshot;
+        let home = TestHome::new();
+        for cancel_original in [true, false] {
+            let tool_cx = orbit_tools::ToolContext::new(
+                home.to_path_buf(),
+                "council-cancel-final".into(),
+                home.to_path_buf(),
+            );
+            let cancel = orbit_provider_http::CancelToken::new();
+            if cancel_original {
+                cancel.cancel();
+            } else {
+                tool_cx.push_cancel_check(std::sync::Arc::new(|| true));
+            }
+            tool_cx.set_ext(PendingCouncilFinal {
+                session_id: "council-cancel-final".into(),
+                cancel,
+                snapshot: std::sync::Mutex::new(Some(CouncilSnapshot {
+                    phase: "VERIFYING".into(),
+                    last_final: "Completed but cancelled result".into(),
+                    ..Default::default()
+                })),
+            });
+            let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+            let qualification = CostQualification::Known { revision: 7 };
+            finish_council(
+                &tool_cx,
+                &sender,
+                "council-cancel-final",
+                true,
+                true,
+                &qualification,
+            );
+            assert!(matches!(
+                bus.try_recv(),
+                Some(Msg::CouncilUpdated { phase, final_text, .. })
+                if phase == "FAIL" && final_text.is_empty()
+            ));
+            assert_eq!(qualification, CostQualification::Known { revision: 7 });
+            finish_council(
+                &tool_cx,
+                &sender,
+                "council-cancel-final",
+                true,
+                true,
+                &qualification,
+            );
+            assert!(bus.try_recv().is_none());
+        }
+    }
+
+    fn council_policy_hook(
+        home: &std::path::Path,
+        command: &str,
+        handler: Option<orbit_engine::hooks::HookHandler>,
+    ) {
+        #[derive(serde::Serialize)]
+        struct Settings {
+            hooks: Vec<orbit_engine::hooks::HookConfig>,
+        }
+        let hook = orbit_engine::hooks::HookConfig {
+            event: "UserPromptSubmit".into(),
+            command: command.into(),
+            timeout_secs: Some(5),
+            matcher: None,
+            condition: None,
+            run_async: false,
+            http: None,
+            handler: None,
+        };
+        let mut source = toml::to_string(&Settings { hooks: vec![hook] }).unwrap();
+        // ORBIT's settings grammar uses flat prompt/agent/mcp_* keys,
+        // rather than the internal HookConfig.handler representation.
+        match handler {
+            Some(orbit_engine::hooks::HookHandler::Prompt { prompt, model }) => {
+                source.push_str(&format!("prompt = {prompt:?}\n"));
+                if let Some(model) = model {
+                    source.push_str(&format!("model = {model:?}\n"));
+                }
+            }
+            Some(orbit_engine::hooks::HookHandler::Agent { prompt, model }) => {
+                source.push_str(&format!("agent = {prompt:?}\n"));
+                if let Some(model) = model {
+                    source.push_str(&format!("model = {model:?}\n"));
+                }
+            }
+            Some(orbit_engine::hooks::HookHandler::McpTool {
+                server,
+                tool,
+                input,
+            }) => {
+                source.push_str(&format!(
+                    "mcp_server = {server:?}\nmcp_tool = {tool:?}\nmcp_input = {:?}\n",
+                    input.to_string()
+                ));
+            }
+            None => {}
+        }
+        std::fs::write(home.join("settings.toml"), source).unwrap();
+    }
+
+    fn council_policy_context(
+        home: &std::path::Path,
+    ) -> (orbit_tools::ToolContext, orbit_engine::TurnConfig) {
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config("http://127.0.0.1:1", "http://127.0.0.1:2"),
+        )
+        .unwrap();
+        let base =
+            crate::checked_model_turn(home, "first/shared-notools", None, None, false).unwrap();
+        (
+            orbit_tools::ToolContext::new(home.into(), "council-policy".into(), home.into()),
+            base,
+        )
+    }
+
+    #[test]
+    fn council_owner_gate_honors_deny_once_and_suppressed_hooks_remain_silent() {
+        let home = TestHome::new();
+        let (cx, base) = council_policy_context(&home);
+        let count = home.join("submission-count");
+        council_policy_hook(
+            &home,
+            &format!(
+                "printf x >> '{}'; printf owner-denied >&2; exit 2",
+                count.display()
+            ),
+            None,
+        );
+        let cancel = orbit_provider_http::CancelToken::new();
+        let error =
+            council_submission_policy(&home, &base, &cx, None, "question", &cancel).unwrap_err();
+        assert!(error.contains("owner-denied"));
+        assert_eq!(std::fs::read(&count).unwrap(), b"x");
+        assert!(!home.join("context-history").exists());
+        let admitted = orbit_engine::hooks::without_hooks(|| {
+            council_submission_policy(&home, &base, &cx, None, "question", &cancel)
+        })
+        .unwrap();
+        assert_eq!(admitted, "question");
+        assert_eq!(std::fs::read(&count).unwrap(), b"x");
+    }
+
+    #[test]
+    fn council_owner_gate_applies_one_rewrite_and_bounded_context() {
+        let home = TestHome::new();
+        let (cx, base) = council_policy_context(&home);
+        let count = home.join("submission-count");
+        let body = r#"{"hookSpecificOutput":{"updatedInput":{"prompt":"/council sanitized question"},"additionalContext":"owner context"}}"#;
+        council_policy_hook(
+            &home,
+            &format!("printf x >> '{}'; printf '%s' '{}'", count.display(), body),
+            None,
+        );
+        let admitted = council_submission_policy(
+            &home,
+            &base,
+            &cx,
+            None,
+            "private original",
+            &orbit_provider_http::CancelToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            admitted,
+            "sanitized question\n\n<hook-context>\nowner context\n</hook-context>"
+        );
+        assert!(!admitted.contains("private original"));
+        assert_eq!(std::fs::read(&count).unwrap(), b"x");
+    }
+
+    #[test]
+    fn council_owner_agent_and_mcp_gates_fail_closed_without_tool_or_accounting_effects() {
+        use orbit_engine::hooks::HookHandler;
+        let home = TestHome::new();
+        let (cx, base) = council_policy_context(&home);
+        for handler in [
+            HookHandler::Agent {
+                prompt: "inspect files".into(),
+                model: None,
+            },
+            HookHandler::McpTool {
+                server: "fixture".into(),
+                tool: "change".into(),
+                input: serde_json::json!({}),
+            },
+        ] {
+            council_policy_hook(&home, "", Some(handler));
+            let error = council_submission_policy(
+                &home,
+                &base,
+                &cx,
+                None,
+                "question",
+                &orbit_provider_http::CancelToken::new(),
+            )
+            .unwrap_err();
+            assert!(error.contains("without inherited tool authorization"));
+            assert!(!home.join("context-history").exists());
+        }
+    }
+
+    #[test]
+    fn native_council_model_submission_policy_is_billed_before_refusing_all_seats() {
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config(&mock.endpoint, "http://127.0.0.1:1"),
+        )
+        .unwrap();
+        council_policy_hook(
+            &home,
+            "",
+            Some(orbit_engine::hooks::HookHandler::Prompt {
+                prompt: "Evaluate this owner submission policy: $ARGUMENTS".into(),
+                model: Some("first/shared-notools".into()),
+            }),
+        );
+        let mut initial = config(&home);
+        initial.model = "shared-notools".into();
+        initial.provider_id = "first".into();
+        initial.gate = mock.endpoint.clone();
+        let session_id = initial.session_id.clone();
+        let lease = fresh_council_worker_lease(&initial);
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        commands
+            .send(WorkerCommand::Prompt(
+                "/council policy-protected question".into(),
+            ))
+            .unwrap();
+        drop(commands);
+        worker_main_owned(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            initial,
+            Default::default(),
+            lease,
+        );
+        // The real mock answers plain text, which is not a policy verdict.
+        // Its one paid check is retained; no seat or judge is then sent.
+        assert_eq!(mock.request_count(), 1);
+        let saved = crate::sessions::load_session(&home, &session_id).unwrap();
+        assert_eq!(
+            (
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (3, 2, 15)
+        );
+        assert_eq!(saved.transcript.len(), 1);
+        let checkpoint = crate::context_history::context_journal(&home, &session_id, None)
+            .unwrap()
+            .accounting_checkpoint_detailed()
+            .unwrap();
+        assert!(checkpoint.pending().is_none());
+        assert_eq!(
+            checkpoint.baseline(),
+            orbit_engine::AccountingBaseline::FreshKnownZero
+        );
+        assert_eq!(
+            checkpoint.totals().knownness,
+            orbit_engine::AccountingKnownness::Known
+        );
+        assert_eq!(checkpoint.totals().ordinary.input_tokens, 0);
+        assert_eq!(checkpoint.totals().housekeeping.input_tokens, 3);
+        assert_eq!(checkpoint.totals().housekeeping.cost_microcents, Some(15));
+        while let Some(message) = bus.try_recv() {
+            assert!(!matches!(message, Msg::CouncilUpdated { phase, .. } if phase == "VERDICT"));
+        }
+    }
+
     #[test]
     fn saved_provider_owns_effort_and_billing_when_model_ids_overlap() {
         use orbit_adapter::types::EffortValue;
@@ -9368,6 +10370,28 @@ default_effort = "medium"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+fn prepare_prompt_input(
+    prompt: &str,
+    tool_cx: &orbit_tools::ToolContext,
+    shell_notes: &mut Vec<String>,
+) -> (String, Option<Vec<ContentBlock>>) {
+    // Detect the operator's actual command before adding any context.
+    // Council has no implicit file reads, attachments or earlier shell input.
+    if crate::council::question(prompt).is_some() {
+        return (prompt.to_string(), None);
+    }
+    let (expanded, blocks) = expand_file_mentions(prompt, tool_cx).into_prompt();
+    let expanded = if shell_notes.is_empty() {
+        expanded
+    } else {
+        format!(
+            "{OPERATOR_SHELL_OPEN}\n{}\n{OPERATOR_SHELL_CLOSE}\n\n{expanded}",
+            std::mem::take(shell_notes).join("\n")
+        )
+    };
+    (expanded, blocks)
 }
 
 #[derive(Debug, Default)]

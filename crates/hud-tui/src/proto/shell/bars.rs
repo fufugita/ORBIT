@@ -564,7 +564,8 @@ pub fn mode_pill_spec_themed(colors: Palette, mode: Option<&str>) -> (&'static s
         }
         "plan" => ("PLAN", colors.on_accent, colors.cyan),
         "auto" => ("AUTO", colors.on_accent, colors.violet),
-        "bypass" | "bypassPermissions" | "dontAsk" => ("BYPASS", colors.white, colors.red),
+        "dontAsk" | "dont-ask" => ("DONT ASK", colors.on_accent, colors.amber),
+        "bypass" | "bypassPermissions" => ("BYPASS", colors.white, colors.red),
         _ => ("DEFAULT", colors.ink, colors.mode_default_bg),
     }
 }
@@ -900,6 +901,49 @@ mod tests {
         std::collections::BTreeMap::new();
     static EMPTY_BOUNDS: std::collections::BTreeMap<String, ChipWidthBounds> =
         std::collections::BTreeMap::new();
+
+    #[test]
+    fn dont_ask_and_bypass_have_distinct_permission_badges() {
+        let colors = Palette::default();
+        for (mode, expected) in [
+            ("dontAsk", "DONT ASK"),
+            ("dont-ask", "DONT ASK"),
+            ("bypass", "BYPASS"),
+            ("bypassPermissions", "BYPASS"),
+        ] {
+            let (label, _, background) = mode_pill_spec_themed(colors, Some(mode));
+            assert_eq!(label, expected, "mode {mode}");
+            assert_eq!(
+                background,
+                if expected == "DONT ASK" {
+                    colors.amber
+                } else {
+                    colors.red
+                },
+            );
+            let mut scenario = Scenario::new();
+            scenario.permission_mode = Some(mode.into());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 1));
+            let mut cv = Cv::new(&mut buffer);
+            status_line(
+                &mut cv, 120, 0, &scenario, 5_000, true, false, true, false, false,
+            );
+            let row = cells(&buffer, 1, 120);
+            assert!(
+                row.starts_with(&format!(" {expected} ")),
+                "mode {mode}: {row}"
+            );
+            assert_eq!(
+                row.contains("BYPASS"),
+                expected == "BYPASS",
+                "mode {mode}: {row}"
+            );
+        }
+        assert_ne!(
+            mode_pill_spec(Some("dontAsk")),
+            mode_pill_spec(Some("bypass"))
+        );
+    }
 
     #[test]
     fn overflowing_switcher_keeps_selected_panel_visible_and_clickable() {

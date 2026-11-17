@@ -123,6 +123,15 @@ pub struct ApprovalGrant {
 /// A message from the worker thread to the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
+    /// Live advisory work from this session's admitted Council operation.
+    CouncilUpdated {
+        session_id: String,
+        phase: String,
+        note: String,
+        seats: Vec<orbit_frontend_protocol::customization::CouncilSeat>,
+        winner_seats: Vec<String>,
+        final_text: String,
+    },
     SessionProjection(SessionProjection),
     /// Transient owning identity only; the reducer never retains this operation.
     OrdinaryTurnEnded {
