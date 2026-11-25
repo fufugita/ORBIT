@@ -262,6 +262,7 @@ fn session_start_hook_context(
             let selected = Hooks {
                 hooks: vec![selected],
                 project_trusted: hooks.project_trusted,
+                context_limit: hooks.context_limit,
             };
             // Allocate before dispatch: a timeout may happen while the runner
             // thread has not reached its first instruction or journal write.
@@ -360,7 +361,8 @@ fn session_start_hook_context(
             "permission_mode": config.scope.mode.config_name(),
         }),
     );
-    let context = orbit_engine::hooks::prompt_context(&outcomes)
+    let context = hooks
+        .prompt_context(&outcomes)
         .map(|context| format!("\n\n## Session start hook output\n{context}"))
         .unwrap_or_default();
     let after = accounting.namespace().checkpoint_detailed();
@@ -477,6 +479,7 @@ fn council_submission_policy(
         let selected = Hooks {
             hooks: vec![hook.clone()],
             project_trusted: hooks.project_trusted,
+            context_limit: hooks.context_limit,
         };
         let submitted = selected.fire(
             HookEvent::UserPromptSubmit,
@@ -519,7 +522,7 @@ fn council_submission_policy(
     if rewritten.is_empty() || rewritten.len() > 16 * 1024 {
         return Err("Council submission policy returned an empty or oversized question".into());
     }
-    Ok(match orbit_engine::hooks::prompt_context(&outcomes) {
+    Ok(match hooks.prompt_context(&outcomes) {
         Some(context) => format!("{rewritten}\n\n<hook-context>\n{context}\n</hook-context>"),
         None => rewritten.to_owned(),
     })
@@ -575,12 +578,12 @@ fn restore_council(
     session_id: &str,
     transcript: &[ChatMessage],
     qualification: &CostQualification,
-) {
+) -> bool {
     if matches!(
         qualification,
         CostQualification::Unavailable | CostQualification::Uncertain { .. }
     ) {
-        return;
+        return false;
     }
     let final_text = transcript.windows(2).rev().find_map(|pair| {
         (pair[0].role == ChatRole::User
@@ -591,18 +594,20 @@ fn restore_council(
             && !pair[1].content.trim().is_empty())
         .then_some(pair[1].content.as_str())
     });
-    if let Some(final_text) = final_text {
-        publish_council(
-            sender,
-            session_id,
-            &orbit_frontend_protocol::customization::CouncilSnapshot {
-                phase: "IDLE".into(),
-                note: "Saved reply to /council; execution metadata unavailable".into(),
-                last_final: format!("Saved reply (execution metadata unavailable): {final_text}"),
-                ..Default::default()
-            },
-        );
-    }
+    let Some(final_text) = final_text else {
+        return false;
+    };
+    publish_council(
+        sender,
+        session_id,
+        &orbit_frontend_protocol::customization::CouncilSnapshot {
+            phase: "IDLE".into(),
+            note: "Saved reply to /council; execution metadata unavailable".into(),
+            last_final: format!("Saved reply (execution metadata unavailable): {final_text}"),
+            ..Default::default()
+        },
+    );
+    true
 }
 
 fn finish_council(
@@ -1220,31 +1225,51 @@ fn inspect_configuration(home: &std::path::Path, what: &str) -> String {
         }
     };
     let mut lines: Vec<String> = match what {
-        "hooks" => orbit_engine::hooks::Hooks::load(home, trusted)
-            .hooks
-            .iter()
-            .map(|hook| {
-                format!(
-                    "{} [{}] {}",
-                    hook.event,
-                    hook.matcher
+        // Listing the hooks is itself the report on their matchers, so nothing is
+        // announced separately (`inspect`, not `load`).
+        "hooks" => {
+            orbit_engine::hooks::Hooks::inspect(home, trusted.then_some(std::path::Path::new(".")))
+                .hooks
+                .iter()
+                .map(|hook| {
+                    let matcher = hook
+                        .matcher
                         .as_deref()
                         .filter(|m| !m.is_empty())
-                        .unwrap_or("*"),
-                    short(&hook.command)
-                )
-            })
-            .collect(),
+                        .unwrap_or("*");
+                    let flag = orbit_engine::hooks::matcher_problem(matcher)
+                        .map(|reason| {
+                            format!(
+                                "  ← matcher is not a valid regular expression ({reason}); only its plain names match"
+                            )
+                        })
+                        .unwrap_or_default();
+                    // A hook an imported plugin brings says which plugin, so nobody has to guess
+                    // where it came from.
+                    let source = hook
+                        .origin
+                        .as_ref()
+                        .map(|origin| format!("(plugin {}) ", origin.name))
+                        .unwrap_or_default();
+                    format!(
+                        "{} [{}] {source}{}{flag}",
+                        hook.event,
+                        matcher,
+                        short(&hook.command)
+                    )
+                })
+                .collect()
+        }
         "skills" => orbit_engine::skills::load_skills(home, trusted)
             .iter()
             .map(|skill| format!("/{} — {}", skill.name, short(&skill.description)))
             .collect(),
-        "memory" => orbit_engine::context::instruction_files(
+        "memory" => orbit_engine::context::instruction_report(
             home,
             &std::env::current_dir().unwrap_or_default(),
         )
         .iter()
-        .map(|(path, bytes)| format!("{} · {bytes} bytes", path.display()))
+        .map(orbit_engine::context::InstructionFile::describe)
         .collect(),
         "agents" => orbit_engine::skills::load_agents(home, trusted)
             .iter()
@@ -1895,20 +1920,27 @@ fn worker_main_initialized(
     let existing = lease.load_optional();
     let was_saved = matches!(&existing, Ok(Some(_)));
     let mut seed = match existing {
-        Ok(Some(saved)) => saved,
-        Ok(None) => crate::sessions::SessionFile::from_chat(
-            &config.session_id,
-            &config.model,
-            &config.gate,
-            &config.provider_id,
-            &config.initial_transcript,
-            config.initial_turns,
-            config.initial_input_tokens,
-            config.initial_output_tokens,
-            config.initial_cost_microcents,
-        )
-        .with_effort(config.effort.clone())
-        .with_selection_origin(selection_origin),
+        Ok(Some(saved)) => {
+            // The snapshot under the lease supersedes the startup copy.
+            config.initial_transcript = Vec::new();
+            saved
+        }
+        Ok(None) => crate::sessions::SessionFile {
+            transcript: std::mem::take(&mut config.initial_transcript),
+            ..crate::sessions::SessionFile::from_chat(
+                &config.session_id,
+                &config.model,
+                &config.gate,
+                &config.provider_id,
+                &[],
+                config.initial_turns,
+                config.initial_input_tokens,
+                config.initial_output_tokens,
+                config.initial_cost_microcents,
+            )
+            .with_effort(config.effort.clone())
+            .with_selection_origin(selection_origin)
+        },
         Err(error) => {
             orbit_hud_tui::emit_notice(&ctx.sender, &error.to_string());
             return;
@@ -1942,12 +1974,10 @@ fn worker_main_initialized(
     config.gate = seed.gate.clone();
     config.provider_id = seed.provider.clone();
     config.effort = seed.effort.clone();
-    config.initial_transcript = seed.to_transcript();
     config.initial_turns = seed.turns;
     config.initial_input_tokens = seed.input_tokens;
     config.initial_output_tokens = seed.output_tokens;
     config.initial_cost_microcents = seed.cost_microcents;
-    let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
     let mut tool_cx = session_tool_context(&config, &ctx.sender);
     tool_cx.working_dir = workspace.clone();
@@ -2012,6 +2042,7 @@ fn worker_main_initialized(
         generation: 1,
     };
     let mut qualification = checked_cost(&accounting, &seed, true);
+    let mut transcript = seed.transcript;
     // Lifecycle hooks start only after their provider and managed accounting
     // owner exist. Their token remains reachable while startup is in flight.
     let startup_cancel = orbit_provider_http::CancelToken::new();
@@ -2112,17 +2143,16 @@ fn worker_main_initialized(
         ProjectionReason::Initial,
         ContextProjection::Unavailable,
     );
+    // A session started with --permission-mode reports it: the status bar and
+    // /mode read the terminal's copy of the mode, which changes only by message.
+    if config.scope.mode != orbit_tools::permissions::PermissionMode::Default {
+        orbit_hud_tui::emit_mode_changed(&ctx.sender, config.scope.mode.config_name());
+    }
     for notice in startup_hooks.notices {
         ctx.sender.send(Msg::SystemMessage(notice));
     }
     restore_council(&ctx.sender, &config.session_id, &transcript, &qualification);
-    orbit_hud_tui::emit_readiness(
-        &ctx.sender,
-        vec![(
-            sandbox_report().confined,
-            sandbox_report().readiness.clone(),
-        )],
-    );
+    orbit_hud_tui::emit_readiness(&ctx.sender, vec![sandbox_readiness(&config.home)]);
 
     // Locally-queued commands (mod commands re-enter the Prompt flow).
     let mut pending: Vec<WorkerCommand> = Vec::new();
@@ -2210,20 +2240,43 @@ fn worker_main_initialized(
                 // runner also retains the lease until actual completion,
                 // even if this worker/front end has already gone away.
                 qualification = CostQualification::Unavailable;
-                let reason = if let Some((operation, registration)) = foreground.take() {
+                let notice = if acknowledged {
+                    "Session-start hook accounting could not be saved; requests remain paused"
+                } else {
+                    "A cancelled session-start model hook is still settling; requests remain paused"
+                };
+                let (reason, context) = if let Some((operation, registration)) = foreground.take() {
+                    emit_ordinary_result(
+                        &ctx.sender,
+                        Some(&operation),
+                        Err(notice),
+                        false,
+                        &qualification,
+                    );
                     drop(registration);
-                    ProjectionReason::Operation { operation }
+                    (
+                        ProjectionReason::Operation { operation },
+                        ContextProjection::Unavailable,
+                    )
                 } else if let WorkerCommand::Compact(operation)
                 | WorkerCommand::ClearSession(operation) = &cmd
                 {
                     let _ = operation.finish_unstarted();
-                    ProjectionReason::Manual {
-                        operation: operation.clone(),
-                        outcome: ManualOutcome::Failed,
-                        applied: false,
-                    }
+                    let context = if operation.action() == ManualAction::Compact {
+                        ContextProjection::PreserveUnchanged
+                    } else {
+                        ContextProjection::Unavailable
+                    };
+                    (
+                        ProjectionReason::Manual {
+                            operation: operation.clone(),
+                            outcome: ManualOutcome::Failed,
+                            applied: false,
+                        },
+                        context,
+                    )
                 } else {
-                    ProjectionReason::Refresh
+                    (ProjectionReason::Refresh, ContextProjection::Unavailable)
                 };
                 emit_session_projection(
                     &ctx.sender,
@@ -2236,16 +2289,20 @@ fn worker_main_initialized(
                     cum_cost,
                     qualification,
                     reason,
-                    ContextProjection::PreserveUnchanged,
+                    context,
                 );
-                ctx.sender.send(Msg::SystemMessage(
-                    if acknowledged {
-                        "Session-start hook accounting could not be saved; requests remain paused"
-                    } else {
-                        "A cancelled session-start model hook is still settling; requests remain paused"
+                // A list request keeps the terminal's picker pending until its
+                // typed reply arrives. Answer it, or the picker cannot open
+                // again once the hook has settled.
+                match &cmd {
+                    WorkerCommand::ListModels => {
+                        ctx.sender.send(Msg::ModelsListFailed(notice.into()))
                     }
-                    .into(),
-                ));
+                    WorkerCommand::ListSessions => {
+                        ctx.sender.send(Msg::SessionsListFailed(notice.into()))
+                    }
+                    _ => ctx.sender.send(Msg::SystemMessage(notice.into())),
+                };
                 continue;
             }
         }
@@ -3046,23 +3103,42 @@ fn worker_main_initialized(
                     let rows = match crate::sessions::list_sessions(&config.home) {
                         Ok(list) => list
                             .iter()
-                            .map(|s| MsgSessionRow {
-                                id: s.session_id.clone(),
+                            // A session nobody typed into and nobody named is
+                            // nothing to go back to. The one in use stays.
+                            .filter(|s| {
+                                s.turns > 0
+                                    || s.session_id == binding.session_id
+                                    || names.contains_key(&s.session_id)
+                            })
+                            .map(|s| {
                                 // A `/rename` name leads the model column;
                                 // without one, how the session began, so
                                 // the list can be told apart by more than
                                 // its ids.
-                                model: match names
+                                let label = match names
                                     .get(&s.session_id)
                                     .cloned()
                                     .or_else(|| session_opening(&s.transcript))
                                 {
                                     Some(name) => format!("{name} · {}", s.model),
                                     None => s.model.clone(),
-                                },
-                                turns: s.turns,
-                                updated_at: session_age(&s.updated_at),
-                                current: s.session_id == binding.session_id,
+                                };
+                                // Say why a row would be refused here, before
+                                // it is chosen.
+                                let model = match s.require_workspace(&tool_cx.working_dir) {
+                                    Ok(()) => label,
+                                    Err(_) if s.workspace.is_none() => {
+                                        format!("not bound to a folder · {label}")
+                                    }
+                                    Err(_) => format!("other folder · {label}"),
+                                };
+                                MsgSessionRow {
+                                    id: s.session_id.clone(),
+                                    model,
+                                    turns: s.turns,
+                                    updated_at: session_age(&s.updated_at),
+                                    current: s.session_id == binding.session_id,
+                                }
                             })
                             .collect(),
                         Err(e) => {
@@ -3093,10 +3169,7 @@ fn worker_main_initialized(
                     match target {
                         Ok((candidate_lease, mut saved)) => {
                             if let Err(error) = saved.require_workspace(&tool_cx.working_dir) {
-                                orbit_hud_tui::emit_status(
-                                    &turn_sender,
-                                    &format!("resume refused: {error}"),
-                                );
+                                after_projection.push(format!("resume refused: {error}"));
                                 break 'command;
                             }
                             let mut candidate = config.clone();
@@ -3108,9 +3181,9 @@ fn worker_main_initialized(
                             let resolved = match configured_turn(&candidate) {
                                 Ok(turn) => turn,
                                 Err(_) => {
-                                    orbit_hud_tui::emit_status(
-                                        &turn_sender,
-                                        "resume refused: model configuration unavailable",
+                                    after_projection.push(
+                                        "resume refused: model configuration unavailable"
+                                            .to_owned(),
                                     );
                                     break 'command;
                                 }
@@ -3121,9 +3194,8 @@ fn worker_main_initialized(
                                 binding.clone()
                             } else {
                                 let Some(generation) = binding.generation.checked_add(1) else {
-                                    orbit_hud_tui::emit_status(
-                                        &turn_sender,
-                                        "resume refused: session generation exhausted",
+                                    after_projection.push(
+                                        "resume refused: session generation exhausted".to_owned(),
                                     );
                                     break 'command;
                                 };
@@ -3138,10 +3210,8 @@ fn worker_main_initialized(
                             ) {
                                 Ok(log) => log,
                                 Err(_) => {
-                                    orbit_hud_tui::emit_status(
-                                        &turn_sender,
-                                        "resume refused: transcript unavailable",
-                                    );
+                                    after_projection
+                                        .push("resume refused: transcript unavailable".to_owned());
                                     break 'command;
                                 }
                             };
@@ -3155,9 +3225,8 @@ fn worker_main_initialized(
                                     if same_id {
                                         qualification = CostQualification::Unavailable;
                                     }
-                                    orbit_hud_tui::emit_status(
-                                        &turn_sender,
-                                        "resume refused: accounting cannot be verified",
+                                    after_projection.push(
+                                        "resume refused: accounting cannot be verified".to_owned(),
                                     );
                                     break 'command;
                                 }
@@ -3254,10 +3323,7 @@ fn worker_main_initialized(
                             if same_id {
                                 qualification = CostQualification::Unavailable;
                             }
-                            orbit_hud_tui::emit_status(
-                                &turn_sender,
-                                &format!("resume refused: {error}"),
-                            );
+                            after_projection.push(format!("resume refused: {error}"));
                         }
                     }
                 }
@@ -3271,6 +3337,11 @@ fn worker_main_initialized(
                             &format!("operation refused: {error}"),
                         );
                         let _ = operation.finish_unstarted();
+                        let context = if operation.action() == ManualAction::Compact {
+                            ContextProjection::PreserveUnchanged
+                        } else {
+                            ContextProjection::Unavailable
+                        };
                         emit_session_projection(
                             &turn_sender,
                             &config,
@@ -3286,7 +3357,7 @@ fn worker_main_initialized(
                                 outcome: ManualOutcome::Failed,
                                 applied: false,
                             },
-                            ContextProjection::PreserveUnchanged,
+                            context,
                         );
                         break 'command;
                     }
@@ -3764,6 +3835,8 @@ fn worker_main_initialized(
                         .iter()
                         .rposition(|message| message.role == ChatRole::User)
                     {
+                        let undo_council =
+                            crate::council::question(&transcript[index].content).is_some();
                         let mut candidate = transcript.clone();
                         let removed: Vec<String> = candidate
                             .split_off(index)
@@ -3788,6 +3861,18 @@ fn worker_main_initialized(
                         ) {
                             transcript = candidate;
                             turns = candidate_turns;
+                            if undo_council
+                                && !restore_council(
+                                    &turn_sender,
+                                    &config.session_id,
+                                    &transcript,
+                                    &qualification,
+                                )
+                            {
+                                turn_sender.send(Msg::CouncilCleared {
+                                    session_id: config.session_id.clone(),
+                                });
+                            }
                             let text = removed.join(" / ");
                             turn_sender.send(Msg::SystemMessage(format!(
                                 "undid last exchange ({})",
@@ -3839,6 +3924,7 @@ fn worker_main_initialized(
                     let owned = |words: &[&str]| -> Vec<String> {
                         words.iter().map(|word| (*word).to_owned()).collect()
                     };
+                    let mut memory_changed = false;
                     let text = match words.as_slice() {
                         // The same commands as `orbit plugin …`, `orbit mcp …`
                         // and `orbit doctor`, from inside the chat. Arguments
@@ -4070,23 +4156,27 @@ fn worker_main_initialized(
                         }
                         ["btw"] => "usage: /btw <question> — answered from the conversation, not added to it".into(),
                         ["sandbox"] => {
-                            let report = sandbox_report();
-                            let mut lines = vec![report.readiness.clone()];
+                            let off = orbit_tools::sandbox::SandboxAdditions::load(&config.home)
+                                .switched_off();
+                            let (confined, readiness) = sandbox_readiness(&config.home);
+                            let mut lines = vec![readiness];
                             lines.extend(
                                 sandbox_facts()
                                     .iter()
                                     .map(|(label, value)| format!("{label}: {value}")),
                             );
-                            lines.push(format!(
-                                "writable: {}",
-                                tool_cx
-                                    .working_dirs
-                                    .iter()
-                                    .map(|dir| dir.display().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ));
-                            if report.confined {
+                            if !off {
+                                lines.push(format!(
+                                    "writable: {}",
+                                    tool_cx
+                                        .working_dirs
+                                        .iter()
+                                        .map(|dir| dir.display().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
+                            }
+                            if confined || off {
                                 lines.extend(sandbox_additions_lines(&config.home));
                             }
                             lines.join("\n")
@@ -4097,7 +4187,7 @@ fn worker_main_initialized(
                             format!("permission mode: {}", config.scope.mode.config_name()),
                             format!("working directory: {}", tool_cx.cwd().display()),
                             format!("turns: {turns}"),
-                            sandbox_report().readiness.clone(),
+                            sandbox_readiness(&config.home).1,
                             format!("home: {}", config.home.display()),
                         ]
                         .join("\n"),
@@ -4156,6 +4246,7 @@ fn worker_main_initialized(
                             }
                         }
                         ["memory", "edited", scope] => {
+                            memory_changed = true;
                             crate::config_edit::memory_edited(&config.home, &workspace, scope)
                         }
                         ["config", "edit"] | ["statusline", "edit"] => {
@@ -4186,20 +4277,26 @@ fn worker_main_initialized(
                                 Err(error) => error,
                             }
                         }
-                        ["memory", "add", ..] => crate::config_edit::memory_add(
-                            &config.home,
-                            &workspace,
-                            what.trim_start_matches("memory").trim().trim_start_matches("add"),
-                        )
-                        .unwrap_or_else(|error| error),
-                        ["memory", "remove", ..] => crate::config_edit::memory_remove(
-                            &config.home,
-                            &workspace,
-                            what.trim_start_matches("memory")
-                                .trim()
-                                .trim_start_matches("remove"),
-                        )
-                        .unwrap_or_else(|error| error),
+                        ["memory", "add", ..] => {
+                            let outcome = crate::config_edit::memory_add(
+                                &config.home,
+                                &workspace,
+                                what.trim_start_matches("memory").trim().trim_start_matches("add"),
+                            );
+                            memory_changed |= outcome.is_ok();
+                            outcome.unwrap_or_else(|error| error)
+                        }
+                        ["memory", "remove", ..] => {
+                            let outcome = crate::config_edit::memory_remove(
+                                &config.home,
+                                &workspace,
+                                what.trim_start_matches("memory")
+                                    .trim()
+                                    .trim_start_matches("remove"),
+                            );
+                            memory_changed |= outcome.is_ok();
+                            outcome.unwrap_or_else(|error| error)
+                        }
                         ["config", "set", key, ..] => {
                             let value = what
                                 .split_once(key)
@@ -4272,6 +4369,15 @@ fn worker_main_initialized(
                             words.first().copied().unwrap_or(""),
                         ),
                     };
+                    if memory_changed {
+                        // The prompt is built once per session. A /memory change
+                        // is read from the next prompt, as its answer says, so
+                        // the prompt is built again from the edited files.
+                        let built =
+                            build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                        system_prompt = built.text;
+                    }
                     let hook_accounting_after = accounting.namespace().checkpoint_detailed();
                     let hook_accounting_changed =
                         match (&hook_accounting_before, &hook_accounting_after) {
@@ -6792,10 +6898,33 @@ struct SandboxReport {
 /// The home whose settings widen the sandbox, for [`sandbox_facts`].
 static SANDBOX_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// The readiness row when the operator switched the sandbox off.
+const SANDBOX_OFF_READINESS: &str =
+    "sandbox · off (your settings) — commands run with your full permissions";
+
+/// `(confined, readiness row)` for this session: ORBIT's measurement of the
+/// machine, unless the operator's own settings switched the sandbox off
+/// (`[sandbox] enabled = false`). Read each time, so the row follows the file.
+fn sandbox_readiness(home: &std::path::Path) -> (bool, String) {
+    if orbit_tools::sandbox::SandboxAdditions::load(home).switched_off() {
+        return (false, SANDBOX_OFF_READINESS.to_owned());
+    }
+    let report = sandbox_report();
+    (report.confined, report.readiness.clone())
+}
+
 /// The approval card's sandbox rows as they are now: the standard ones,
 /// reworded where the operator's `[sandbox]` settings widen them. Read
 /// each time, so an edit to the settings shows on the next card.
 fn sandbox_facts() -> Vec<(String, String)> {
+    if let Some(home) = SANDBOX_HOME.get()
+        && orbit_tools::sandbox::SandboxAdditions::load(home).switched_off()
+    {
+        return vec![(
+            "sandbox".to_owned(),
+            "OFF — runs with your full permissions (your settings)".to_owned(),
+        )];
+    }
     let report = sandbox_report();
     let additions = match SANDBOX_HOME.get() {
         Some(home) if report.confined => orbit_tools::sandbox::SandboxAdditions::load(home),
@@ -6844,9 +6973,42 @@ fn sandbox_additions_lines(home: &std::path::Path) -> Vec<String> {
             .join(", ")
     };
     let mut lines = Vec::new();
+    if additions.switched_off() {
+        lines.push(
+            "the sandbox is OFF (your settings: [sandbox] enabled = false): commands run with your full permissions, not confined · remove the line to confine them again"
+                .to_owned(),
+        );
+        if !additions.inherit_env.is_empty() {
+            lines.push(format!(
+                "copied from ORBIT's environment into commands (your settings): {}",
+                additions.inherit_env.join(", ")
+            ));
+        }
+        if !additions.path.is_empty() {
+            lines.push(format!(
+                "first on PATH (your settings): {}",
+                list(&additions.path)
+            ));
+        }
+        if !additions.env.is_empty() {
+            lines.push(format!(
+                "variables set (your settings): {}",
+                additions
+                    .env
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for problem in &additions.problems {
+            lines.push(format!("not used: {problem}"));
+        }
+        return lines;
+    }
     if additions.is_empty() && additions.problems.is_empty() {
         lines.push(
-            "your settings add nothing: commands see the system directories and the working directories, with no network · a [sandbox] table in settings.toml can add read, write, path, network, env"
+            "your settings add nothing: commands see the system directories and the working directories, with no network · a [sandbox] table in settings.toml can add read, write, path, network, env, or switch the sandbox off with enabled = false"
                 .to_owned(),
         );
         return lines;
@@ -9717,7 +9879,7 @@ mod session_tests {
         let mut refused = false;
         let mut backend_failure = false;
         let mut source: Option<SessionProjection> = None;
-        let mut refusal_notice = false;
+        let mut refreshed: Option<SessionProjection> = None;
         while std::time::Instant::now() < deadline {
             match bus.try_recv() {
                 Some(Msg::SessionProjection(view))
@@ -9728,12 +9890,20 @@ mod session_tests {
                     assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
                     source = Some(view);
                 }
-                Some(Msg::Status(text)) if text == "resume refused: transcript unavailable" => {
-                    refusal_notice = true;
-                }
+                // The terminal replaces what it shows with each projection, so
+                // the refusal is explained by a message that follows the
+                // refreshed one.
                 Some(Msg::SessionProjection(view))
-                    if refusal_notice && matches!(&view.reason, ProjectionReason::Refresh) =>
+                    if matches!(&view.reason, ProjectionReason::Refresh) =>
                 {
+                    refreshed = Some(view);
+                }
+                Some(Msg::SystemMessage(text))
+                    if text == "resume refused: transcript unavailable" =>
+                {
+                    let view = refreshed
+                        .as_ref()
+                        .expect("the refusal is explained after the refreshed projection");
                     let source = source
                         .as_ref()
                         .expect("refusal follows the actual Initial view");
@@ -9838,7 +10008,7 @@ default_effort = "low"
         );
         let mut refused = false;
         let mut source: Option<SessionProjection> = None;
-        let mut refusal_notice = false;
+        let mut refreshed: Option<SessionProjection> = None;
         while std::time::Instant::now() < deadline {
             if let Some(message) = bus.try_recv() {
                 match message {
@@ -9850,12 +10020,18 @@ default_effort = "low"
                         assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
                         source = Some(view);
                     }
-                    Msg::Status(text) if text == expected_refusal => {
-                        refusal_notice = true;
-                    }
+                    // The terminal replaces what it shows with each projection,
+                    // so the refusal is explained by a message that follows the
+                    // refreshed one.
                     Msg::SessionProjection(view)
-                        if refusal_notice && matches!(&view.reason, ProjectionReason::Refresh) =>
+                        if matches!(&view.reason, ProjectionReason::Refresh) =>
                     {
+                        refreshed = Some(view);
+                    }
+                    Msg::SystemMessage(text) if text == expected_refusal => {
+                        let view = refreshed
+                            .as_ref()
+                            .expect("the refusal is explained after the refreshed projection");
                         let source = source
                             .as_ref()
                             .expect("refusal follows the actual Initial view");
@@ -10172,6 +10348,41 @@ reasoning_rate_policy = "output_rate"
         // to the worker. An absent snapshot alone is deliberately legacy.
         session_accounting::prepare_root(&lease, &mut seed, RootOrigin::FreshCandidate).unwrap();
         lease
+    }
+
+    #[test]
+    fn startup_projects_the_leased_history_when_the_handoff_is_stale() {
+        let home = TestHome::new();
+        let mut initial = config(&home);
+        initial.initial_transcript = vec![orbit_engine::user_message("saved history")];
+        let lease = fresh_council_worker_lease(&initial);
+        initial.initial_transcript = vec![orbit_engine::user_message("stale handoff")];
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        drop(commands);
+        orbit_engine::hooks::without_hooks(|| {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                lease,
+            );
+        });
+        let view = std::iter::from_fn(|| bus.try_recv())
+            .find_map(|msg| match msg {
+                Msg::SessionProjection(view) if view.reason == ProjectionReason::Initial => {
+                    Some(view)
+                }
+                _ => None,
+            })
+            .expect("the initial session projection");
+        assert!(
+            matches!(view.lines.as_slice(), [TranscriptLine::User { text, .. }] if text == "saved history")
+        );
     }
 
     #[test]
@@ -10596,6 +10807,7 @@ if event["hook_event_name"] == "SessionStart":
     struct SessionHookWorker {
         bus: orbit_hud_tui::bus::Bus,
         notices: Vec<String>,
+        ordinary_end: Option<Msg>,
         commands: Option<mpsc::Sender<WorkerCommand>>,
         cancel: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -10631,6 +10843,7 @@ if event["hook_event_name"] == "SessionStart":
             let mut worker = Self {
                 bus,
                 notices: Vec::new(),
+                ordinary_end: None,
                 commands: Some(commands),
                 cancel,
                 thread: Some(thread),
@@ -10652,6 +10865,9 @@ if event["hook_event_name"] == "SessionStart":
                         panic!("session hook worker failed: {error}")
                     }
                     Some(Msg::SystemMessage(text)) => self.notices.push(text),
+                    Some(message @ Msg::OrdinaryTurnEnded { .. }) => {
+                        self.ordinary_end = Some(message);
+                    }
                     _ => {}
                 }
                 assert!(
@@ -10880,6 +11096,8 @@ if event["hook_event_name"] == "SessionStart":
 
     #[test]
     fn timed_out_session_model_hooks_block_controls_and_hold_ownership_until_acknowledged() {
+        use orbit_hud_tui::proto::{runtime::apply_session_projection, scenario::Scenario};
+
         if !isolated_council_clear_case(
             "tui_worker::session_tests::timed_out_session_model_hooks_block_controls_and_hold_ownership_until_acknowledged",
         ) {
@@ -10964,13 +11182,62 @@ if event["hook_event_name"] == "SessionStart":
             );
             assert!(checkpoint.pending().is_none());
             let settings_before = std::fs::read(home.join("settings.toml")).unwrap();
-            let blocked = worker.command(
-                &startup.binding,
+            let mut scenario = Scenario::new();
+            assert!(apply_session_projection(startup.clone(), &mut scenario, 0));
+            let commands = worker.commands.as_ref().unwrap().clone();
+            for command in [
+                WorkerCommand::Prompt("/council blocked question".into()),
                 WorkerCommand::Inspect("statusline off".into()),
-                1,
-            );
-            assert_eq!(blocked.binding, startup.binding);
-            assert_eq!(blocked.cost, CostQualification::Unavailable);
+            ] {
+                let operation = scenario
+                    .new_foreground_operation(command.foreground_kind().unwrap())
+                    .unwrap();
+                assert!(scenario.admit_foreground(operation.clone()));
+                commands
+                    .send(WorkerCommand::Bound {
+                        operation: operation.clone(),
+                        command: Box::new(command),
+                    })
+                    .unwrap();
+                let blocked = worker.projection(|view| {
+                    matches!(&view.reason, ProjectionReason::Operation { operation: observed } if observed == &operation)
+                });
+                assert_eq!(blocked.binding, startup.binding);
+                assert_eq!(blocked.cost, CostQualification::Unavailable);
+                if operation.kind().is_ordinary() {
+                    assert!(
+                        matches!(worker.ordinary_end.take(), Some(Msg::OrdinaryTurnEnded {
+                        operation: owner,
+                        end: OrdinaryEnd::Failed(_),
+                        publication: OrdinaryPublication::BlockedOrUncertain,
+                    }) if owner == operation)
+                    );
+                }
+                assert!(apply_session_projection(blocked, &mut scenario, 1));
+                assert!(!scenario.is_busy());
+            }
+            for (action, context) in [
+                (ManualAction::Clear, ContextProjection::Unavailable),
+                (ManualAction::Compact, ContextProjection::PreserveUnchanged),
+            ] {
+                let operation = scenario.new_manual_operation(action).unwrap();
+                assert!(scenario.admit_manual(operation.clone()));
+                commands
+                    .send(match action {
+                        ManualAction::Clear => WorkerCommand::ClearSession(operation.clone()),
+                        ManualAction::Compact => WorkerCommand::Compact(operation.clone()),
+                    })
+                    .unwrap();
+                let blocked = worker.projection(|view| {
+                    matches!(&view.reason, ProjectionReason::Manual { operation: observed, outcome: ManualOutcome::Failed, applied: false } if observed == &operation)
+                });
+                assert_eq!(blocked.cost, CostQualification::Unavailable);
+                assert_eq!(blocked.context, context);
+                assert!(apply_session_projection(blocked, &mut scenario, 2));
+                assert_eq!(scenario.session_binding(), Some(&startup.binding));
+                assert!(!scenario.is_busy());
+            }
+            drop(commands);
             assert_eq!(
                 std::fs::read(home.join("settings.toml")).unwrap(),
                 settings_before
@@ -11033,6 +11300,296 @@ if event["hook_event_name"] == "SessionStart":
                 assert_eq!(mock.request_count(), 0);
             }
         }
+    }
+
+    #[test]
+    fn blocked_list_requests_get_typed_failures_so_the_pickers_can_reopen() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::blocked_list_requests_get_typed_failures_so_the_pickers_can_reopen",
+        ) {
+            return;
+        }
+        struct Release(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        // A session-start model hook that outlives its timeout leaves the
+        // worker refusing requests until that hook settles.
+        std::fs::write(
+            home.join("settings.toml"),
+            "[[hooks]]\nevent = \"SessionStart\"\nprompt = \"Check fixture\"\nmodel = \"first/shared-notools\"\ntimeout_secs = 1\n",
+        )
+        .unwrap();
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Release(gate.clone());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (worker, startup) = SessionHookWorker::initialized(initial, move |cx| {
+            cx.set_ext(crate::hook_handlers::HookJudge(std::sync::Arc::new(
+                move |_| {
+                    entered_tx.send(()).unwrap();
+                    let (lock, wake) = &*gate;
+                    let (_released, timeout) = wake
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            std::time::Duration::from_secs(8),
+                            |released| !*released,
+                        )
+                        .unwrap();
+                    assert!(
+                        !timeout.timed_out(),
+                        "fixture judge release deadline exceeded"
+                    );
+                    Ok("{\"decision\":\"allow\"}".into())
+                },
+            )));
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(startup.cost, CostQualification::Unavailable);
+        let commands = worker.commands.as_ref().unwrap().clone();
+        commands.send(WorkerCommand::ListModels).unwrap();
+        commands.send(WorkerCommand::ListSessions).unwrap();
+        // The terminal keeps a picker request pending until it receives the
+        // matching typed reply, so a refused listing must still answer.
+        let (mut models, mut sessions) = (None, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while models.is_none() || sessions.is_none() {
+            match worker.bus.try_recv() {
+                Some(Msg::ModelsListFailed(text)) => models = Some(text),
+                Some(Msg::SessionsListFailed(text)) => sessions = Some(text),
+                Some(Msg::ModelsListed(_) | Msg::SessionsListed(_)) => {
+                    panic!("a refused request must not list anything")
+                }
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker left a list request without a typed reply: {models:?} {sessions:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for text in [models.unwrap(), sessions.unwrap()] {
+            assert!(text.contains("requests remain paused"), "{text}");
+        }
+        assert_eq!(mock.request_count(), 0);
+        drop(release);
+    }
+
+    #[test]
+    fn a_launch_permission_mode_is_announced_to_the_terminal() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::a_launch_permission_mode_is_announced_to_the_terminal",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let mut launched = lifecycle_fixture(&home, &mock);
+        launched.scope = crate::tool_runtime::PermissionScope::from_flags(Some("plan"), None, None);
+        let (worker, _startup) = SessionHookWorker::start(launched);
+        // The status bar and /mode read this announcement; without it a
+        // session started with --permission-mode reports the default.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let announced = loop {
+            if let Some(Msg::ModeChanged(mode)) = worker.bus.try_recv() {
+                break mode;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launch permission mode never reached the terminal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_eq!(announced, "plan");
+    }
+
+    #[test]
+    fn refused_resumes_explain_themselves_after_the_refreshed_projection() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::refused_resumes_explain_themselves_after_the_refreshed_projection",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        // Two saved sessions this folder cannot resume: another folder's,
+        // and a legacy one that was never bound to any folder.
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for (id, folder) in [("other-folder", Some(&elsewhere)), ("legacy-unbound", None)] {
+            let lease = crate::sessions::SessionLease::acquire(&home, id, "fixture").unwrap();
+            let mut saved = crate::sessions::SessionFile::from_chat(
+                id,
+                "shared-notools",
+                &mock.endpoint,
+                "first",
+                &[],
+                1,
+                0,
+                0,
+                0,
+            );
+            if let Some(folder) = folder {
+                saved.bind_workspace(folder).unwrap();
+            }
+            lease.save(&saved).unwrap();
+        }
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        for (number, (id, reason)) in [
+            ("other-folder", "belongs to another workspace"),
+            ("legacy-unbound", "workspace is unknown"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let kept = worker.command(
+                &startup.binding,
+                WorkerCommand::ResumeSession(id.into()),
+                number as u64 + 1,
+            );
+            assert_eq!(
+                kept.binding, startup.binding,
+                "{id}: the current session stays"
+            );
+            // The terminal replaces what it shows with each projection, so the
+            // explanation has to arrive after it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut explained = worker.notices.iter().any(|text| text.contains(reason));
+            while !explained {
+                if let Some(Msg::SystemMessage(text)) = worker.bus.try_recv() {
+                    explained = text.contains("resume refused") && text.contains(reason);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{id}: no 'resume refused' explanation followed the projection"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[test]
+    fn a_memory_entry_added_in_the_session_is_sent_with_its_next_prompt() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::a_memory_entry_added_in_the_session_is_sent_with_its_next_prompt",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        let added = worker.command(
+            &startup.binding,
+            WorkerCommand::Inspect("memory add --user MEMORY_ADDED_MID_SESSION".into()),
+            1,
+        );
+        assert_eq!(added.binding, startup.binding);
+        // /memory add answers "it is read from the next prompt".
+        worker.command(&startup.binding, WorkerCommand::Prompt("hello".into()), 2);
+        assert_eq!(mock.request_count(), 1);
+        let sent = mock.last_request().to_string();
+        assert!(
+            sent.contains("MEMORY_ADDED_MID_SESSION"),
+            "the next prompt's request lacks the new memory entry"
+        );
+    }
+
+    #[test]
+    fn the_session_picker_hides_empty_sessions_and_marks_those_this_folder_cannot_resume() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::the_session_picker_hides_empty_sessions_and_marks_those_this_folder_cannot_resume",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let here = crate::sessions::current_workspace().unwrap();
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let seed = |id: &str, turns: u64, folder: Option<&std::path::Path>| {
+            let lease = crate::sessions::SessionLease::acquire(&home, id, "fixture").unwrap();
+            let mut saved = crate::sessions::SessionFile::from_chat(
+                id,
+                "shared-notools",
+                &mock.endpoint,
+                "first",
+                &[],
+                turns,
+                0,
+                0,
+                0,
+            );
+            if let Some(folder) = folder {
+                saved.bind_workspace(folder).unwrap();
+            }
+            lease.save(&saved).unwrap();
+        };
+        seed("empty-here", 0, Some(&here));
+        seed("named-empty-here", 0, Some(&here));
+        crate::session_names::set(&home, "named-empty-here", "keep-me").unwrap();
+        seed("resumable-here", 2, Some(&here));
+        seed("other-folder", 1, Some(&elsewhere));
+        seed("legacy-unbound", 1, None);
+        let (worker, _startup) = SessionHookWorker::start(initial);
+        worker
+            .commands
+            .as_ref()
+            .unwrap()
+            .send(WorkerCommand::ListSessions)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let rows = loop {
+            if let Some(Msg::SessionsListed(rows)) = worker.bus.try_recv() {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session list never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"empty-here"),
+            "an empty, unnamed session is nothing to go back to: {ids:?}"
+        );
+        let row = |id: &str| {
+            rows.iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("{id} is listed: {ids:?}"))
+        };
+        assert!(
+            rows.iter().any(|row| row.current),
+            "the session in use stays listed even while empty"
+        );
+        row("named-empty-here");
+        let resumable = &row("resumable-here").model;
+        assert!(
+            !resumable.contains("other folder") && !resumable.contains("not bound"),
+            "{resumable}"
+        );
+        assert!(
+            row("other-folder").model.contains("other folder"),
+            "{}",
+            row("other-folder").model
+        );
+        assert!(
+            row("legacy-unbound")
+                .model
+                .contains("not bound to a folder"),
+            "{}",
+            row("legacy-unbound").model
+        );
     }
 
     #[test]
@@ -11714,6 +12271,79 @@ if event["hook_event_name"] == "SessionStart":
     }
 
     #[test]
+    fn undo_restores_the_remaining_council_reply_then_clears_the_pane() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::undo_restores_the_remaining_council_reply_then_clears_the_pane",
+        ) {
+            return;
+        }
+        let home = TestHome::new();
+        let mock = MockProvider::start();
+        let mut config = lifecycle_fixture(&home, &mock);
+        config.initial_turns = 3;
+        config.initial_transcript = vec![
+            orbit_engine::user_message("/council first question"),
+            orbit_engine::assistant_message("first decision"),
+            orbit_engine::user_message("/council second question"),
+            orbit_engine::assistant_message("second decision"),
+            orbit_engine::user_message("unrelated question"),
+            orbit_engine::assistant_message("unrelated answer"),
+        ];
+        let session_id = config.session_id.clone();
+        let lease = crate::sessions::SessionLease::acquire(&home, &session_id, "tui").unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        for _ in 0..3 {
+            commands.send(WorkerCommand::Undo).unwrap();
+        }
+        drop(commands);
+        worker_main_owned(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            config,
+            Default::default(),
+            lease,
+        );
+
+        let mut updates = Vec::new();
+        while let Some(message) = bus.try_recv() {
+            match message {
+                Msg::CouncilUpdated {
+                    session_id: owner,
+                    phase,
+                    final_text,
+                    ..
+                } => {
+                    assert_eq!(owner, session_id);
+                    assert_eq!(phase, "IDLE");
+                    updates.push(Some(final_text));
+                }
+                Msg::CouncilCleared { session_id: owner } => {
+                    assert_eq!(owner, session_id);
+                    updates.push(None);
+                }
+                Msg::BackendError(error) => panic!("Council undo worker failed: {error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            updates,
+            [
+                Some("Saved reply (execution metadata unavailable): second decision".into()),
+                Some("Saved reply (execution metadata unavailable): first decision".into()),
+                None,
+            ]
+        );
+        let saved = crate::sessions::load_session(&home, &session_id).unwrap();
+        assert_eq!(saved.turns, 0);
+        assert!(saved.transcript.is_empty());
+        assert_eq!(mock.request_count(), 0);
+    }
+
+    #[test]
     fn council_cancelled_final_publication_preserves_known_accounting_without_a_verdict() {
         use orbit_frontend_protocol::customization::CouncilSnapshot;
         let home = TestHome::new();
@@ -11784,6 +12414,7 @@ if event["hook_event_name"] == "SessionStart":
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let mut source = toml::to_string(&Settings { hooks: vec![hook] }).unwrap();
         // ORBIT's settings grammar uses flat prompt/agent/mcp_* keys,
@@ -13002,6 +13633,98 @@ mod inspect_configuration_tests {
         assert!(inspect_configuration(&home, "other").contains("nothing to list"));
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn the_hooks_listing_names_the_plugin_a_hook_comes_from() {
+        use orbit_plugin_compat::{InspectOptions, PluginFormat, PluginStore, StoreScope};
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("orbit-inspect-pl-{}", ulid::Ulid::new()));
+        let (home, project, source) = (root.join("home"), root.join("project"), root.join("src"));
+        for dir in [
+            &home,
+            &project,
+            &source.join(".claude-plugin"),
+            &source.join("hooks"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // The store keeps its copies only in a private home.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            source.join(".claude-plugin/plugin.json"),
+            r#"{"name":"hookify","description":"d"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"echo plugin-side"}]}]}}"#,
+        )
+        .unwrap();
+        PluginStore::open(&home, &project, false)
+            .unwrap()
+            .import(
+                &source,
+                &InspectOptions {
+                    format: Some(PluginFormat::Claude),
+                    ..InspectOptions::default()
+                },
+                StoreScope::User,
+                true,
+            )
+            .unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "plugin_hooks = [\"hookify\"]\n\n[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ncommand = \"my-own-guard\"\n",
+        )
+        .unwrap();
+        let hooks = inspect_configuration(&home, "hooks");
+        let line = |word: &str| hooks.lines().find(|l| l.contains(word)).unwrap().to_owned();
+        let plugin = line("plugin-side");
+        assert!(plugin.contains("(plugin hookify)"), "{plugin}");
+        let own = line("my-own-guard");
+        assert!(!own.contains("(plugin"), "{own}");
+        // Taking the name out of the setting takes the hook out of the listing.
+        std::fs::write(home.join("settings.toml"), "").unwrap();
+        assert!(inspect_configuration(&home, "hooks").starts_with("no hooks"));
+        // The stored copy is read-only.
+        fn open(path: &std::path::Path) {
+            if let Ok(meta) = std::fs::symlink_metadata(path)
+                && meta.is_dir()
+            {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                    open(&entry.path());
+                }
+            }
+        }
+        open(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_hooks_listing_flags_a_matcher_that_is_not_a_valid_regular_expression() {
+        let home = std::env::temp_dir().join(format!("orbit-inspect-rx-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"^(Bash|Edit)$\"\ncommand = \"fine\"\n\
+             [[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"mcp__.*(exa\"\ncommand = \"broken\"\n",
+        )
+        .unwrap();
+        let hooks = inspect_configuration(&home, "hooks");
+        let line = |word: &str| hooks.lines().find(|l| l.contains(word)).unwrap().to_owned();
+        assert_eq!(line("fine"), "PreToolUse [^(Bash|Edit)$] fine");
+        let broken = line("broken");
+        assert!(
+            broken.starts_with("PreToolUse [mcp__.*(exa] broken"),
+            "{broken}"
+        );
+        assert!(
+            broken.contains("not a valid regular expression") && broken.contains("unclosed group"),
+            "{broken}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 #[cfg(test)]
@@ -13121,5 +13844,56 @@ mod operator_shell_tests {
         assert_eq!(super::collapse_file_mentions(own), own);
         // A refused command (no exit code) leaves no record.
         assert!(super::shell_bang_record("rm -rf x", r#"{"ok":false,"denied":true}"#).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_switch_tests {
+    fn home_with(settings: Option<&str>) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("orbit-tui-sandbox-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(home.join("settings.toml"), text).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn the_readiness_row_says_when_the_operator_switched_the_sandbox_off() {
+        let off = home_with(Some("[sandbox]\nenabled = false\n"));
+        let (confined, text) = super::sandbox_readiness(&off);
+        assert!(!confined);
+        assert_eq!(
+            text,
+            "sandbox · off (your settings) — commands run with your full permissions"
+        );
+        // Without the switch the row is ORBIT's own measurement, whatever it is.
+        let plain = home_with(None);
+        let (_, text) = super::sandbox_readiness(&plain);
+        assert!(!text.contains("your settings"), "{text}");
+        let _ = std::fs::remove_dir_all(off);
+        let _ = std::fs::remove_dir_all(plain);
+    }
+
+    #[test]
+    fn slash_sandbox_says_what_the_switch_and_its_table_do() {
+        let home = home_with(Some(
+            "[sandbox]\nenabled = false\ninherit_env = [\"SSH_AUTH_SOCK\"]\nbogus = 1\n",
+        ));
+        let text = super::sandbox_additions_lines(&home).join("\n");
+        assert!(text.contains("the sandbox is OFF"), "{text}");
+        assert!(text.contains("full permissions"), "{text}");
+        assert!(text.contains("SSH_AUTH_SOCK"), "{text}");
+        assert!(
+            text.contains("not used: sandbox.bogus is not a setting"),
+            "{text}"
+        );
+        // An ordinary table is described as before, with the switch offered.
+        let plain = home_with(None);
+        let text = super::sandbox_additions_lines(&plain).join("\n");
+        assert!(text.contains("your settings add nothing"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(plain);
     }
 }

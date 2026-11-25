@@ -10,8 +10,8 @@
 //! overlap: the payload also carries `tool_name`, `tool_input` and `cwd`,
 //! a `matcher` limits a hook to named tools, and stdout may use Claude
 //! Code's `hookSpecificOutput` / `decision` JSON. A matcher is a list of
-//! names separated by `|` or `,` with `*` (or `.*`) as a wildcard; full
-//! regular expressions are not supported.
+//! names separated by `|` or `,` with `*` (or `.*`) as a wildcard, or a
+//! regular expression (see [`matcher_accepts`]).
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The v1 hook events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
@@ -92,6 +92,14 @@ pub enum HookEvent {
     SessionEnd,
 }
 
+impl std::str::FromStr for HookEvent {
+    type Err = serde::de::value::Error;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::deserialize(serde::de::IntoDeserializer::into_deserializer(name))
+    }
+}
+
 impl HookEvent {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -140,7 +148,8 @@ pub struct HookConfig {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     /// Limits the hook to matching tools (tool events) or session sources
-    /// (`SessionStart`). Absent, empty or `*` matches everything.
+    /// (`SessionStart`): a list of names or a regular expression, see
+    /// [`matcher_accepts`]. Absent, empty or `*` matches everything.
     #[serde(default)]
     pub matcher: Option<String>,
     /// A further condition on tool events, in permission-rule form:
@@ -162,6 +171,18 @@ pub struct HookConfig {
     /// [`set_handler_runner`]).
     #[serde(default)]
     pub handler: Option<HookHandler>,
+    /// The imported plugin this hook came with: its stored copy (`CLAUDE_PLUGIN_ROOT`) and its
+    /// private state folder (`CLAUDE_PLUGIN_DATA`). `None` for the operator's own hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<PluginOrigin>,
+}
+
+/// Where a plugin's hook runs from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOrigin {
+    pub name: String,
+    pub root: PathBuf,
+    pub data: PathBuf,
 }
 
 /// Claude Code's `prompt`, `agent` and `mcp_tool` hook types.
@@ -659,8 +680,74 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     rest.ends_with(last)
 }
 
+/// What only a regular expression writes. A matcher with one of these is also
+/// searched as one; a name list, its `|` and `,` separators and its `*` and
+/// `.*` wildcards use none of them.
+const REGEX_SYNTAX: [char; 11] = ['^', '$', '(', ')', '[', ']', '{', '}', '+', '?', '\\'];
+
+/// The longest matcher compiled as a regular expression, and how large its
+/// program may get. A project's own settings are read, so neither is the
+/// author's to choose.
+const MAX_REGEX_MATCHER_BYTES: usize = 1024;
+const REGEX_MATCHER_SIZE_LIMIT: usize = 1024 * 1024;
+const MAX_REMEMBERED_MATCHERS: usize = 256;
+
+fn has_regex_syntax(matcher: &str) -> bool {
+    matcher.contains(REGEX_SYNTAX)
+}
+
+type CompiledMatchers = std::collections::HashMap<String, Result<regex::Regex, String>>;
+
+/// The matcher as a regular expression, or why it is not one. Compiling is the
+/// costly part and every tool call asks, so the answer is kept.
+fn matcher_regex(pattern: &str) -> Result<regex::Regex, String> {
+    static COMPILED: std::sync::LazyLock<std::sync::Mutex<CompiledMatchers>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut known = COMPILED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(answer) = known.get(pattern) {
+        return answer.clone();
+    }
+    let answer = if pattern.len() > MAX_REGEX_MATCHER_BYTES {
+        Err(format!("longer than {MAX_REGEX_MATCHER_BYTES} bytes"))
+    } else {
+        regex::RegexBuilder::new(pattern)
+            .size_limit(REGEX_MATCHER_SIZE_LIMIT)
+            .build()
+            .map_err(|error| regex_reason(&error))
+    };
+    if known.len() >= MAX_REMEMBERED_MATCHERS {
+        known.clear();
+    }
+    known.insert(pattern.to_owned(), answer.clone());
+    answer
+}
+
+/// The line of a regex error that says what is wrong: the library's own text
+/// is a block that quotes the pattern back.
+fn regex_reason(error: &regex::Error) -> String {
+    let text = error.to_string();
+    text.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("error: "))
+        .or_else(|| text.lines().next())
+        .unwrap_or("not a valid pattern")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect()
+}
+
 /// Does a hook's matcher accept this subject (a tool name or session
 /// source)? An event with no subject ignores the matcher.
+///
+/// A matcher is a list of names (`|` or `,` between them, `*` or `.*` as a
+/// wildcard), each compared whole. One that also uses regular-expression
+/// syntax is searched as a regular expression too, anywhere in the subject as
+/// Claude Code's `RegExp.test` does, so `^…$` pins it. The name list comes
+/// first and is unchanged: nothing that matched before stops matching, and a
+/// name with a bracket in it (`[id].tsx`) still matches itself.
 pub fn matcher_accepts(matcher: Option<&str>, subject: Option<&str>) -> bool {
     let matcher = matcher.map(str::trim).unwrap_or("");
     let Some(subject) = subject else {
@@ -673,6 +760,69 @@ pub fn matcher_accepts(matcher: Option<&str>, subject: Option<&str>) -> bool {
         .split(['|', ','])
         .map(|name| name.trim().replace(".*", "*"))
         .any(|name| !name.is_empty() && glob_matches(&name, subject))
+        || (has_regex_syntax(matcher)
+            && matcher_regex(matcher).is_ok_and(|pattern| pattern.is_match(subject)))
+}
+
+/// Is this matcher also read as a regular expression?
+pub fn is_regex_matcher(matcher: &str) -> bool {
+    has_regex_syntax(matcher.trim())
+}
+
+/// What is wrong with a matcher written as a regular expression, or `None`: a
+/// name list is always fine, and so is a pattern that compiles. A pattern that
+/// does not compile still matches the plain names in it; telling the operator
+/// is the caller's job.
+pub fn matcher_problem(matcher: &str) -> Option<String> {
+    let matcher = matcher.trim();
+    if !has_regex_syntax(matcher) {
+        return None;
+    }
+    matcher_regex(matcher).err()
+}
+
+/// Text for one line of hook trouble: no control characters, bounded.
+fn tidy(text: &str, limit: usize) -> String {
+    let mut tidy: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(limit)
+        .collect();
+    if text.chars().count() > limit {
+        tidy.push('…');
+    }
+    tidy
+}
+
+/// Tell the operator about each hook whose matcher is written as a regular
+/// expression and is not one, once per process: the hooks load again for every
+/// tool call.
+fn report_matcher_problems(hooks: &[HookConfig]) {
+    static ANNOUNCED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    for hook in hooks {
+        let Some(matcher) = hook.matcher.as_deref() else {
+            continue;
+        };
+        let Some(reason) = matcher_problem(matcher) else {
+            continue;
+        };
+        let problem = format!(
+            "{} hook matcher \"{}\" is not a valid regular expression ({reason}); only its plain names can match, so the hook may never run · {}",
+            tidy(&hook.event, 40),
+            tidy(matcher.trim(), 80),
+            hook_label(hook)
+        );
+        let mut announced = ANNOUNCED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if announced.len() >= MAX_REMEMBERED_MATCHERS {
+            announced.clear();
+        }
+        if announced.insert(problem.clone()) {
+            note_hook_problem(problem);
+        }
+    }
 }
 
 /// A hook's decision output.
@@ -712,6 +862,10 @@ pub struct Hooks {
     pub hooks: Vec<HookConfig>,
     /// Project hooks loaded only when the folder is trusted.
     pub project_trusted: bool,
+    /// The most text these hooks may add to the model's context at one event, as
+    /// `hook_context_max_bytes` in the operator's settings says; `None` is the default.
+    /// It travels with the hooks, so every place that fires them applies the same bound.
+    pub context_limit: Option<usize>,
 }
 
 /// Is the current folder trusted for project-scope hooks? (E9: the
@@ -725,8 +879,28 @@ pub fn project_trusted(home: &Path) -> bool {
 }
 
 impl Hooks {
-    /// Load hooks from the settings scopes.
+    /// Load hooks from the settings scopes (the project's from the working
+    /// directory, when it is trusted), and tell the operator about a matcher
+    /// written as a regular expression that is not one.
     pub fn load(home: &Path, project_trusted: bool) -> Self {
+        let loaded = Self::inspect(home, project_trusted.then_some(Path::new(".")));
+        report_matcher_problems(&loaded.hooks);
+        crate::plugin_hooks::resolve(home)
+            .problems
+            .into_iter()
+            .for_each(note_load_problem);
+        context_limit_with_problems(home)
+            .1
+            .into_iter()
+            .for_each(note_load_problem);
+        loaded
+    }
+
+    /// The hooks a session started in `project` would run (`None`: that folder
+    /// is not trusted, so only the operator's own), without telling anyone
+    /// about them: for a diagnostic that prints its own findings.
+    pub fn inspect(home: &Path, project: Option<&Path>) -> Self {
+        let project_trusted = project.is_some();
         if crate::bare_mode() {
             return Self {
                 project_trusted,
@@ -751,7 +925,9 @@ impl Hooks {
             });
         }
         // Project scope (trusted only).
-        if project_trusted && let Ok(text) = std::fs::read_to_string(".orbit/settings.toml") {
+        if let Some(dir) = project
+            && let Ok(text) = std::fs::read_to_string(dir.join(".orbit/settings.toml"))
+        {
             hooks.extend(parse_hooks_toml(&text));
         }
         // Claude Code's own hook files, when the operator opted in.
@@ -760,9 +936,9 @@ impl Hooks {
             if let Some(dir) = claude_config_dir() {
                 files.push(dir.join("settings.json"));
             }
-            if project_trusted {
-                files.push(PathBuf::from(".claude/settings.json"));
-                files.push(PathBuf::from(".claude/settings.local.json"));
+            if let Some(dir) = project {
+                files.push(dir.join(".claude/settings.json"));
+                files.push(dir.join(".claude/settings.local.json"));
             }
             for file in files {
                 if let Some(text) = read_bounded(&file) {
@@ -770,10 +946,30 @@ impl Hooks {
                 }
             }
         }
+        // The command hooks of the imported plugins the operator named in `plugin_hooks`.
+        hooks.extend(crate::plugin_hooks::resolve(home).hooks);
         Hooks {
             hooks,
             project_trusted,
+            context_limit: Some(context_limit_with_problems(home).0),
         }
+    }
+
+    /// The most text hooks may add to the model's context at one event.
+    pub fn context_limit(&self) -> usize {
+        self.context_limit.unwrap_or(DEFAULT_HOOK_CONTEXT_BYTES)
+    }
+
+    /// Everything these hooks want the model to see at one event, within the limit.
+    pub fn added_context(&self, outcomes: &[HookOutcome]) -> Option<String> {
+        announce_context_cut(bounded_context(outcomes, self.context_limit()))
+    }
+
+    /// Context for the model from `SessionStart` and `UserPromptSubmit` hooks.
+    /// As in Claude Code, a successful hook's plain-text output counts as
+    /// context there, alongside any `additionalContext`.
+    pub fn prompt_context(&self, outcomes: &[HookOutcome]) -> Option<String> {
+        self.added_context(&lift_plain_output(outcomes))
     }
 
     fn matching(&self, event: HookEvent, subject: Option<&str>) -> Vec<&HookConfig> {
@@ -942,6 +1138,156 @@ fn claude_compat_key(text: &str) -> bool {
         .any(|(key, value)| key.trim() == "claude_compat" && value.trim() == "true")
 }
 
+/// How often a blocking `Stop`, `SubagentStop` or `TeammateIdle` hook may send
+/// the model back to work in one turn, until the operator says otherwise.
+pub const DEFAULT_STOP_CONTINUATIONS: u32 = 3;
+
+/// The most `stop_hook_max_continuations` can allow. A hook that never lets go
+/// still ends, and a typo cannot buy an unbounded run.
+pub const STOP_CONTINUATIONS_CEILING: u32 = 1000;
+
+const STOP_LIMIT_KEY: &str = "stop_hook_max_continuations";
+
+/// How often a blocking stop hook may send the model back to work in one
+/// turn: `stop_hook_max_continuations`, a top-level key in the operator's own
+/// settings (`$ORBIT_HOME/settings.toml`, then the `--settings` file, which
+/// wins), or 3. A project's `.orbit/settings.toml` cannot raise it: the limit is
+/// what stops a hook from holding the model forever, so it is the operator's
+/// to set. A value that cannot be used keeps the default and is reported with
+/// the rest of the hook trouble.
+pub fn stop_continuation_limit(home: &Path) -> u32 {
+    let (value, problems) = operator_number(
+        home,
+        STOP_LIMIT_KEY,
+        i64::from(STOP_CONTINUATIONS_CEILING),
+        i64::from(DEFAULT_STOP_CONTINUATIONS),
+    );
+    problems.into_iter().for_each(note_hook_problem);
+    u32::try_from(value).unwrap_or(DEFAULT_STOP_CONTINUATIONS)
+}
+
+/// A whole-number setting that only the operator may set, read from the top level of
+/// `$ORBIT_HOME/settings.toml` and then of the `--settings` file (which wins), never from a
+/// project's settings: `(value, what to tell the operator)`. Nothing is reported from here, so a
+/// diagnostic can read the same value quietly.
+fn operator_number(home: &Path, key: &str, ceiling: i64, default: i64) -> (i64, Vec<String>) {
+    if crate::bare_mode() {
+        return (default, Vec::new());
+    }
+    let user = std::fs::read_to_string(home.join("settings.toml")).ok();
+    let extra = orbit_tools::executor::extra_settings_file()
+        .filter(|file| !orbit_tools::executor::is_json(file))
+        .and_then(|file| read_bounded(&file));
+    let mut value = default;
+    let mut problems = Vec::new();
+    for text in [user, extra].into_iter().flatten() {
+        if let Some((setting, problem)) = number_setting(&text, key, ceiling, default) {
+            value = setting;
+            problems.extend(problem);
+        }
+    }
+    (value, problems)
+}
+
+/// What one settings file says about a whole-number setting: `None` when it says nothing,
+/// otherwise the value to use and, when it could not be taken as it stands, what to tell the
+/// operator. Like `claude_compat`, the key counts only above the first `[table]`: TOML puts a key
+/// below one inside that table.
+fn number_setting(
+    text: &str,
+    key: &str,
+    ceiling: i64,
+    default: i64,
+) -> Option<(i64, Option<String>)> {
+    let mut at_top = true;
+    let mut found = None;
+    let mut under_table = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            at_top = false;
+            continue;
+        }
+        let Some((name, raw)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        if at_top {
+            found = Some(read_number(raw, key, ceiling, default));
+        } else {
+            under_table = true;
+        }
+    }
+    found.or_else(|| {
+        under_table.then(|| {
+            (
+                default,
+                Some(format!(
+                    "{key} is under a [table] in settings.toml, where it is not read; put it above the first [table]"
+                )),
+            )
+        })
+    })
+}
+
+/// The value after `=`: a whole number from 0 to the ceiling. Above it, the
+/// ceiling; anything else, the default. Both come with what to tell the operator.
+fn read_number(raw: &str, key: &str, ceiling: i64, default: i64) -> (i64, Option<String>) {
+    let value = (raw.len() <= 4096)
+        .then(|| toml::from_str::<toml::Table>(&format!("value = {}", raw.trim())).ok())
+        .flatten()
+        .and_then(|table| table.get("value").and_then(toml::Value::as_integer));
+    match value {
+        Some(n) if (0..=ceiling).contains(&n) => (n, None),
+        Some(n) if n > ceiling => (
+            ceiling,
+            Some(format!(
+                "{key} = {n} is above the largest allowed, {ceiling}; using that"
+            )),
+        ),
+        _ => (
+            default,
+            Some(format!(
+                "{key} must be a whole number from 0 to {ceiling}; the limit stays {default}"
+            )),
+        ),
+    }
+}
+
+/// What one settings file says about the Stop limit (see [`number_setting`]).
+#[cfg(test)]
+fn stop_limit_setting(text: &str) -> Option<(u32, Option<String>)> {
+    number_setting(
+        text,
+        STOP_LIMIT_KEY,
+        i64::from(STOP_CONTINUATIONS_CEILING),
+        i64::from(DEFAULT_STOP_CONTINUATIONS),
+    )
+    .map(|(value, problem)| {
+        (
+            u32::try_from(value).unwrap_or(DEFAULT_STOP_CONTINUATIONS),
+            problem,
+        )
+    })
+}
+
+/// A blocking stop hook the turn did not obey: its continuations were used up,
+/// or the turn was out of rounds. Without this the turn simply ends and the
+/// operator cannot tell that the hook was overruled.
+pub fn note_stop_hook_not_obeyed(continued: u32, limit: u32, max_rounds: u32) {
+    note_hook_problem(if continued >= limit {
+        format!(
+            "a stop hook still asked the model to keep working after {continued} continuation{}; the limit is {limit}, so the turn ended ({STOP_LIMIT_KEY} in settings.toml raises it)",
+            if continued == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "a stop hook still asked the model to keep working, but the turn had used its {max_rounds} rounds, so it ended"
+        )
+    });
+}
+
 pub fn claude_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
@@ -949,7 +1295,7 @@ pub fn claude_config_dir() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".claude"))
 }
 
-fn read_bounded(path: &Path) -> Option<String> {
+pub(crate) fn read_bounded(path: &Path) -> Option<String> {
     const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
     let meta = std::fs::metadata(path).ok()?;
     (meta.is_file() && meta.len() <= MAX_SETTINGS_BYTES)
@@ -957,13 +1303,14 @@ fn read_bounded(path: &Path) -> Option<String> {
         .flatten()
 }
 
+/// Maximum number of handlers the Claude-compatible reader loads from one file.
+pub const MAX_CLAUDE_HOOKS_PER_FILE: usize = 256;
+
 /// The `hooks` object of a Claude Code `settings.json`:
 /// `{"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
-/// "command": "...", "timeout": 30}]}]}`. Only `command` handlers are
-/// taken; anything else (prompt, agent, HTTP handlers; malformed entries)
-/// is skipped. An event ORBIT never fires simply never runs.
+/// "command": "...", "timeout": 30}]}]}`. Unsupported or malformed handlers
+/// are skipped. An event ORBIT never fires simply never runs.
 pub fn parse_claude_settings(text: &str) -> Vec<HookConfig> {
-    const MAX_HOOKS: usize = 256;
     let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
     };
@@ -1053,7 +1400,7 @@ pub fn parse_claude_settings(text: &str) -> Vec<HookConfig> {
                     (Some("prompt" | "agent" | "mcp_tool"), _, _, Some(_)) => "",
                     _ => continue,
                 };
-                if out.len() == MAX_HOOKS {
+                if out.len() == MAX_CLAUDE_HOOKS_PER_FILE {
                     return out;
                 }
                 out.push(HookConfig {
@@ -1075,11 +1422,46 @@ pub fn parse_claude_settings(text: &str) -> Vec<HookConfig> {
                         .unwrap_or(false),
                     http,
                     handler: special,
+                    origin: None,
                 });
             }
         }
     }
     out
+}
+
+/// The session a hook belongs to, under the names the guards written for
+/// Claude Code read: `CLAUDE_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, and
+/// `ORBIT_SESSION_ID` for scripts written for ORBIT. It is the payload's
+/// `session_id`, so a hook sees the same session in its environment as on
+/// standard input. It replaces an inherited value: ORBIT started from another
+/// agent's shell would otherwise hand its hooks that agent's session. An id
+/// that is not a plain name is not exported, because scripts use it to name files.
+fn session_environment(payload: &serde_json::Value) -> Vec<(&'static str, String)> {
+    let Some(id) = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| plain_session_id(id))
+    else {
+        return Vec::new();
+    };
+    [
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "ORBIT_SESSION_ID",
+    ]
+    .into_iter()
+    .map(|name| (name, id.to_owned()))
+    .collect()
+}
+
+/// Letters, digits, `-`, `_` and `.`, one to 128 of them, and not `.` or `..`.
+fn plain_session_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && !matches!(id, "." | "..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// Run one hook: JSON on stdin, exit code + stdout JSON decide.
@@ -1113,6 +1495,24 @@ fn run_hook(cfg: &HookConfig, payload: &serde_json::Value) -> HookOutcome {
             shell
         }
     };
+    if let Some(origin) = &cfg.origin {
+        // A plugin's hook finds its files and its own state folder here. The folder is private and
+        // made when a hook first runs: looking at a plugin never creates it.
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let _ = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&origin.data);
+        }
+        program
+            .env("CLAUDE_PLUGIN_ROOT", &origin.root)
+            .env("CLAUDE_PLUGIN_DATA", &origin.data)
+            // A Python hook that imports a file beside it would write `__pycache__` into the
+            // stored copy, which then no longer verifies and runs none of its hooks. The
+            // bytecode goes to the plugin's own state folder instead.
+            .env("PYTHONPYCACHEPREFIX", origin.data.join("pycache"));
+    }
     let mut child = match program
         // Claude Code hooks locate their scripts through this variable.
         .envs(
@@ -1121,6 +1521,8 @@ fn run_hook(cfg: &HookConfig, payload: &serde_json::Value) -> HookOutcome {
                 .filter(|_| std::env::var_os("CLAUDE_PROJECT_DIR").is_none())
                 .map(|cwd| ("CLAUDE_PROJECT_DIR", cwd)),
         )
+        // Guards that keep state per session find the session here.
+        .envs(session_environment(payload))
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1254,6 +1656,10 @@ fn parse_output(stdout: &str) -> (Option<HookDecision>, Option<String>) {
         text(specific, "permissionDecisionReason")
             .or_else(|| text(&value, "reason"))
             .or_else(|| text(&value, "stopReason"))
+            // hookify, for one, explains a block only here. Claude Code shows
+            // it to the person; here it is also what the model is told, so a block that says
+            // why does not leave an empty reason behind.
+            .or_else(|| text(&value, "systemMessage"))
             .unwrap_or_default()
     };
     let rewritten = specific
@@ -1293,11 +1699,10 @@ pub fn rewritten_input(outcomes: &[HookOutcome]) -> Option<serde_json::Value> {
     })
 }
 
-/// Context for the model from `SessionStart` and `UserPromptSubmit` hooks.
-/// As in Claude Code, a successful hook's plain-text output counts as
-/// context there, alongside any `additionalContext`.
-pub fn prompt_context(outcomes: &[HookOutcome]) -> Option<String> {
-    let lifted: Vec<HookOutcome> = outcomes
+/// What a hook that exits 0 and prints plain text means: the text is context, as in Claude
+/// Code, unless it spoke JSON, decided something or already gave `additionalContext`.
+fn lift_plain_output(outcomes: &[HookOutcome]) -> Vec<HookOutcome> {
+    outcomes
         .iter()
         .map(|o| {
             let plain = o.stdout.trim();
@@ -1312,31 +1717,175 @@ pub fn prompt_context(outcomes: &[HookOutcome]) -> Option<String> {
             }
             o
         })
-        .collect();
-    added_context(&lifted)
+        .collect()
 }
 
-/// Everything the hooks want the model to see, bounded.
-pub fn added_context(outcomes: &[HookOutcome]) -> Option<String> {
-    const MAX_BYTES: usize = 8 * 1024;
-    let mut joined = outcomes
+/// What `hook_context_max_bytes` allows when the operator has not said.
+pub const DEFAULT_HOOK_CONTEXT_BYTES: usize = 8 * 1024;
+
+/// The most `hook_context_max_bytes` can allow: text hooks add to the model's context is
+/// text the operator did not write, so there is a bound whatever the setting says.
+pub const HOOK_CONTEXT_CEILING: usize = 256 * 1024;
+
+const HOOK_CONTEXT_KEY: &str = "hook_context_max_bytes";
+
+/// How much text hooks may add to the model's context at one event:
+/// `hook_context_max_bytes`, a top-level key in the operator's own settings
+/// (`$ORBIT_HOME/settings.toml`, then the `--settings` file, which wins), or 8 KiB; 0 means
+/// hooks add none. A project's `.orbit/settings.toml` cannot raise it: the text is not the
+/// operator's own, and this bound is what keeps one hook from filling the context. A value that
+/// cannot be used keeps the default and is reported with the rest of the hook trouble.
+pub fn hook_context_limit(home: &Path) -> usize {
+    let (limit, problems) = context_limit_with_problems(home);
+    problems.into_iter().for_each(note_load_problem);
+    limit
+}
+
+/// The limit, and what to tell the operator about the setting, without telling anyone.
+fn context_limit_with_problems(home: &Path) -> (usize, Vec<String>) {
+    let (value, problems) = operator_number(
+        home,
+        HOOK_CONTEXT_KEY,
+        HOOK_CONTEXT_CEILING as i64,
+        DEFAULT_HOOK_CONTEXT_BYTES as i64,
+    );
+    (
+        usize::try_from(value).unwrap_or(DEFAULT_HOOK_CONTEXT_BYTES),
+        problems,
+    )
+}
+
+/// What one settings file says about the limit (see [`number_setting`]).
+#[cfg(test)]
+fn context_limit_setting(text: &str) -> Option<(usize, Option<String>)> {
+    number_setting(
+        text,
+        HOOK_CONTEXT_KEY,
+        HOOK_CONTEXT_CEILING as i64,
+        DEFAULT_HOOK_CONTEXT_BYTES as i64,
+    )
+    .map(|(value, problem)| {
+        (
+            usize::try_from(value).unwrap_or(DEFAULT_HOOK_CONTEXT_BYTES),
+            problem,
+        )
+    })
+}
+
+/// A line for the front end to show once: trouble found while loading configuration. It shares
+/// the channel hook trouble uses and is told once per process, because what it comes from (the
+/// hooks, the prompt) loads again for every tool call and turn.
+pub fn note_load_problem(text: String) {
+    static TOLD: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut told = TOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if told.len() >= MAX_REMEMBERED_MATCHERS {
+        told.clear();
+    }
+    if told.insert(text.clone()) {
+        note_hook_problem(text);
+    }
+}
+
+/// What hooks added to the model's context at one event, within a limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCut {
+    /// The limit that applied.
+    pub limit: usize,
+    /// What the hooks wanted to add, in all.
+    pub total: usize,
+    /// How much each hook that added anything wanted to add, in order.
+    pub sizes: Vec<usize>,
+}
+
+/// The text hooks add to the model's context, and what the limit took from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedContext {
+    pub text: Option<String>,
+    pub cut: Option<ContextCut>,
+}
+
+/// Everything the hooks want the model to see, within `limit` bytes. What does not fit is cut at
+/// a character boundary and the text ends in a line that says so, so the model is not left
+/// believing it has the whole of it. A limit of 0 is the operator's choice: nothing is added and
+/// nothing is said about it.
+pub fn bounded_context(outcomes: &[HookOutcome], limit: usize) -> BoundedContext {
+    let parts: Vec<&str> = outcomes
         .iter()
         .filter_map(|o| o.additional_context.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if joined.is_empty() {
-        return None;
+        .collect();
+    if parts.is_empty() {
+        return BoundedContext {
+            text: None,
+            cut: None,
+        };
     }
-    if joined.len() > MAX_BYTES {
-        let mut cut = MAX_BYTES;
-        while !joined.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        joined.truncate(cut);
+    let joined = parts.join("\n");
+    if joined.len() <= limit {
+        return BoundedContext {
+            text: Some(joined),
+            cut: None,
+        };
     }
-    Some(joined)
+    if limit == 0 {
+        return BoundedContext {
+            text: None,
+            cut: None,
+        };
+    }
+    let cut = ContextCut {
+        limit,
+        total: joined.len(),
+        sizes: parts.iter().map(|part| part.len()).collect(),
+    };
+    // The marker is part of the limit; a limit too small for it just cuts.
+    let marker = format!("\n… (hook context cut at {limit} bytes)");
+    let room = if limit > marker.len() {
+        limit - marker.len()
+    } else {
+        limit
+    };
+    let mut end = room;
+    while !joined.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut text = joined[..end].to_owned();
+    if limit > marker.len() {
+        text.push_str(&marker);
+    }
+    BoundedContext {
+        text: Some(text),
+        cut: Some(cut),
+    }
+}
+
+/// Tell the operator, once per process, that the limit took some of what hooks added, and hand
+/// back the text. Each hook's size is listed in the order the hooks ran: nothing else
+/// identifies a hook here, and the order is the order of `/hooks`.
+fn announce_context_cut(bounded: BoundedContext) -> Option<String> {
+    static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(cut) = &bounded.cut
+        && !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let sizes = cut
+            .sizes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        note_hook_problem(format!(
+            "hook context was cut at {} bytes: {} hook{} wanted to add {} bytes ({sizes}, in the order they ran), so the later text is missing; {HOOK_CONTEXT_KEY} in settings.toml raises the limit",
+            cut.limit,
+            cut.sizes.len(),
+            if cut.sizes.len() == 1 { "" } else { "s" },
+            cut.total,
+        ));
+    }
+    bounded.text
 }
 
 /// Decode one complete quoted TOML value without changing the legacy line grammar.
@@ -1379,6 +1928,7 @@ fn parse_hooks_toml(text: &str) -> Vec<HookConfig> {
                 run_async: false,
                 http: None,
                 handler: None,
+                origin: None,
             });
             continue;
         }
@@ -1593,6 +2143,7 @@ mod tests {
                     .unwrap(),
                 ],
                 project_trusted: true,
+                context_limit: None,
             };
             let runner_marker = root.join("handler.marker");
             set_handler_runner(Some(std::sync::Arc::new(move |_, _| {
@@ -1722,6 +2273,7 @@ mod tests {
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let started = std::time::Instant::now();
         let outcome = run_hook(&cfg, &serde_json::json!({ "content": "y".repeat(300_000) }));
@@ -1743,6 +2295,7 @@ mod tests {
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let outcome = run_hook(&cfg, &serde_json::json!({}));
         assert_eq!(outcome.exit_code, -2, "the hook timed out");
@@ -1761,6 +2314,7 @@ mod tests {
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let started = std::time::Instant::now();
         let outcome = run_hook(&cfg, &serde_json::json!({}));
@@ -1822,8 +2376,10 @@ timeout_secs = 5
                 run_async: false,
                 http: None,
                 handler: None,
+                origin: None,
             }],
             project_trusted: true,
+            context_limit: None,
         };
         let fire = |tool: &str| {
             blocked(&hooks.fire(
@@ -1833,6 +2389,254 @@ timeout_secs = 5
         };
         assert!(fire("Write").is_some());
         assert!(fire("Read").is_none());
+    }
+
+    /// The matchers the operator registered in Claude Code, and ones plugins ship, against
+    /// the names each must and must not accept. Claude Code searches a regular expression
+    /// anywhere in the name (`new RegExp(matcher).test(name)`), so `^…$` pins one.
+    #[test]
+    fn regular_expression_matchers_are_searched_anywhere_like_claude_codes() {
+        const EGRESS: &str = "WebSearch|WebFetch|mcp__.*(exa|tavily|nimble|brightdata|firecrawl)";
+        const SOURCES: &str = "^(startup|resume|clear|compact|fork)$";
+        const MEMORY: &str = "Read|^read_file$|^Bash$|^Grep$|^Glob$|^memory_search$|^memory$|^mcp__.+__memory_search$";
+        const COMMAND: &str = "^claude-security:claude-security$";
+        for (matcher, subject, expected) in [
+            (EGRESS, "WebSearch", true),
+            (EGRESS, "WebFetch", true),
+            (EGRESS, "mcp__tavily__tavily_search", true),
+            (EGRESS, "mcp__plugin_exa_exa__web_search_exa", true),
+            (EGRESS, "mcp__firecrawl__firecrawl_scrape", true),
+            (EGRESS, "mcp__serena__find_symbol", false),
+            (EGRESS, "Bash", false),
+            (EGRESS, "Write", false),
+            (SOURCES, "startup", true),
+            (SOURCES, "resume", true),
+            (SOURCES, "clear", true),
+            (SOURCES, "compact", true),
+            (SOURCES, "fork", true),
+            (SOURCES, "restart", false),
+            (SOURCES, "startup2", false),
+            (SOURCES, "pre-startup", false),
+            (MEMORY, "Read", true),
+            (MEMORY, "Bash", true),
+            (MEMORY, "Grep", true),
+            (MEMORY, "read_file", true),
+            (MEMORY, "mcp__mempalace__memory_search", true),
+            (MEMORY, "Write", false),
+            // `^Bash$` is pinned, a bare `Read` is searched anywhere.
+            (MEMORY, "BashOutput", false),
+            (MEMORY, "NotebookRead", true),
+            (COMMAND, "claude-security:claude-security", true),
+            (COMMAND, "claude-security:threat-model", false),
+            // Anchors, groups and case.
+            ("^Notebook", "NotebookEdit", true),
+            ("^Notebook", "MyNotebook", false),
+            ("Edit$", "NotebookEdit", true),
+            ("(Bash|Edit)", "NotebookEdit", true),
+            ("^bash$", "Bash", false),
+            ("^[A-Z][a-z]+$", "Bash", true),
+            ("^[A-Z][a-z]+$", "mcp__x", false),
+            // A Unicode class is a big program (about 50 KB each): ordinary patterns with several fit.
+            (r"^mcp__\w+__\w+$", "mcp__tavily__search", true),
+            (r"^mcp__\w+__\w+$", "mcp__tavily", false),
+            (r"^\w+\w+\w+\w+\w+\w+$", "NotebookEdit", true),
+            (r"^\w+\w+\w+\w+\w+\w+$", "Bash", false),
+        ] {
+            assert_eq!(
+                matcher_accepts(Some(matcher), Some(subject)),
+                expected,
+                "{matcher:?} against {subject}"
+            );
+        }
+    }
+
+    /// A character only a regular expression uses turns the reading on; the characters of a
+    /// plain name list (and `.`, `*`, `,`, `|`) do not, so those lists are not searched.
+    #[test]
+    fn only_regular_expression_characters_turn_the_regular_expression_reading_on() {
+        for c in ['^', '$', '(', ')', '[', ']', '{', '}', '+', '?', '\\'] {
+            assert!(is_regex_matcher(&format!("a{c}b")), "{c:?}");
+        }
+        for c in [
+            '.', '*', '|', ',', ' ', '-', '_', ':', '/', '@', '#', '%', '~', '!', '&', '=', '<',
+            '>', ';', '\'', '"', 'x', '7',
+        ] {
+            assert!(!is_regex_matcher(&format!("a{c}b")), "{c:?}");
+        }
+        assert!(!is_regex_matcher("mcp__*tavily*"));
+        assert!(!is_regex_matcher("Web.*|Edit"));
+        assert!(
+            is_regex_matcher("  ^Bash$  "),
+            "the matcher is trimmed first"
+        );
+        // The same, seen from matching: each of these needs the regular-expression reading.
+        for (matcher, subject) in [
+            ("^Bash", "BashOutput"),
+            ("Bash$", "XBash"),
+            ("(Bash)", "XBashY"),
+            ("Ba[s]h", "Bash"),
+            ("Bas{1}h", "Bash"),
+            ("Ba+sh", "Baash"),
+            ("Bas?h", "Bah"),
+            (r"Notebook\w+", "NotebookEdit"),
+            ("Bash]", "XBash]Y"),
+            ("Bash}", "XBash}Y"),
+        ] {
+            assert!(
+                matcher_accepts(Some(matcher), Some(subject)),
+                "{matcher:?} against {subject}"
+            );
+        }
+    }
+
+    /// Nothing that matched before stops matching, and a plain list is still compared whole.
+    #[test]
+    fn a_plain_name_list_is_read_as_before_and_literal_names_still_match_themselves() {
+        for (matcher, subject, expected) in [
+            ("Bash", "BashOutput", false),
+            ("Edit|Write", "NotebookEdit", false),
+            ("Edit,Write", "Write", true),
+            ("Edit, Write", "Read", false),
+            ("Web*", "WebFetch", true),
+            ("Web*", "Write", false),
+            ("Web.*", "WebSearch", true),
+            ("mcp__*tavily*", "mcp__tavily__tavily_search", true),
+            ("*tavily*", "mcp__exa__search", false),
+            ("*Edit", "NotebookEdit", true),
+            (".*", "Anything", true),
+            ("  Bash  ", "Bash", true),
+            // A name that happens to contain regular-expression characters matches itself.
+            ("[id].tsx", "[id].tsx", true),
+            ("claude-opus-5-5[1m]", "claude-opus-5-5[1m]", true),
+            ("file(1).txt", "file(1).txt", true),
+            ("c++", "c++", true),
+            ("what?", "what?", true),
+            ("a$b", "a$b", true),
+            // ... even half written, where it is not a regular expression at all.
+            ("file[1.txt", "file[1.txt", true),
+            ("file[1.txt", "other.txt", false),
+        ] {
+            assert_eq!(
+                matcher_accepts(Some(matcher), Some(subject)),
+                expected,
+                "{matcher:?} against {subject}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_is_not_a_regular_expression_says_why_and_matches_only_its_plain_names() {
+        for (matcher, reason) in [
+            ("mcp__.*(exa", "unclosed group"),
+            ("Bash)", "unopened group"),
+            ("Bash[", "unclosed character class"),
+            ("^(?!Bash)", "look-around"),
+            (r"(Bash)\1", "backreference"),
+            ("a{2,1}", "repetition"),
+        ] {
+            let problem = matcher_problem(matcher)
+                .unwrap_or_else(|| panic!("{matcher:?} is not a regular expression"));
+            assert!(problem.contains(reason), "{matcher:?}: {problem}");
+            assert!(!problem.contains('\n'), "one line: {problem:?}");
+        }
+        for fine in [
+            "",
+            "*",
+            "Bash",
+            "Edit|Write",
+            "Edit, Write",
+            "mcp__*tavily*",
+            "*Edit",
+            "Web.*",
+            "^(startup|resume)$",
+            "[id].tsx",
+            "claude-opus-5-5[1m]",
+        ] {
+            assert_eq!(matcher_problem(fine), None, "{fine:?}");
+        }
+        // Bounds: a runaway pattern cannot make a matcher expensive. The size limit is ours, not
+        // the library's (10 MiB): a program of a few megabytes is refused, one of a few hundred
+        // kilobytes is not.
+        let long = format!("^({})$", "a".repeat(1100));
+        assert!(matcher_problem(&long).unwrap().contains("longer than"));
+        let big =
+            matcher_problem("((a{100}){100}){10}").expect("a multi-megabyte program is refused");
+        assert!(big.contains(&REGEX_MATCHER_SIZE_LIMIT.to_string()), "{big}");
+        assert_eq!(matcher_problem("(a{100}){100}"), None);
+        // What is left of a broken pattern: its plain names.
+        assert!(!matcher_accepts(
+            Some("mcp__.*(exa"),
+            Some("mcp__exa__search")
+        ));
+        assert!(matcher_accepts(Some("Read|mcp__.*(exa"), Some("Read")));
+        assert!(!matcher_accepts(Some("Read|mcp__.*(exa"), Some("Write")));
+    }
+
+    /// The forms an operator writes a pattern in reach the matcher unchanged, and a hook
+    /// registered the way Claude Code takes it runs for the names it means.
+    #[test]
+    fn regular_expression_hooks_load_from_toml_and_claude_settings_and_fire() {
+        for quoted in [
+            r#""^tool\\d+$""#,
+            r"'^tool\d+$'",
+            // Not valid TOML ("\d"), kept as written rather than dropping the guard.
+            r#""^tool\d+$""#,
+        ] {
+            let hooks = parse_hooks_toml(&format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = {quoted}\ncommand = \"echo no >&2; exit 2\"\n"
+            ));
+            assert_eq!(hooks[0].matcher.as_deref(), Some(r"^tool\d+$"), "{quoted}");
+            let hooks = Hooks {
+                hooks,
+                project_trusted: false,
+                context_limit: None,
+            };
+            let fires = |tool: &str| {
+                blocked(&hooks.fire(
+                    HookEvent::PreToolUse,
+                    &serde_json::json!({"tool": tool, "arguments": {}}),
+                ))
+                .is_some()
+            };
+            assert!(fires("tool42"), "{quoted}");
+            assert!(!fires("tool"), "{quoted}");
+            assert!(!fires("xtool42"), "{quoted}");
+        }
+
+        let hooks = Hooks {
+            hooks: parse_claude_settings(
+                r#"{"hooks": {
+                  "PreToolUse": [{"matcher": "WebSearch|WebFetch|mcp__.*(exa|tavily|nimble|brightdata|firecrawl)",
+                    "hooks": [{"type": "command", "command": "echo egress >&2; exit 2"}]}],
+                  "SessionStart": [{"matcher": "^(startup|resume|clear|compact|fork)$",
+                    "hooks": [{"type": "command", "command": "echo started"}]}]
+                }}"#,
+            ),
+            project_trusted: false,
+            context_limit: None,
+        };
+        let stopped = |tool: &str| {
+            blocked(&hooks.fire(
+                HookEvent::PreToolUse,
+                &serde_json::json!({"tool": tool, "arguments": {}}),
+            ))
+            .is_some()
+        };
+        assert!(stopped("mcp__tavily__tavily_search"));
+        assert!(stopped("WebFetch"));
+        assert!(!stopped("mcp__serena__find_symbol"));
+        assert!(!stopped("Bash"));
+        let started = |source: &str| {
+            hooks
+                .fire(
+                    HookEvent::SessionStart,
+                    &serde_json::json!({"source": source, "frontend": "headless"}),
+                )
+                .len()
+        };
+        assert_eq!(started("startup"), 1);
+        assert_eq!(started("fork"), 1);
+        assert_eq!(started("restart"), 0);
     }
 
     #[test]
@@ -1847,8 +2651,10 @@ timeout_secs = 5
                 run_async: false,
                 http: None,
                 handler: None,
+                origin: None,
             }],
             project_trusted: true,
+            context_limit: None,
         };
         let outcomes = hooks.fire(
             HookEvent::PreToolUse,
@@ -1935,8 +2741,35 @@ mcp_input = "{"allow":false}"
         let guards = Hooks {
             hooks: hooks[2..4].to_vec(),
             project_trusted: false,
+            context_limit: None,
         };
         assert_eq!(guards.matching(HookEvent::Stop, None).len(), 2);
+    }
+
+    #[test]
+    fn a_deny_with_no_reason_takes_the_system_message_as_its_reason() {
+        // hookify, for one, explains a block only in `systemMessage`.
+        let hookify = parse_output(
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"},"systemMessage":"Dangerous rm"}"#,
+        );
+        assert!(
+            matches!(hookify.0, Some(HookDecision::Deny { reason }) if reason == "Dangerous rm")
+        );
+        let stop = parse_output(r#"{"decision":"block","systemMessage":"keep going"}"#);
+        assert!(matches!(stop.0, Some(HookDecision::Deny { reason }) if reason == "keep going"));
+        let ask = parse_output(
+            r#"{"hookSpecificOutput":{"permissionDecision":"ask"},"systemMessage":"sure?"}"#,
+        );
+        assert!(matches!(ask.0, Some(HookDecision::Ask { reason }) if reason == "sure?"));
+        // A reason the hook gave wins over the message.
+        let both = parse_output(
+            r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"R"},"systemMessage":"M"}"#,
+        );
+        assert!(matches!(both.0, Some(HookDecision::Deny { reason }) if reason == "R"));
+        // A message alone decides nothing, and a deny with neither still has no reason.
+        assert!(parse_output(r#"{"systemMessage":"careful"}"#).0.is_none());
+        let bare = parse_output(r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#);
+        assert!(matches!(bare.0, Some(HookDecision::Deny { reason }) if reason.is_empty()));
     }
 
     #[test]
@@ -1983,7 +2816,10 @@ mcp_input = "{"allow":false}"
                 ..HookOutcome::default()
             },
         ];
-        assert_eq!(added_context(&outcomes).as_deref(), Some("one\ntwo"));
+        assert_eq!(
+            Hooks::default().added_context(&outcomes).as_deref(),
+            Some("one\ntwo")
+        );
         let printed = vec![
             HookOutcome {
                 stdout: "agent id: a1\n".into(),
@@ -1995,8 +2831,11 @@ mcp_input = "{"allow":false}"
                 ..HookOutcome::default()
             },
         ];
-        assert_eq!(prompt_context(&printed).as_deref(), Some("agent id: a1"));
-        assert_eq!(added_context(&printed), None);
+        assert_eq!(
+            Hooks::default().prompt_context(&printed).as_deref(),
+            Some("agent id: a1")
+        );
+        assert_eq!(Hooks::default().added_context(&printed), None);
         assert_eq!(
             rewritten_input(&outcomes),
             Some(serde_json::json!({ "a": 1 }))
@@ -2030,9 +2869,10 @@ mcp_input = "{"allow":false}"
                 condition: None,
                 run_async: false,
                 http: None,
-                handler: None,
+                handler: None, origin: None,
             }],
             project_trusted: true,
+            context_limit: None,
         };
         // NOTE: the hook reads JSON on STDIN, not env; the shell here
         // greps the payload passed via stdin. Fire it for real:
@@ -2054,8 +2894,10 @@ mcp_input = "{"allow":false}"
                 run_async: false,
                 http: None,
                 handler: None,
+                origin: None,
             }],
             project_trusted: true,
+            context_limit: None,
         };
         let outcomes = hooks.fire(
             HookEvent::PreToolUse,
@@ -2270,6 +3112,7 @@ mcp_input = "{"allow":false}"
                 prompt: "done?".into(),
                 model: None,
             }),
+            origin: None,
         };
         let payload = serde_json::json!({"n": 1});
         let none = run_hook(&hook(None), &payload);
@@ -2307,6 +3150,7 @@ mcp_input = "{"allow":false}"
                 prompt: "done?".into(),
                 model: None,
             }),
+            origin: None,
         };
         let named = |name: &'static str| -> std::sync::Arc<HandlerRunner> {
             std::sync::Arc::new(move |_, _| HookOutcome {
@@ -2334,6 +3178,7 @@ mcp_input = "{"allow":false}"
         let hooks = Hooks {
             hooks: parse_hooks_toml("[[hooks]]\nevent = \"Stop\"\ncommand = \"exit 2\"\n"),
             project_trusted: false,
+            context_limit: None,
         };
         let fire = || hooks.fire(HookEvent::Stop, &serde_json::json!({})).len();
         assert_eq!(fire(), 1);
@@ -2351,6 +3196,7 @@ mcp_input = "{"allow":false}"
                  [[hooks]]\nevent = \"Setup\"\nmatcher = \"init\"\ncommand = \"exit 2\"\n",
             ),
             project_trusted: false,
+            context_limit: None,
         };
         let fired =
             |event, payload: serde_json::Value| blocked(&hooks.fire(event, &payload)).is_some();
@@ -2419,6 +3265,7 @@ mcp_input = "{"allow":false}"
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let outcome = run_hook(&cfg, &serde_json::json!({}));
         if std::env::var_os("CLAUDE_PROJECT_DIR").is_none() {
@@ -2427,6 +3274,435 @@ mcp_input = "{"allow":false}"
                 std::env::current_dir().unwrap().to_string_lossy()
             );
         }
+    }
+
+    #[test]
+    fn a_hook_is_told_which_session_it_belongs_to() {
+        let dir = test_dir("session-environment");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seen = dir.join("seen");
+        let cfg = HookConfig {
+            event: "PreToolUse".into(),
+            command: format!(
+                "printf '%s|%s|%s' \"$CLAUDE_SESSION_ID\" \"$CLAUDE_CODE_SESSION_ID\" \"$ORBIT_SESSION_ID\" > '{}'",
+                seen.display()
+            ),
+            timeout_secs: Some(10),
+            matcher: None,
+            condition: None,
+            run_async: false,
+            http: None,
+            handler: None,
+            origin: None,
+        };
+        let id = "session-01JTESTSESSIONENVIRONMENT";
+        run_hook(&cfg, &serde_json::json!({ "session_id": id }));
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            format!("{id}|{id}|{id}"),
+            "a guard that reads CLAUDE_SESSION_ID gets ORBIT's session, never an inherited one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_plain_session_id_reaches_a_hooks_environment() {
+        let exported = |id: &str| {
+            session_environment(&serde_json::json!({ "session_id": id }))
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            exported("session-01J9.x_y"),
+            [
+                "CLAUDE_SESSION_ID=session-01J9.x_y",
+                "CLAUDE_CODE_SESSION_ID=session-01J9.x_y",
+                "ORBIT_SESSION_ID=session-01J9.x_y"
+            ]
+        );
+        // Scripts name files after the id, so nothing path-like gets through.
+        for bad in ["", ".", "..", "a/b", "../x", "a b", "a\nb", "x;y", "é"] {
+            assert!(exported(bad).is_empty(), "{bad:?}");
+        }
+        assert!(exported(&"a".repeat(129)).is_empty());
+        assert!(!exported(&"a".repeat(128)).is_empty());
+        assert!(session_environment(&serde_json::json!({})).is_empty());
+        assert!(session_environment(&serde_json::json!({ "session_id": 7 })).is_empty());
+    }
+
+    #[test]
+    fn the_stop_limit_is_read_from_the_top_of_a_settings_file() {
+        assert_eq!(stop_limit_setting(""), None);
+        assert_eq!(stop_limit_setting("claude_compat = true\n"), None);
+        for (text, limit) in [
+            ("stop_hook_max_continuations = 7\n", 7),
+            (
+                "# mine\n  stop_hook_max_continuations=12 # plenty\n[[hooks]]\n",
+                12,
+            ),
+            ("stop_hook_max_continuations = 0\n", 0),
+            ("stop_hook_max_continuations = 1_000\n", 1000),
+            // The last one wins, as in TOML tooling that tolerates repeats.
+            (
+                "stop_hook_max_continuations = 2\nstop_hook_max_continuations = 5\n",
+                5,
+            ),
+            // A stray copy below a table does not shadow the real one.
+            (
+                "stop_hook_max_continuations = 4\n[x]\nstop_hook_max_continuations = 9\n",
+                4,
+            ),
+        ] {
+            assert_eq!(stop_limit_setting(text), Some((limit, None)), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_above_the_ceiling_is_lowered_and_one_that_is_no_number_is_not_used() {
+        let (limit, problem) = stop_limit_setting("stop_hook_max_continuations = 5000\n").unwrap();
+        assert_eq!(limit, STOP_CONTINUATIONS_CEILING);
+        assert!(problem.unwrap().contains("5000"));
+        for bad in ["-1", "2.5", "\"many\"", "true", "[3]", "", "1001e0"] {
+            let (limit, problem) =
+                stop_limit_setting(&format!("stop_hook_max_continuations = {bad}\n")).unwrap();
+            assert_eq!(limit, DEFAULT_STOP_CONTINUATIONS, "{bad:?}");
+            assert!(problem.unwrap().contains("whole number"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_under_a_table_is_not_read_and_the_operator_is_told() {
+        let (limit, problem) = stop_limit_setting(
+            "[[hooks]]\nevent = \"Stop\"\ncommand = \"x\"\nstop_hook_max_continuations = 9\n",
+        )
+        .unwrap();
+        assert_eq!(limit, DEFAULT_STOP_CONTINUATIONS);
+        assert!(problem.unwrap().contains("under a [table]"));
+    }
+
+    #[test]
+    fn the_stop_limit_comes_from_the_homes_settings_and_is_three_without_one() {
+        let home = test_dir("stop-limit-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(stop_continuation_limit(&home), DEFAULT_STOP_CONTINUATIONS);
+        assert_eq!(DEFAULT_STOP_CONTINUATIONS, 3);
+        std::fs::write(
+            home.join("settings.toml"),
+            "stop_hook_max_continuations = 40\n[[hooks]]\nevent = \"Stop\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        assert_eq!(stop_continuation_limit(&home), 40);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_operators_own_settings_set_the_stop_limit() {
+        const FIXTURE_DIR: &str = "ORBIT_STOP_LIMIT_FIXTURE_DIR";
+        const WANT: &str = "ORBIT_STOP_LIMIT_FIXTURE_WANT";
+        if let Some(root) = std::env::var_os(FIXTURE_DIR) {
+            // The child process, started inside a project directory.
+            let want: u32 = std::env::var(WANT).unwrap().parse().unwrap();
+            assert_eq!(
+                stop_continuation_limit(&PathBuf::from(root).join("home")),
+                want
+            );
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = test_dir(&format!("stop-limit-scope-{nonce}"));
+        let project = root.join("project");
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(project.join(".orbit")).unwrap();
+        // A repository asking for a lot, in the folder the process runs in.
+        std::fs::write(
+            project.join(".orbit/settings.toml"),
+            "stop_hook_max_continuations = 500\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("extra.toml"),
+            "stop_hook_max_continuations = 25\n",
+        )
+        .unwrap();
+        for (home, extra, want) in [
+            // The project cannot raise it.
+            (None, None, 3),
+            // The operator's own settings do.
+            (Some(8), None, 8),
+            // A `--settings` file is the operator's too, and wins for that run.
+            (Some(8), Some("extra.toml"), 25),
+        ] {
+            let settings = root.join("home/settings.toml");
+            match home {
+                Some(limit) => std::fs::write(
+                    &settings,
+                    format!("stop_hook_max_continuations = {limit}\n"),
+                )
+                .unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&settings);
+                }
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "hooks::tests::only_the_operators_own_settings_set_the_stop_limit",
+                    "--nocapture",
+                ])
+                .current_dir(&project)
+                .env(FIXTURE_DIR, &root)
+                .env(WANT, want.to_string())
+                .env_remove("ORBIT_BARE")
+                .env_remove("ORBIT_SETTINGS_FILE");
+            if let Some(extra) = extra {
+                child.env("ORBIT_SETTINGS_FILE", root.join(extra));
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "home={home:?} extra={extra:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- hook_context_max_bytes: how much text hooks may add to the model's context ----
+
+    #[test]
+    fn the_context_limit_setting_is_read_like_the_stop_limit() {
+        for (text, want) in [
+            ("hook_context_max_bytes = 65536\n", 65_536),
+            (
+                "# mine\n  hook_context_max_bytes=20_000 # plenty\n[[hooks]]\n",
+                20_000,
+            ),
+            ("hook_context_max_bytes = 0\n", 0),
+            (
+                "hook_context_max_bytes = 2\nhook_context_max_bytes = 4096\n",
+                4096,
+            ),
+            (
+                "hook_context_max_bytes = 4\n[x]\nhook_context_max_bytes = 9\n",
+                4,
+            ),
+        ] {
+            let (limit, problem) = context_limit_setting(text).expect(text);
+            assert_eq!(limit, want, "{text}");
+            assert!(problem.is_none(), "{text}: {problem:?}");
+        }
+        assert!(context_limit_setting("stop_hook_max_continuations = 4\n").is_none());
+        assert!(context_limit_setting("").is_none());
+        // A hook's own table can hold a key of the same name; it is not the setting.
+        assert!(
+            context_limit_setting("[[hooks]]\nevent = \"Stop\"\nhook_context_max_bytes = 9\n")
+                .is_some_and(
+                    |(limit, problem)| limit == DEFAULT_HOOK_CONTEXT_BYTES && problem.is_some()
+                )
+        );
+    }
+
+    #[test]
+    fn a_context_limit_that_cannot_be_used_is_reported_and_keeps_the_default() {
+        let (limit, problem) = context_limit_setting("hook_context_max_bytes = 5000000\n").unwrap();
+        assert_eq!(limit, HOOK_CONTEXT_CEILING);
+        assert!(problem.unwrap().contains("above the largest allowed"));
+        for bad in ["\"lots\"", "-1", "1.5", "true", "[1]"] {
+            let (limit, problem) =
+                context_limit_setting(&format!("hook_context_max_bytes = {bad}\n")).unwrap();
+            assert_eq!(limit, DEFAULT_HOOK_CONTEXT_BYTES, "{bad}");
+            assert!(
+                problem.is_some_and(
+                    |p| p.contains("hook_context_max_bytes") && p.contains("whole number")
+                ),
+                "{bad}"
+            );
+        }
+        let (limit, problem) = context_limit_setting("[x]\nhook_context_max_bytes = 9\n").unwrap();
+        assert_eq!(limit, DEFAULT_HOOK_CONTEXT_BYTES);
+        assert!(problem.unwrap().contains("above the first [table]"));
+    }
+
+    #[test]
+    fn the_context_limit_comes_from_the_homes_settings_and_travels_with_the_hooks() {
+        let home = test_dir("context-limit-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(hook_context_limit(&home), DEFAULT_HOOK_CONTEXT_BYTES);
+        assert_eq!(DEFAULT_HOOK_CONTEXT_BYTES, 8 * 1024);
+        assert_eq!(HOOK_CONTEXT_CEILING, 256 * 1024);
+        std::fs::write(
+            home.join("settings.toml"),
+            "hook_context_max_bytes = 65536\n[[hooks]]\nevent = \"SessionStart\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        assert_eq!(hook_context_limit(&home), 65_536);
+        assert_eq!(Hooks::inspect(&home, None).context_limit(), 65_536);
+        assert_eq!(Hooks::default().context_limit(), DEFAULT_HOOK_CONTEXT_BYTES);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_operators_own_settings_set_the_context_limit() {
+        const FIXTURE_DIR: &str = "ORBIT_CONTEXT_LIMIT_FIXTURE_DIR";
+        const WANT: &str = "ORBIT_CONTEXT_LIMIT_FIXTURE_WANT";
+        if let Some(root) = std::env::var_os(FIXTURE_DIR) {
+            let want: usize = std::env::var(WANT).unwrap().parse().unwrap();
+            assert_eq!(hook_context_limit(&PathBuf::from(root).join("home")), want);
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = test_dir(&format!("context-limit-scope-{nonce}"));
+        let project = root.join("project");
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(project.join(".orbit")).unwrap();
+        // A repository asking for a lot, in the folder the process runs in.
+        std::fs::write(
+            project.join(".orbit/settings.toml"),
+            "hook_context_max_bytes = 200000\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("extra.toml"), "hook_context_max_bytes = 100000\n").unwrap();
+        for (home, extra, want) in [
+            (None, None, DEFAULT_HOOK_CONTEXT_BYTES),
+            (Some(65_536), None, 65_536),
+            (Some(65_536), Some("extra.toml"), 100_000),
+        ] {
+            let settings = root.join("home/settings.toml");
+            match home {
+                Some(limit) => {
+                    std::fs::write(&settings, format!("hook_context_max_bytes = {limit}\n"))
+                        .unwrap()
+                }
+                None => {
+                    let _ = std::fs::remove_file(&settings);
+                }
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "hooks::tests::only_the_operators_own_settings_set_the_context_limit",
+                    "--nocapture",
+                ])
+                .current_dir(&project)
+                .env(FIXTURE_DIR, &root)
+                .env(WANT, want.to_string())
+                .env_remove("ORBIT_BARE")
+                .env_remove("ORBIT_SETTINGS_FILE");
+            if let Some(extra) = extra {
+                child.env("ORBIT_SETTINGS_FILE", root.join(extra));
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "home={home:?} extra={extra:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn context_from(text: &str) -> HookOutcome {
+        HookOutcome {
+            additional_context: Some(text.into()),
+            ..HookOutcome::default()
+        }
+    }
+
+    #[test]
+    fn text_over_the_limit_is_cut_with_a_marker_and_described() {
+        let outcomes = vec![
+            context_from(&"a".repeat(6000)),
+            context_from(&"b".repeat(5000)),
+            context_from(&"Z".repeat(400)),
+        ];
+        let bounded = bounded_context(&outcomes, 8192);
+        let text = bounded.text.expect("something fits");
+        assert!(text.len() <= 8192, "{} bytes", text.len());
+        assert!(text.starts_with(&"a".repeat(6000)));
+        assert!(
+            text.contains('b') && !text.contains('Z'),
+            "the third hook did not fit"
+        );
+        assert!(text.ends_with("(hook context cut at 8192 bytes)"), "{text}");
+        let cut = bounded.cut.expect("a cut is described");
+        assert_eq!(cut.limit, 8192);
+        assert_eq!(cut.sizes, [6000, 5000, 400]);
+        assert_eq!(cut.total, 6000 + 1 + 5000 + 1 + 400);
+    }
+
+    #[test]
+    fn text_within_the_limit_is_untouched() {
+        let outcomes = vec![
+            context_from("one"),
+            context_from(" two "),
+            HookOutcome::default(),
+        ];
+        let bounded = bounded_context(&outcomes, 8192);
+        assert_eq!(bounded.text.as_deref(), Some("one\ntwo"));
+        assert_eq!(bounded.cut, None);
+        // Exactly at the limit is within it.
+        assert_eq!(bounded_context(&outcomes, 7).cut, None);
+        assert!(bounded_context(&outcomes, 6).cut.is_some());
+    }
+
+    #[test]
+    fn a_context_cut_never_lands_inside_a_character() {
+        let outcomes = vec![context_from(&"—".repeat(5000))];
+        for limit in [8192, 8193, 8194, 100, 101, 102, 40, 41, 42] {
+            let text = bounded_context(&outcomes, limit)
+                .text
+                .expect("fits in part");
+            assert!(text.len() <= limit, "limit {limit}: {} bytes", text.len());
+            assert!(text.starts_with('—'), "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn a_limit_of_zero_adds_nothing_and_says_nothing() {
+        let bounded = bounded_context(&[context_from("anything")], 0);
+        assert_eq!(bounded.text, None);
+        assert_eq!(
+            bounded.cut, None,
+            "the operator chose this; no notice every prompt"
+        );
+    }
+
+    #[test]
+    fn plain_output_counts_as_context_within_the_hooks_own_limit() {
+        let hooks = Hooks {
+            context_limit: Some(40),
+            ..Hooks::default()
+        };
+        let printed = vec![HookOutcome {
+            stdout: format!("{}\n", "x".repeat(200)),
+            ..HookOutcome::default()
+        }];
+        let text = hooks
+            .prompt_context(&printed)
+            .expect("plain output is context");
+        assert!(text.len() <= 40, "{} bytes", text.len());
+        assert!(text.ends_with("(hook context cut at 40 bytes)"), "{text}");
+        assert!(
+            Hooks::default()
+                .prompt_context(&printed)
+                .is_some_and(|text| text.len() <= 8192)
+        );
     }
 
     #[test]
@@ -2463,6 +3739,7 @@ mcp_input = "{"allow":false}"
             run_async,
             http: None,
             handler: None,
+            origin: None,
         };
         let hooks = Hooks {
             hooks: vec![
@@ -2471,6 +3748,7 @@ mcp_input = "{"allow":false}"
                 hook("echo ran", Some("Bash(ls*)"), false),
             ],
             project_trusted: false,
+            context_limit: None,
         };
         let started = std::time::Instant::now();
         let outcomes = hooks.fire(
@@ -2516,6 +3794,7 @@ mcp_input = "{"allow":false}"
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let hooks = Hooks {
             hooks: vec![
@@ -2524,6 +3803,7 @@ mcp_input = "{"allow":false}"
                 hook("InstructionsLoaded", "session_start"),
             ],
             project_trusted: false,
+            context_limit: None,
         };
         let ran = |event, payload: serde_json::Value| hooks.fire(event, &payload).len();
         assert_eq!(
@@ -2576,8 +3856,10 @@ mcp_input = "{"allow":false}"
                 run_async: false,
                 http: None,
                 handler: None,
+                origin: None,
             }],
             project_trusted: false,
+            context_limit: None,
         };
         let payload = serde_json::json!({ "message": "done" });
         let id = begin_prompt(Some("high"));
@@ -2616,8 +3898,10 @@ mcp_input = "{"allow":false}"
                 run_async: false,
                 http: None,
                 handler: None,
+                origin: None,
             }],
             project_trusted: false,
+            context_limit: None,
         };
         let outcomes = hooks.fire(
             HookEvent::MessageDisplay,
@@ -2757,6 +4041,7 @@ mcp_input = "{"allow":false}"
                 )
                 .unwrap(),
             ),
+            origin: None,
         };
         let payload =
             serde_json::json!({ "tool": "Bash", "arguments": { "command": "rm -rf build" } });
@@ -2800,6 +4085,7 @@ mcp_input = "{"allow":false}"
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         };
         let hooks = Hooks {
             hooks: vec![
@@ -2808,6 +4094,7 @@ mcp_input = "{"allow":false}"
                 hook("PreToolUse", "Bash"),
             ],
             project_trusted: false,
+            context_limit: None,
         };
         assert_eq!(watched_files(&hooks), [".env", ".envrc", "Cargo.toml"]);
         // The hook for `.env` runs for `.env` and not for another file.

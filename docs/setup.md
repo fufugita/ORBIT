@@ -462,7 +462,7 @@ still applies; `/sandbox` in the chat lists what the table adds and what was
 not used, and the approval card for a command says when the network or more
 directories are open.
 
-Three things do not change, whatever the table says:
+While the sandbox is on, three things do not change, whatever the table says:
 
 - only your own `settings.toml` is read; a project's settings cannot widen
   the sandbox it runs in;
@@ -473,6 +473,56 @@ Three things do not change, whatever the table says:
 
 With `network = true` a confined command can send what it can read to
 anywhere. Keep `read` as narrow as the tools need.
+
+## Run commands without the sandbox
+
+Some commands cannot work inside the sandbox, whatever the table adds. Measured
+on one machine:
+
+- `docker`: the sandbox runs in an unprivileged user namespace, which does not
+  carry your `docker` group, so the socket refuses the connection even when it
+  is listed;
+- `ssh` with your agent: a command starts with an empty environment, so there
+  is no `SSH_AUTH_SOCK`, and `~/.ssh` is never readable;
+- `ps`, `pgrep` and `kill` on your own processes: the sandbox has a process
+  namespace of its own. It also keeps ORBIT's environment, provider keys
+  included, out of reach of the commands.
+
+If you want commands to run as you, the way they do in a shell, say so in your
+own `settings.toml`:
+
+```toml
+[sandbox]
+enabled = false
+inherit_env = ["SSH_AUTH_SOCK"]   # variables copied from ORBIT's environment into commands
+```
+
+What changes: commands run on the host with your full permissions, and every
+Bash result says `"sandboxed": false`. `/sandbox`, `/status`, the welcome line
+and the approval card say the sandbox is off. ORBIT stops treating the missing
+sandbox as a reason to ask or refuse (that rule is for a sandbox that fails):
+your permission mode and rules decide, as they do for a confined command. On a
+machine without bubblewrap the same line replaces `ORBIT_ALLOW_UNSANDBOXED_BASH=1`.
+
+What does not:
+
+- The line is read only from your own `settings.toml`, and only as the boolean
+  `false`; anything else leaves the sandbox on, and `/sandbox` says why. A
+  project's settings cannot set it and the model has no parameter for it. Write
+  and Edit never write ORBIT's own `settings.toml`, `settings.local.toml`,
+  `permissions.toml`, `permission-overrides.toml`, `mcp.json` or
+  `providers.toml`, in any permission mode and however the path is spelled:
+  only you edit them, by hand or with `/config set` for the keys it knows.
+- A command still starts with an empty environment plus `PATH`, `HOME`, `LANG`,
+  `TERM`, `TMPDIR`, `SHELL`, the table's `env` and `path`, and the variables
+  named in `inherit_env`. ORBIT's own variables, provider keys included, reach
+  no command unless you name them. A variable you name is visible to every
+  command, and so to the model through what a command prints.
+- The check of a command's own arguments against the deny-read paths (`~/.ssh`,
+  `.env` files and the rest) and the secret scan of results stay. The mask that
+  hid those paths from the commands themselves goes with the sandbox.
+- A command file's `` !`command` `` still runs only inside the sandbox, because
+  a project can supply it.
 
 ## Preserve an inactive session
 

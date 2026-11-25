@@ -132,6 +132,15 @@ fn inspect(
         for kind in ["commands", "skills"] {
             sources.push(inventory(&directory.join(kind), scope, kind));
         }
+        if scope == "user" {
+            // The operator's own instructions: read only when `claude_compat` is on.
+            sources.push(instruction_in(
+                scope,
+                &directory.join("CLAUDE.md"),
+                "CLAUDE.md",
+                "User instruction file present; read only when claude_compat is on; contents not displayed",
+            ));
+        }
     }
     sources.push(json_source(&workspace.join(".mcp.json"), "project", "mcp"));
     for name in ["CLAUDE.md", "AGENTS.md"] {
@@ -454,8 +463,13 @@ fn settings(path: &Path, scope: &'static str, tools: &[String]) -> Source {
             failure(&mut source, "invalid");
             return source;
         };
-        for event in hooks.values() {
-            let Some(entries) = event.as_array() else {
+        let mut supported_handlers = 0;
+        for (name, groups) in hooks {
+            if name.parse::<orbit_engine::hooks::HookEvent>().is_err() {
+                source.status = "review";
+                source.detail = "Unknown hook event requires review";
+            }
+            let Some(entries) = groups.as_array() else {
                 failure(&mut source, "invalid");
                 return source;
             };
@@ -474,7 +488,7 @@ fn settings(path: &Path, scope: &'static str, tools: &[String]) -> Source {
                 };
                 for handler in handlers {
                     match hook_status(handler) {
-                        Ok(true) => {}
+                        Ok(true) => supported_handlers += 1,
                         Ok(false) => {
                             source.status = "review";
                             source.detail = "Unsupported or unresolved hook requires review";
@@ -486,6 +500,10 @@ fn settings(path: &Path, scope: &'static str, tools: &[String]) -> Source {
                     }
                 }
             }
+        }
+        if supported_handlers > orbit_engine::hooks::MAX_CLAUDE_HOOKS_PER_FILE {
+            source.status = "review";
+            source.detail = "Hook handler count exceeds the per-file runtime limit";
         }
         source.hook_events = hooks.len();
     }
@@ -508,11 +526,25 @@ fn settings(path: &Path, scope: &'static str, tools: &[String]) -> Source {
 }
 
 fn instruction(path: &Path, kind: &'static str) -> Source {
-    let mut source = Source::new("project", kind);
+    instruction_in(
+        "project",
+        path,
+        kind,
+        "Instruction file present; contents not displayed",
+    )
+}
+
+fn instruction_in(
+    scope: &'static str,
+    path: &Path,
+    kind: &'static str,
+    present: &'static str,
+) -> Source {
+    let mut source = Source::new(scope, kind);
     match source_bytes(path) {
         Ok(Some(_)) => {
             source.status = "valid";
-            source.detail = "Instruction file present; contents not displayed";
+            source.detail = present;
             source.files = 1;
         }
         Ok(None) => {}
@@ -767,6 +799,34 @@ mod tests {
     }
 
     #[test]
+    fn the_user_instruction_file_is_listed_and_said_to_need_the_switch() {
+        let tree = Tree::new();
+        let user = tree.0.join("claude");
+        let find = |report: &Value| {
+            report["report"]["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|source| source["scope"] == "user" && source["kind"] == "CLAUDE.md")
+                .cloned()
+        };
+        let absent = inspect(&tree.0, Some(&user), Some(false), doctor(true));
+        assert_eq!(
+            find(&absent).map(|source| source["status"].clone()),
+            Some(json!("missing"))
+        );
+        tree.write("claude/CLAUDE.md", "DO_NOT_DISPLAY_SECRET");
+        let report = inspect(&tree.0, Some(&user), Some(false), doctor(true));
+        let entry = find(&report).expect("listed");
+        assert_eq!(entry["status"], "valid");
+        assert!(
+            entry["detail"].as_str().unwrap().contains("claude_compat"),
+            "it says what reads it: {entry}"
+        );
+        assert!(!report.to_string().contains("DO_NOT_DISPLAY_SECRET"));
+    }
+
+    #[test]
     fn missing_source_and_required_doctor_failure_are_not_ready() {
         let tree = Tree::new();
         let empty = inspect(&tree.0, None, Some(false), doctor(true));
@@ -873,6 +933,77 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn migration_checks_hook_event_names_without_running_or_disclosing_handlers() {
+        let tree = Tree::new();
+        let marker = tree.0.join("hook-ran");
+        let handler = json!({"type": "command", "command": format!("echo PRIVATE_HOOK > \"{}\"", marker.display())});
+        for (event, ready) in [
+            ("Stop", true),
+            ("stop", false),
+            ("UserPromptSubmitt", false),
+            ("FutureEvent", false),
+        ] {
+            let settings = json!({"hooks": {(event): [{"hooks": [&handler]}]}}).to_string();
+            let path = tree.write(".claude/settings.json", &settings);
+            let report = inspect(&tree.0, None, Some(false), doctor(true));
+            assert_eq!(report["report"]["ready"], ready, "{event}");
+            assert_eq!(
+                report["report"]["sources"][0]["status"],
+                if ready { "valid" } else { "review" }
+            );
+            assert!(!report.to_string().contains("PRIVATE_HOOK"));
+            assert!(!marker.exists());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), settings);
+        }
+    }
+
+    #[test]
+    fn migration_checks_the_hook_handler_limit_per_settings_file() {
+        let tree = Tree::new();
+        let handler = json!({"type": "command", "command": "true"});
+        // Each source can fill the runtime limit across multiple groups and events.
+        let hooks = |last_group| {
+            json!({"hooks": {
+                "SessionStart": [{"hooks": vec![&handler; 128]}],
+                "Stop": [{"hooks": vec![&handler; 127]}, {"hooks": vec![&handler; last_group]}]
+            }})
+            .to_string()
+        };
+        tree.write(".claude/settings.json", &hooks(1));
+        for (last_group, ready) in [(1, true), (2, false)] {
+            let local = hooks(last_group);
+            assert_eq!(
+                orbit_engine::hooks::parse_claude_settings(&local).len(),
+                256
+            );
+            tree.write(".claude/settings.local.json", &local);
+            let report = inspect(&tree.0, None, Some(false), doctor(true));
+            assert_eq!(report["report"]["ready"], ready);
+            assert_eq!(report["report"]["sources"][0]["status"], "valid");
+            assert_eq!(
+                report["report"]["sources"][1]["status"],
+                if ready { "valid" } else { "review" }
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_handlers_do_not_consume_the_runtime_limit() {
+        let tree = Tree::new();
+        let handlers = vec![json!({"type": "future_handler"}); 257];
+        let path = tree.write(
+            "settings.json",
+            &json!({"hooks": {"Stop": [{"hooks": handlers}]}}).to_string(),
+        );
+        let source = settings(&path, "user", &[]);
+        assert_eq!(source.status, "review");
+        assert_eq!(
+            source.detail,
+            "Unsupported or unresolved hook requires review"
+        );
     }
 
     #[test]

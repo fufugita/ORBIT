@@ -22,7 +22,9 @@
 //!   pipe needs a pattern that spells out the whole line;
 //! * no permission rule of the session denies it or asks about it, and no
 //!   `PreToolUse` hook blocks it;
-//! * the shell sandbox is up, and the command runs inside it;
+//! * the shell sandbox is up, and the command runs inside it — also when the
+//!   operator switched it off for their own Bash (`[sandbox] enabled =
+//!   false`): a command file may come from a project;
 //! * the session is not in plan mode and has not excluded `Bash`.
 //!
 //! `allowed-tools` also covers the turn the command starts: a call it names
@@ -616,6 +618,14 @@ fn run_shell(
     if orbit_engine::hooks::blocked(&fired).is_some() {
         return unrun("a hook blocked it");
     }
+    // The operator switched the sandbox off for their own Bash. A command
+    // file may come from a project, so its shell expansions still run only
+    // inside the sandbox.
+    if orbit_tools::sandbox::SandboxAdditions::load(home).switched_off() {
+        return unrun(
+            "the shell sandbox is switched off in your settings, and command files run only inside it",
+        );
+    }
     if !matches!(
         orbit_tools::sandbox::ShellSandbox::probe(),
         orbit_tools::sandbox::SandboxStatus::Confined
@@ -921,6 +931,39 @@ mod tests {
         assert_eq!(out.matches("too many commands").count(), 2, "{out}");
         // Without a runner the text is sent as written.
         assert_eq!(expand("Now: !`date`", ""), "Now: !`date`");
+    }
+
+    /// The operator's switch lets their own Bash run outside the sandbox. A
+    /// command file may come from a project, so its shell stays inside it.
+    #[test]
+    fn a_command_file_never_runs_its_shell_outside_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("orbit-command-switch-{}", ulid::Ulid::new()));
+        let (home, project) = (dir.join("home"), dir.join("project"));
+        std::fs::create_dir_all(project.join(".orbit/commands")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            project.join(".orbit/commands/hello.md"),
+            "---\nallowed-tools: Bash(echo hi:*)\n---\nSaid: !`echo hi`\n",
+        )
+        .unwrap();
+        // Control: with the sandbox on, the command runs (where there is one).
+        if matches!(
+            orbit_tools::sandbox::ShellSandbox::probe(),
+            orbit_tools::sandbox::SandboxStatus::Confined
+        ) {
+            let text = prompt(&home, &project, true, "hello", "", Shell::On).unwrap();
+            assert!(text.contains("hi"), "{text}");
+            assert!(!text.contains("not run"), "{text}");
+        }
+        std::fs::write(home.join("settings.toml"), "[sandbox]\nenabled = false\n").unwrap();
+        let text = prompt(&home, &project, true, "hello", "", Shell::On).unwrap();
+        assert!(
+            text.contains(
+                "!`echo hi` [not run: the shell sandbox is switched off in your settings"
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// What decides whether a command of a file runs: its own allowed-tools

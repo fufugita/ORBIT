@@ -448,6 +448,7 @@ pub mod onboarding;
 pub mod pentest;
 pub mod permissions;
 pub mod phase_routing;
+mod plugin_bulk;
 pub mod plugin_commands;
 pub mod plugin_content;
 pub mod presets;

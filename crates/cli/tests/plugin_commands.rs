@@ -1049,9 +1049,19 @@ fn managed_reports_redact_credentials_and_dynamic_mapping_keys_without_forged_ha
     ] {
         let output = fixture.run(&args);
         success(&output);
-        assert!(!stdout(&output).contains(secret));
-        if args.contains(&"--json") {
+        assert!(
+            !stdout(&output).contains(secret),
+            "{args:?} printed a configured literal:\n{}",
+            stdout(&output)
+        );
+        // An environment reference is not a secret and stays readable where the component is shown:
+        // in the whole record of one plugin, not in the list, which only counts what a plugin holds.
+        if args.contains(&"--json") && args.contains(&"status") {
             assert!(stdout(&output).contains("${SAMPLE_TOKEN}"));
+        }
+        if args.contains(&"--json") && args.contains(&"list") {
+            assert!(!stdout(&output).contains("${SAMPLE_TOKEN}"));
+            assert!(stdout(&output).contains("component_counts"));
         }
     }
     assert_eq!(fixture.inventory(), before);
@@ -1463,4 +1473,715 @@ fn lifecycle_strict_grammar_rejects_invalid_flags_before_state_initialization() 
             assert_eq!(fixture.inventory(), before);
         }
     }
+}
+
+/// A Claude Code plugin as one finds it in the wild: a good skill, a skill with a name the id rules
+/// refuse, a command whose YAML Claude Code reads and a strict parser does not, and a link.
+fn wild_plugin(fixture: &Fixture) -> PathBuf {
+    let source = fixture.root.join("wild-source");
+    for (path, bytes) in [
+        (
+            ".claude-plugin/plugin.json",
+            r#"{"name":"wild","description":"d","license":"MIT"}"#,
+        ),
+        (
+            "skills/good/SKILL.md",
+            "---\nname: good\ndescription: d\n---\nbody\n",
+        ),
+        (
+            "skills/spaced/SKILL.md",
+            "---\nname: Agent Cost Report\ndescription: d\n---\nbody\n",
+        ),
+        (
+            "commands/doctor.md",
+            "---\ndescription: Run it. Input: a name\nargument-hint: [--strict] [--json]\n---\nbody\n",
+        ),
+    ] {
+        let target = source.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, bytes).unwrap();
+    }
+    std::os::unix::fs::symlink("/etc/hostname", source.join("link")).unwrap();
+    source
+}
+
+#[test]
+fn lenient_import_keeps_the_good_content_says_what_it_left_out_and_remembers_the_choice() {
+    let fixture = managed_fixture();
+    let source = wild_plugin(&fixture);
+    let source = source.to_str().unwrap();
+
+    // As before: one link, one name and one line of YAML refuse the whole package.
+    let strict = fixture.run(&["plugin", "import", source, "--format", "claude", "--json"]);
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("source_entry_type"));
+    assert!(
+        !fixture.home.join("plugins").exists(),
+        "a refusal writes nothing"
+    );
+
+    let output = fixture.run(&[
+        "plugin",
+        "import",
+        source,
+        "--format",
+        "claude",
+        "--lenient",
+        "--json",
+    ]);
+    success(&output);
+    let imported: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plugin = &imported["receipt"]["plugin"];
+    assert_eq!(plugin["options"]["lenient"], true);
+    let mut ids: Vec<_> = plugin["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["wild:command:doctor", "wild:skill:good"]);
+    let codes: Vec<_> = plugin["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap().to_owned())
+        .collect();
+    for code in ["component_skipped", "source_entry_skipped"] {
+        assert!(codes.iter().any(|c| c == code), "{code} in {codes:?}");
+    }
+
+    // A fresh process reads the stored copy the same way: the choice travelled with the plugin.
+    let status = fixture.run(&["plugin", "status", "wild", "--json"]);
+    success(&status);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["plugin"]["options"]["lenient"], true);
+    assert_eq!(status["plugin"]["components"].as_array().unwrap().len(), 2);
+
+    // An upgrade without the flag keeps what the plugin was imported with.
+    let upgraded = fixture.run(&["plugin", "upgrade", "wild", source, "--json"]);
+    success(&upgraded);
+    let again = fixture.run(&["plugin", "status", "wild", "--json"]);
+    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(again["plugin"]["options"]["lenient"], true);
+
+    // Inspecting takes the flag too; a doubled flag is a usage error and a strict inspect is unchanged.
+    success(&fixture.run(&[
+        "plugin",
+        "inspect",
+        source,
+        "--format",
+        "claude",
+        "--lenient",
+        "--json",
+    ]));
+    assert!(
+        !fixture
+            .run(&["plugin", "inspect", source, "--format", "claude", "--json"])
+            .status
+            .success()
+    );
+    let twice = fixture.run(&["plugin", "inspect", source, "--lenient", "--lenient"]);
+    assert!(!twice.status.success());
+    assert!(String::from_utf8_lossy(&twice.stderr).contains("duplicate --lenient"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// `orbit plugin import --from-claude`: bring in what Claude Code has installed and enabled.
+// ---------------------------------------------------------------------------------------------
+
+/// A token Claude Code keeps next to its plugin registry. Importing plugins has no business reading
+/// it, so it must never reach an output or ORBIT's own folder.
+const CLAUDE_TOKEN: &str = "claude-code-credential-that-nothing-may-read";
+
+impl Fixture {
+    fn claude(&self) -> PathBuf {
+        self.root.join("claude")
+    }
+
+    /// Install a plugin the way Claude Code lays it out in its cache and return its folder.
+    fn claude_plugin(&self, key: &str, files: &[(&str, &str)]) -> PathBuf {
+        let (name, market) = key.split_once('@').unwrap();
+        let dir = self
+            .claude()
+            .join("plugins/cache")
+            .join(market)
+            .join(name)
+            .join("1.0.0");
+        self.claude_files(&dir, name, files);
+        dir
+    }
+
+    fn claude_files(&self, dir: &Path, name: &str, files: &[(&str, &str)]) {
+        let manifest = format!(r#"{{"name":"{name}","description":"d","version":"1.0.0"}}"#);
+        let mut all = vec![(".claude-plugin/plugin.json", manifest.as_str())];
+        all.extend_from_slice(files);
+        for (path, text) in all {
+            let target = dir.join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, text).unwrap();
+        }
+    }
+
+    /// Claude Code's records: the install registry and the user settings that say what is enabled.
+    /// `installs` is `(key, install path, scope)`; `enabled` is `(key, value)`.
+    fn claude_registry(&self, installs: &[(&str, &Path, &str)], enabled: &[(&str, Value)]) {
+        let mut plugins = serde_json::Map::new();
+        for (key, path, scope) in installs {
+            plugins.insert(
+                (*key).to_owned(),
+                json!([{"scope": scope, "installPath": path, "version": "1.0.0"}]),
+            );
+        }
+        let claude = self.claude();
+        fs::create_dir_all(claude.join("plugins")).unwrap();
+        fs::write(
+            claude.join("plugins/installed_plugins.json"),
+            serde_json::to_vec(&json!({"version": 2, "plugins": plugins})).unwrap(),
+        )
+        .unwrap();
+        let enabled: serde_json::Map<String, Value> = enabled
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect();
+        fs::write(
+            claude.join("settings.json"),
+            serde_json::to_vec(&json!({
+                "enabledPlugins": enabled,
+                "env": {"ANTHROPIC_AUTH_TOKEN": CLAUDE_TOKEN},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            claude.join(".credentials.json"),
+            format!(r#"{{"claudeAiOauth":{{"accessToken":"{CLAUDE_TOKEN}"}}}}"#),
+        )
+        .unwrap();
+    }
+
+    fn bulk(&self, args: &[&str]) -> Value {
+        let mut all = vec!["plugin", "import", "--from-claude", "--json"];
+        all.extend_from_slice(args);
+        let output = self.run(&all);
+        success(&output);
+        let text = stdout(&output);
+        assert!(
+            !text.contains(CLAUDE_TOKEN),
+            "a Claude Code credential was printed"
+        );
+        serde_json::from_str(&text).unwrap()
+    }
+}
+
+fn entry<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["bulk"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plugin| plugin["name"] == name)
+        .unwrap_or_else(|| panic!("no entry {name} in {}", report["bulk"]["plugins"]))
+}
+
+const ALPHA_HOOKS: &str = r#"{"hooks":{
+  "PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"echo one"}]}],
+  "Stop":[{"hooks":[{"type":"command","command":"echo two"}]}]}}"#;
+
+/// What the operator's Claude Code looks like in miniature: a plugin with everything, one that needs
+/// a lenient read, one nothing can read, two of one name, and the ways an entry can be unusable.
+fn claude_world(fixture: &Fixture) {
+    let alpha = fixture.claude_plugin(
+        "alpha@market-a",
+        &[
+            (
+                "skills/review/SKILL.md",
+                "---\nname: review\ndescription: Review a change\n---\nbody\n",
+            ),
+            (
+                "commands/ship.md",
+                "---\ndescription: Ship it\n---\nShip.\n",
+            ),
+            ("hooks/hooks.json", ALPHA_HOOKS),
+            (
+                ".mcp.json",
+                r#"{"mcpServers":{"srv":{"command":"srv-bin"}}}"#,
+            ),
+        ],
+    );
+    let wild = fixture.claude_plugin(
+        "wild@market-a",
+        &[
+            ("skills/good/SKILL.md", "---\nname: good\ndescription: d\n---\nbody\n"),
+            ("skills/spaced/SKILL.md", "---\nname: Agent Cost Report\ndescription: d\n---\nbody\n"),
+            ("commands/doctor.md", "---\ndescription: Run it. Input: a name\nargument-hint: [--strict] [--json]\n---\nbody\n"),
+        ],
+    );
+    std::os::unix::fs::symlink("/etc/hostname", wild.join("link")).unwrap();
+    let broken =
+        fixture.claude_plugin("broken@market-a", &[("hooks/hooks.json", r#"{"hooks":5}"#)]);
+    let twin_a = fixture.claude_plugin(
+        "twin@market-a",
+        &[(
+            "skills/a/SKILL.md",
+            "---\nname: a\ndescription: d\n---\nbody\n",
+        )],
+    );
+    let twin_b = fixture.claude_plugin(
+        "twin@market-b",
+        &[(
+            "skills/b/SKILL.md",
+            "---\nname: b\ndescription: d\n---\nbody\n",
+        )],
+    );
+    let quiet = fixture.claude_plugin("quiet@market-a", &[]);
+    let elsewhere = fixture.claude_plugin("elsewhere@market-a", &[]);
+    let outside = fixture.root.join("outside-the-claude-folder");
+    fixture.claude_files(&outside, "outside", &[]);
+    fixture.claude_registry(
+        &[
+            ("alpha@market-a", &alpha, "user"),
+            ("wild@market-a", &wild, "user"),
+            ("broken@market-a", &broken, "user"),
+            ("twin@market-a", &twin_a, "user"),
+            ("twin@market-b", &twin_b, "user"),
+            ("quiet@market-a", &quiet, "user"),
+            ("elsewhere@market-a", &elsewhere, "project"),
+            ("outside@market-a", &outside, "user"),
+        ],
+        &[
+            ("alpha@market-a", json!(true)),
+            ("wild@market-a", json!(true)),
+            ("broken@market-a", json!(true)),
+            ("twin@market-a", json!(true)),
+            ("twin@market-b", json!(true)),
+            ("quiet@market-a", json!(false)),
+            ("elsewhere@market-a", json!(true)),
+            ("ghost@market-a", json!(true)),
+            ("outside@market-a", json!(true)),
+            ("odd@market-a", json!("yes")),
+        ],
+    );
+}
+
+#[test]
+fn bulk_import_brings_in_what_claude_code_has_enabled_and_says_what_it_did_not() {
+    let fixture = managed_fixture();
+    claude_world(&fixture);
+    let before = fixture.inventory();
+    let report = fixture.bulk(&[]);
+    assert_eq!(report["package_code_executed"], false);
+    let bulk = &report["bulk"];
+    assert_eq!(bulk["dry_run"], false);
+    assert_eq!(bulk["lenient"], true);
+    let summary = &bulk["summary"];
+    for (key, expected) in [
+        ("enabled", 8),
+        ("imported", 3),
+        ("already", 0),
+        ("changed", 0),
+        ("refused", 2),
+        ("skipped", 4),
+        ("not_enabled", 1),
+    ] {
+        assert_eq!(summary[key], expected, "{key} in {summary}");
+    }
+
+    // A plugin with everything: what it holds, and what stays off.
+    let alpha = entry(&report, "alpha");
+    assert_eq!(alpha["status"], "imported");
+    assert_eq!(alpha["marketplace"], "market-a");
+    assert_eq!(
+        alpha["components"],
+        json!({"skill": 1, "agent": 0, "command": 1, "hook": 2, "mcp": 1})
+    );
+    assert_eq!(alpha["withheld"]["hooks"], 2);
+    assert_eq!(alpha["withheld"]["mcp_servers"], 1);
+    assert!(alpha["digest"].as_str().unwrap().len() >= 8);
+
+    // Read as Claude Code reads it: the good content comes in, and what was left out is said.
+    let wild = entry(&report, "wild");
+    assert_eq!(wild["status"], "imported");
+    assert_eq!(wild["components"]["skill"], 1);
+    assert_eq!(wild["components"]["command"], 1);
+    assert_eq!(wild["withheld"]["left_out"], 1);
+    let warnings: Vec<_> = wild["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(warnings.contains(&"component_skipped"), "{warnings:?}");
+
+    // A plugin nothing can read is refused with its code and costs the others nothing.
+    let broken = entry(&report, "broken");
+    assert_eq!(broken["status"], "refused");
+    assert!(!broken["code"].as_str().unwrap().is_empty());
+
+    // One store entry per name: the second marketplace's copy is named and left alone.
+    assert_eq!(entry(&report, "twin")["status"], "imported");
+    let twin_b = report["bulk"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "twin" && p["marketplace"] == "market-b")
+        .unwrap();
+    assert_eq!(twin_b["status"], "skipped");
+    assert!(
+        twin_b["reason"].as_str().unwrap().contains("market-a"),
+        "{twin_b}"
+    );
+
+    // The ways an entry can be unusable.
+    let reason = |name: &str| entry(&report, name)["reason"].as_str().unwrap().to_owned();
+    assert!(
+        reason("elsewhere").contains("project"),
+        "{}",
+        reason("elsewhere")
+    );
+    assert!(
+        reason("ghost").contains("not installed"),
+        "{}",
+        reason("ghost")
+    );
+    assert!(
+        reason("odd").contains("neither true nor false"),
+        "an enabledPlugins value that is not a bool is said, not guessed: {}",
+        reason("odd")
+    );
+    assert_eq!(entry(&report, "outside")["status"], "refused");
+    assert!(
+        reason("outside").contains("outside"),
+        "{}",
+        reason("outside")
+    );
+    assert!(
+        report["bulk"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["name"] != "quiet")
+    );
+
+    // ORBIT now holds exactly the three, enabled; nothing else about Claude Code moved or was read.
+    let listed = fixture.run(&["plugin", "list", "--json"]);
+    success(&listed);
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let mut names: Vec<_> = listed["snapshot"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["id"]["name"].as_str().unwrap().to_owned(),
+                p["enabled"].as_bool().unwrap(),
+                p["options"]["lenient"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            ("alpha".to_owned(), true, true),
+            ("twin".to_owned(), true, true),
+            ("wild".to_owned(), true, true)
+        ]
+    );
+    let after = fixture.inventory();
+    for (path, was) in &before {
+        assert_eq!(after.get(path), Some(was), "{} changed", path.display());
+    }
+    for path in after.keys().filter(|path| !before.contains_key(*path)) {
+        assert!(
+            path.starts_with("home/plugins"),
+            "wrote outside the plugin store: {}",
+            path.display()
+        );
+    }
+    for (path, (_, bytes)) in &after {
+        if path.starts_with("home") {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains(CLAUDE_TOKEN),
+                "{} holds a Claude Code credential",
+                path.display()
+            );
+        }
+    }
+
+    // The same run for people: one line per plugin, what stays off, and how to turn hooks on.
+    let human = fixture.run(&["plugin", "import", "--from-claude"]);
+    success(&human);
+    let text = stdout(&human);
+    assert!(!text.contains(CLAUDE_TOKEN));
+    for part in [
+        "alpha",
+        "already",
+        "wild",
+        "broken",
+        "refused",
+        "twin",
+        "market-b",
+        "no package code was run",
+        "plugin_hooks",
+    ] {
+        assert!(text.contains(part), "{part} in:\n{text}");
+    }
+    // The last line says how to turn the hooks of what was imported on, with the plugin that has some.
+    assert!(
+        text.contains("plugin_hooks = [\"alpha\""),
+        "how to turn hooks on, naming the plugin that has them:\n{text}"
+    );
+}
+
+#[test]
+fn bulk_import_is_repeatable_previews_without_writing_and_never_overwrites() {
+    let fixture = managed_fixture();
+    claude_world(&fixture);
+    let before = fixture.inventory();
+
+    // A preview inspects everything and writes nothing at all.
+    let preview = fixture.bulk(&["--dry-run"]);
+    assert_eq!(preview["bulk"]["dry_run"], true);
+    assert_eq!(entry(&preview, "alpha")["status"], "would_import");
+    assert_eq!(entry(&preview, "broken")["status"], "refused");
+    assert_eq!(preview["bulk"]["summary"]["imported"], 0);
+    assert_eq!(fixture.inventory(), before);
+
+    // `--only` takes one plugin; a name that matches nothing is said, not ignored.
+    let one = fixture.bulk(&["--only", "alpha", "--only", "nonesuch"]);
+    assert_eq!(entry(&one, "alpha")["status"], "imported");
+    assert_eq!(one["bulk"]["plugins"].as_array().unwrap().len(), 2, "{one}");
+    assert_eq!(entry(&one, "nonesuch")["status"], "skipped");
+    let listed = fixture.run(&["plugin", "list", "--json"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["snapshot"]["entries"].as_array().unwrap().len(), 1);
+
+    // The rest follows; what is already there is recognised by its content and left alone.
+    let rest = fixture.bulk(&[]);
+    assert_eq!(entry(&rest, "alpha")["status"], "already");
+    assert_eq!(entry(&rest, "wild")["status"], "imported");
+    let revision = |fixture: &Fixture| {
+        let listed = fixture.run(&["plugin", "list", "--json"]);
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        listed["snapshot"]["revision"].as_str().unwrap().to_owned()
+    };
+    let settled = revision(&fixture);
+    let again = fixture.bulk(&[]);
+    for name in ["alpha", "wild", "twin"] {
+        assert_eq!(entry(&again, name)["status"], "already", "{name}");
+    }
+    assert_eq!(again["bulk"]["summary"]["imported"], 0);
+    assert_eq!(revision(&fixture), settled, "a repeat changes nothing");
+
+    // Claude Code updates a plugin: ORBIT's copy is kept, and the way to take the new one is named.
+    let alpha_dir = fixture.claude().join("plugins/cache/market-a/alpha/1.0.0");
+    fs::write(
+        alpha_dir.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Changed\n---\nnew body\n",
+    )
+    .unwrap();
+    let moved = fixture.bulk(&[]);
+    let alpha = entry(&moved, "alpha");
+    assert_eq!(alpha["status"], "changed");
+    assert!(
+        alpha["hint"]
+            .as_str()
+            .unwrap()
+            .contains("orbit plugin upgrade alpha"),
+        "{alpha}"
+    );
+    assert_eq!(moved["bulk"]["summary"]["changed"], 1);
+    let preview = fixture.bulk(&["--dry-run"]);
+    let alpha = entry(&preview, "alpha");
+    assert_eq!(
+        alpha["status"], "changed",
+        "a preview says what a run would"
+    );
+    assert!(
+        alpha["hint"]
+            .as_str()
+            .unwrap()
+            .contains("orbit plugin upgrade alpha"),
+        "{alpha}"
+    );
+    assert_eq!(
+        revision(&fixture),
+        settled,
+        "the stored copy was not touched"
+    );
+
+    // A plugin disabled in ORBIT is not switched back on behind the operator's back.
+    success(&fixture.run(&["plugin", "disable", "wild"]));
+    let off = revision(&fixture);
+    let kept = fixture.bulk(&[]);
+    assert_eq!(entry(&kept, "wild")["status"], "kept");
+    assert_eq!(revision(&fixture), off);
+}
+
+#[test]
+fn bulk_import_refuses_unreadable_registries_and_ambiguous_commands_without_writing() {
+    let fixture = managed_fixture();
+    let ours = |fixture: &Fixture| {
+        fixture
+            .inventory()
+            .into_iter()
+            .filter(|(path, _)| path.starts_with("home") || path.starts_with("workspace"))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = ours(&fixture);
+    let fails = |args: &[&str], code: Option<i32>, needle: &str| {
+        let mut all = vec!["plugin", "import", "--from-claude"];
+        all.extend_from_slice(args);
+        let output = fixture.run(&all);
+        assert!(!output.status.success(), "{args:?}");
+        if code.is_some() {
+            assert_eq!(output.status.code(), code, "{args:?}");
+        }
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "{needle} in {stderr}");
+        assert!(!stderr.contains(CLAUDE_TOKEN));
+    };
+
+    // No registry at all, then a broken one, then one from a format this was never checked against.
+    fails(&[], None, "installed_plugins.json");
+    fixture.claude_registry(&[], &[]);
+    let registry = fixture.claude().join("plugins/installed_plugins.json");
+    fs::write(&registry, "{ not json").unwrap();
+    fails(&[], None, "installed_plugins.json");
+    fs::write(&registry, r#"{"version":3,"plugins":{}}"#).unwrap();
+    fails(&[], None, "version 3");
+    fs::write(&registry, r#"{"version":2,"plugins":{}}"#).unwrap();
+    fs::write(fixture.claude().join("settings.json"), "[1, 2]").unwrap();
+    fails(&[], None, "settings.json");
+    fs::write(
+        fixture.claude().join("settings.json"),
+        r#"{"enabledPlugins": [1]}"#,
+    )
+    .unwrap();
+    fails(&[], None, "enabledPlugins");
+
+    // Ambiguous or unsupported commands are usage errors.
+    fails(&["somewhere"], Some(64), "package path");
+    fails(&["--scope", "project"], Some(64), "--scope");
+    fails(&["--dry-run", "--dry-run"], Some(64), "duplicate --dry-run");
+    fails(&["--only"], Some(64), "--only");
+    fails(&["--from-claude"], Some(64), "duplicate --from-claude");
+    fails(&["--format", "claude"], Some(64), "--format");
+    for operation in ["inspect", "install", "upgrade"] {
+        let output = fixture.run(&["plugin", operation, "--from-claude"]);
+        assert_eq!(output.status.code(), Some(64), "{operation}");
+    }
+    let help = fixture.run(&["plugin", "--help"]);
+    assert!(
+        stdout(&help).contains("--from-claude"),
+        "the usage line lists the new command"
+    );
+    assert_eq!(
+        ours(&fixture),
+        before,
+        "a refusal writes nothing to ORBIT's home or the workspace"
+    );
+}
+
+#[test]
+fn a_store_of_many_plugins_still_lists_every_plugin_by_name() {
+    // Seventy plugins is what importing everything Claude Code has enabled leaves. The list used to
+    // carry every plugin's whole record and ran out of display budget before it reached the names.
+    let fixture = managed_fixture();
+    let names: Vec<String> = (0..8).map(|n| format!("plug{n}")).collect();
+    for name in &names {
+        let source = fixture.root.join(format!("many-{name}"));
+        fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+        fs::write(
+            source.join(".claude-plugin/plugin.json"),
+            format!(r#"{{"name":"{name}","description":"d","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        for skill in 0..30 {
+            let dir = source.join(format!("skills/s{skill}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: s{skill}\ndescription: Skill number {skill} of {name}\n---\nBody of skill {skill}.\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(source.join("hooks")).unwrap();
+        fs::write(
+            source.join("hooks/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo x"}]}]}}"#,
+        )
+        .unwrap();
+        let imported = fixture.run(&[
+            "plugin",
+            "import",
+            source.to_str().unwrap(),
+            "--format",
+            "claude",
+            "--json",
+        ]);
+        success(&imported);
+        // The receipt shows the plugin just taken in in full, and the store beside it compactly.
+        let receipt: Value = serde_json::from_slice(&imported.stdout).unwrap();
+        assert_eq!(
+            receipt["receipt"]["plugin"]["components"]
+                .as_array()
+                .unwrap()
+                .len(),
+            31
+        );
+        for entry in receipt["receipt"]["snapshot"]["entries"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(entry.get("components").is_none(), "{entry}");
+            assert_eq!(entry["component_counts"]["skill"], 30);
+        }
+    }
+    let output = fixture.run(&["plugin", "list", "--json"]);
+    success(&output);
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        listed["display_truncated"], false,
+        "the list fits its display"
+    );
+    let entries = listed["snapshot"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 8);
+    let mut found: Vec<_> = entries
+        .iter()
+        .map(|e| e["id"]["name"].as_str().unwrap().to_owned())
+        .collect();
+    found.sort();
+    assert_eq!(found, names, "every name is there, none withheld");
+    for entry in entries {
+        assert_eq!(entry["component_counts"]["skill"], 30, "{entry}");
+        assert_eq!(entry["component_counts"]["hook"], 1);
+        assert!(
+            entry.get("components").is_none(),
+            "the whole record is `plugin status`"
+        );
+        assert!(entry["manifest"]["version"] == "1.0.0");
+        assert_eq!(entry["enabled"], true);
+    }
+    // For people: a line a plugin, with what it holds.
+    let human = fixture.run(&["plugin", "list"]);
+    success(&human);
+    let text = stdout(&human);
+    assert!(!text.contains("withheld"), "{text}");
+    for name in &names {
+        assert!(
+            text.contains(&format!("{name} [user], version 1.0.0")),
+            "{name} in:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("30 skills") && text.contains("1 command hook"),
+        "{text}"
+    );
+    // The whole record of one is a command away, and is the one the import receipt showed.
+    let status = fixture.run(&["plugin", "status", "plug3", "--json"]);
+    success(&status);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["plugin"]["components"].as_array().unwrap().len(), 31);
 }

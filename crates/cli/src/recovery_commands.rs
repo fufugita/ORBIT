@@ -48,6 +48,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--easy",
     "--hard",
     "-p",
+    "--print",
 ];
 
 /// Handle a selected recovery command completely, before normal CLI startup.
@@ -2162,6 +2163,20 @@ mod tests {
 
     fn words(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn print_flag_operands_stay_opaque_to_recovery_selection() {
+        for flag in ["-p", "--print"] {
+            // The operand is the prompt, even when it spells a command word.
+            assert!(!selects_recovery(&words(&[flag, "recovery"])), "{flag}");
+            // A command word after the prompt still selects the recovery
+            // grammar, which then refuses the print flag.
+            assert!(
+                selects_recovery(&words(&[flag, "a prompt", "recovery", "status"])),
+                "{flag}"
+            );
+        }
     }
 
     fn arguments(json: bool) -> Arguments {

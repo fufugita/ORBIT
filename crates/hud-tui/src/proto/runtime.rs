@@ -977,9 +977,165 @@ fn same_read_source(before: &TranscriptLine, after: &TranscriptLine, _last_entry
                 && before.tool_name == after.tool_name))
 }
 
-/// The UI tick: 16 ms. §10.5 — an idle ORBIT draws nothing; the loop
-/// still polls so redraws after events are instant.
+/// Active frames are capped at about 60 Hz. Terminal input wakes the poll
+/// immediately; the idle bound is for worker messages and other timers.
 const UI_TICK: Duration = Duration::from_millis(16);
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
+fn ui_poll_timeout(elapsed: Duration, active: bool, dirty: bool) -> Duration {
+    let interval = if active || dirty { UI_TICK } else { IDLE_TICK };
+    interval.saturating_sub(elapsed)
+}
+
+fn crossed_beat(previous_ms: u64, now_ms: u64, period_ms: u64) -> bool {
+    previous_ms / period_ms != now_ms / period_ms
+}
+
+/// The default conversation, its steady insertion caret and ordinary settled
+/// messages have no periodic motion. Other pane layouts and tool cards can
+/// still animate independently of a foreground turn.
+fn needs_chat_heartbeat(
+    tui: &Tui,
+    s: &Scenario,
+    overlay: Option<Overlay>,
+    last_paint_ms: u64,
+) -> bool {
+    use super::layout::Node;
+    static COLUMNS: std::sync::LazyLock<Node> = std::sync::LazyLock::new(Node::default_tree);
+
+    if tui.app.tree != *COLUMNS
+        || tui.app.sidebar
+        || tui.app.arranging
+        || tui.app.picker.is_some()
+        || overlay.is_some()
+        || s.is_busy()
+        || s.first_prompt_waiting
+        || !s.tapes.is_empty()
+    {
+        return true;
+    }
+    // Extra readiness rows can finish after the normal startup animation.
+    // Use the last *painted* time so a delayed tick still paints the end.
+    let last_check = s.welcome_chips.len().saturating_sub(1) as u64;
+    if tui.brand_tier == super::welcome::BrandTier::Anim && last_paint_ms < 1_700 + 120 * last_check
+    {
+        return true;
+    }
+    // The turn report types in at 60 graphemes/s. Two seconds covers its
+    // bounded numeric fields even when the normal message motion has ended.
+    if s.turn_report.is_some()
+        && s.turn_ended_ms
+            .is_some_and(|ended| last_paint_ms.saturating_sub(ended) < 2_000)
+    {
+        return true;
+    }
+    s.transcript.iter().any(|line| {
+        matches!(line.kind, LineKind::Tool | LineKind::Queued)
+            || line
+                .arrivals
+                .last()
+                .is_some_and(|&(_, arrival)| last_paint_ms.saturating_sub(arrival) < 450)
+    })
+}
+
+#[cfg(test)]
+mod frame_cadence_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_frames_park_and_pending_input_uses_the_next_active_frame() {
+        let ms = Duration::from_millis;
+        assert_eq!(ui_poll_timeout(ms(3), false, false), ms(97));
+        assert_eq!(ui_poll_timeout(ms(3), false, true), ms(13));
+        assert_eq!(ui_poll_timeout(ms(30), false, true), Duration::ZERO);
+        assert_eq!(ui_poll_timeout(ms(3), true, false), ms(13));
+        assert_eq!(ui_poll_timeout(ms(120), false, false), Duration::ZERO);
+    }
+
+    #[test]
+    fn slow_or_delayed_frames_still_observe_periodic_beats() {
+        for period_ms in [125, 550, 1_000] {
+            assert!(crossed_beat(period_ms - 40, period_ms + 60, period_ms));
+            assert!(!crossed_beat(period_ms + 60, period_ms + 61, period_ms));
+            assert!(crossed_beat(1, period_ms * 3, period_ms));
+        }
+    }
+
+    #[test]
+    fn settled_columns_sleep_with_empty_or_resumed_text() {
+        let mut tui = Tui::new();
+        tui.app.tree = crate::customization::profile_tree(&Default::default()).unwrap();
+        let mut s = Scenario::default();
+        assert!(!needs_chat_heartbeat(&tui, &s, None, 6_000));
+        for kind in [LineKind::User, LineKind::Model, LineKind::System] {
+            s.transcript.push(TranscriptLine {
+                kind,
+                text: "settled history".into(),
+                ..Default::default()
+            });
+        }
+        assert!(!needs_chat_heartbeat(&tui, &s, None, 6_000));
+        s.transcript[1].arrivals.push((0, 6_000));
+        assert!(needs_chat_heartbeat(&tui, &s, None, 6_449));
+        assert!(!needs_chat_heartbeat(&tui, &s, None, 6_450));
+    }
+
+    #[test]
+    fn other_views_and_live_work_keep_their_heartbeat() {
+        use super::super::layout::{Node, Preset};
+        let mut tui = Tui::new();
+        let mut s = Scenario::default();
+        assert!(needs_chat_heartbeat(&tui, &s, Some(Overlay::Help), 5_000));
+        s.agents_running = 1;
+        assert!(needs_chat_heartbeat(&tui, &s, None, 5_000));
+        s.agents_running = 0;
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::Tool,
+            tool_state: ToolState::Running,
+            ..Default::default()
+        });
+        assert!(needs_chat_heartbeat(&tui, &s, None, 5_000));
+        s.transcript.clear();
+        s.tapes.push(super::super::scenario::Tape {
+            call_id: "shell".into(),
+            lines: Vec::new(),
+            dropped: 0,
+        });
+        assert!(needs_chat_heartbeat(&tui, &s, None, 5_000));
+        s.tapes.clear();
+        tui.app.sidebar = true;
+        assert!(needs_chat_heartbeat(&tui, &s, None, 5_000));
+        tui.app.sidebar = false;
+        for preset in [Preset::Build, Preset::Agents, Preset::Review] {
+            tui.app.tree = Node::preset(preset);
+            assert!(needs_chat_heartbeat(&tui, &s, None, 5_000));
+        }
+    }
+
+    #[test]
+    fn delayed_readiness_checks_paint_their_final_frame() {
+        let mut tui = Tui::new();
+        tui.brand_tier = super::super::welcome::BrandTier::Anim;
+        let mut s = Scenario {
+            welcome_chips: vec![(true, String::new()); 8],
+            ..Scenario::default()
+        };
+        assert!(needs_chat_heartbeat(&tui, &s, None, 2_539));
+        assert!(!needs_chat_heartbeat(&tui, &s, None, 2_540));
+        s.first_prompt_waiting = true;
+        assert!(needs_chat_heartbeat(&tui, &s, None, 10_000));
+        s.first_prompt_waiting = false;
+        s.turn_report = Some(TurnReport {
+            duration_ms: u64::MAX,
+            tools: u64::MAX,
+            cost_microcents: u64::MAX,
+            priced: true,
+        });
+        s.turn_ended_ms = Some(10_000);
+        assert!(needs_chat_heartbeat(&tui, &s, None, 11_999));
+        assert!(!needs_chat_heartbeat(&tui, &s, None, 12_000));
+    }
+}
 
 /// The composer history's bound (§11.3): newest first, the last 200
 /// prompts. The persisted file holds the same bound.
@@ -1581,6 +1737,9 @@ fn run_proto_inner(
         crossterm::cursor::SetCursorStyle::SteadyBar
     );
     let mut last_tick = Instant::now();
+    let mut active_tick = true;
+    let mut was_animating = false;
+    let mut last_paint_ms = 0;
     let boot_ms = Instant::now();
     let mut last_drawn = String::new();
     let mut overlay_dirty = true;
@@ -1605,54 +1764,15 @@ fn run_proto_inner(
         notify_enabled || std::env::var("ORBIT_BELL").is_ok_and(|value| value == "1");
     let mut bell_turn_end = scenario.turn_ended_ms;
     loop {
-        let timeout = UI_TICK
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or(Duration::from_millis(0));
-        let now_ms = boot_ms.elapsed().as_millis() as u64;
-        tui.tick_ms = now_ms;
-        overlay_dirty |= refresh_builtin_panes(
-            &mut tui,
-            &mut scenario,
-            now_ms,
-            &mut council_pane_ms,
-            &mut reactor_pane_ms,
-            &mut reactor_pane_dirty,
-        );
-        // A council seat that is working animates its card (about 8 fps),
-        // only while the layout shows the pane and motion is not reduced.
-        if !tui.reduced
-            && now_ms / 125 != now_ms.saturating_sub(UI_TICK.as_millis() as u64) / 125
-            && scenario
-                .custom_panes
-                .get("council")
-                .is_some_and(|pane| pane.text.contains("심의중") || pane.text.contains("SYNK"))
-            && (0..tui.app.tree.panel_count())
-                .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("council"))
-        {
-            overlay_dirty = true;
-        }
-        // The reactor scene moves at about 8 fps during a turn and once a
-        // second at rest, under the same two conditions.
-        let reactor_beat = if scenario.turn_live || scenario.compacting {
-            125
-        } else {
-            1_000
-        };
-        if !tui.reduced
-            && now_ms / reactor_beat
-                != now_ms.saturating_sub(UI_TICK.as_millis() as u64) / reactor_beat
-            && (0..tui.app.tree.panel_count())
-                .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("reactor"))
-        {
-            overlay_dirty = true;
-        }
+        let timeout = ui_poll_timeout(last_tick.elapsed(), active_tick, overlay_dirty);
         // A deleted terminal (closed window, dead PTY) makes poll/read
         // fail with EIO — swallow nothing: treat any input error as
         // "terminal gone" and quit at once (the same rule as SIGHUP).
         // unwrap_or(false) here would busy-loop the EIO at 100% CPU.
         let mut bound_command: Option<String> = None;
         let ev = if let Some(click) = pending_picker_click.take() {
-            picker_click_key(click, &mut scenario, overlay, now_ms).map(Event::Key)
+            let click_ms = boot_ms.elapsed().as_millis() as u64;
+            picker_click_key(click, &mut scenario, overlay, click_ms).map(Event::Key)
         } else if let Some(click) = pending_palette_click.take() {
             palette_click_key(click, &scenario, overlay, &palette_query, &mut palette_sel)
                 .map(Event::Key)
@@ -1680,6 +1800,9 @@ fn run_proto_inner(
                 },
             }
         };
+        // Timestamp the input after the poll so a quiet stretch cannot age
+        // a fresh keystroke, approval action or animation before it happens.
+        let now_ms = boot_ms.elapsed().as_millis() as u64;
         // A key bound to a slash command runs it as if typed, and only
         // when nothing else is in the way: a draft is never overwritten.
         if let Some(command) = bound_command {
@@ -2200,20 +2323,54 @@ fn run_proto_inner(
             // it must redraw as time passes.
             let card_armed = scenario.approval_pending.is_some()
                 && now_ms.saturating_sub(scenario.last_key_ms) < 1500;
-            // The breathing caret (§9.13, 0.9 Hz) is always live while
-            // the composer holds focus — the idle screen must visibly
-            // breathe, not render one dead frame ("frozen" bug). Draw
-            // at the caret's pace (~2 changes/s) instead of the 16 ms
-            // tick: same animation, a fraction of the redraws.
-            let caret_breathes = !tui.reduced
+            let previous_ms = tui.tick_ms;
+            tui.tick_ms = now_ms;
+            overlay_dirty |= refresh_builtin_panes(
+                &mut tui,
+                &mut scenario,
+                now_ms,
+                &mut council_pane_ms,
+                &mut reactor_pane_ms,
+                &mut reactor_pane_dirty,
+            );
+            // External Council activity can animate even while chat is idle.
+            let council_animating = !tui.reduced
+                && scenario
+                    .custom_panes
+                    .get("council")
+                    .is_some_and(|pane| pane.text.contains("심의중") || pane.text.contains("SYNK"))
+                && (0..tui.app.tree.panel_count())
+                    .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("council"));
+            let reactor_beat = if scenario.turn_live || scenario.compacting {
+                125
+            } else {
+                1_000
+            };
+            overlay_dirty |= (council_animating && crossed_beat(previous_ms, now_ms, 125))
+                || (!tui.reduced
+                    && crossed_beat(previous_ms, now_ms, reactor_beat)
+                    && (0..tui.app.tree.panel_count()).any(|index| {
+                        tui.app.tree.custom_id_at(index).as_deref() == Some("reactor")
+                    }));
+            active_tick = animating
+                || council_animating
+                || scenario.is_busy()
+                || scenario.pending_picker_kind().is_some()
+                || !queued.is_empty();
+            // Paint the settled state even when a delayed tick skips
+            // straight past the end of an animation.
+            let motion_frame = animating || was_animating;
+            was_animating = animating;
+            let heartbeat = !tui.reduced
                 && tui.focus == Focus::Conversation
-                && (now_ms / 550) != (now_ms.saturating_sub(UI_TICK.as_millis() as u64) / 550);
-            if animating
+                && crossed_beat(previous_ms, now_ms, 550)
+                && needs_chat_heartbeat(&tui, &scenario, overlay, last_paint_ms);
+            if motion_frame
                 || bus_dirty
                 || last_drawn != composer
                 || overlay_dirty
                 || card_armed
-                || caret_breathes
+                || heartbeat
             {
                 last_drawn.clone_from(&composer);
                 overlay_dirty = false;
@@ -2247,6 +2404,7 @@ fn run_proto_inner(
                     break;
                 };
                 reading.commit(conversation_frame);
+                last_paint_ms = now_ms;
                 last_buf = Some(done.buffer.clone());
                 last_palette_frame =
                     capture_palette_frame(&scenario, overlay, &palette_query, &frame_hits);
@@ -5633,6 +5791,14 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.council = Some(council_for_display(&snapshot, now_ms));
             scenario.council_snapshot = Some(snapshot);
             scenario.council_session_id = Some(session_id);
+        }
+        Msg::CouncilCleared { session_id } => {
+            if session_id == scenario.session_id {
+                scenario.council = None;
+                scenario.council_snapshot = None;
+                scenario.council_session_id = None;
+                scenario.frontend.dirty = true;
+            }
         }
         Msg::StatusLine(text) => {
             let clean = crate::bridge::safe_text(&crate::bridge::terminal_safe(&text));
@@ -11001,6 +11167,45 @@ mod live_pane_tests {
     }
 
     #[test]
+    fn council_undo_clear_only_applies_to_the_active_session() {
+        use crate::msg::Msg;
+        let mut s = Scenario::new();
+        s.session_id = "active-council".into();
+        apply_msg(
+            Msg::CouncilUpdated {
+                session_id: s.session_id.clone(),
+                phase: "VERDICT".into(),
+                note: "Council result and accounting saved".into(),
+                seats: vec![],
+                winner_seats: vec![],
+                final_text: "the decision".into(),
+            },
+            &mut s,
+            10,
+        );
+        apply_msg(
+            Msg::CouncilCleared {
+                session_id: "another-session".into(),
+            },
+            &mut s,
+            20,
+        );
+        assert_eq!(
+            pane_context(&s, true).council.unwrap().last_final,
+            "the decision"
+        );
+        apply_msg(
+            Msg::CouncilCleared {
+                session_id: s.session_id.clone(),
+            },
+            &mut s,
+            30,
+        );
+        assert!(s.council.is_none());
+        assert!(pane_context(&s, true).council.is_none());
+    }
+
+    #[test]
     fn native_council_progress_is_gated_session_bound_and_cleared_on_switch() {
         let mut s = Scenario::new();
         s.session_id = "session-council-fixture".into();
@@ -11464,6 +11669,7 @@ fn source_affects_transcript(msg: &crate::msg::Msg) -> bool {
                 | Msg::Identity { .. }
                 | Msg::ModelChanged(_)
                 | Msg::CouncilUpdated { .. }
+                | Msg::CouncilCleared { .. }
         ),
     }
 }

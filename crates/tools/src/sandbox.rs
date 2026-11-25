@@ -42,11 +42,20 @@ pub enum SandboxStatus {
 /// path = ["~/.cargo/bin"]             # put first on PATH
 /// network = true                      # let commands reach the network
 /// env = { CARGO_HOME = "~/.cargo" }   # variables set for every command
+/// enabled = false                     # run commands WITHOUT the sandbox
+/// inherit_env = ["SSH_AUTH_SOCK"]     # variables copied into such commands
 /// ```
 ///
 /// Only the operator's own file is read: a project's settings cannot widen
 /// the sandbox it runs in. Nothing here unmasks the deny-read list, and
 /// ORBIT's own home stays hidden whatever is listed.
+///
+/// `enabled = false` is the operator's decision to run Bash as themselves, the
+/// way Claude Code does: `ssh` with their agent, `docker`, `ps` on the host.
+/// Only a TOML boolean counts; anything else leaves the sandbox on. A command
+/// that runs without the sandbox still gets an allowlisted environment (never
+/// ORBIT's own variables, provider keys included) plus this table's `env`,
+/// `path` and `inherit_env`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxAdditions {
     pub read: Vec<PathBuf>,
@@ -54,6 +63,11 @@ pub struct SandboxAdditions {
     pub path: Vec<PathBuf>,
     pub network: bool,
     pub env: Vec<(String, String)>,
+    /// `enabled = false`: the operator runs commands without the sandbox.
+    pub disabled: bool,
+    /// Names of variables copied from ORBIT's environment into a command
+    /// that runs without the sandbox.
+    pub inherit_env: Vec<String>,
     /// What the table got wrong, one line each. A wrong entry is left out;
     /// the rest of the table still applies.
     pub problems: Vec<String>,
@@ -142,6 +156,39 @@ impl SandboxAdditions {
                         .problems
                         .push("sandbox.network must be true or false".into()),
                 },
+                // Fail safe: only a real `false` turns the sandbox off.
+                "enabled" => match value.as_bool() {
+                    Some(on) => out.disabled = !on,
+                    None => out
+                        .problems
+                        .push("sandbox.enabled must be true or false".into()),
+                },
+                "inherit_env" => {
+                    let Some(items) = value.as_array() else {
+                        out.problems
+                            .push("sandbox.inherit_env must be a list of variable names".into());
+                        continue;
+                    };
+                    for item in items.iter().take(MAX_ENTRIES) {
+                        let Some(name) = item.as_str() else {
+                            out.problems
+                                .push("sandbox.inherit_env: every entry must be text".into());
+                            continue;
+                        };
+                        if !plain_env_name(name) {
+                            out.problems.push(format!(
+                                "sandbox.inherit_env: {name:?} is not a plain variable name"
+                            ));
+                        } else if !out.inherit_env.iter().any(|known| known == name) {
+                            out.inherit_env.push(name.to_owned());
+                        }
+                    }
+                    if items.len() > MAX_ENTRIES {
+                        out.problems.push(format!(
+                            "sandbox.inherit_env: only the first {MAX_ENTRIES} entries are used"
+                        ));
+                    }
+                }
                 "env" => {
                     let Some(vars) = value.as_table() else {
                         out.problems
@@ -149,9 +196,7 @@ impl SandboxAdditions {
                         continue;
                     };
                     for (name, value) in vars.iter().take(MAX_ENTRIES) {
-                        let name_ok = !name.is_empty()
-                            && !name.starts_with(|c: char| c.is_ascii_digit())
-                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                        let name_ok = plain_env_name(name);
                         let text = value.as_str().filter(|text| {
                             text.len() <= 4096 && !text.chars().any(char::is_control)
                         });
@@ -175,7 +220,7 @@ impl SandboxAdditions {
                     }
                 }
                 other => out.problems.push(format!(
-                    "sandbox.{other} is not a setting (read, write, path, network, env)"
+                    "sandbox.{other} is not a setting (enabled, read, write, path, network, env, inherit_env)"
                 )),
             }
         }
@@ -201,7 +246,24 @@ impl SandboxAdditions {
             && self.path.is_empty()
             && !self.network
             && self.env.is_empty()
+            && !self.disabled
+            && self.inherit_env.is_empty()
     }
+
+    /// Has the operator, in their own settings, chosen to run commands
+    /// without the sandbox? The one place that answers it: a project's
+    /// settings are never read, and nothing the model can set reaches it.
+    pub fn switched_off(&self) -> bool {
+        self.disabled
+    }
+}
+
+/// A variable name a shell can use: letters, digits and `_`, not starting
+/// with a digit.
+fn plain_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The sandbox configuration for one Bash call.
@@ -524,6 +586,90 @@ extra = 1
         assert_eq!(
             plain.get_args().collect::<Vec<_>>(),
             added.get_args().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_sandbox_is_on_unless_the_operator_switches_it_off() {
+        for on in [
+            "",
+            "[sandbox]\nnetwork = true\n",
+            "[sandbox]\nenabled = true\n",
+        ] {
+            let additions = SandboxAdditions::parse(on, None);
+            assert!(!additions.disabled, "{on:?}");
+            assert!(!additions.switched_off(), "{on:?}");
+        }
+        let off = SandboxAdditions::parse("[sandbox]\nenabled = false\n", None);
+        assert!(off.disabled && off.switched_off());
+        assert!(off.problems.is_empty(), "{:?}", off.problems);
+        assert!(!off.is_empty(), "switching it off is a change");
+    }
+
+    #[test]
+    fn only_a_real_boolean_switches_the_sandbox_off() {
+        for bad in [
+            "\"false\"",
+            "0",
+            "\"off\"",
+            "[false]",
+            "{ v = false }",
+            "1.5",
+        ] {
+            let additions = SandboxAdditions::parse(&format!("[sandbox]\nenabled = {bad}\n"), None);
+            assert!(!additions.disabled, "{bad}");
+            assert!(
+                additions
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("sandbox.enabled must be true or false")),
+                "{bad}: {:?}",
+                additions.problems
+            );
+        }
+        // It is a key of the [sandbox] table, nowhere else.
+        assert!(!SandboxAdditions::parse("enabled = false\n", None).disabled);
+        assert!(!SandboxAdditions::parse("[other]\nenabled = false\n", None).disabled);
+    }
+
+    #[test]
+    fn the_switch_is_read_from_the_operators_file_each_time() {
+        let (root, home) = additions_fixture("switch-file");
+        let settings = home.join("settings.toml");
+        std::fs::write(&settings, "[sandbox]\nenabled = false\n").unwrap();
+        assert!(SandboxAdditions::load(&home).switched_off());
+        std::fs::write(&settings, "[sandbox]\nenabled = true\n").unwrap();
+        assert!(!SandboxAdditions::load(&home).switched_off());
+        std::fs::remove_file(&settings).unwrap();
+        assert!(!SandboxAdditions::load(&home).switched_off(), "no file");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inherit_env_takes_plain_names_only() {
+        let additions = SandboxAdditions::parse(
+            "[sandbox]\ninherit_env = [\"SSH_AUTH_SOCK\", \"XDG_RUNTIME_DIR\", \"SSH_AUTH_SOCK\", \"bad name\", \"1ST\", \"\", \"A=B\", 7]\n",
+            None,
+        );
+        assert_eq!(additions.inherit_env, ["SSH_AUTH_SOCK", "XDG_RUNTIME_DIR"]);
+        let problems = additions.problems.join("\n");
+        for bad in ["\"bad name\"", "\"1ST\"", "\"\"", "\"A=B\""] {
+            assert!(
+                problems.contains(&format!("{bad} is not a plain variable name")),
+                "{bad}: {problems}"
+            );
+        }
+        assert!(problems.contains("every entry must be text"), "{problems}");
+        assert!(!additions.is_empty(), "naming a variable is a change");
+        let wrong = SandboxAdditions::parse("[sandbox]\ninherit_env = \"SSH_AUTH_SOCK\"\n", None);
+        assert!(wrong.inherit_env.is_empty());
+        assert!(
+            wrong
+                .problems
+                .iter()
+                .any(|p| p.contains("sandbox.inherit_env must be a list of variable names")),
+            "{:?}",
+            wrong.problems
         );
     }
 

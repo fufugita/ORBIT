@@ -284,22 +284,22 @@ pub fn mcp_tool_definitions(
     let selected = crate::tool_runtime::effective_mcp_tool_selection(cx, selection);
     let selection = selected.as_deref();
     let mut emitted_mcp = std::collections::HashSet::new();
-    for (name, server) in &cfg.servers {
-        if !server.enabled
-            || !crate::plugin_content::server_exposed(cx, &cfg, name)
-            || server.tools.as_ref().is_some_and(Vec::is_empty)
-            || selection
-                .is_some_and(|names| !crate::plugin_content::selects_mcp_server(&cfg, names, name))
-        {
-            continue;
-        }
-        // The process-lifetime pool: one server process per name,
-        // reused across calls and definition builds (phase 5).
-        let mut options =
-            orbit_mcp::McpCallOptions::new(std::time::Duration::from_millis(server.timeout_ms));
-        options.cancel = cx.cancel_check();
-        options.working_dir = Some(cx.working_dir.clone());
-        let listed = orbit_mcp::POOL.list_tools_with_options(name, server, &options);
+    let wanted: Vec<(&String, &orbit_mcp::McpServerConfig)> = cfg
+        .servers
+        .iter()
+        .filter(|(name, server)| {
+            server.enabled
+                && crate::plugin_content::server_exposed(cx, &cfg, name.as_str())
+                && !server.tools.as_ref().is_some_and(Vec::is_empty)
+                && !selection.is_some_and(|names| {
+                    !crate::plugin_content::selects_mcp_server(&cfg, names, name.as_str())
+                })
+        })
+        .collect();
+    // The process-lifetime pool: one server process per name, reused across calls and
+    // definition builds (phase 5). The servers start together, so the first turn waits for
+    // the slowest of them instead of all of them in turn.
+    for (name, server, listed) in list_servers_together(&wanted, cx) {
         if !cx.cancel_check().is_some_and(|cancelled| cancelled()) {
             note_mcp_state(name, listed.as_ref().map(Vec::len).map_err(Clone::clone));
         }
@@ -338,6 +338,61 @@ pub fn mcp_tool_definitions(
         }
     }
     defs
+}
+
+/// What one server answered when it was asked for its tools.
+type Listed = Result<Vec<orbit_mcp::McpToolInfo>, String>;
+
+/// Start and list these servers together, eight at a time, and give each one's answer back with
+/// it, in the order the servers were given: the tool definitions are part of the prompt, and an
+/// order that changed from one turn to the next would defeat a provider's prompt cache. 29 real
+/// servers took 22.5 s one after another on the first turn; together it is the slowest of them.
+/// The pool keeps one lock per server, so they do not wait for each other.
+fn list_servers_together<'a>(
+    servers: &[(&'a String, &'a orbit_mcp::McpServerConfig)],
+    cx: &orbit_tools::ToolContext,
+) -> Vec<(&'a String, &'a orbit_mcp::McpServerConfig, Listed)> {
+    const WORKERS: usize = 8;
+    let cancel = cx.cancel_check();
+    let working_dir = cx.working_dir.clone();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut answered: Vec<(usize, Listed)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..WORKERS.min(servers.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((name, server)) = servers.get(at) else {
+                            break mine;
+                        };
+                        let mut options = orbit_mcp::McpCallOptions::new(
+                            std::time::Duration::from_millis(server.timeout_ms),
+                        );
+                        options.cancel = cancel.clone();
+                        options.working_dir = Some(working_dir.clone());
+                        mine.push((
+                            at,
+                            orbit_mcp::POOL.list_tools_with_options(name, server, &options),
+                        ));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    answered.sort_by_key(|(at, _)| *at);
+    answered
+        .into_iter()
+        .map(|(at, listed)| (servers[at].0, servers[at].1, listed))
+        .collect()
 }
 
 /// More MCP tools than this are deferred behind tool search by default.
@@ -1329,14 +1384,27 @@ pub(crate) fn monitors_running() -> usize {
     MONITORS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// The one agent an agent-control call names. `agent` and `agent_id` are
+/// aliases, and naming two different agents is refused, so the permission
+/// check and the executor can never act on different ones.
+pub(crate) fn agent_target(args: &serde_json::Value) -> Result<Option<&str>, String> {
+    let named = |key| {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+    };
+    match (named("agent"), named("agent_id")) {
+        (Some(agent), Some(id)) if agent != id => {
+            Err("'agent' and 'agent_id' name different agents; send only one".into())
+        }
+        (agent, id) => Ok(agent.or(id)),
+    }
+}
+
 /// `AgentStop`: ask a running background agent to stop.
 pub(crate) fn agent_stop(args: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let wanted = args
-        .get("agent")
-        .or_else(|| args.get("agent_id"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|wanted| !wanted.is_empty())
-        .ok_or("AgentStop requires 'agent': the name or id Task returned")?;
+    let wanted =
+        agent_target(args)?.ok_or("AgentStop requires 'agent': the name or id Task returned")?;
     let stops = BACKGROUND_STOPS
         .lock()
         .map_err(|_| "background agent registry is unavailable".to_string())?;
@@ -1490,12 +1558,7 @@ pub(crate) fn agent_output(
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     const MAX_REPORT_CHARS: usize = 24_000;
-    let wanted = args
-        .get("agent")
-        .or_else(|| args.get("agent_id"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|wanted| !wanted.is_empty())
-        .ok_or("AgentOutput requires 'agent': an agent_id or name")?;
+    let wanted = agent_target(args)?.ok_or("AgentOutput requires 'agent': an agent_id or name")?;
     let agents = store.list()?;
     // An id is exact; a name picks the newest agent that carries it.
     let summary = agents
@@ -2010,7 +2073,7 @@ pub(crate) fn execute_task_resolved(
             "prompt_bytes": prompt.len(),
         }),
     );
-    if let Some(context) = orbit_engine::hooks::added_context(&started) {
+    if let Some(context) = hooks.added_context(&started) {
         input.push_str(&format!("\n\n<hook-context>\n{context}\n</hook-context>"));
     }
     let cancel = orbit_provider_http::CancelToken::new();
@@ -3705,6 +3768,39 @@ mod tool_search_tests {
         assert!(!offer_for("nobody came", quick));
         assert!(ROUND_INBOX.lock().unwrap().is_empty());
         *LAST_ROUND.lock().unwrap() = None;
+    }
+
+    /// `agent` and `agent_id` name one target. A call that names two different
+    /// agents is refused: otherwise the permission check and this executor could
+    /// each act on a different one.
+    #[test]
+    fn agent_stop_refuses_conflicting_agent_aliases() {
+        let conflicting = serde_json::json!({"agent": "alpha", "agent_id": "beta"});
+        let error = agent_stop(&conflicting).unwrap_err();
+        assert!(error.contains("different agents"), "{error}");
+    }
+
+    #[test]
+    fn agent_output_refuses_conflicting_agent_aliases_and_keeps_every_single_alias() {
+        let home = std::env::temp_dir().join(format!("orbit-agent-alias-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = orbit_engine::agent_store::AgentStore::new(&home, "session-alias").unwrap();
+        store
+            .create("Explore", Some("alpha"), "mock/model", None)
+            .unwrap();
+        let conflicting = serde_json::json!({"agent": "alpha", "agent_id": "beta"});
+        let error = agent_output(&store, &conflicting).unwrap_err();
+        assert!(error.contains("different agents"), "{error}");
+        // The same agent named twice, or by either alias alone, still resolves.
+        for arguments in [
+            serde_json::json!({"agent": "alpha", "agent_id": "alpha"}),
+            serde_json::json!({"agent": "alpha"}),
+            serde_json::json!({"agent_id": "alpha"}),
+        ] {
+            let report = agent_output(&store, &arguments).unwrap();
+            assert_eq!(report["name"], "alpha", "{arguments}");
+        }
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     /// The operator's view of one agent: its header, what it was asked,

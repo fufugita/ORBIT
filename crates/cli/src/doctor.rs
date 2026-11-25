@@ -333,6 +333,321 @@ fn inspect_integration_bytes(bytes: &[u8], label: &str, report: &mut DoctorRepor
         );
     }
 }
+/// Hook matchers written as regular expressions: a pattern that does not
+/// compile leaves its hook matching only the plain names in it, and nothing else
+/// says so before the hook fails to run. Reads settings only; no hook is run,
+/// and a hook's command stays out of the report, which people paste.
+fn inspect_hook_matchers(home: &Path, workspace: &Path, report: &mut DoctorReport) {
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(workspace);
+    let hooks = orbit_engine::hooks::Hooks::inspect(home, trusted.then_some(workspace));
+    let mut patterns = 0usize;
+    let mut broken = Vec::new();
+    for hook in &hooks.hooks {
+        let Some(matcher) = hook.matcher.as_deref() else {
+            continue;
+        };
+        if !orbit_engine::hooks::is_regex_matcher(matcher) {
+            continue;
+        }
+        patterns += 1;
+        if let Some(reason) = orbit_engine::hooks::matcher_problem(matcher) {
+            broken.push((hook.event.as_str(), matcher.trim(), reason));
+        }
+    }
+    if patterns == 0 {
+        return;
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if broken.is_empty() {
+        report.add(
+            "hooks.matchers",
+            CheckStatus::Configured,
+            &format!(
+                "{patterns} regular-expression matcher{} across {} hook{}; all compile; no hook was run",
+                plural(patterns),
+                hooks.hooks.len(),
+                plural(hooks.hooks.len())
+            ),
+            false,
+        );
+        return;
+    }
+    report.add(
+        "hooks.matchers",
+        CheckStatus::Invalid,
+        &format!(
+            "{} of the {patterns} regular-expression matcher{} did not compile; those hooks match only the plain names in them",
+            broken.len(),
+            plural(patterns)
+        ),
+        false,
+    );
+    for (index, (event, matcher, reason)) in broken.iter().enumerate().take(8) {
+        report.add(
+            &format!("hooks.matchers.{index}"),
+            CheckStatus::Invalid,
+            &format!(
+                "{event} hook matcher \"{matcher}\" is not a valid regular expression ({reason})"
+            ),
+            false,
+        );
+    }
+}
+
+/// The command hooks of the imported plugins the operator named in `plugin_hooks`: which run, which
+/// are left out and why, and which named plugin is not there to run at all. Reads the settings and
+/// the plugin store; no hook is run, and a hook's command stays out of the report, which people
+/// paste. Nothing is said when no plugin is named: they are off by default. Not required either
+/// way: whether a plugin's hooks should run is the operator's call, not a reason for ORBIT to call
+/// itself not ready.
+fn inspect_plugin_hooks(home: &Path, report: &mut DoctorReport) {
+    let (_, setting_problems) = orbit_engine::plugin_hooks::allowed(home);
+    let resolved = orbit_engine::plugin_hooks::resolve(home);
+    if resolved.report.is_empty() && setting_problems.is_empty() {
+        return;
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let named = resolved.report.len();
+    let running: usize = resolved
+        .report
+        .iter()
+        .map(|plugin| plugin.active.len())
+        .sum();
+    let left_out: usize = resolved
+        .report
+        .iter()
+        .map(|plugin| plugin.skipped.len())
+        .sum();
+    let inactive = resolved
+        .report
+        .iter()
+        .filter(|plugin| plugin.inactive.is_some())
+        .count();
+    let clean = setting_problems.is_empty() && left_out == 0 && inactive == 0;
+    let detail = if named == 0 {
+        "plugin_hooks could not be read; no plugin's hooks run".to_owned()
+    } else {
+        let mut detail = format!(
+            "{named} plugin{} named in plugin_hooks; {running} command hook{} {}",
+            plural(named),
+            plural(running),
+            if running == 1 { "runs" } else { "run" }
+        );
+        if left_out > 0 {
+            detail.push_str(&format!(", {left_out} left out"));
+        }
+        if inactive > 0 {
+            detail.push_str(&format!(
+                ", {inactive} plugin{} {} not run",
+                plural(inactive),
+                if inactive == 1 { "does" } else { "do" }
+            ));
+        }
+        detail.push_str("; no hook was run");
+        detail
+    };
+    report.add(
+        "plugins.hooks",
+        if clean {
+            CheckStatus::Configured
+        } else {
+            CheckStatus::Invalid
+        },
+        &detail,
+        false,
+    );
+    for (index, problem) in setting_problems.iter().enumerate().take(8) {
+        report.add(
+            &format!("plugins.hooks.setting.{index}"),
+            CheckStatus::Invalid,
+            problem,
+            false,
+        );
+    }
+    // Each detail is cut at 256 bytes and a report holds 128 checks, so a plugin gets one short
+    // line (how many hooks run, at which events) and each hook left out gets a line of its own.
+    const LISTED: usize = 12;
+    const LISTED_LEFT_OUT: usize = 12;
+    let (mut lines_shown, mut hooks_shown) = (0usize, 0usize);
+    for (index, plugin) in resolved.report.iter().enumerate().take(LISTED) {
+        let digest = plugin
+            .digest
+            .as_deref()
+            .map(|digest| format!(" (digest {}…)", &digest[..digest.len().min(8)]))
+            .unwrap_or_default();
+        let (status, detail) = match &plugin.inactive {
+            Some(why) => (
+                CheckStatus::Invalid,
+                format!("{}{digest}: its hooks do not run: {why}", plugin.name),
+            ),
+            None => {
+                let mut detail = format!(
+                    "{}{digest}: {}",
+                    plugin.name,
+                    if plugin.active.is_empty() {
+                        "no command hook runs".to_owned()
+                    } else {
+                        format!(
+                            "{} command hook{}: {}",
+                            plugin.active.len(),
+                            plural(plugin.active.len()),
+                            events_of(&plugin.active)
+                        )
+                    }
+                );
+                if !plugin.skipped.is_empty() {
+                    detail.push_str(&format!("; {} left out", plugin.skipped.len()));
+                }
+                (
+                    if plugin.skipped.is_empty() {
+                        CheckStatus::Configured
+                    } else {
+                        CheckStatus::Invalid
+                    },
+                    detail,
+                )
+            }
+        };
+        report.add(&format!("plugins.hooks.{index}"), status, &detail, false);
+        // Hooks left out for the same reason share a line: a plugin can lose six to one cause.
+        let mut by_reason: Vec<(&str, Vec<String>)> = Vec::new();
+        for skipped in &plugin.skipped {
+            let (event, reason) = skipped.split_once(": ").unwrap_or(("", skipped.as_str()));
+            match by_reason.iter_mut().find(|(known, _)| *known == reason) {
+                Some((_, events)) => events.push(event.to_owned()),
+                None => by_reason.push((reason, vec![event.to_owned()])),
+            }
+        }
+        for (line, (reason, events)) in by_reason.iter().enumerate() {
+            if lines_shown == LISTED_LEFT_OUT {
+                break;
+            }
+            lines_shown += 1;
+            hooks_shown += events.len();
+            report.add(
+                &format!("plugins.hooks.{index}.left_out.{line}"),
+                CheckStatus::Invalid,
+                &format!(
+                    "{}: left out {} hook{} ({}): {reason}",
+                    plugin.name,
+                    events.len(),
+                    plural(events.len()),
+                    events_of(events)
+                ),
+                false,
+            );
+        }
+    }
+    if left_out > hooks_shown {
+        report.add(
+            "plugins.hooks.left_out.more",
+            CheckStatus::Invalid,
+            &format!(
+                "{} more hooks left out are not listed here",
+                left_out - hooks_shown
+            ),
+            false,
+        );
+    }
+    if named > LISTED {
+        report.add(
+            "plugins.hooks.more",
+            CheckStatus::Configured,
+            &format!("{} more named plugins are not listed here", named - LISTED),
+            false,
+        );
+    }
+}
+
+/// The events a plugin's running hooks are at, each once with a count when there is more than one:
+/// `PreToolUse, SessionStart ×3`. Matchers are left to `/hooks`, which has the room.
+fn events_of(active: &[String]) -> String {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for hook in active {
+        let event = hook.split(" [").next().unwrap_or(hook);
+        match counted.iter_mut().find(|(known, _)| *known == event) {
+            Some((_, n)) => *n += 1,
+            None => counted.push((event, 1)),
+        }
+    }
+    counted
+        .iter()
+        .map(|(event, n)| {
+            if *n == 1 {
+                (*event).to_owned()
+            } else {
+                format!("{event} ×{n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What the instruction files the prompt reads add up to, which of them the 200-line / 25 KB cap
+/// cuts, and which are not read at all because a link in them leads where an instruction file may
+/// not (to a key, or out of the project): rules that never reach the model are not something to
+/// find out from its behaviour. The files are read, no text from them is shown, and nothing here
+/// is required: a cut or a refusal is the operator's to weigh, not a reason for ORBIT to call
+/// itself not ready.
+fn inspect_instructions(home: &Path, workspace: &Path, report: &mut DoctorReport) {
+    let files = orbit_engine::context::instruction_report(home, workspace);
+    if files.is_empty() {
+        return;
+    }
+    let (refused, read): (Vec<_>, Vec<_>) = files.iter().partition(|file| file.refused.is_some());
+    let cut: Vec<_> = read.iter().filter(|file| file.cut.is_some()).collect();
+    let bytes: u64 = read.iter().map(|file| file.bytes).sum();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut detail = format!(
+        "{} instruction file{} read, {bytes} bytes in all",
+        read.len(),
+        plural(read.len())
+    );
+    if cut.is_empty() {
+        detail.push_str("; none is cut");
+    } else {
+        detail.push_str(&format!("; {} cut by the 200-line / 25 KB cap", cut.len()));
+    }
+    if !refused.is_empty() {
+        detail.push_str(&format!("; {} not read", refused.len()));
+    }
+    report.add(
+        "instructions",
+        if cut.is_empty() && refused.is_empty() {
+            CheckStatus::Configured
+        } else {
+            CheckStatus::Invalid
+        },
+        &detail,
+        false,
+    );
+    let problems = cut
+        .iter()
+        .map(|file| {
+            format!(
+                "{} is cut: {}",
+                file.path.display(),
+                file.cut.as_deref().unwrap_or("")
+            )
+        })
+        .chain(refused.iter().map(|file| {
+            format!(
+                "{} is not read: {}",
+                file.path.display(),
+                file.refused.as_deref().unwrap_or("")
+            )
+        }));
+    for (index, problem) in problems.enumerate().take(8) {
+        report.add(
+            &format!("instructions.{index}"),
+            CheckStatus::Invalid,
+            &problem,
+            false,
+        );
+    }
+}
+
 fn inspect_project(home: &Path, workspace: &Path, report: &mut DoctorReport) {
     let trusted =
         orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(workspace);
@@ -827,6 +1142,9 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
     inspect_integration(home, "mcp.json", &mut report);
     inspect_integration(home, "lsp.toml", &mut report);
     inspect_project(home, workspace, &mut report);
+    inspect_hook_matchers(home, workspace, &mut report);
+    inspect_plugin_hooks(home, &mut report);
+    inspect_instructions(home, workspace, &mut report);
     let context =
         orbit_tools::ToolContext::new(home.to_path_buf(), "doctor".into(), workspace.to_path_buf());
     match crate::lsp::availability(home, &context) {

@@ -298,6 +298,9 @@ impl Tool for WriteTool {
         if is_deny_read(&path) {
             return ToolResult::denied("that path is on the deny list");
         }
+        if crate::is_operator_config(&path, &cx.home) {
+            return ToolResult::denied(OPERATOR_CONFIG_REFUSAL);
+        }
         // An existing file must have been read in full this session
         // (read-before-write, the Write half of read-before-edit).
         if path.exists() && !cx.was_read(&path) {
@@ -333,6 +336,9 @@ impl Tool for WriteTool {
         }))
     }
 }
+
+/// Why Write and Edit leave ORBIT's own configuration alone.
+const OPERATOR_CONFIG_REFUSAL: &str = "that file is the operator's own ORBIT configuration (settings, permissions, MCP servers, providers): it decides what runs outside the sandbox or without asking, so only the operator edits it";
 
 // ============================== Edit ==============================
 
@@ -384,6 +390,9 @@ impl Tool for EditTool {
         let path = resolve_path(cx, file_path);
         if is_deny_read(&path) {
             return ToolResult::denied("that path is on the deny list");
+        }
+        if crate::is_operator_config(&path, &cx.home) {
+            return ToolResult::denied(OPERATOR_CONFIG_REFUSAL);
         }
         if !cx.was_read(&path) {
             return ToolResult::err(
@@ -1280,5 +1289,114 @@ mod diff_tests {
         let diff = simple_diff(&old, &new);
         assert_eq!(diff.lines().count(), 41);
         assert!(diff.ends_with("…\n"), "{diff}");
+    }
+}
+
+/// The files that decide what runs without a sandbox or without asking
+/// (hooks, permission rules, the sandbox's own switch, MCP servers, provider
+/// endpoints) are the operator's. The model's file tools never write them, in
+/// any permission mode: a model that could would switch its own sandbox off.
+#[cfg(test)]
+mod operator_config_tests {
+    use super::*;
+
+    const FILES: [&str; 6] = [
+        "settings.toml",
+        "settings.local.toml",
+        "permissions.toml",
+        "permission-overrides.toml",
+        "mcp.json",
+        "providers.toml",
+    ];
+
+    /// A context whose ORBIT home and working directory are different directories.
+    fn fixture(tag: &str) -> (ToolContext, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("orbit-opcfg-{tag}-{}", ulid::Ulid::new()));
+        let (home, work) = (root.join("home"), root.join("work"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let (home, work) = (home.canonicalize().unwrap(), work.canonicalize().unwrap());
+        (
+            ToolContext::new(home.clone(), "opcfg".into(), work.clone()),
+            home,
+            work,
+        )
+    }
+
+    fn denied(result: &ToolResult) -> bool {
+        serde_json::from_str::<serde_json::Value>(&result.payload)
+            .map(|v| v["denied"] == true)
+            .unwrap_or(false)
+    }
+
+    fn write(cx: &ToolContext, path: &std::path::Path, content: &str) -> ToolResult {
+        WriteTool.run(
+            &json!({ "file_path": path.to_string_lossy(), "content": content }),
+            cx,
+        )
+    }
+
+    #[test]
+    fn the_models_file_tools_never_write_the_operators_configuration() {
+        let (cx, home, _work) = fixture("write");
+        for name in FILES {
+            let target = home.join(name);
+            let result = write(&cx, &target, "[sandbox]\nenabled = false\n");
+            assert!(denied(&result), "{name}: {}", result.payload);
+            assert!(!target.exists(), "{name} must not have been created");
+        }
+        // An existing file stays what it was, however it is approached.
+        let settings = home.join("settings.toml");
+        let original = "[sandbox]\nnetwork = false\n";
+        std::fs::write(&settings, original).unwrap();
+        let path = settings.to_string_lossy().into_owned();
+        ReadTool.run(&json!({ "file_path": path }), &cx);
+        let edit = EditTool.run(
+            &json!({ "file_path": path, "old_string": "false", "new_string": "true" }),
+            &cx,
+        );
+        assert!(denied(&edit), "{}", edit.payload);
+        let rewrite = write(&cx, &settings, "[sandbox]\nenabled = false\n");
+        assert!(denied(&rewrite), "{}", rewrite.payload);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+    }
+
+    #[test]
+    fn another_spelling_of_the_same_file_is_the_same_file() {
+        let (cx, home, work) = fixture("spelling");
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let settings = home.join("settings.toml");
+        std::fs::write(&settings, "original\n").unwrap();
+        // `..` through a directory that exists.
+        let dotted = home.join("sub").join("..").join("settings.toml");
+        let result = write(&cx, &dotted, "x");
+        assert!(denied(&result), "{}", result.payload);
+        // A link in the working directory that points at it.
+        let link = work.join("innocent.txt");
+        std::os::unix::fs::symlink(&settings, &link).unwrap();
+        let result = write(&cx, &link, "x");
+        assert!(denied(&result), "{}", result.payload);
+        // A link to a directory that holds a file the tools could create.
+        let dir_link = work.join("home-link");
+        std::os::unix::fs::symlink(&home, &dir_link).unwrap();
+        let result = write(&cx, &dir_link.join("providers.toml"), "x");
+        assert!(denied(&result), "{}", result.payload);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "original\n");
+        assert!(!home.join("providers.toml").exists());
+    }
+
+    #[test]
+    fn a_project_file_of_the_same_name_and_the_rest_of_the_home_are_not_affected() {
+        let (cx, home, work) = fixture("unaffected");
+        // A project's own settings.toml is just a file of the project.
+        let project_settings = work.join("settings.toml");
+        let result = write(&cx, &project_settings, "a = 1\n");
+        assert!(!denied(&result), "{}", result.payload);
+        assert!(project_settings.exists());
+        // So is anything else, even where the tools may not usually go.
+        let notes = home.join("notes.txt");
+        let result = write(&cx, &notes, "hello\n");
+        assert!(!denied(&result), "{}", result.payload);
+        assert!(notes.exists());
     }
 }

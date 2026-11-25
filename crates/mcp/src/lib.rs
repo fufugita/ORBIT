@@ -19,6 +19,39 @@ mod legacy;
 pub mod oauth;
 
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// The most one server reply may hold.
+pub const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
+
+/// A line a server wrote to standard output that is not JSON-RPC at all: it does not parse and
+/// it is not the start of a JSON object. A banner, a log line or a usage text (a dotenv tip, an
+/// `[INFO]` line) lands here, and the official clients skip it. A line that starts with `{` and
+/// does not parse is a frame cut off in the middle, and a line that parses as something other
+/// than an object is a protocol error: neither is noise.
+fn is_log_noise(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line).is_err()
+        && !line.trim_ascii_start().starts_with(b"{")
+}
+
+fn reply_too_large() -> String {
+    format!("mcp input frame exceeds {} MiB", MAX_REPLY_BYTES >> 20)
+}
+
+/// The size `value` would have as JSON, without building it.
+fn json_len(value: &serde_json::Value) -> Result<usize, String> {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(|_| "mcp tool metadata is not JSON")?;
+    Ok(count.0)
+}
 const MAX_TOOL_PAGES: usize = 32;
 const MAX_TOOLS: usize = 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -667,6 +700,9 @@ pub struct McpSession {
     ended: Option<std::process::ExitStatus>,
     /// The server closed a pipe itself (not this side retiring it).
     peer_closed: bool,
+    /// The last text the server wrote to standard output that was not JSON-RPC.
+    /// It is skipped, and kept only to explain a server that then says nothing.
+    noise: Option<String>,
 }
 
 enum RemoteTransport {
@@ -773,6 +809,7 @@ impl McpSession {
                     relays_permission: false,
                     ended: None,
                     peer_closed: false,
+                    noise: None,
                     cfg: cfg.clone(),
                 };
                 session.initialize(&initialize_options)?;
@@ -845,6 +882,7 @@ impl McpSession {
                 relays_permission: false,
                 ended: None,
                 peer_closed: false,
+                noise: None,
                 cfg: cfg.clone(),
             };
             set_nonblocking(
@@ -868,9 +906,23 @@ impl McpSession {
         }
     }
 
+    /// Remember, and otherwise ignore, a line of standard output that is not JSON-RPC.
+    fn note_noise(&mut self, line: &[u8]) {
+        let head = &line[..line.len().min(1024)];
+        let text: String = String::from_utf8_lossy(head)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let text = text.trim();
+        if !text.is_empty() {
+            self.noise = Some(text.chars().take(160).collect());
+        }
+    }
+
     /// Why a server that was started did not answer its handshake: the
     /// handshake's own error, and when the process has already ended, how
-    /// it ended and the last thing it wrote to standard error.
+    /// it ended and the last thing it wrote to standard error (or, when it
+    /// wrote nothing there, to standard output as text that was not JSON-RPC).
     #[cfg(unix)]
     fn startup_failure(
         &self,
@@ -878,11 +930,18 @@ impl McpSession {
         stderr_tail: &Mutex<Vec<u8>>,
         stderr_drained: &std::sync::mpsc::Receiver<()>,
     ) -> String {
-        if matches!(
-            error.as_str(),
-            "mcp request cancelled" | "mcp request timed out"
-        ) {
+        if error == "mcp request cancelled" {
             return error;
+        }
+        if error == "mcp request timed out" {
+            return match &self.noise {
+                Some(noise) => {
+                    format!(
+                        "{error}; its standard output held text that is not JSON-RPC, the last line being: {noise}"
+                    )
+                }
+                None => error,
+            };
         }
         let Some(status) = self.ended else {
             return error;
@@ -905,7 +964,12 @@ impl McpSession {
             .take(160)
             .collect();
         if last.is_empty() {
-            format!("its process ended before answering ({status})")
+            match &self.noise {
+                Some(noise) => format!(
+                    "its process ended before answering ({status}); the last line on its standard output was: {noise}"
+                ),
+                None => format!("its process ended before answering ({status})"),
+            }
         } else {
             format!("its process ended before answering ({status}): {last}")
         }
@@ -1091,8 +1155,15 @@ impl McpSession {
         loop {
             let line = self.read_frame(options).map_err(|error| (error, true))?;
             options.check().map_err(|error| (error, true))?;
-            let value: serde_json::Value = serde_json::from_slice(&line)
-                .map_err(|e| (format!("malformed mcp frame: {e}"), true))?;
+            let value: serde_json::Value = match serde_json::from_slice(&line) {
+                Ok(value) => value,
+                // A banner or a log line on standard output is not a reply to anything.
+                Err(_) if is_log_noise(&line) => {
+                    self.note_noise(&line);
+                    continue;
+                }
+                Err(error) => return Err((format!("malformed mcp frame: {error}"), true)),
+            };
             options.check().map_err(|error| (error, true))?;
             let object = value
                 .as_object()
@@ -1133,9 +1204,13 @@ impl McpSession {
                 }
                 continue;
             }
-            let response_id = object
-                .get("id")
-                .ok_or_else(|| ("mcp response has no id".into(), true))?;
+            // A reply with no id at all answers nothing we sent. A server that takes a
+            // notification for a request (`notifications/initialized`) answers it with an
+            // error like that; `id: null` is different, it is a server saying it could not
+            // read a request, and stays an error below.
+            let Some(response_id) = object.get("id") else {
+                continue;
+            };
             if !(response_id.is_string() || response_id.is_i64() || response_id.is_u64()) {
                 return Err(("mcp response has invalid id".into(), true));
             }
@@ -1223,18 +1298,26 @@ impl McpSession {
     }
 
     fn read_frame(&mut self, options: &McpCallOptions) -> Result<Vec<u8>, String> {
+        // What was already searched holds no newline, so each read is searched once. Searching
+        // the whole buffer after every 8 KiB takes seconds on a 12 MiB reply.
+        let mut searched = 0;
         loop {
             options.check()?;
-            if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
-                if newline > MAX_FRAME_BYTES {
-                    return Err("mcp input frame exceeds 1 MiB".into());
+            if let Some(offset) = self.input[searched..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let newline = searched + offset;
+                if newline > MAX_REPLY_BYTES {
+                    return Err(reply_too_large());
                 }
                 let mut frame: Vec<_> = self.input.drain(..=newline).collect();
                 frame.pop();
                 return Ok(frame);
             }
-            if self.input.len() > MAX_FRAME_BYTES {
-                return Err("mcp input frame exceeds 1 MiB".into());
+            searched = self.input.len();
+            if searched > MAX_REPLY_BYTES {
+                return Err(reply_too_large());
             }
             let stdout = self.stdout.as_mut().ok_or("mcp transport is retired")?;
             let mut bytes = [0_u8; 8192];
@@ -1263,10 +1346,15 @@ impl McpSession {
             return Ok(());
         }
         let deadline = Instant::now() + wait;
+        let mut searched = 0;
         loop {
-            let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') else {
-                if self.input.len() > MAX_FRAME_BYTES {
-                    return Err("mcp input frame exceeds 1 MiB".into());
+            let Some(offset) = self.input[searched..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            else {
+                searched = self.input.len();
+                if searched > MAX_REPLY_BYTES {
+                    return Err(reply_too_large());
                 }
                 let stdout = self.stdout.as_mut().ok_or("mcp transport is retired")?;
                 let mut bytes = [0_u8; 8192];
@@ -1287,12 +1375,20 @@ impl McpSession {
                 }
                 continue;
             };
+            let newline = searched + offset;
+            searched = 0;
+            if newline > MAX_REPLY_BYTES {
+                return Err(reply_too_large());
+            }
             let mut frame: Vec<_> = self.input.drain(..=newline).collect();
             frame.pop();
-            let Ok(serde_json::Value::Object(object)) =
-                serde_json::from_slice::<serde_json::Value>(&frame)
-            else {
-                return Err("malformed mcp frame".into());
+            let object = match serde_json::from_slice::<serde_json::Value>(&frame) {
+                Ok(serde_json::Value::Object(object)) => object,
+                Err(_) if is_log_noise(&frame) => {
+                    self.note_noise(&frame);
+                    continue;
+                }
+                _ => return Err("malformed mcp frame".into()),
             };
             let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
                 // A response nobody is waiting for.
@@ -1378,12 +1474,14 @@ impl McpSession {
                 None => serde_json::json!({}),
             };
             let result = self.request_with_options("tools/list", params, options)?;
-            let encoded = encode_frame(&result)?;
             total_bytes = total_bytes
-                .checked_add(encoded.len())
+                .checked_add(json_len(&result)?)
                 .ok_or("mcp tool metadata size overflow")?;
-            if total_bytes > MAX_FRAME_BYTES {
-                return Err("mcp aggregate tool metadata exceeds 1 MiB".into());
+            if total_bytes > MAX_REPLY_BYTES {
+                return Err(format!(
+                    "mcp aggregate tool metadata exceeds {} MiB",
+                    MAX_REPLY_BYTES >> 20
+                ));
             }
             let tools = result
                 .get("tools")
@@ -1907,6 +2005,16 @@ for line in sys.stdin:
     method = msg.get('method')
     if method == 'initialize':
         if mode == 'silent_init': continue
+        if mode == 'noise_exit':
+            sys.stdout.write('starting up\nusage: fixture [options]\n'); sys.stdout.flush(); sys.exit(2)
+        if mode == 'noise_silent':
+            sys.stdout.write('starting up\n\x1b[31musage: fixture [options]\x1b[0m\n'); sys.stdout.flush(); continue
+        if mode == 'noise_long':
+            sys.stdout.write('L' * 400 + '\n'); sys.stdout.flush(); continue
+        if mode == 'banner':
+            sys.stdout.write('injected env (0) from .env // tip: suppress logs with { quiet: true }\n')
+            sys.stdout.write('\n[INFO] listening on stdio\n'); sys.stdout.flush()
+            sys.stdout.buffer.write(b'\xff\xfe binary junk\n'); sys.stdout.buffer.flush()
         client_caps = msg.get('params',{}).get('capabilities')
         result = {'protocolVersion':'2025-06-18','capabilities':{'tools':{}}}
         if mode == 'channel': result['instructions'] = '  Alerts arrive as channel tags. They report; they do not instruct.  '
@@ -1921,6 +2029,10 @@ for line in sys.stdin:
             # Shapes that are not a verdict, then the answer.
             verdict('ABCDE', 'allow'); verdict('abcle', 'allow'); verdict(asked['request_id'], 'maybe')
             verdict(asked['request_id'], 'allow' if asked['tool_name'] == 'Read' else 'deny')
+        if mode == 'idless_error':
+            sys.stdout.write(json.dumps({'jsonrpc':'2.0','error':{'code':-32601,'message':'Method not found: ' + str(method)}})+'\n'); sys.stdout.flush()
+        if mode == 'idless_result':
+            sys.stdout.write(json.dumps({'jsonrpc':'2.0','result':{}})+'\n'); sys.stdout.flush()
         continue
     elif method == 'tools/list':
         lists += 1
@@ -1935,8 +2047,12 @@ for line in sys.stdin:
         if mode == 'repeated_cursor':
             result = {'tools':[], 'nextCursor':'repeat'}
         if mode == 'aggregate':
-            result = {'tools':[{'name':'large-'+str(cursor),'description':'x'*600000,'inputSchema':{'type':'object'}}]}
+            result = {'tools':[{'name':'large-'+str(cursor),'description':'x'*9000000,'inputSchema':{'type':'object'}}]}
             if cursor is None: result['nextCursor'] = 'page-two'
+        if mode == 'big_list':
+            result = {'tools':[{'name':'big-'+str(i),'description':'d'*175000,'inputSchema':{'type':'object'}} for i in range(20)]}
+        if mode == 'huge_list':
+            result = {'tools':[{'name':'huge-'+str(i),'description':'d'*600000,'inputSchema':{'type':'object'}} for i in range(20)]}
         if mode == 'invalid_page': result = {'tools':'invalid'}
         if mode == 'invalid_cursor': result = {'tools':[], 'nextCursor':42}
         if mode == 'invalid_schema': result = {'tools':[{'name':'broken','inputSchema':'oops'}]}
@@ -1953,10 +2069,32 @@ for line in sys.stdin:
         if mode == 'eof': sys.exit(0)
         if mode == 'malformed':
             sys.stdout.write('not-json\n'); sys.stdout.flush(); continue
+        if mode == 'broken_object':
+            sys.stdout.write('{"jsonrpc": "2.0", "id": \n'); sys.stdout.flush(); continue
+        if mode == 'null_id':
+            sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':None,'error':{'code':-32700,'message':'Parse error'}})+'\n'); sys.stdout.flush(); continue
+        if mode == 'big_call':
+            sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'content':[{'type':'text','text':'y'*(2*1024*1024)}]}})+'\n'); sys.stdout.flush(); continue
+        if mode == 'idle_noise':
+            import threading
+            threading.Timer(.1, lambda: (sys.stdout.write('late log line\n'), sys.stdout.flush())).start()
+        if mode == 'idle_huge':
+            import threading
+            threading.Timer(.1, lambda: (sys.stdout.write('z' * (12*1024*1024) + '\n'), sys.stdout.flush())).start()
+        if mode == 'idle_oversize':
+            import threading
+            threading.Timer(.1, lambda: (sys.stdout.write('z' * (16*1024*1024+1) + '\n'), sys.stdout.flush())).start()
+        if mode == 'idle_endless':
+            import threading
+            threading.Timer(.1, lambda: (sys.stdout.write('z' * (16*1024*1024+1)), sys.stdout.flush())).start()
         if mode == 'invalid_protocol':
             sys.stdout.write(json.dumps({'jsonrpc':'1.0','id':msg['id'],'result':{}})+'\n'); sys.stdout.flush(); continue
         if mode in ('oversize','no_newline'):
-            sys.stdout.write('x' * (1024*1024+1) + ('\n' if mode == 'oversize' else '')); sys.stdout.flush(); continue
+            sys.stdout.write('x' * (16*1024*1024+1) + ('\n' if mode == 'oversize' else '')); sys.stdout.flush(); continue
+        if mode == 'noise_flood':
+            while True:
+                sys.stdout.write('a log line that never ends the conversation\n')
+                sys.stdout.flush()
         if mode == 'flood':
             while True:
                 sys.stdout.write(json.dumps({'jsonrpc':'2.0','method':'notifications/progress','params':{}})+'\n')
@@ -1988,6 +2126,7 @@ for line in sys.stdin:
         if mode == 'rpc_error' and calls == 1:
             sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32000,'message':'fixture failure'}})+'\n'); sys.stdout.flush(); continue
         result = {'content':[{'type':'text','text':'hello from mcp'}], 'pid':os.getpid(), 'cwd':os.getcwd(), 'arguments':msg.get('params',{}).get('arguments'), 'home':os.environ.get('HOME')}
+    if mode == 'banner': sys.stdout.write('[INFO] answering ' + str(method) + '\n')
     sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}) + '\n')
     sys.stdout.flush()
 "#;
@@ -2459,7 +2598,7 @@ for line in sys.stdin:
     fn discovery_rejects_repeated_cursor_invalid_pages_and_aggregate_caps() {
         for (mode, expected) in [
             ("repeated_cursor", "repeats a cursor"),
-            ("aggregate", "aggregate tool metadata exceeds 1 MiB"),
+            ("aggregate", "aggregate tool metadata exceeds 16 MiB"),
             ("invalid_page", "no tools array"),
             ("invalid_cursor", "invalid nextCursor"),
             ("invalid_schema", "invalid inputSchema"),
@@ -2672,7 +2811,7 @@ for line in sys.stdin:
 
     #[test]
     fn notification_flood_never_resets_deadline() {
-        for mode in ["flood", "unmatched_ids"] {
+        for mode in ["flood", "unmatched_ids", "noise_flood"] {
             let fixture = Fixture::new(mode);
             let mut session = McpSession::spawn(mode, &fixture.cfg).unwrap();
             let start = Instant::now();
@@ -2701,7 +2840,7 @@ for line in sys.stdin:
     #[test]
     fn malformed_eof_and_oversized_frames_retire_transport() {
         for mode in [
-            "malformed",
+            "broken_object",
             "invalid_protocol",
             "eof",
             "oversize",
@@ -2717,7 +2856,7 @@ for line in sys.stdin:
             assert_quick(start);
             assert!(!session.is_alive(), "{mode}");
             if mode == "oversize" || mode == "no_newline" {
-                assert!(error.contains("1 MiB"), "{error}");
+                assert!(error.contains("16 MiB"), "{error}");
             }
         }
         let fixture = Fixture::new("normal");
@@ -2737,6 +2876,213 @@ for line in sys.stdin:
                 .events()
                 .iter()
                 .any(|e| e["msg"]["method"] == "tools/call")
+        );
+    }
+
+    /// Real servers print a banner, a log line or a usage text on standard output. The official
+    /// clients skip what is not JSON-RPC; so does ORBIT, and a frame cut off in the middle (it starts
+    /// with `{`) is still a broken server.
+    #[test]
+    fn only_text_that_cannot_start_a_json_object_is_noise() {
+        for noise in [
+            &b""[..],
+            b"   ",
+            b"hello",
+            b"[INFO] up",
+            b"[dotenv@17.2.3] injecting env (0) from .env",
+            b"\xff\xfe binary junk",
+            "\u{25c7} injected env (0) from .env".as_bytes(),
+        ] {
+            assert!(is_log_noise(noise), "{:?}", String::from_utf8_lossy(noise));
+        }
+        for not_noise in [
+            &b"{"[..],
+            b" \t{\"jsonrpc\":\"2.0\",\"id\":",
+            b"{not json}",
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            b"[]",
+            b"42",
+            b"\"text\"",
+        ] {
+            assert!(
+                !is_log_noise(not_noise),
+                "{:?}",
+                String::from_utf8_lossy(not_noise)
+            );
+        }
+    }
+
+    #[test]
+    fn text_a_server_prints_on_standard_output_is_skipped() {
+        let fixture = Fixture::new("banner");
+        let mut session = McpSession::spawn("banner", &fixture.cfg).unwrap();
+        assert_eq!(session.list_tools().unwrap().len(), 2);
+        assert!(session.call_tool("echo", serde_json::json!({})).unwrap()["content"].is_array());
+        assert!(session.is_alive());
+    }
+
+    #[test]
+    fn text_printed_while_nothing_is_asked_does_not_end_the_session() {
+        let fixture = Fixture::new("idle_noise");
+        let mut session = McpSession::spawn("idle", &fixture.cfg).unwrap();
+        assert!(session.call_tool("echo", serde_json::json!({})).unwrap()["content"].is_array());
+        std::thread::sleep(Duration::from_millis(250));
+        session.poll_channel(Duration::from_millis(300)).unwrap();
+        assert!(session.is_alive());
+        assert!(session.call_tool("echo", serde_json::json!({})).is_ok());
+    }
+
+    /// What arrives while nothing is asked is read once, not searched again from its start for
+    /// every 8 KiB, and a line beyond the limit ends the session instead of filling memory.
+    #[test]
+    fn a_huge_line_arriving_while_nothing_is_asked_is_read_in_linear_time() {
+        let fixture = Fixture::new("idle_huge");
+        let mut session = McpSession::spawn("idle-huge", &fixture.cfg).unwrap();
+        assert!(session.call_tool("echo", serde_json::json!({})).is_ok());
+        std::thread::sleep(Duration::from_millis(250));
+        let start = Instant::now();
+        session.poll_channel(Duration::from_millis(500)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(session.is_alive());
+    }
+
+    #[test]
+    fn a_line_beyond_the_limit_while_nothing_is_asked_ends_the_session() {
+        let fixture = Fixture::new("idle_oversize");
+        let mut session = McpSession::spawn("idle-oversize", &fixture.cfg).unwrap();
+        assert!(session.call_tool("echo", serde_json::json!({})).is_ok());
+        std::thread::sleep(Duration::from_millis(250));
+        let error = session.poll_channel(Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("16 MiB"), "{error}");
+    }
+
+    /// The same bound holds for a line that never gets its newline: the buffer does not grow
+    /// for as long as the server keeps writing.
+    #[test]
+    fn a_line_that_never_ends_while_nothing_is_asked_ends_the_session() {
+        let fixture = Fixture::new("idle_endless");
+        let mut session = McpSession::spawn("idle-endless", &fixture.cfg).unwrap();
+        assert!(session.call_tool("echo", serde_json::json!({})).is_ok());
+        std::thread::sleep(Duration::from_millis(250));
+        let error = session.poll_channel(Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("16 MiB"), "{error}");
+    }
+
+    #[test]
+    fn standard_output_that_is_not_json_still_explains_a_server_that_ended() {
+        let fixture = Fixture::new("noise_exit");
+        let error = match McpSession::spawn("noise", &fixture.cfg) {
+            Ok(_) => panic!("a server that exits cannot answer"),
+            Err(error) => error,
+        };
+        assert!(error.contains("usage: fixture [options]"), "{error}");
+        assert!(error.contains("exit status: 2"), "{error}");
+        // The last line it wrote explains it, not the first.
+        assert!(!error.contains("starting up"), "{error}");
+    }
+
+    #[test]
+    fn standard_output_that_is_not_json_is_named_when_a_server_never_answers() {
+        let mut fixture = Fixture::new("noise_silent");
+        fixture.cfg.initialize_timeout_ms = 400;
+        let error = match McpSession::spawn("quiet", &fixture.cfg) {
+            Ok(_) => panic!("a server that only prints cannot answer"),
+            Err(error) => error,
+        };
+        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("usage: fixture [options]"), "{error}");
+        assert!(!error.contains("starting up"), "{error}");
+        // Whatever a server prints is shown to the operator as text: its escape sequences are not.
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+    }
+
+    /// What a server printed is quoted in a message, not pasted in whole.
+    #[test]
+    fn a_long_line_of_standard_output_is_quoted_in_part() {
+        let mut fixture = Fixture::new("noise_long");
+        fixture.cfg.initialize_timeout_ms = 400;
+        let error = match McpSession::spawn("long", &fixture.cfg) {
+            Ok(_) => panic!("a server that only prints cannot answer"),
+            Err(error) => error,
+        };
+        assert!(error.contains(&"L".repeat(160)), "{error}");
+        assert!(!error.contains(&"L".repeat(161)), "{error}");
+    }
+
+    /// `id: null` is how JSON-RPC says "I could not read your request". Unlike a reply with no id
+    /// at all, it is information, and the session is not carried on as if nothing had been said.
+    #[test]
+    fn a_reply_with_a_null_id_is_still_an_error() {
+        let fixture = Fixture::new("null_id");
+        let mut session = McpSession::spawn("null-id", &fixture.cfg).unwrap();
+        let error = session
+            .call_tool_with_options("echo", serde_json::json!({}), &options(700))
+            .unwrap_err();
+        assert!(error.contains("invalid id"), "{error}");
+        assert!(!session.is_alive());
+    }
+
+    #[test]
+    fn a_json_object_that_is_cut_off_is_still_a_broken_server() {
+        let fixture = Fixture::new("broken_object");
+        let mut session = McpSession::spawn("broken", &fixture.cfg).unwrap();
+        let error = session
+            .call_tool_with_options("echo", serde_json::json!({}), &options(700))
+            .unwrap_err();
+        assert!(error.contains("malformed mcp frame"), "{error}");
+        assert!(!session.is_alive());
+    }
+
+    /// A real server answers the `initialized` notification with `{"jsonrpc":"2.0","error":…}` and
+    /// no id: an answer to nothing.
+    #[test]
+    fn a_reply_without_an_id_is_ignored() {
+        for mode in ["idless_error", "idless_result"] {
+            let fixture = Fixture::new(mode);
+            let mut session = McpSession::spawn(mode, &fixture.cfg).unwrap();
+            assert_eq!(session.list_tools().unwrap().len(), 2, "{mode}");
+            assert!(
+                session.call_tool("echo", serde_json::json!({})).unwrap()["content"].is_array(),
+                "{mode}"
+            );
+            assert!(session.is_alive(), "{mode}");
+        }
+    }
+
+    /// One real server's `tools/list` is a single 3.5 MB line (229 tools).
+    #[test]
+    fn a_tool_list_and_a_result_of_a_few_megabytes_are_accepted() {
+        let mut fixture = Fixture::new("big_list");
+        fixture.cfg.timeout_ms = 20_000;
+        let mut session = McpSession::spawn("big", &fixture.cfg).unwrap();
+        assert_eq!(session.list_tools().unwrap().len(), 20);
+        assert!(session.is_alive());
+        let mut fixture = Fixture::new("big_call");
+        fixture.cfg.timeout_ms = 20_000;
+        let mut session = McpSession::spawn("big-call", &fixture.cfg).unwrap();
+        let result = session.call_tool("echo", serde_json::json!({})).unwrap();
+        assert_eq!(
+            result["content"][0]["text"].as_str().map(str::len),
+            Some(2 * 1024 * 1024)
+        );
+    }
+
+    /// A buffer that is searched again from the start for every 8 KiB read takes seconds at 12 MiB.
+    #[test]
+    fn a_reply_near_the_limit_is_read_in_linear_time() {
+        let mut fixture = Fixture::new("huge_list");
+        fixture.cfg.timeout_ms = 30_000;
+        let mut session = McpSession::spawn("huge", &fixture.cfg).unwrap();
+        let start = Instant::now();
+        assert_eq!(session.list_tools().unwrap().len(), 20);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            start.elapsed()
         );
     }
 
@@ -3030,6 +3376,7 @@ for line in sys.stdin:
             relays_permission: false,
             ended: None,
             peer_closed: false,
+            noise: None,
         };
         set_nonblocking(session.stdin.as_ref().unwrap().as_raw_fd()).unwrap();
         set_nonblocking(session.stdout.as_ref().unwrap().as_raw_fd()).unwrap();

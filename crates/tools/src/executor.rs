@@ -117,7 +117,10 @@ impl<'a> Wave1Executor<'a> {
             );
         let (mut verdict, _sandbox_up) = {
             // evaluate_live: mode/rules semantics + the fallback rule
-            // (no shell sandbox → every Bash command asks).
+            // (no shell sandbox → every Bash command asks), which does not
+            // apply when the operator switched the sandbox off themselves.
+            let sandbox_off = call.name == "Bash"
+                && crate::sandbox::SandboxAdditions::load(&self.cx.home).switched_off();
             crate::permissions::evaluate_live(
                 self.mode,
                 &self.rules,
@@ -125,6 +128,7 @@ impl<'a> Wave1Executor<'a> {
                 &key.pattern,
                 is_ro_tool,
                 is_ro_cmd,
+                sandbox_off,
             )
         };
         // A remembered grant can cover a default ask, never a deny or a

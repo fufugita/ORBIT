@@ -442,7 +442,8 @@ impl RolesConfig {
 /// resolver in tools.rs defaulted to a CWD-relative `.orbit` and silently
 /// disagreed with the rest of ORBIT.
 pub fn resolve_home(args: &[String]) -> std::path::PathBuf {
-    if let Some(h) = args
+    let options = args.split(|arg| arg == "--").next().unwrap_or_default();
+    if let Some(h) = options
         .windows(2)
         .find(|w| w[0] == "--home")
         .map(|w| w[1].clone())

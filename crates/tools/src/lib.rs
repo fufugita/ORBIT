@@ -709,6 +709,45 @@ pub fn is_deny_read(path: &Path) -> bool {
     false
 }
 
+/// ORBIT's own configuration files in the operator's home. They decide what
+/// runs without a sandbox or without asking: hooks, permission rules, the
+/// sandbox's own switch, MCP servers, provider endpoints. The model's file
+/// tools never write them, in any permission mode; the operator edits them
+/// (or uses `/config`).
+const OPERATOR_CONFIG_FILES: &[&str] = &[
+    "settings.toml",
+    "settings.local.toml",
+    "permissions.toml",
+    "permission-overrides.toml",
+    "mcp.json",
+    "providers.toml",
+];
+
+/// Is `path` one of the operator's configuration files in `home`, spelled
+/// any way? Both sides are compared in canonical form — an existing file by
+/// itself, a file still to be created by its directory — so `..` and links
+/// do not help.
+pub fn is_operator_config(path: &Path, home: &Path) -> bool {
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let target = match std::fs::canonicalize(path) {
+        Ok(existing) => existing,
+        Err(_) => {
+            let Some(name) = path.file_name() else {
+                return false;
+            };
+            let parent = path.parent().unwrap_or(Path::new("."));
+            std::fs::canonicalize(parent)
+                .unwrap_or_else(|_| parent.to_path_buf())
+                .join(name)
+        }
+    };
+    target.parent() == Some(home.as_path())
+        && target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| OPERATOR_CONFIG_FILES.contains(&name))
+}
+
 /// Minimal glob matcher for a single path component (`*` wildcard).
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     // '*' matches any run (including none) within one component.

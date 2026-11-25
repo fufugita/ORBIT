@@ -202,6 +202,28 @@ fn usual_response(request: &Request, stream: &mut TcpStream) {
     }
 }
 
+/// A remote server's tool list can be several megabytes too (a 3.5 MB list of 229 tools is real).
+#[test]
+fn a_tool_list_of_several_megabytes_is_accepted_over_http() {
+    let server = Server::new(|request, stream| {
+        if request.body["method"] == "tools/list" {
+            let tools: Vec<Value> = (0..20)
+                .map(|i| {
+                    json!({"name": format!("big-{i}"), "description": "d".repeat(175_000),
+                           "inputSchema": {"type": "object"}})
+                })
+                .collect();
+            rpc_response(stream, request, json!({ "tools": tools }));
+        } else {
+            usual_response(request, stream);
+        }
+    });
+    let mut config = server.config();
+    config.timeout_ms = 20_000;
+    let tools = McpPool::new().list_tools("remote", &config).unwrap();
+    assert_eq!(tools.len(), 20);
+}
+
 #[test]
 fn json_tool_call_and_pagination_share_negotiated_session_headers() {
     let server = Server::new(|request, stream| {
@@ -695,7 +717,7 @@ fn response_framing_and_protocol_limits_retire_without_replay() {
                     "200 OK",
                     "application/json",
                     "",
-                    &vec![b'x'; orbit_mcp::MAX_FRAME_BYTES + 1],
+                    &vec![b'x'; orbit_mcp::MAX_REPLY_BYTES + 1],
                 ),
                 "utf8" => response(stream, "200 OK", "text/event-stream", "", b"data: \xff\n\n"),
                 "wrong-id" => response(

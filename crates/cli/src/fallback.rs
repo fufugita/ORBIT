@@ -18,9 +18,26 @@
 /// reached: rate limit, capacity, timeout, transport.
 const UNAVAILABLE: [&str; 4] = ["E0407", "E0408", "E0409", "E0410"];
 
-/// Set for the fallback run of a resumed conversation: the fork it starts
-/// from ends with the prompt the failed run left unanswered.
+/// Byte length of the normalized prompt on the fallback child's stdin.
+/// A resumed fallback also removes the saved copy of that unanswered prompt.
 pub const RETRY_MARK: &str = "ORBIT_FALLBACK_RETRY";
+pub const STDIN_RETRY_PREFIX: &str = "stdin-v1:";
+pub const SAVED_TAIL_MARK: &str = "ORBIT_FALLBACK_SAVED_TAIL";
+
+/// Identify the exact unanswered message, including hook-added content, at its
+/// saved position. Another process may update the source before the fork opens.
+pub fn saved_tail_identity(history: &[orbit_adapter::types::ChatMessage]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let message = history.last()?;
+    if message.role != orbit_adapter::types::ChatRole::User {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update((history.len() as u64).to_be_bytes());
+    serde_json::to_writer(&mut digest, message).ok()?;
+    Some(hex::encode(digest.finalize()))
+}
 
 /// The fallback model named for this run: `--fallback-model` (carried in
 /// `ORBIT_FALLBACK_MODEL`). Empty means none.
@@ -46,21 +63,26 @@ pub fn applies(failure: &str, final_text: &str, output_tokens: u64, completed_ro
 /// on the fallback model. The first run's model, provider and effort
 /// choices are dropped (they belong to the model that failed), and so are
 /// its session choices: a conversation that was being resumed continues as
-/// a fork, because the failed session keeps its unsettled request.
+/// a fork, because the failed session keeps its unsettled request. An
+/// empty operand leaves a trailing `-p` for the prompt sent over stdin.
 pub fn rerun_arguments(
     prompt: &str,
     args: &[String],
     fallback: &str,
     resumed_session: Option<&str>,
 ) -> Vec<String> {
-    let mut out = vec!["-p".to_owned(), prompt.to_owned()];
+    let mut out = if prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec!["-p".to_owned(), prompt.to_owned()]
+    };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" | "--provider" | "--effort" | "--resume" => {
                 args.next();
             }
-            "--continue" | "--fork-session" => {}
+            "--continue" | "--fork-session" | "--adopt-workspace" => {}
             _ => out.push(arg.clone()),
         }
     }
@@ -72,6 +94,9 @@ pub fn rerun_arguments(
             "--fork-session".to_owned(),
         ]);
     }
+    if prompt.is_empty() {
+        out.push("-p".to_owned());
+    }
     out
 }
 
@@ -79,23 +104,44 @@ pub fn rerun_arguments(
 /// this one's terminal, and return its exit code. The fallback run gets no
 /// fallback of its own.
 pub fn rerun(prompt: &str, args: &[String], fallback: &str, resumed_session: Option<&str>) -> i32 {
-    let binary = match std::env::current_exe() {
-        Ok(binary) => binary,
-        Err(error) => {
-            eprintln!("fallback model {fallback} could not be started: {error}");
-            return 1;
+    rerun_with_saved_tail(prompt, args, fallback, resumed_session, None)
+}
+
+pub fn rerun_with_saved_tail(
+    prompt: &str,
+    args: &[String],
+    fallback: &str,
+    resumed_session: Option<&str>,
+    saved_tail: Option<&str>,
+) -> i32 {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let run = || -> std::io::Result<std::process::ExitStatus> {
+        let mut child = Command::new(std::env::current_exe()?)
+            .args(rerun_arguments("", args, fallback, resumed_session))
+            .stdin(Stdio::piped())
+            .env(RETRY_MARK, format!("{STDIN_RETRY_PREFIX}{}", prompt.len()))
+            .env_remove(SAVED_TAIL_MARK)
+            .envs(saved_tail.map(|identity| (SAVED_TAIL_MARK, identity)))
+            .env_remove("ORBIT_FALLBACK_MODEL")
+            .env_remove("ORBIT_MODEL")
+            // Setup hooks ran once, in this process.
+            .env_remove("ORBIT_SETUP_TRIGGER")
+            .env_remove("ORBIT_SETUP_ONLY")
+            .spawn()?;
+        let sent = child
+            .stdin
+            .take()
+            .expect("piped fallback stdin")
+            .write_all(prompt.as_bytes());
+        let status = child.wait()?;
+        if status.success() {
+            sent?;
         }
+        Ok(status)
     };
-    match std::process::Command::new(binary)
-        .args(rerun_arguments(prompt, args, fallback, resumed_session))
-        .env_remove("ORBIT_FALLBACK_MODEL")
-        .env_remove("ORBIT_MODEL")
-        // `--init` ran its Setup hooks once, in this process.
-        .env_remove("ORBIT_SETUP_TRIGGER")
-        .env_remove("ORBIT_SETUP_ONLY")
-        .envs(resumed_session.map(|_| (RETRY_MARK, "1")))
-        .status()
-    {
+    match run() {
         Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
             eprintln!("fallback model {fallback} could not be started: {error}");
@@ -208,6 +254,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resumed_fallback_identity_tracks_the_saved_user_message_and_its_position() {
+        let user = orbit_engine::user_message("prompt\n\n<hook-context>\none\n</hook-context>");
+        let saved = saved_tail_identity(std::slice::from_ref(&user)).unwrap();
+        let edited = orbit_engine::user_message("prompt\n\n<hook-context>\ntwo\n</hook-context>");
+        assert_ne!(saved_tail_identity(&[edited]), Some(saved.clone()));
+        assert_ne!(saved_tail_identity(&[user.clone(), user]), Some(saved));
+        assert!(saved_tail_identity(&[orbit_engine::assistant_message("answer")]).is_none());
+    }
+
+    #[test]
     fn the_fallback_chat_keeps_the_options_and_moves_to_the_fork() {
         let args: Vec<String> = [
             "chat",
@@ -256,6 +312,10 @@ mod tests {
 
     #[test]
     fn the_fallback_run_keeps_the_options_and_drops_the_failed_models_choices() {
+        assert_eq!(
+            rerun_arguments("--help", &[], "small", None),
+            ["-p", "--help", "--model", "small"]
+        );
         let args: Vec<String> = [
             "--home",
             "/h",
@@ -276,10 +336,8 @@ mod tests {
         .map(|arg| (*arg).to_owned())
         .collect();
         assert_eq!(
-            rerun_arguments("fix --model it", &args, "p/small", None),
+            rerun_arguments("", &args, "p/small", None),
             [
-                "-p",
-                "fix --model it",
                 "--home",
                 "/h",
                 "--output-format",
@@ -288,25 +346,25 @@ mod tests {
                 "4",
                 "--auto-tools",
                 "--model",
-                "p/small"
+                "p/small",
+                "-p"
             ]
         );
         let resumed = rerun_arguments(
-            "go",
-            &["--resume".into(), "s-1".into()],
+            "",
+            &["--resume".into(), "s-1".into(), "--adopt-workspace".into()],
             "small",
             Some("s-1"),
         );
         assert_eq!(
             resumed,
             [
-                "-p",
-                "go",
                 "--model",
                 "small",
                 "--resume",
                 "s-1",
-                "--fork-session"
+                "--fork-session",
+                "-p"
             ]
         );
     }

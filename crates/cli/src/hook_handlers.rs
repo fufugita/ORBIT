@@ -480,6 +480,7 @@ mod tests {
             run_async: false,
             http: None,
             handler: Some(handler),
+            origin: None,
         }
     }
 
@@ -530,6 +531,7 @@ mod tests {
                 model: None,
             })],
             project_trusted: false,
+            context_limit: None,
         };
         let fire = || hooks.fire(orbit_engine::hooks::HookEvent::Stop, &serde_json::json!({}));
         let _parent_scope = orbit_engine::hooks::handler_runner_scope(runner(&home, &parent));

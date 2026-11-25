@@ -65,6 +65,20 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // An imported plugin's stored copy is read-only; open it so it can be removed.
+        fn open(path: &Path) {
+            if let Ok(meta) = std::fs::symlink_metadata(path)
+                && meta.is_dir()
+            {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        open(&entry.path());
+                    }
+                }
+            }
+        }
+        open(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -257,6 +271,306 @@ fn malformed_lsp_toml_is_visible() {
     let f = Fixture::new();
     f.write("lsp.toml", b"[broken");
     assert_eq!(f.status("lsp"), CheckStatus::Invalid);
+}
+fn hook_checks(report: &DoctorReport) -> Vec<&DoctorCheck> {
+    report
+        .checks
+        .iter()
+        .filter(|c| c.id.starts_with("hooks."))
+        .collect()
+}
+#[test]
+fn regular_expression_hook_matchers_are_checked_and_nothing_is_run() {
+    let f = Fixture::new();
+    let baseline = f.report();
+    assert!(
+        hook_checks(&baseline).is_empty(),
+        "no hooks: nothing to say"
+    );
+    // Working patterns and plain name lists are fine.
+    f.write(
+        "settings.toml",
+        "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"WebSearch|WebFetch|mcp__.*(exa|tavily)\"\ncommand = \"a\"\n\n\
+         [[hooks]]\nevent = \"SessionStart\"\nmatcher = \"^(startup|resume)$\"\ncommand = \"b\"\n\n\
+         [[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Write|Edit\"\ncommand = \"c\"\n",
+    );
+    let good = f.report();
+    let summary = good
+        .checks
+        .iter()
+        .find(|c| c.id == "hooks.matchers")
+        .expect("a summary once a hook uses a regular expression");
+    assert_eq!(summary.status, CheckStatus::Configured);
+    assert!(
+        summary.detail.contains("2 regular-expression matchers"),
+        "{}",
+        summary.detail
+    );
+    assert!(!summary.required);
+    assert_eq!(hook_checks(&good).len(), 1);
+    // A pattern that does not compile is named, with the reason; readiness is not its call.
+    f.write(
+        "settings.toml",
+        "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"mcp__.*(exa\"\ncommand = \"/opt/guards/egress.sh\"\n\n\
+         [[hooks]]\nevent = \"SessionStart\"\nmatcher = \"^(startup|resume)$\"\ncommand = \"b\"\n",
+    );
+    let bad = f.report();
+    let summary = bad
+        .checks
+        .iter()
+        .find(|c| c.id == "hooks.matchers")
+        .unwrap();
+    assert_eq!(summary.status, CheckStatus::Invalid);
+    assert!(!summary.required);
+    let broken = bad
+        .checks
+        .iter()
+        .find(|c| c.id == "hooks.matchers.0")
+        .expect("one check per broken matcher");
+    assert_eq!(broken.status, CheckStatus::Invalid);
+    assert!(!broken.required);
+    for part in ["PreToolUse", "mcp__.*(exa", "unclosed group"] {
+        assert!(broken.detail.contains(part), "{part}: {}", broken.detail);
+    }
+    assert!(
+        !broken.detail.contains("egress.sh"),
+        "a hook's command stays out of a report people paste: {}",
+        broken.detail
+    );
+    assert_eq!(bad.ready, baseline.ready);
+}
+/// Import a Claude plugin that has this `hooks/hooks.json` into the fixture's home, enabled.
+fn import_plugin(f: &Fixture, name: &str, hooks: &str) {
+    use orbit_plugin_compat::{InspectOptions, PluginFormat, PluginStore, StoreScope};
+    let source = f.root.join(format!("source-{name}"));
+    std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(source.join("hooks")).unwrap();
+    std::fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        format!(r#"{{"name":"{name}","description":"d"}}"#),
+    )
+    .unwrap();
+    std::fs::write(source.join("hooks/hooks.json"), hooks).unwrap();
+    PluginStore::open(&f.home, &f.workspace, false)
+        .unwrap()
+        .import(
+            &source,
+            &InspectOptions {
+                format: Some(PluginFormat::Claude),
+                ..InspectOptions::default()
+            },
+            StoreScope::User,
+            true,
+        )
+        .unwrap();
+}
+fn plugin_hook_checks(report: &DoctorReport) -> Vec<&DoctorCheck> {
+    report
+        .checks
+        .iter()
+        .filter(|c| c.id.starts_with("plugins.hooks"))
+        .collect()
+}
+fn check<'a>(report: &'a DoctorReport, id: &str) -> &'a DoctorCheck {
+    report
+        .checks
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("no check {id}: {:?}", plugin_hook_checks(report)))
+}
+#[test]
+fn the_hooks_of_named_plugins_are_reported_and_nothing_is_run() {
+    let f = Fixture::new();
+    let baseline = f.report();
+    assert!(
+        plugin_hook_checks(&baseline).is_empty(),
+        "no plugin named: nothing to say"
+    );
+    import_plugin(
+        &f,
+        "hookify",
+        r#"{"hooks":{
+          "PreToolUse":[{"matcher":"Write|Edit","hooks":[{"type":"command","command":"echo SECRET-ONE"}]}],
+          "Stop":[{"hooks":[{"type":"command","command":"echo SECRET-TWO"}]}]}}"#,
+    );
+    assert!(
+        plugin_hook_checks(&f.report()).is_empty(),
+        "imported but not named: its hooks stay off and doctor stays quiet"
+    );
+    f.write("settings.toml", "plugin_hooks = [\"hookify\"]\n");
+    let report = f.report();
+    let summary = check(&report, "plugins.hooks");
+    assert_eq!(summary.status, CheckStatus::Configured);
+    assert!(!summary.required);
+    for part in ["1 plugin named", "2 command hooks run", "no hook was run"] {
+        assert!(summary.detail.contains(part), "{part}: {}", summary.detail);
+    }
+    let line = check(&report, "plugins.hooks.0");
+    assert_eq!(line.status, CheckStatus::Configured);
+    for part in ["hookify", "2 command hooks", "PreToolUse", "Stop"] {
+        assert!(line.detail.contains(part), "{part}: {}", line.detail);
+    }
+    for c in plugin_hook_checks(&report) {
+        assert!(
+            !c.detail.contains("SECRET"),
+            "a hook's command stays out of a report people paste: {}",
+            c.detail
+        );
+    }
+    assert_eq!(report.ready, baseline.ready, "readiness is not its call");
+}
+#[test]
+fn what_a_named_plugin_leaves_out_or_lacks_is_named() {
+    let f = Fixture::new();
+    import_plugin(
+        &f,
+        "rewaker",
+        r#"{"hooks":{
+          "Stop":[{"hooks":[{"type":"command","command":"echo a","asyncRewake":true}]}],
+          "PostToolUse":[{"hooks":[{"type":"command","command":"echo c","asyncRewake":true}]}],
+          "SessionStart":[{"hooks":[{"type":"command","command":"echo b"},{"type":"command","command":"echo d"}]}]}}"#,
+    );
+    let baseline = f.report();
+    f.write("settings.toml", "plugin_hooks = [\"rewaker\", \"ghost\"]\n");
+    let report = f.report();
+    assert_eq!(
+        report.ready, baseline.ready,
+        "a plugin that does not run is not a reason for ORBIT to call itself not ready"
+    );
+    let summary = check(&report, "plugins.hooks");
+    assert_eq!(summary.status, CheckStatus::Invalid);
+    assert!(!summary.required);
+    for part in [
+        "2 plugins named",
+        "2 command hooks run",
+        "2 left out",
+        "1 plugin does not run",
+    ] {
+        assert!(summary.detail.contains(part), "{part}: {}", summary.detail);
+    }
+    let rewaker = check(&report, "plugins.hooks.0");
+    assert_eq!(rewaker.status, CheckStatus::Invalid);
+    for part in ["rewaker", "2 command hooks: SessionStart ×2", "2 left out"] {
+        assert!(rewaker.detail.contains(part), "{part}: {}", rewaker.detail);
+    }
+    // Hooks left out for the same reason share one line, at the events they were declared on.
+    let left_out = check(&report, "plugins.hooks.0.left_out.0");
+    assert_eq!(left_out.status, CheckStatus::Invalid);
+    assert!(!left_out.required);
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|c| c.id != "plugins.hooks.0.left_out.1"),
+        "one reason, one line"
+    );
+    for part in [
+        "rewaker",
+        "left out 2 hooks",
+        "PostToolUse",
+        "Stop",
+        "asyncRewake",
+    ] {
+        assert!(
+            left_out.detail.contains(part),
+            "{part}: {}",
+            left_out.detail
+        );
+    }
+    let ghost = check(&report, "plugins.hooks.1");
+    assert_eq!(ghost.status, CheckStatus::Invalid);
+    assert!(
+        ghost.detail.contains("ghost") && ghost.detail.contains("not imported"),
+        "{}",
+        ghost.detail
+    );
+    // A setting that is not a list is a fault in the setting, not a plugin.
+    f.write("settings.toml", "plugin_hooks = \"rewaker\"\n");
+    let report = f.report();
+    let setting = check(&report, "plugins.hooks.setting.0");
+    assert_eq!(setting.status, CheckStatus::Invalid);
+    assert!(
+        setting.detail.contains("list of plugin names"),
+        "{}",
+        setting.detail
+    );
+    assert_eq!(check(&report, "plugins.hooks").status, CheckStatus::Invalid);
+    // A project cannot name a plugin: its settings are not read for this.
+    f.write("settings.toml", "");
+    std::fs::create_dir(f.workspace.join(".orbit")).unwrap();
+    std::fs::write(
+        f.workspace.join(".orbit/settings.toml"),
+        "plugin_hooks = [\"rewaker\"]\n",
+    )
+    .unwrap();
+    orbit_tools::permissions::FolderTrust::new(f.home.clone())
+        .trust(&f.workspace)
+        .unwrap();
+    assert!(
+        plugin_hook_checks(&f.report()).is_empty(),
+        "a trusted project's settings still cannot switch a plugin's hooks on"
+    );
+}
+#[test]
+fn a_long_list_of_hooks_left_out_stays_inside_the_report() {
+    // Fourteen hooks at events ORBIT does not have: fourteen reasons. The report holds 128 checks and
+    // calls itself not ready past that, so a plugin cannot be allowed to fill it.
+    let f = Fixture::new();
+    let events: Vec<String> = (0..14)
+        .map(|n| {
+            format!(r#""NoSuchEvent{n}":[{{"hooks":[{{"type":"command","command":"echo x"}}]}}]"#)
+        })
+        .collect();
+    import_plugin(
+        &f,
+        "many",
+        &format!(r#"{{"hooks":{{{}}}}}"#, events.join(",")),
+    );
+    let baseline = f.report();
+    f.write("settings.toml", "plugin_hooks = [\"many\"]\n");
+    let report = f.report();
+    let lines = report
+        .checks
+        .iter()
+        .filter(|c| c.id.starts_with("plugins.hooks.0.left_out."))
+        .count();
+    assert_eq!(
+        lines, 12,
+        "twelve lines, then a line that says there are more"
+    );
+    let more = check(&report, "plugins.hooks.left_out.more");
+    assert!(
+        more.detail.contains("2 more hooks left out"),
+        "{}",
+        more.detail
+    );
+    assert!(!more.required);
+    assert!(report.checks.len() < 128);
+    assert_eq!(report.ready, baseline.ready);
+    assert!(
+        check(&report, "plugins.hooks")
+            .detail
+            .contains("14 left out"),
+        "the summary counts them all"
+    );
+}
+#[test]
+fn a_projects_hook_matchers_are_checked_only_when_the_folder_is_trusted() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.workspace.join(".orbit")).unwrap();
+    std::fs::write(
+        f.workspace.join(".orbit/settings.toml"),
+        "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"^(zzproject\"\ncommand = \"x\"\n",
+    )
+    .unwrap();
+    assert!(
+        hook_checks(&f.report()).is_empty(),
+        "an untrusted folder's hooks are not read"
+    );
+    orbit_tools::permissions::FolderTrust::new(f.home.clone())
+        .trust(&f.workspace)
+        .unwrap();
+    assert_eq!(f.status("hooks.matchers.0"), CheckStatus::Invalid);
 }
 #[test]
 fn malformed_profile_does_not_reset_file() {
@@ -1925,5 +2239,112 @@ fn normal_cli_doctor_selects_private_home_and_reports_retry_policy() {
             assert!(human.contains("retry.policy: configured"));
             assert!(human.contains(policy.detail.as_str()));
         },
+    );
+}
+
+fn instruction_checks(report: &DoctorReport) -> Vec<&DoctorCheck> {
+    report
+        .checks
+        .iter()
+        .filter(|c| c.id == "instructions" || c.id.starts_with("instructions."))
+        .collect()
+}
+
+#[test]
+fn instruction_files_are_summarised_and_a_cut_one_is_named_without_its_text() {
+    let f = Fixture::new();
+    assert!(
+        instruction_checks(&f.report()).is_empty(),
+        "no files: nothing to say"
+    );
+    std::fs::write(f.workspace.join("AGENTS.md"), "short\n").unwrap();
+    let ok = f.report();
+    let summary = ok
+        .checks
+        .iter()
+        .find(|c| c.id == "instructions")
+        .expect("a summary once a file is read");
+    assert_eq!(summary.status, CheckStatus::Configured);
+    assert!(!summary.required);
+    assert!(
+        summary.detail.contains("1 instruction file"),
+        "{}",
+        summary.detail
+    );
+    assert_eq!(instruction_checks(&ok).len(), 1);
+    // A file over the cap is named, with the numbers; the operator's rules are what is cut.
+    let many: String = (1..=231).map(|n| format!("rule {n}\n")).collect();
+    std::fs::write(f.workspace.join("CLAUDE.md"), &many).unwrap();
+    let cut = f.report();
+    let summary = cut.checks.iter().find(|c| c.id == "instructions").unwrap();
+    assert_eq!(summary.status, CheckStatus::Invalid);
+    assert!(!summary.required);
+    let named = cut
+        .checks
+        .iter()
+        .find(|c| c.id == "instructions.0")
+        .expect("one check per cut file");
+    assert_eq!(named.status, CheckStatus::Invalid);
+    assert!(!named.required);
+    for part in ["CLAUDE.md", "231", "200"] {
+        assert!(named.detail.contains(part), "{part}: {}", named.detail);
+    }
+    assert!(
+        !named.detail.contains("rule 5"),
+        "contents are never shown: {}",
+        named.detail
+    );
+    assert_eq!(cut.ready, ok.ready, "readiness is not this check's call");
+}
+
+/// A link that leads to a key, or out of the project, is a file the operator expects to be read and
+/// is not: doctor says so, and counts it apart from the files that are read.
+#[test]
+fn a_refused_instruction_file_is_named_and_not_counted_as_read() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.root.join("outside")).unwrap();
+    std::fs::write(f.root.join("outside/id_rsa_made_up"), "MADE-UP KEY\n").unwrap();
+    std::os::unix::fs::symlink("../outside/id_rsa_made_up", f.workspace.join("CLAUDE.md")).unwrap();
+    let alone = f.report();
+    let summary = alone
+        .checks
+        .iter()
+        .find(|c| c.id == "instructions")
+        .expect("a refused file is not nothing: the summary is there");
+    assert_eq!(summary.status, CheckStatus::Invalid);
+    assert!(!summary.required);
+    assert!(
+        summary.detail.contains("0 instruction files read")
+            && summary.detail.contains("1 not read"),
+        "{}",
+        summary.detail
+    );
+    std::fs::write(f.workspace.join("AGENTS.md"), "short\n").unwrap();
+    let both = f.report();
+    let summary = both.checks.iter().find(|c| c.id == "instructions").unwrap();
+    assert_eq!(summary.status, CheckStatus::Invalid);
+    assert!(
+        summary.detail.contains("1 instruction file read") && summary.detail.contains("1 not read"),
+        "{}",
+        summary.detail
+    );
+    let named = both
+        .checks
+        .iter()
+        .find(|c| c.id == "instructions.0")
+        .expect("one check per file with a problem");
+    assert_eq!(named.status, CheckStatus::Invalid);
+    assert!(!named.required);
+    for part in ["CLAUDE.md", "is not read", "deny-read"] {
+        assert!(named.detail.contains(part), "{part}: {}", named.detail);
+    }
+    assert!(
+        !named.detail.contains("MADE-UP KEY"),
+        "contents are never shown: {}",
+        named.detail
+    );
+    assert_eq!(
+        both.ready, alone.ready,
+        "readiness is not this check's call"
     );
 }

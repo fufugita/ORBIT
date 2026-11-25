@@ -60,12 +60,83 @@ fn help_exposes_supported_migration_and_session_controls() {
         "completions bash|zsh|fish",
         "--bare",
         "--worktree",
+        "--print",
         "--permission-mode",
         "--fallback-model",
         "--channels",
         "--channel-permissions",
     ] {
         assert!(help.contains(option), "missing supported control: {option}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn print_alias_owns_its_prompt_before_dispatch() {
+    use std::process::Stdio;
+
+    let fixture = OutputFixture::new();
+    for flag in ["-p", "--print"] {
+        for prompt in ["a prompt", "--help", "--init-only", "compact", "recovery"] {
+            let output = fixture.run(&[flag, prompt], Stdio::piped());
+            // The isolated home is uninitialized. Reaching that headless
+            // check proves the operand didn't run a command, hook, or help.
+            assert_eq!(output.status.code(), Some(1), "{flag} {prompt}");
+            assert!(output.stdout.is_empty(), "{flag} {prompt}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("ORBIT-E0706"),
+                "{flag} {prompt}: {output:?}"
+            );
+        }
+        let missing = fixture.run(&[flag], Stdio::piped());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("requires a prompt"));
+        for (command, subcommand) in [("provider", "role"), ("mcp", "add")] {
+            let expected = fixture.run(&[command, subcommand, "--help"], Stdio::piped());
+            let nested = fixture.run(&[command, subcommand, flag, "--help"], Stdio::piped());
+            assert!(nested.status.success(), "{command} {flag}: {nested:?}");
+            assert_eq!(nested.stdout, expected.stdout);
+        }
+        let plugin = fixture.run(&["plugin", flag, "--help"], Stdio::piped());
+        assert!(String::from_utf8_lossy(&plugin.stderr).contains("unknown plugin operation"));
+    }
+    let help = fixture.run(&["help", "--json"], Stdio::piped());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--print"));
+}
+
+#[cfg(unix)]
+#[test]
+fn private_fallback_input_requires_its_argv_shape_and_exact_length() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let fixture = OutputFixture::new();
+    let run = |args: &[&str], marker: &str, stdin: &[u8]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_orbit"))
+            .args(args)
+            .env_clear()
+            .env("ORBIT_HOME", fixture.root.join("home"))
+            .env(orbit_cli::fallback::RETRY_MARK, marker)
+            .current_dir(&fixture.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        String::from_utf8(child.wait_with_output().unwrap().stderr).unwrap()
+    };
+    let full = format!(
+        "<piped-input>\n{}\n</piped-input>\n\n--literal   ",
+        "x".repeat(1024 * 1024)
+    );
+    let marker = format!("{}{}", orbit_cli::fallback::STDIN_RETRY_PREFIX, full.len());
+    assert!(run(&["-p"], &marker, full.as_bytes()).contains("ORBIT-E0706"));
+    assert!(run(&["-p"], &marker, b"short").contains("incorrect fallback prompt length"));
+    assert!(
+        run(&["-p"], "stdin-v1:18446744073709551615", b"").contains("invalid fallback prompt size")
+    );
+    for marker in ["1", "stdin-v1:42"] {
+        assert!(run(&["-p", "explicit prompt"], marker, b"").contains("ORBIT-E0706"));
     }
 }
 
@@ -193,6 +264,65 @@ fn local_cli_output_reports_real_io_errors_without_a_print_panic() {
 }
 
 #[cfg(unix)]
+#[test]
+fn mcp_add_preserves_server_arguments_after_the_separator() {
+    use std::process::Stdio;
+
+    let fixture = OutputFixture::new();
+    let help = fixture.run(
+        &["mcp", "add", "fixture", "fixture-server", "--help"],
+        Stdio::piped(),
+    );
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).starts_with("orbit mcp list"));
+    assert!(!fixture.root.join("home/mcp.json").exists());
+
+    let explicit_home = fixture.root.join("explicit-home");
+    for (home, mut args) in [
+        (fixture.root.join("home"), vec![]),
+        (
+            explicit_home.clone(),
+            vec!["--home", explicit_home.to_str().unwrap()],
+        ),
+    ] {
+        let server_args = ["--help", "-h", "--home", "server-home", "--json", "--print"];
+        args.extend(["mcp", "add", "fixture", "--", "fixture-server"]);
+        args.extend(server_args);
+        let output = fixture.run(&args, Stdio::piped());
+        assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("Added"));
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(config["servers"]["fixture"]["command"], "fixture-server");
+        assert_eq!(
+            config["servers"]["fixture"]["args"],
+            serde_json::json!(server_args)
+        );
+    }
+    assert!(!fixture.root.join("server-home").exists());
+}
+
+#[test]
+fn mcp_help_lists_its_own_operations() {
+    for args in [
+        &["mcp", "--help"][..],
+        &["mcp", "add", "--help"],
+        &["mcp", "remove", "-h"],
+    ] {
+        let output = orbit(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.starts_with("orbit mcp list"), "{help}");
+        assert!(help.contains("orbit mcp add"));
+    }
+    let output = orbit(&["mcp", "add", "--help", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let help: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(help["command"], "mcp help");
+}
+
+#[cfg(unix)]
 struct SetupFixture {
     root: std::path::PathBuf,
     home: std::path::PathBuf,
@@ -219,6 +349,10 @@ impl SetupFixture {
     }
 
     fn assert_setup(&self, args: &[&str], hook_runs: bool) {
+        self.assert_setup_with_input(args, std::process::Stdio::null(), hook_runs);
+    }
+
+    fn assert_setup_with_input(&self, args: &[&str], input: std::process::Stdio, hook_runs: bool) {
         use std::process::Stdio;
         use std::time::{Duration, Instant};
 
@@ -230,7 +364,7 @@ impl SetupFixture {
             .env("HOME", &self.root)
             .env("ORBIT_HOME", &self.home)
             .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::null())
+            .stdin(input)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -298,6 +432,100 @@ fn bare_flag_suppresses_setup_hooks_before_every_harness_entry() {
 
 #[cfg(unix)]
 #[test]
+fn piped_input_resolves_bare_flag_before_setup() {
+    use std::io::Write;
+
+    let fixture = SetupFixture::new();
+    for (args, input, hook_runs) in [
+        (vec!["--init-only", "-p", "--bare"], "piped prompt", false),
+        (vec!["--init-only", "--bare", "-p"], "piped prompt", false),
+        (
+            vec!["--init-only", "-p", "--output-format", "json", "--bare"],
+            "piped prompt",
+            false,
+        ),
+        (vec!["--init-only", "-p", "--bare"], "", true),
+    ] {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(input.as_bytes()).unwrap();
+        drop(writer);
+        fixture.assert_setup_with_input(&args, reader.into(), hook_runs);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn oversized_piped_input_is_refused_before_setup_hooks_can_run() {
+    use std::process::Stdio;
+
+    let fixture = SetupFixture::new();
+    // One byte past the 1 MiB limit on piped input, redirected from a file.
+    let oversized = fixture.root.join("oversized-input");
+    std::fs::write(&oversized, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    for args in [
+        vec!["--init", "-p", "--bare"],
+        vec!["--init-only", "-p", "--bare"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_orbit"))
+            .args(&args)
+            .current_dir(&fixture.root)
+            .env_clear()
+            .env("HOME", &fixture.root)
+            .env("ORBIT_HOME", &fixture.home)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::from(std::fs::File::open(&oversized).unwrap()))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains("ORBIT-E1101"), "{args:?}: {stderr}");
+        assert!(
+            !fixture.root.join("setup-hook-ran").exists(),
+            "an input error ran the Setup hook: {args:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_print_flag_before_recovery_words_is_refused_before_setup_hooks_can_run() {
+    use std::process::Stdio;
+
+    let fixture = SetupFixture::new();
+    for flag in ["-p", "--print"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_orbit"))
+            .args([
+                "--init-only",
+                flag,
+                "a prompt",
+                "recovery",
+                "status",
+                "--session",
+                "owner",
+            ])
+            .current_dir(&fixture.root)
+            .env_clear()
+            .env("HOME", &fixture.root)
+            .env("ORBIT_HOME", &fixture.home)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{flag}: {stderr}");
+        assert!(
+            stderr.starts_with("ORBIT-E1101: recovery_status_usage"),
+            "{flag}: {stderr}"
+        );
+        assert!(
+            !fixture.root.join("setup-hook-ran").exists(),
+            "{flag}: the invalid command ran the Setup hook"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn bare_words_in_prompt_settings_or_downstream_arguments_do_not_suppress_setup() {
     for args in [
         vec!["--init-only", "-p", "--bare"],
@@ -316,5 +544,33 @@ fn bare_words_in_prompt_settings_or_downstream_arguments_do_not_suppress_setup()
     ] {
         let fixture = SetupFixture::new();
         fixture.assert_setup(&args, true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_resolves_the_home_option_around_a_flag_looking_print_operand() {
+    let fixture = SetupFixture::new();
+    for flag in ["--print", "-p"] {
+        fixture.assert_setup(
+            &[
+                "--init-only",
+                flag,
+                "--home",
+                "--home",
+                fixture.home.to_str().unwrap(),
+            ],
+            true,
+        );
+        fixture.assert_setup(
+            &[
+                "--init-only",
+                flag,
+                "--",
+                "--home",
+                fixture.root.to_str().unwrap(),
+            ],
+            false,
+        );
     }
 }

@@ -202,17 +202,69 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if bare_startup_requested(&args) {
+    let setup_trigger = std::env::var("ORBIT_SETUP_TRIGGER");
+    // The parent sends the already assembled fallback prompt on a private
+    // stdin pipe. Consume its byte count before starting hooks or tools.
+    let retry_marker = std::env::var(orbit_cli::fallback::RETRY_MARK).ok();
+    let fallback_tail = std::env::var(orbit_cli::fallback::SAVED_TAIL_MARK).ok();
+    // SAFETY: startup is still single-threaded.
+    unsafe {
+        std::env::remove_var(orbit_cli::fallback::RETRY_MARK);
+        std::env::remove_var(orbit_cli::fallback::SAVED_TAIL_MARK);
+    }
+    let headless_index = headless_prompt_index(&args);
+    let fallback_prompt_size = retry_marker
+        .as_deref()
+        .and_then(|value| value.strip_prefix(orbit_cli::fallback::STDIN_RETRY_PREFIX))
+        .filter(|_| {
+            headless_index.is_some_and(|index| index + 1 == args.len() && args[index] == "-p")
+        });
+    let bare = bare_startup_requested(&args);
+    // A long option after -p can be either the prompt or a real flag, depending
+    // on stdin. Resolve it before Setup if it could change bare mode or
+    // the settings directory, and reuse the result so input is read once.
+    let prepared_headless = if !bare && setup_trigger.is_ok() {
+        headless_index
+            .filter(|&index| {
+                let tail = &args[index + 1..];
+                tail.first().is_some_and(|arg| {
+                    matches!(arg.as_str(), "--" | "--home")
+                        || (arg.starts_with("--") && tail.iter().any(|arg| arg == "--bare"))
+                })
+            })
+            .map(|_| headless_arguments_with_input(&args, fallback_prompt_size))
+    } else {
+        None
+    };
+    // An input error ends the run before bare mode or Setup is decided from
+    // arguments that never resolved.
+    if let Some(Err(error)) = &prepared_headless {
+        eprintln!("ORBIT-E1101: {error}");
+        std::process::exit(1);
+    }
+    if bare
+        || prepared_headless
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|arguments| arguments[1..].iter().any(|arg| arg == "--bare"))
+    {
         tools::enable_bare_mode();
     }
+    // Both print spellings keep their operand opaque to this selection, so a
+    // prompt that spells a command word is never dispatched, while a command
+    // word after the prompt still reaches the recovery grammar before Setup.
     if let Some(code) = orbit_cli::recovery_commands::try_run(&args) {
         std::process::exit(code);
     }
     // `--init`, `--init-only`, `--maintenance`: the Setup hooks run once,
     // before anything else starts. They are observational: a failing hook
     // is reported and the session still starts.
-    if let Ok(trigger) = std::env::var("ORBIT_SETUP_TRIGGER") {
-        let home = config::resolve_home(&args);
+    if let Ok(trigger) = setup_trigger {
+        let setup_options = prepared_headless
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map_or(args.as_slice(), |parsed| &parsed[1..]);
+        let home = config::resolve_home(setup_options);
         let hooks =
             orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
         for outcome in hooks.fire(
@@ -229,7 +281,7 @@ fn main() {
     }
     // Local compaction has its own complete grammar, including rejection of
     // help/prompt/model overrides before any ownership or discovery effects.
-    if positionals(&args).first().copied() == Some("compact") {
+    if headless_index.is_none() && positionals(&args).first().copied() == Some("compact") {
         std::process::exit(cmd_compact(&args));
     }
 
@@ -253,31 +305,38 @@ fn main() {
     let wants_chat = args.is_empty() || first_word == Some("chat") || first_word.is_none();
     // A prompt is arbitrary text. Only a top-level -p selects headless mode;
     // operands of local commands cannot change the execution path.
-    if headless_prompt_index(&args).is_some() {
-        let headless = match headless_arguments_with_input(&args) {
+    if headless_index.is_some() {
+        let headless = match prepared_headless
+            .unwrap_or_else(|| headless_arguments_with_input(&args, fallback_prompt_size))
+        {
             Ok(arguments) => arguments,
             Err(error) => {
                 eprintln!("ORBIT-E1101: {error}");
                 std::process::exit(1);
             }
         };
-        std::process::exit(cmd_headless(&headless));
+        let retry = fallback_prompt_size.is_some() || retry_marker.as_deref() == Some("1");
+        std::process::exit(cmd_headless(
+            &headless,
+            retry,
+            fallback_prompt_size.and(fallback_tail.as_deref()),
+        ));
     }
     // C1: `--help`/`-h` print HUMAN help (exit 0); `--version` prints the
     // version line. The machine-readable forms stay on the verbs:
     // `orbit help --json` and `orbit version` (JSON).
     // `orbit provider --help` (and `orbit provider role --help`): the
     // provider commands, not the whole program's help.
-    if first_word == Some("provider")
-        && !args.iter().any(|a| a == "--json")
-        && args.iter().any(|a| a == "--help" || a == "-h")
-    {
+    let options = args.split(|arg| arg == "--").next().unwrap_or_default();
+    let help = options.iter().any(|arg| arg == "--help" || arg == "-h");
+    let json = options.iter().any(|arg| arg == "--json");
+    if first_word == Some("provider") && !json && help {
         std::process::exit(write_cli_output(0, |output| {
             writeln!(output, "{PROVIDER_USAGE}")
         }));
     }
-    if first_word != Some("plugin") && args.iter().any(|a| a == "--help" || a == "-h") {
-        let code = if args.iter().any(|a| a == "--json") {
+    if !matches!(first_word, Some("plugin" | "mcp")) && help {
+        let code = if json {
             let value = dispatch(&["help".into(), "--json".into()]).expect("static help command");
             write_cli_output(0, |output| {
                 writeln!(
@@ -352,13 +411,7 @@ fn main() {
                 orbit_cli::configuration_ui::human_report(&v)
             } else if command == "plugin" && !args.iter().any(|arg| arg == "--json") {
                 orbit_cli::plugin_commands::human_report(&v)
-            } else if command == "mcp"
-                // After `--` the words are the server's command line.
-                && !args
-                    .iter()
-                    .take_while(|arg| *arg != "--")
-                    .any(|arg| arg == "--json")
-            {
+            } else if command == "mcp" && !json {
                 orbit_cli::mcp_commands::human_report(&v)
             } else if human {
                 orbit_cli::cli_release_commands::human_report(&v)
@@ -492,7 +545,7 @@ fn print_human_help(output: &mut dyn Write) -> std::io::Result<()> {
             "preserve an inactive root session in a new private directory",
         ),
         (
-            "-p PROMPT",
+            "-p, --print [PROMPT]",
             "headless one-shot with tools (stream-json output)",
         ),
         ("web", "start the browser harness (orbit-web bridge)"),
@@ -775,7 +828,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "compact --session ID [--home PATH] [--json]  compact an inactive saved session",
                 "recovery status --session ID [--child CHILD] [--json]  inspect existing accounting without replay",
                 "recovery export --session ID --expect-revision REV --expect-inspection DIGEST --to DIR [--json]  preserve an inactive root session",
-                "-p PROMPT     headless one-shot with tools (stream-json output)",
+                "-p, --print [PROMPT]  headless one-shot with tools (stream-json output)",
                 "run           run the example phase chain",
                 "cancel        cancel the session (terminal: cancelled)",
                 "verify-ledger verify the Ledger hash chain",
@@ -825,6 +878,10 @@ fn command_tail(args: &[String]) -> Result<Vec<String>, (&'static str, String)> 
     let mut seen_home = false;
     let mut index = 0;
     while index < args.len() {
+        if args[index] == "--" {
+            tail.extend_from_slice(&args[index..]);
+            break;
+        }
         if args[index] == "--home" {
             if seen_home
                 || args
@@ -2288,6 +2345,7 @@ fn owned_startup_session_with_origin(
     args: &[String],
     kind: &str,
     fresh_id: &str,
+    fallback_tail: Option<&str>,
 ) -> Result<
     (
         sessions::SessionLease,
@@ -2353,6 +2411,16 @@ fn owned_startup_session_with_origin(
         sessions::SessionLease::acquire_for_workspace(home, &source_id, kind, &workspace)
             .map_err(|error| error.to_string())?
     };
+    // A fallback retry forks exactly the conversation the failed run saved.
+    // Check that under the source lease, before any part of the fork is
+    // published, so a refusal leaves nothing a later --continue could pick.
+    if let Some(expected) = fallback_tail
+        && (!forking
+            || orbit_cli::fallback::saved_tail_identity(&saved.transcript).as_deref()
+                != Some(expected))
+    {
+        return Err("the saved session no longer ends with the failed prompt".into());
+    }
     if !forking {
         // A request that was stopped or timed out before its outcome was
         // known leaves a session that admits nothing more. For a person at
@@ -2437,7 +2505,7 @@ fn owned_startup_session(
     kind: &str,
     fresh_id: &str,
 ) -> Result<(sessions::SessionLease, Option<sessions::SessionFile>), String> {
-    owned_startup_session_with_origin(home, args, kind, fresh_id)
+    owned_startup_session_with_origin(home, args, kind, fresh_id, None)
         .map(|(lease, saved, _origin)| (lease, saved))
 }
 
@@ -2650,6 +2718,56 @@ mod owned_startup_tests {
         std::fs::remove_dir_all(home).unwrap();
     }
     #[test]
+    fn stale_fallback_tail_is_refused_before_any_fork_is_published() {
+        let home = home();
+        let mut source = saved(&home, "source", "2026-10-14T12:00:00Z");
+        source.transcript = vec![
+            orbit_engine::user_message("first question"),
+            orbit_engine::assistant_message("first answer"),
+            orbit_engine::user_message("the failed prompt"),
+        ];
+        let lease = SessionLease::acquire(&home, "source", "fixture").unwrap();
+        lease.save(&source).unwrap();
+        drop(lease);
+        std::fs::create_dir(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join("projects/source.jsonl"),
+            b"{\"kind\":\"fixture\"}\n",
+        )
+        .unwrap();
+        let recorded = orbit_cli::fallback::saved_tail_identity(&source.transcript).unwrap();
+        let before = std::fs::read(home.join("sessions/source.json")).unwrap();
+        let fork = args(&["--resume", "source", "--fork-session"]);
+        // The failed run's saved tail no longer matches what is on disk: the
+        // retry is refused, and nothing a later --continue could pick is left.
+        let error = owned_startup_session_with_origin(
+            &home,
+            &fork,
+            "headless",
+            "fresh",
+            Some("stale-identity"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("no longer ends with the failed prompt"),
+            "{error}"
+        );
+        assert!(!home.join("sessions/fresh.json").exists());
+        assert!(!home.join("projects/fresh.jsonl").exists());
+        assert_eq!(
+            std::fs::read(home.join("sessions/source.json")).unwrap(),
+            before
+        );
+        // The identity the failed run recorded still forks.
+        let (lease, forked, _origin) =
+            owned_startup_session_with_origin(&home, &fork, "headless", "fresh", Some(&recorded))
+                .unwrap();
+        assert_eq!(forked.unwrap().session_id, "fresh");
+        assert!(home.join("sessions/fresh.json").exists());
+        drop(lease);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
     fn malformed_resume_identity_never_loads_or_creates_fresh_state() {
         let home = home();
         assert!(
@@ -2757,7 +2875,7 @@ fn context_meter_text(
     }
 }
 
-fn cmd_headless(args: &[String]) -> i32 {
+fn cmd_headless(args: &[String], fallback_retry: bool, fallback_tail: Option<&str>) -> i32 {
     let prompt = args.first().map(String::as_str).unwrap_or("");
     if prompt.is_empty() {
         eprintln!("ORBIT-E1101: -p requires a prompt");
@@ -2847,6 +2965,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         args,
         "headless",
         &format!("p-{}", ulid::Ulid::new()),
+        fallback_tail,
     ) {
         Ok(owned) => owned,
         Err(error) => {
@@ -2926,7 +3045,16 @@ fn cmd_headless(args: &[String]) -> i32 {
         transcript = sf.to_transcript();
         // A fallback run forks the conversation the failed run saved, which
         // ends with this very prompt, unanswered. It is asked once.
-        if std::env::var_os(orbit_cli::fallback::RETRY_MARK).is_some()
+        if let Some(expected) = fallback_tail {
+            if !args.iter().any(|arg| arg == "--fork-session")
+                || orbit_cli::fallback::saved_tail_identity(&transcript).as_deref()
+                    != Some(expected)
+            {
+                eprintln!("cannot retry: the saved session no longer ends with the failed prompt");
+                return 1;
+            }
+            transcript.pop();
+        } else if fallback_retry
             && transcript.last().is_some_and(|message| {
                 message.role == orbit_adapter::types::ChatRole::User && message.content == prompt
             })
@@ -3064,7 +3192,8 @@ fn cmd_headless(args: &[String]) -> i32 {
                 "source": if resumed_file.is_some() { "resume" } else { "startup" },
             }),
         );
-        orbit_engine::hooks::prompt_context(&outcomes)
+        hooks
+            .prompt_context(&outcomes)
             .map(|context| format!("\n\n## Session start hook output\n{context}"))
             .unwrap_or_default()
     };
@@ -3494,17 +3623,33 @@ fn cmd_headless(args: &[String]) -> i32 {
     if let Some(spec) = &fallback_spec
         && storage_error.is_none()
     {
-        eprintln!("{model} is unavailable; running the prompt on fallback model {spec}");
-        fire_session_end(&home, "error");
-        if let Err(error) = signal_guard.close() {
-            eprintln!("process signal cleanup failed: {error}");
-        }
+        let cancelled = signal_guard.sync_signal() != 0 || signal_guard.token().is_cancelled();
+        fire_session_end(&home, if cancelled { "cancelled" } else { "error" });
         // The fallback run continues a resumed conversation as a fork of
         // it; this session's lease is released first so it can be read.
-        let resumed = resumed_file.as_ref().map(|_| session_id.clone());
+        let resumed = resumed_file.as_ref().map(|_| session_id.as_str());
+        let identity = if resumed.is_some() && saved.transcript != initial.transcript {
+            orbit_cli::fallback::saved_tail_identity(&saved.transcript)
+        } else {
+            None
+        };
         drop(accounting);
         drop(live_lease);
-        return orbit_cli::fallback::rerun(prompt, args, spec, resumed.as_deref());
+        if let Err(code) = signal_guard.close_before_fallback() {
+            return code;
+        }
+        if resumed.is_some() && identity.is_none() {
+            eprintln!("cannot retry: the failed prompt was not recorded in the saved session");
+            return 1;
+        }
+        eprintln!("{model} is unavailable; running the prompt on fallback model {spec}");
+        return orbit_cli::fallback::rerun_with_saved_tail(
+            prompt,
+            args,
+            spec,
+            resumed,
+            identity.as_deref(),
+        );
     }
     let full_status = saved
         .accounting_watermark
@@ -4132,6 +4277,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         args,
         "chat",
         &orbit_gateway::new_session_id(),
+        None,
     ) {
         Ok(owned) => owned,
         Err(error) => {
@@ -4179,15 +4325,13 @@ fn cmd_chat(args: &[String]) -> i32 {
         resumed_file.as_ref(),
         !cfg.roles.main.is_empty(),
     );
+    let resuming = resumed_file.is_some();
     let mut initial = sessions::SessionFile::from_chat(
         live_lease.session_id(),
         &model,
         &gate,
         &active_provider,
-        &resumed_file
-            .as_ref()
-            .map(|saved| saved.to_transcript())
-            .unwrap_or_default(),
+        &[],
         resumed_file.as_ref().map_or(0, |saved| saved.turns),
         resumed_file.as_ref().map_or(0, |saved| saved.input_tokens),
         resumed_file.as_ref().map_or(0, |saved| saved.output_tokens),
@@ -4197,6 +4341,9 @@ fn cmd_chat(args: &[String]) -> i32 {
     )
     .with_effort(selected_effort.clone())
     .with_selection_origin(selection_origin);
+    if let Some(saved) = resumed_file {
+        initial.transcript = saved.transcript;
+    }
     if let Err(error) =
         sessions::current_workspace().and_then(|workspace| initial.bind_workspace(&workspace))
     {
@@ -4240,7 +4387,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                     value_after(args, "--allowedTools").as_deref(),
                     value_after(args, "--disallowedTools").as_deref(),
                 ),
-                initial_transcript: initial.to_transcript(),
+                initial_transcript: initial.transcript,
                 initial_turns: initial.turns,
                 initial_input_tokens: initial.input_tokens,
                 initial_output_tokens: initial.output_tokens,
@@ -4304,12 +4451,15 @@ fn cmd_chat(args: &[String]) -> i32 {
         );
     }
 
-    if let Some(s) = &resumed_file {
-        eprintln!("resumed session {} ({} prior turns)", s.session_id, s.turns);
+    if resuming {
+        eprintln!(
+            "resumed session {} ({} prior turns)",
+            initial.session_id, initial.turns
+        );
     }
     let mut session = live_lease.session_id().to_string();
     // Conversation transcript: role + content per turn (multi-turn wire payload).
-    let mut transcript = initial.to_transcript();
+    let mut transcript = initial.transcript;
     let mut total_input = initial.input_tokens;
     let mut total_output = initial.output_tokens;
     let mut total_cost = initial.cost_microcents;
@@ -4367,10 +4517,11 @@ fn cmd_chat(args: &[String]) -> i32 {
             orbit_engine::hooks::HookEvent::SessionStart,
             &serde_json::json!({
                 "frontend": "plain",
-                "source": if resumed_file.is_some() { "resume" } else { "startup" },
+                "source": if resuming { "resume" } else { "startup" },
             }),
         );
-        orbit_engine::hooks::prompt_context(&outcomes)
+        hooks
+            .prompt_context(&outcomes)
             .map(|context| format!("\n\n## Session start hook output\n{context}"))
             .unwrap_or_default()
     };
@@ -6702,11 +6853,12 @@ fn headless_prompt_index(args: &[String]) -> Option<usize> {
     let mut index = 0;
     while let Some(argument) = args.get(index).map(String::as_str) {
         match argument {
-            "-p" => return Some(index),
-            "--help" | "-h" | "--version" | "-V" => return None,
+            "-p" | "--print" => return Some(index),
+            "--" | "--help" | "-h" | "--version" | "-V" => return None,
             "--home" | "--model" | "--provider" | "--gate" | "--effort" | "--resume"
             | "--permission-mode" | "--allowedTools" | "--disallowedTools" | "--output-format"
-            | "--json-schema" | "--max-turns" | "--max-cost" => index += 2,
+            | "--json-schema" | "--max-turns" | "--max-cost" | "--worktree" | "--socket"
+            | "--session" => index += 2,
             value if value.starts_with('-') => index += 1,
             _ => return None,
         }
@@ -6731,51 +6883,85 @@ fn headless_arguments(args: &[String]) -> Result<Vec<String>, String> {
 /// `git diff | orbit -p "review this"` puts the diff in front of the prompt,
 /// and `echo "question" | orbit -p` (no prompt word) makes the piped text
 /// the prompt.
-fn headless_arguments_with_input(args: &[String]) -> Result<Vec<String>, String> {
+fn headless_arguments_with_input(
+    args: &[String],
+    fallback_prompt_size: Option<&str>,
+) -> Result<Vec<String>, String> {
     let index = headless_prompt_index(args).ok_or("-p must be a top-level option")?;
-    let with_prompt = |prompt: String| {
-        let mut all = args.to_vec();
-        all.insert(index + 1, prompt);
-        headless_arguments(&all)
-    };
+    if let Some(size) = fallback_prompt_size {
+        use std::io::Read;
+        // The parent already trimmed and composed the prompt. Lossy UTF-8
+        // conversion expands 1 MiB to at most 3 MiB. The remaining space
+        // covers the wrapper and an explicit operand from the original argv.
+        const LIMIT: u64 = 16 * 1024 * 1024;
+        let size = size
+            .parse::<u64>()
+            .ok()
+            .filter(|size| (1..=LIMIT).contains(size))
+            .ok_or("invalid fallback prompt size")?;
+        let pipe = rustix::fs::fstat(std::io::stdin()).is_ok_and(|stat| {
+            rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Fifo
+        });
+        if !pipe {
+            return Err("missing fallback prompt pipe".into());
+        }
+        let mut prompt = String::new();
+        std::io::stdin()
+            .lock()
+            .take(size + 1)
+            .read_to_string(&mut prompt)
+            .map_err(|error| format!("cannot read fallback prompt: {error}"))?;
+        if prompt.len() as u64 != size {
+            return Err("incorrect fallback prompt length".into());
+        }
+        return headless_from_piped_input(args, index, prompt);
+    }
     let next_is_option = args
         .get(index + 1)
         .is_none_or(|next| next.starts_with("--"));
-    match headless_arguments(args) {
-        // `-p --output-format json` with input piped in: the piped text is
-        // the prompt and the option keeps its meaning.
-        Ok(arguments) if next_is_option => match piped_input(whole_prompt_wait())? {
-            Some(input) => with_prompt(input).or(Ok(arguments)),
-            None => Ok(arguments),
-        },
-        Ok(mut arguments) => {
-            // A pipeline's producer may take its time: `slow | orbit -p x`
-            // waits for it (half a minute for its first byte). A pipe that
-            // a program which started this run still holds for writing is
-            // another matter: it may never be written to, and must not
-            // stall the run, so it gets a moment and no more.
-            let held = stdin_pipe_held_by_ancestor();
-            let wait = std::time::Duration::from_millis(if held { 250 } else { 30_000 });
-            let started = std::time::Instant::now();
-            let input = piped_input(Some(wait))?;
-            if input.is_none() && !held && started.elapsed() >= wait {
-                eprintln!(
-                    "no piped input arrived in {} s; continuing without it",
-                    wait.as_secs()
-                );
-            }
-            if let Some(input) = input {
-                arguments[0] =
-                    format!("<piped-input>\n{input}\n</piped-input>\n\n{}", arguments[0]);
-            }
-            Ok(arguments)
-        }
-        Err(error) if next_is_option => match piped_input(whole_prompt_wait())? {
-            Some(input) => with_prompt(input),
-            None => Err(error),
-        },
-        Err(error) => Err(error),
+    if next_is_option {
+        return match piped_input(whole_prompt_wait())? {
+            Some(input) => headless_from_piped_input(args, index, input),
+            None => headless_arguments(args),
+        };
     }
+    let mut arguments = headless_arguments(args)?;
+    // A delayed pipeline producer gets half a minute for its first byte.
+    // An ancestor may hold an unused write end indefinitely.
+    let held = stdin_pipe_held_by_ancestor();
+    let wait = std::time::Duration::from_millis(if held { 250 } else { 30_000 });
+    let started = std::time::Instant::now();
+    if let Some(input) = piped_input(Some(wait))? {
+        arguments[0] = prompt_with_piped_input(&arguments[0], &input);
+    } else if !held && started.elapsed() >= wait {
+        eprintln!(
+            "no piped input arrived in {} s; continuing without it",
+            wait.as_secs()
+        );
+    }
+    Ok(arguments)
+}
+
+fn prompt_with_piped_input(prompt: &str, input: &str) -> String {
+    format!("<piped-input>\n{input}\n</piped-input>\n\n{prompt}")
+}
+
+fn headless_from_piped_input(
+    args: &[String],
+    index: usize,
+    input: String,
+) -> Result<Vec<String>, String> {
+    let mut options = args.to_vec();
+    options.remove(index);
+    if let Err(option_error) = validate_headless_arguments(&options) {
+        // A flag-looking word can be an explicit prompt. If treating it
+        // as an option fails, retain both the word and its piped context.
+        let mut explicit = headless_arguments(args).map_err(|_| option_error)?;
+        explicit[0] = prompt_with_piped_input(&explicit[0], &input);
+        return Ok(explicit);
+    }
+    options.insert(0, input);
+    Ok(options)
 }
 
 /// How long to wait for a prompt that is to come from standard input: to
@@ -6843,6 +7029,8 @@ fn stdin_pipe_held_by_ancestor() -> bool {
     false
 }
 
+const PIPED_INPUT_LIMIT: u64 = 1024 * 1024;
+
 /// The text on standard input when it is a pipe or a file (never a
 /// terminal, `/dev/null` or a socket), without trailing blank space; `None`
 /// when there is none. A pipe is waited on for `first_byte` before it is
@@ -6850,7 +7038,6 @@ fn stdin_pipe_held_by_ancestor() -> bool {
 /// it has spoken it is read to its end. More than 1 MiB is refused, not cut.
 fn piped_input(first_byte: Option<std::time::Duration>) -> Result<Option<String>, String> {
     use std::io::Read;
-    const LIMIT: u64 = 1024 * 1024;
     let Ok(stat) = rustix::fs::fstat(std::io::stdin()) else {
         return Ok(None);
     };
@@ -6877,10 +7064,10 @@ fn piped_input(first_byte: Option<std::time::Duration>) -> Result<Option<String>
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
-        .take(LIMIT + 1)
+        .take(PIPED_INPUT_LIMIT + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read piped input: {error}"))?;
-    if bytes.len() as u64 > LIMIT {
+    if bytes.len() as u64 > PIPED_INPUT_LIMIT {
         return Err(
             "piped input is larger than 1 MiB; pass a file path in the prompt instead".into(),
         );
@@ -7138,7 +7325,7 @@ fn cmd_serve(args: &[String]) -> i32 {
         }
         let fresh_id = named.unwrap_or_else(orbit_gateway::new_session_id);
         let (lease, saved, startup_origin) =
-            owned_startup_session_with_origin(&home, args, "daemon", &fresh_id)?;
+            owned_startup_session_with_origin(&home, args, "daemon", &fresh_id, None)?;
         let model = manual
             .clone()
             .or_else(|| saved.as_ref().map(|session| session.model.clone()))
@@ -7345,6 +7532,20 @@ fn same_signal_action(left: &libc::sigaction, right: &libc::sigaction) -> bool {
 }
 
 impl ProcessSignalGuard {
+    /// The final handoff happens after publishing the session and firing its
+    /// close hook. Either may have allowed cancellation since model selection.
+    fn close_before_fallback(&mut self) -> Result<(), i32> {
+        match self.close() {
+            Ok(0) if !self.token().is_cancelled() => Ok(()),
+            Ok(0) => Err(1),
+            Ok(signal) => Err(128 + signal),
+            Err(error) => {
+                eprintln!("process signal cleanup failed: {error}");
+                Err(1)
+            }
+        }
+    }
+
     fn new() -> Result<Self, String> {
         #[cfg(unix)]
         {
@@ -7646,14 +7847,47 @@ mod effort_frontend_tests {
             headless_prompt_index(&args(&["--home", "fixture", "setup", "-p", "hello"])).is_none()
         );
         assert!(headless_prompt_index(&args(&["--model", "-p", "chat"])).is_none());
+        for values in [
+            &["--model", "--print", "chat"][..],
+            &["--socket", "--print", "serve"],
+            &["--worktree", "--print", "chat"],
+            &["--", "--print", "prompt"],
+            &["--help", "--print", "prompt"],
+        ] {
+            assert!(headless_prompt_index(&args(values)).is_none(), "{values:?}");
+        }
         assert!(headless_arguments(&args(&["-p", "hello", "extra"])).is_err());
         assert!(headless_arguments(&args(&["-p", "hello", "--unknown"])).is_err());
         assert!(headless_arguments(&args(&["-p", "hello", "-p", "again"])).is_err());
+        assert_eq!(
+            headless_arguments(&args(&["-p", "--bare"])).unwrap(),
+            ["--bare"]
+        );
         for prompt in ["setup", "web", "--help", "--effort"] {
             assert_eq!(
                 headless_arguments(&args(&["-p", prompt, "--bare"])).unwrap(),
                 [prompt, "--bare"]
             );
+        }
+    }
+
+    #[test]
+    fn piped_input_retains_flag_like_explicit_prompts_and_real_options() {
+        let input = "x".repeat(PIPED_INPUT_LIMIT as usize);
+        for flag in ["--print", "-p"] {
+            let literal = "--literal prompt   ";
+            let parsed =
+                headless_from_piped_input(&args(&[flag, literal, "--bare"]), 0, input.clone())
+                    .unwrap();
+            assert_eq!(
+                parsed[0],
+                format!("<piped-input>\n{input}\n</piped-input>\n\n{literal}")
+            );
+            assert_eq!(&parsed[1..], ["--bare"]);
+            let parsed =
+                headless_from_piped_input(&args(&[flag, "--bare"]), 0, input.clone()).unwrap();
+            assert_eq!(parsed[0], input);
+            assert_eq!(&parsed[1..], ["--bare"]);
         }
     }
 
@@ -8609,6 +8843,17 @@ mod process_signal_guard_tests {
         assert!(!PROCESS_SIGNAL_ACTIVE.load(Ordering::Acquire));
         fixture.assert_restored();
         assert_eq!(guard.close().unwrap(), 0);
+    }
+
+    #[test]
+    fn token_cancellation_with_no_signal_stops_fallback_after_close() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = ProcessSignalGuard::new().unwrap();
+        guard.token().cancel();
+        assert_eq!(guard.close_before_fallback(), Err(1));
+        assert!(!guard.owns_installer);
     }
 
     #[test]

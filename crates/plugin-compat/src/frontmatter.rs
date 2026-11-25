@@ -22,6 +22,10 @@ pub struct FrontmatterDocument {
 /// tags are rejected because their expansion or host meaning is not portable.
 /// Errors contain stable codes and no source values or parser excerpts.
 pub fn parse_frontmatter(text: &str) -> Result<FrontmatterDocument, CompatError> {
+    parse_document(text, false)
+}
+
+fn parse_document(text: &str, repair: bool) -> Result<FrontmatterDocument, CompatError> {
     if text.len() > MAX_DOCUMENT_BYTES {
         return Err(diagnostic("document_size_limit"));
     }
@@ -39,8 +43,16 @@ pub fn parse_frontmatter(text: &str) -> Result<FrontmatterDocument, CompatError>
             if metadata.len() > MAX_FRONTMATTER_BYTES {
                 return Err(diagnostic("frontmatter_size_limit"));
             }
+            let frontmatter = match parse_yaml_metadata(metadata) {
+                // Only plain "malformed" is retried: every refusal that guards the reader (aliases,
+                // tags, limits, duplicate keys, several documents) keeps its own code and stands.
+                Err(error) if repair && error.code == "yaml_invalid" => {
+                    parse_yaml_metadata(&quote_unreadable_values(metadata)).map_err(|_| error)?
+                }
+                result => result?,
+            };
             return Ok(FrontmatterDocument {
-                frontmatter: parse_yaml_metadata(metadata)?,
+                frontmatter,
                 body: text[offset + line.len()..].trim().to_owned(),
             });
         }
@@ -50,6 +62,67 @@ pub fn parse_frontmatter(text: &str) -> Result<FrontmatterDocument, CompatError>
         }
     }
     Err(diagnostic("frontmatter_unterminated"))
+}
+
+/// [`parse_frontmatter`], and when the YAML is malformed only because of how a plain value is
+/// written, the text Claude Code reads there. Used when the operator imports leniently.
+pub fn parse_frontmatter_lenient(text: &str) -> Result<FrontmatterDocument, CompatError> {
+    parse_document(text, true)
+}
+
+/// Claude Code's own repair for front matter written by hand: a top-level `key: value` whose value
+/// cannot be read as plain YAML (`description: Run it. Input: a name`, `argument-hint: [--a] [--b]`)
+/// is taken as the text it is. Only a line that fails by itself is touched. A value that is already
+/// quoted, a block scalar, an anchor or a tag, or that continues on the next line, is left alone, so
+/// what the document means never changes under it; the result goes through the same limits as any
+/// other metadata.
+fn quote_unreadable_values(metadata: &str) -> String {
+    let lines: Vec<&str> = metadata.split_inclusive('\n').collect();
+    let mut repaired = String::with_capacity(metadata.len() + 64);
+    for (at, line) in lines.iter().enumerate() {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[content.len()..];
+        let continues = lines
+            .get(at + 1)
+            .is_some_and(|next| next.starts_with([' ', '\t']) && !next.trim().is_empty());
+        match plain_pair(content) {
+            Some((key, value)) if !continues && unreadable(key, value) => {
+                repaired.push_str(key);
+                repaired.push_str(": \"");
+                for c in value.chars() {
+                    if matches!(c, '\\' | '"') {
+                        repaired.push('\\');
+                    }
+                    repaired.push(c);
+                }
+                repaired.push('"');
+                repaired.push_str(ending);
+            }
+            _ => repaired.push_str(line),
+        }
+    }
+    repaired
+}
+
+/// `key: value` at the left margin, with a value a quote could stand in for.
+fn plain_pair(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    let mut name = key.chars();
+    if !name
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !name.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    let value = value.strip_prefix([' ', '\t'])?.trim();
+    (!value.is_empty() && !value.starts_with(['"', '\'', '|', '>', '&', '!']))
+        .then_some((key, value))
+}
+
+/// Does this line, read by itself, fail as plain malformed YAML?
+fn unreadable(key: &str, value: &str) -> bool {
+    parse_yaml_metadata(&format!("{key}: {value}")).is_err_and(|error| error.code == "yaml_invalid")
 }
 
 fn is_delimiter(line: &str) -> bool {
@@ -703,6 +776,103 @@ mod tests {
             assert!(!error.to_string().contains("secret-value"));
             assert!(!format!("{error:?}").contains("secret-value"));
             assert!(error.message.len() <= 1024);
+        }
+    }
+
+    // ---- the lenient reader ----
+
+    fn lenient_code(text: &str) -> String {
+        parse_frontmatter_lenient(text).unwrap_err().code
+    }
+
+    #[test]
+    fn a_plain_value_yaml_cannot_read_is_read_as_the_text_it_is() {
+        let text = "---\nname: ok\ndescription: Run it. Input: a category\nargument-hint: [--strict] [--json]\n---\nbody\n";
+        assert_eq!(code(text), "yaml_invalid", "strict is unchanged");
+        let parsed = parse_frontmatter_lenient(text).unwrap();
+        assert_eq!(parsed.frontmatter["name"], "ok");
+        assert_eq!(
+            parsed.frontmatter["description"],
+            "Run it. Input: a category"
+        );
+        assert_eq!(parsed.frontmatter["argument-hint"], "[--strict] [--json]");
+        assert_eq!(parsed.body, "body");
+    }
+
+    #[test]
+    fn what_yaml_reads_fine_is_never_rewritten() {
+        for text in [
+            "---\nname: [a, b]\ndescription: ok # a comment\n---\nb",
+            "---\ndescription: >-\n  folded: text\n  more\n---\nb",
+            "---\ntools:\n  - Read\n  - Grep\nmodel: 'x: y'\n---\nb",
+            "---\nname: sample\n---\n",
+        ] {
+            assert_eq!(
+                parse_frontmatter_lenient(text).unwrap(),
+                parse_frontmatter(text).unwrap(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_lines_that_cannot_be_read_are_quoted() {
+        let text = "---\ndescription: a: b\nlist: [x, y]\nnote: fine # comment\nflag: true\n---\n";
+        let parsed = parse_frontmatter_lenient(text).unwrap();
+        assert_eq!(parsed.frontmatter["description"], "a: b");
+        assert_eq!(parsed.frontmatter["list"], json!(["x", "y"]));
+        assert_eq!(parsed.frontmatter["note"], "fine");
+        assert_eq!(parsed.frontmatter["flag"], true);
+    }
+
+    #[test]
+    fn quotes_and_backslashes_survive_the_repair() {
+        let text = "---\ndescription: say \"hi\" \\ there: now\n---\n";
+        assert_eq!(
+            parse_frontmatter_lenient(text).unwrap().frontmatter["description"],
+            "say \"hi\" \\ there: now"
+        );
+    }
+
+    #[test]
+    fn a_value_that_continues_on_the_next_line_is_not_guessed_at() {
+        for text in [
+            "---\ndescription: first part: oops\n  second line\n---\n",
+            "---\ndescription: \"never closed\n---\n",
+            "---\nname: ok\n\tdescription: tab indented\n---\n",
+            // An indented comment after it is still something the line might have meant to continue into.
+            "---\ndescription: a: b\n  # a note\n---\n",
+        ] {
+            assert_eq!(lenient_code(text), "yaml_invalid", "{text}");
+        }
+    }
+
+    #[test]
+    fn the_refusals_that_guard_the_reader_are_never_retried() {
+        for (yaml, expected) in [
+            ("a: &x 1\nb: *x", "yaml_alias_unsupported"),
+            ("a: 1\na: 2", "yaml_duplicate_key"),
+            ("a: !!python/object x", "yaml_tag_unsupported"),
+        ] {
+            let text = format!("---\n{yaml}\n---\n");
+            assert_eq!(code(&text), expected, "{yaml}");
+            assert_eq!(lenient_code(&text), expected, "{yaml}");
+        }
+        let long = format!("---\nname: {}\n---\n", "x".repeat(MAX_FRONTMATTER_BYTES));
+        assert_eq!(lenient_code(&long), "frontmatter_size_limit");
+        assert_eq!(lenient_code("body only"), "frontmatter_missing");
+        assert_eq!(
+            lenient_code("---\nname: sample"),
+            "frontmatter_unterminated"
+        );
+    }
+
+    #[test]
+    fn the_lenient_reader_keeps_its_errors_free_of_source_text() {
+        for yaml in ["secret-value: \"unterminated", "secret-value: [a\n  b: c"] {
+            let error = parse_frontmatter_lenient(&format!("---\n{yaml}\n---\n")).unwrap_err();
+            assert!(!error.to_string().contains("secret-value"), "{yaml}");
+            assert!(!format!("{error:?}").contains("secret-value"), "{yaml}");
         }
     }
 }

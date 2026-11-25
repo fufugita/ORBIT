@@ -1,6 +1,6 @@
 //! Bounded Streamable HTTP transport for MCP sessions.
 
-use crate::{MAX_FRAME_BYTES, McpCallOptions, POLL_INTERVAL, encode_frame};
+use crate::{MAX_REPLY_BYTES, McpCallOptions, POLL_INTERVAL, encode_frame};
 use futures::Future;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
@@ -444,9 +444,12 @@ pub(super) async fn bounded_body(
 ) -> Result<Vec<u8>, String> {
     if response
         .content_length()
-        .is_some_and(|size| size > MAX_FRAME_BYTES as u64)
+        .is_some_and(|size| size > MAX_REPLY_BYTES as u64)
     {
-        return Err("mcp HTTP response exceeds 1 MiB".into());
+        return Err(format!(
+            "mcp HTTP response exceeds {} MiB",
+            MAX_REPLY_BYTES >> 20
+        ));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -455,8 +458,11 @@ pub(super) async fn bounded_body(
         .map_err(|_| "mcp HTTP response body failed".to_string())?
     {
         options.check()?;
-        if chunk.len() > MAX_FRAME_BYTES.saturating_sub(body.len()) {
-            return Err("mcp HTTP response exceeds 1 MiB".into());
+        if chunk.len() > MAX_REPLY_BYTES.saturating_sub(body.len()) {
+            return Err(format!(
+                "mcp HTTP response exceeds {} MiB",
+                MAX_REPLY_BYTES >> 20
+            ));
         }
         body.extend_from_slice(&chunk);
     }
@@ -677,13 +683,20 @@ struct SseDecoder {
     first_line: bool,
     total: usize,
     event_count: usize,
+    /// How much of the front of `buffer` was already searched for the end of its line, and held
+    /// none. A long line that arrives in small pieces is then searched once, not again from its
+    /// start for every piece.
+    scanned: usize,
     events: VecDeque<SseEvent>,
 }
 
 impl SseDecoder {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.len() > MAX_FRAME_BYTES.saturating_sub(self.total) {
-            return Err("mcp SSE response exceeds 1 MiB".into());
+        if bytes.len() > MAX_REPLY_BYTES.saturating_sub(self.total) {
+            return Err(format!(
+                "mcp SSE response exceeds {} MiB",
+                MAX_REPLY_BYTES >> 20
+            ));
         }
         self.total += bytes.len();
         self.buffer.extend_from_slice(bytes);
@@ -699,18 +712,25 @@ impl SseDecoder {
                     continue;
                 }
             }
-            let Some(relative_end) = self.buffer[start..]
+            let searched_already = if start == 0 {
+                std::mem::take(&mut self.scanned).min(self.buffer.len())
+            } else {
+                0
+            };
+            let Some(relative_end) = self.buffer[start + searched_already..]
                 .iter()
                 .position(|b| matches!(b, b'\r' | b'\n'))
             else {
                 break;
             };
-            let end = start + relative_end;
+            let end = start + searched_already + relative_end;
             self.skip_next_lf = self.buffer[end] == b'\r';
             let line = self.buffer[start..end].to_vec();
             self.line(&line)?;
             start = end + 1;
         }
+        // What is left is a line whose end has not arrived, and all of it has been searched.
+        self.scanned = self.buffer.len() - start;
         self.buffer.drain(..start);
         Ok(())
     }
@@ -799,9 +819,30 @@ mod tests {
     #[test]
     fn bounded_sse_decoder_rejects_large_and_invalid_utf8_events() {
         let mut decoder = SseDecoder::default();
-        assert!(decoder.feed(&vec![b'x'; MAX_FRAME_BYTES + 1]).is_err());
+        assert!(decoder.feed(&vec![b'x'; MAX_REPLY_BYTES + 1]).is_err());
         let mut decoder = SseDecoder::default();
         assert!(decoder.feed(b"data: \xff\n\n").is_err());
+    }
+
+    /// A tool list of 3.5 MB is a real reply, and a remote server may stream it as one event.
+    /// A line that arrives in small pieces is searched once, not again from its start for every
+    /// piece: at 12 MiB that is milliseconds against many seconds.
+    #[test]
+    fn an_sse_event_of_many_megabytes_in_small_pieces_is_read_in_linear_time() {
+        const SIZE: usize = 12 * 1024 * 1024;
+        let mut decoder = SseDecoder::default();
+        let started = std::time::Instant::now();
+        decoder.feed(b"data: ").unwrap();
+        for _ in 0..SIZE / 4096 {
+            decoder.feed(&[b'y'; 4096]).unwrap();
+        }
+        decoder.feed(b"\n\n").unwrap();
+        assert_eq!(decoder.events.pop_front().unwrap().data.len(), SIZE);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

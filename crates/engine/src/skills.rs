@@ -569,14 +569,21 @@ pub fn load_catalog(
                     }
                     let relevant_error = active.plugin.diagnostics.iter().any(|diagnostic| {
                         diagnostic.severity == DiagnosticSeverity::Error
-                            && diagnostic
-                                .component_id
-                                .as_ref()
-                                .is_none_or(|id| id == &component.id)
+                            && match diagnostic.component_id.as_ref() {
+                                Some(id) => id == &component.id,
+                                // An error that names no component hides the plugin's content,
+                                // except one that only says another capability needs an adapter (a
+                                // prompt hook, a theme, an LSP server): that says nothing about a
+                                // skill, an agent or a command.
+                                None => diagnostic.code != "host_adapter_required",
+                            }
                     });
                     let unmet = active.plugin.requirements.iter().any(|requirement| {
                         !requirement.satisfied
-                            && requirement.kind != "model_mapping"
+                            && !matches!(
+                                requirement.kind.as_str(),
+                                "model_mapping" | "host_adapter"
+                            )
                             && requirement
                                 .component_id
                                 .as_ref()

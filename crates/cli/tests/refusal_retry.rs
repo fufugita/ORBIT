@@ -2965,6 +2965,161 @@ fn failed_manual_summary(result: &CliResult, cancelled: bool) {
     assert!(!result.stderr.contains("process signal cleanup failed:"));
 }
 
+fn fallback_args(prompt: &str) -> Vec<&str> {
+    vec![
+        "-p",
+        prompt,
+        "--model",
+        "fixture/model-a",
+        "--fallback-model",
+        "selected/model-b",
+    ]
+}
+
+fn assert_fallback_requests(wire: &Wire, expected: &[(&str, &[&str])]) {
+    assert_wire(wire, expected.len());
+    let captures = wire.captures.lock().unwrap();
+    for (capture, (model, prompts)) in captures.iter().zip(expected) {
+        let body: Value = serde_json::from_slice(&capture.body).unwrap();
+        assert_eq!(body["model"], *model);
+        let actual: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .map(|message| message["content"].as_str().unwrap())
+            .collect();
+        // A mismatch can span a full MiB. Keep the failure output bounded.
+        assert!(
+            actual == *prompts,
+            "wrong user messages delivered to {model}"
+        );
+    }
+}
+
+#[test]
+fn headless_fallback_preserves_large_piped_input_and_explicit_prompt_whitespace() {
+    if !dispatch_isolated(
+        "headless_fallback_preserves_large_piped_input_and_explicit_prompt_whitespace",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    let mut wire = Wire::new(&f.clock, vec![Reply::rejection(503), Reply::text(ANSWER)]);
+    f.configure(&wire, 2_000_000, false);
+    let prompt = "summarize this   ";
+    // Past the single-argument OS limit, but inside the 256 KiB routing limit.
+    let pipe = "0123456789abcdef".repeat(12_288);
+    let expected = format!("<piped-input>\n{pipe}\n</piped-input>\n\n{prompt}");
+    let mut args = fallback_args(prompt);
+    args.push("--bare");
+    let mut process = Process::start(&f, &args);
+    process.feed("headless stdin", &pipe);
+    let result = process.wait(&f);
+    assert!(result.status.success(), "{}", result.stderr);
+    assert!(result.stdout.contains(ANSWER));
+    wire.finish();
+    assert_fallback_requests(
+        &wire,
+        &[("model-a", &[&expected]), ("model-b", &[&expected])],
+    );
+}
+
+#[test]
+fn headless_fallback_sigterm_during_session_end_stops_after_one_hook() {
+    if !dispatch_isolated("headless_fallback_sigterm_during_session_end_stops_after_one_hook") {
+        return;
+    }
+    let f = Fixture::new();
+    let mut wire = Wire::new(&f.clock, vec![Reply::rejection(503), Reply::text(ANSWER)]);
+    f.configure(&wire, 64_000, false);
+    replace_owned(
+        &f.home.join("settings.toml"),
+        r#"[[hooks]]
+event = "SessionEnd"
+command = "echo reached >> hook-runs; while test ! -f release-hook; do sleep 0.02; done"
+timeout_secs = 8
+"#,
+    );
+    let mut process = Process::start(&f, &fallback_args(PROMPT));
+    process.close_input();
+    let ran = f.workspace.join("hook-runs");
+    while !ran.exists() {
+        process.live();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    process.terminate();
+    write_new(&f.workspace.join("release-hook"), "");
+    let result = process.wait(&f);
+    assert_eq!(result.status.code(), Some(143), "{}", result.stderr);
+    assert_eq!(fs::read_to_string(ran).unwrap(), "reached\n");
+    wire.finish();
+    assert_fallback_requests(&wire, &[("model-a", &[PROMPT])]);
+}
+
+#[test]
+fn headless_fallback_forks_an_adopted_session_and_asks_its_unanswered_prompt_once() {
+    if !dispatch_isolated(
+        "headless_fallback_forks_an_adopted_session_and_asks_its_unanswered_prompt_once",
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    let mut wire = Wire::new(
+        &f.clock,
+        vec![
+            Reply::text("retained answer"),
+            Reply::rejection(503),
+            Reply::text(ANSWER),
+        ],
+    );
+    f.configure(&wire, 64_000, false);
+    let seed = "retained question";
+    let initial = cli(&f, &["-p", seed, "--bare"]);
+    assert!(initial.status.success(), "{}", initial.stderr);
+    let mut legacy = f.saved();
+    legacy.workspace = None;
+    replace_owned(
+        &f.home
+            .join("sessions")
+            .join(format!("{}.json", legacy.session_id)),
+        serde_json::to_vec(&legacy).unwrap(),
+    );
+
+    replace_owned(
+        &f.home.join("settings.toml"),
+        r#"[[hooks]]
+event = "UserPromptSubmit"
+command = "echo retained-hook-context"
+"#,
+    );
+    let effective_prompt =
+        format!("{PROMPT}\n\n<hook-context>\nretained-hook-context\n</hook-context>");
+    let mut args = fallback_args(PROMPT);
+    args.extend(["--resume", &legacy.session_id, "--adopt-workspace"]);
+    let result = cli(&f, &args);
+    assert!(result.status.success(), "{}", result.stderr);
+    assert!(result.stdout.contains(ANSWER));
+    wire.finish();
+    assert_fallback_requests(
+        &wire,
+        &[
+            ("model-a", &[seed]),
+            ("model-a", &[seed, &effective_prompt]),
+            ("model-b", &[seed, &effective_prompt]),
+        ],
+    );
+    let sessions = sessions::list_sessions(&f.home).unwrap();
+    assert_eq!(sessions.len(), 2);
+    let fork = sessions
+        .iter()
+        .find(|saved| saved.session_id != legacy.session_id)
+        .unwrap();
+    assert_eq!(fork.model, "model-b");
+    assert_eq!(fork.workspace.as_deref(), Some(f.workspace.as_path()));
+    assert_eq!(fork.transcript.last().unwrap().content, ANSWER);
+}
+
 #[test]
 fn real_cli_post_refusal_manual_503_summary_does_not_retry() {
     if !dispatch_isolated("real_cli_post_refusal_manual_503_summary_does_not_retry") {

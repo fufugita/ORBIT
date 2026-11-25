@@ -9,8 +9,11 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_ENTRIES: usize = 4096;
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_TREE_BYTES: u64 = 32 * 1024 * 1024;
+/// The most one file in a package may hold. The store keeps and verifies what the importer takes,
+/// so it reads this too: two copies of a limit drift apart.
+pub(crate) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// The most one package may hold in all (see [`MAX_FILE_BYTES`]).
+pub(crate) const MAX_TREE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 32;
 const MAX_PATH_BYTES: usize = 1024;
 
@@ -19,7 +22,7 @@ const MAX_PATH_BYTES: usize = 1024;
 /// No plugin, interpreter, credential environment or executable is loaded.
 /// Source changes detected during the inventory require a fresh inspection.
 pub fn inspect(source: &Path, options: &InspectOptions) -> Result<Inspection, CompatError> {
-    let tree = SourceTree::read_named(source, None)?;
+    let tree = SourceTree::read_named(source, None, options.lenient)?;
     crate::formats::normalize(&tree, options)
 }
 
@@ -30,12 +33,35 @@ pub(crate) struct SourceTree {
     pub(crate) scm_excluded: bool,
     pub(crate) directories: BTreeSet<String>,
     pub(crate) directory_name: Option<String>,
+    /// What a lenient read left out of the inventory, and why.
+    pub(crate) skipped: Vec<SkippedEntry>,
+}
+
+pub(crate) struct SkippedEntry {
+    pub(crate) path: String,
+    pub(crate) kind: SkippedKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkippedKind {
+    /// A symbolic link: never followed, never stored.
+    Link,
+    /// `node_modules`, a virtualenv or a bytecode cache: other people's code, not the package.
+    Dependencies,
+}
+
+/// Folders a lenient read does not take into the package, as it does not take `.git`.
+fn is_dependency_directory(name: &str) -> bool {
+    matches!(name, "node_modules" | ".venv" | "venv" | "__pycache__")
 }
 
 impl SourceTree {
+    /// `lenient`: symbolic links and dependency folders are left out and listed in `skipped`
+    /// instead of refusing the package. Special files, hard links and every limit still refuse it.
     pub(crate) fn read_named(
         source: &Path,
         inferred_name: Option<&str>,
+        lenient: bool,
     ) -> Result<Self, CompatError> {
         if let Some(name) = inferred_name {
             crate::formats::validate_legacy_id(name)?;
@@ -80,6 +106,8 @@ impl SourceTree {
             entries: 0,
             root_device: before.st_dev,
             scm_excluded: false,
+            lenient,
+            skipped: Vec::new(),
         };
         inventory.walk(&root, "", 0)?;
         if !same_stat(
@@ -105,6 +133,7 @@ impl SourceTree {
             scm_excluded: inventory.scm_excluded,
             directories: inventory.directory_paths,
             directory_name,
+            skipped: inventory.skipped,
         })
     }
 
@@ -131,6 +160,8 @@ struct Inventory {
     entries: usize,
     root_device: u64,
     scm_excluded: bool,
+    lenient: bool,
+    skipped: Vec<SkippedEntry>,
 }
 
 impl Inventory {
@@ -205,8 +236,20 @@ impl Inventory {
                 return Err(failure("source_changed"));
             }
             match FileType::from_raw_mode(actual.st_mode) {
+                FileType::Directory if self.lenient && is_dependency_directory(&name) => {
+                    self.skipped.push(SkippedEntry {
+                        path: path.clone(),
+                        kind: SkippedKind::Dependencies,
+                    });
+                }
                 FileType::Directory => self.walk(&child, &path, depth + 1)?,
                 FileType::RegularFile => self.read_file(&child, &path, &actual)?,
+                FileType::Symlink if self.lenient => {
+                    self.skipped.push(SkippedEntry {
+                        path: path.clone(),
+                        kind: SkippedKind::Link,
+                    });
+                }
                 _ => return Err(failure("source_entry_type")),
             }
             let after = statat(directory, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)

@@ -315,7 +315,8 @@ pub fn tool(
             match action {
                 "keep" => report["kept"] = serde_json::json!(true),
                 "remove" => {
-                    report["removed"] = serde_json::json!(remove(&hooks, &worktree, discard)?);
+                    report["removed"] =
+                        serde_json::json!(remove(&hooks, &cx.working_dir, &worktree, discard)?);
                 }
                 _ => return Err("ExitWorktree 'action' must be \"keep\" or \"remove\"".into()),
             }
@@ -334,6 +335,7 @@ pub fn tool(
 /// git removes what git made.
 fn remove(
     hooks: &orbit_engine::hooks::Hooks,
+    repository: &Path,
     worktree: &Worktree,
     discard: bool,
 ) -> Result<String, String> {
@@ -382,7 +384,7 @@ fn remove(
         args.push("--force");
     }
     args.push(&path);
-    let out = git(&args, &worktree.back)?;
+    let out = git(&args, repository)?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -391,7 +393,7 @@ fn remove(
     let branch = format!("orbit/{}", worktree.name);
     let deleted = git(
         &["branch", if discard { "-D" } else { "-d" }, &branch],
-        &worktree.back,
+        repository,
     )?;
     Ok(if deleted.status.success() {
         format!("removed the worktree and branch {branch}")
@@ -599,16 +601,59 @@ mod tests {
         };
         let hooks = orbit_engine::hooks::Hooks::default();
         std::fs::write(path.join("new.txt"), "wip\n").unwrap();
-        let refused = remove(&hooks, &worktree, false).unwrap_err();
+        let refused = remove(&hooks, &project, &worktree, false).unwrap_err();
         assert!(refused.contains("uncommitted"), "{refused}");
         assert!(path.exists());
-        let removed = remove(&hooks, &worktree, true).unwrap();
+        let removed = remove(&hooks, &project, &worktree, true).unwrap();
         assert!(removed.contains("orbit/fix"), "{removed}");
         assert!(!path.exists());
         assert!(!git(
             &project,
             &["rev-parse", "--verify", "-q", "orbit/fix"]
         ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removing_a_worktree_from_an_added_repo_restores_cwd_and_cleans_the_owner() {
+        let dir = scratch("added-repo");
+        let home = dir.join("home");
+        let mut cx = context(&dir);
+        let other = dir.join("other");
+        let previous_cwd = other.join("src");
+        std::fs::create_dir_all(&previous_cwd).unwrap();
+        for repo in [&cx.working_dir, &other] {
+            assert!(git(repo, &["init", "-q", "-b", "main"]));
+            assert!(git(repo, &["commit", "-q", "--allow-empty", "-m", "first"]));
+        }
+        assert!(git(&other, &["branch", "orbit/topic"]));
+        cx.working_dirs.push(other.clone());
+        change_dir(&home, &cx, previous_cwd.to_str().unwrap()).unwrap();
+
+        tool(
+            &home,
+            &cx,
+            "EnterWorktree",
+            &serde_json::json!({"name": "topic"}),
+        )
+        .unwrap();
+        let worktree = cx.working_dir.join(".orbit/worktrees/topic");
+        assert_eq!(cx.cwd(), worktree);
+        let result = tool(
+            &home,
+            &cx,
+            "ExitWorktree",
+            &serde_json::json!({"action": "remove"}),
+        )
+        .unwrap();
+
+        assert_eq!(cx.cwd(), previous_cwd);
+        assert_eq!(result["returned_to"], previous_cwd.to_str().unwrap());
+        assert!(!worktree.exists());
+        let branch_exists = ["show-ref", "--verify", "--quiet", "refs/heads/orbit/topic"];
+        assert!(!git(&cx.working_dir, &branch_exists));
+        assert!(git(&other, &branch_exists));
+        orbit_engine::hooks::set_working_dir(None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

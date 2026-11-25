@@ -25,9 +25,14 @@ $ orbit mcp remove tracker
 
 Everything after `--` is the server's own command line. `--scope project`
 writes `.orbit/mcp.json` instead. `orbit mcp list` shows the names of a
-server's environment variables and headers, never their values. In the
-terminal chat, `/mcp add`, `/mcp get`, `/mcp list` and `/mcp remove` take the
-same arguments, split on spaces.
+server's environment variables and headers, never their values. It also hides
+what a URL or a command line keeps secret: the values in a URL's query and its
+user information (`https://host/mcp?key=<hidden>`), the word after a
+credential flag (`--api-key <hidden>`, `--token=<hidden>`, `API_KEY=<hidden>`)
+and the value of a credential header (`--header Authorization: <hidden>`). A
+word of a command line longer than 100 characters is cut there. The file keeps
+what it was given. In the terminal chat, `/mcp add`, `/mcp get`, `/mcp list`
+and `/mcp remove` take the same arguments, split on spaces.
 
 For an already installed browser MCP executable, a configuration has this shape:
 
@@ -137,6 +142,33 @@ link, as `python3` and `npx` often are, counts).
 
 A server's own `instructions`, given at its handshake, are part of the
 system prompt under the server's name.
+
+### What a server may print or send
+
+Real servers are not tidy, and ORBIT reads them the way the official clients do.
+
+- A line on a stdio server's standard output that is not JSON and does not
+  begin with `{` (a dotenv banner, a log line, a usage text) is skipped. A line
+  that begins with `{` and does not parse is a frame cut off in the middle, and
+  ends the session as a broken server; so does JSON that is not an object.
+- A reply with no `id` answers nothing ORBIT sent (a server that takes the
+  `notifications/initialized` notification for a request answers it with an
+  error like that) and is ignored. `"id": null` is how JSON-RPC says the server
+  could not read a request, and stays an error.
+- When a server never answers, or ends without a word on standard error, the
+  last line it printed on standard output (control characters removed, 160
+  characters at most) is named in the message: `its process ended before
+  answering (exit status: 2); the last line on its standard output was:
+  usage: …`.
+- A server's reply may be up to 16 MiB: one stdio frame, an HTTP body, an SSE
+  stream, and the sum of the pages of one `tools/list` (one real server's list
+  of 229 tools is 3.5 MB). What ORBIT sends stays within 1 MiB, and the model
+  is never shown more than 64 KiB of a result: the rest is cut and the result
+  is marked `truncated`.
+- The enabled servers are started together when ORBIT lists their tools, eight
+  at a time, so the first prompt waits for the slowest server and not for all of
+  them in turn (29 real servers took 22.5 s one after another). A server that
+  does not come up costs only itself.
 
 ## Read MCP resources and run MCP prompts
 
@@ -290,7 +322,10 @@ agent's name, the agent keeps working, and `AgentOutput {agent}` reports its
 status and, when it has finished, its report. At most four background agents run
 at a time. A background agent cannot show an approval card: a call that would
 ask is denied (or classified, in `auto` mode). `AgentStop {agent}` stops one at
-its next cancellation point. In the terminal chat, `/tasks agents` lists the
+its next cancellation point. Both calls also accept `agent_id` for the same
+target. A call that names two different agents in `agent` and `agent_id` is
+refused, so the permission rule that is checked is always the agent that is
+acted on. In the terminal chat, `/tasks agents` lists the
 agents this session has started, `/tasks show <agent>` prints one agent's own
 conversation (what it was asked, what it said, which tools it called and what
 came back, long texts cut), and `/tasks stop <agent>` stops a background one.
@@ -375,10 +410,10 @@ ORBIT fires all 33 of Claude Code's events:
 | `InstructionsLoaded` | Once per instruction or rule file at session start (`load_reason`: `session_start`) | No |
 | `UserPromptSubmit` | Before a prompt is sent | Yes: the prompt is refused |
 | `UserPromptExpansion` | A custom command file is about to become a prompt (matcher: the command name) | Yes |
-| `PreToolUse` | Before a tool call | Yes |
+| `PreToolUse` | Before a tool call: built-in tools and MCP tools (`mcp__server__tool`) alike, after the permission verdict. A hook may deny, ask, rewrite the input or add context; the context is attached to MCP results | Yes |
 | `PermissionRequest` | You are about to be asked | No |
 | `PermissionDenied` | A call was refused, by a rule, the mode, auto mode or you | No |
-| `PostToolUse`, `PostToolUseFailure` | After a tool call. The payload carries the result as `tool_response` (the error text, for a failure). The call has already run, so nothing is blocked, but what a `PostToolUse` hook reports goes to the model with the result: its `additionalContext`, and its complaint when it exits 2 or answers `decision: "block"` (a failed lint after an edit, say) | No |
+| `PostToolUse`, `PostToolUseFailure` | Built-in registry and MCP tools fire `PostToolUse` on success with `tool_response`, or `PostToolUseFailure` on failure with `error`. Both events carry the effective `tool_input`. Denied and cancelled calls skip these events. Hook context goes to the model with the result, along with any complaint from a success hook | No |
 | `PostToolBatch` | All of a round's tool calls have returned | Yes: the turn ends |
 | `TaskCreated`, `TaskCompleted` | `TaskCreate`, or `TaskUpdate` marking a task done | Yes |
 | `Stop` | The model finished its reply | Yes: it keeps working |
@@ -405,7 +440,8 @@ to the working directory (`.env|.envrc`). They are compared by modification
 time when you send a prompt, not continuously.
 
 A blocked `Stop`, `SubagentStop` or `TeammateIdle` sends the hook's reason
-back to the model, which keeps working, at most three times a turn. A blocked
+back to the model, which keeps working, at most three times a turn unless you
+raise that (`stop_hook_max_continuations`, below). A blocked
 automatic `PreCompact` skips the summary while the request still fits the
 model's window; once it no longer fits, the turn stops with the hook's reason.
 ORBIT has no agent teams: `TeammateIdle` fires for a background agent started
@@ -424,9 +460,33 @@ and the same values as `tool_name` and `tool_input`. Exit code 2 blocks the
 action and gives the hook's standard error to the model. The default timeout
 is 60 seconds.
 
-`matcher` limits a hook to some tools: names separated by `|` or `,`, with `*`
-(or `.*`) as a wildcard, for example `mcp__github__*`. Other regular-expression
-syntax is not supported. Without a matcher the hook runs for every tool.
+Hooks run with `CLAUDE_PROJECT_DIR` set to the working directory (unless it is
+already set), and with `CLAUDE_SESSION_ID`, `CLAUDE_CODE_SESSION_ID` and
+`ORBIT_SESSION_ID` set to the session's id, the same as the payload's
+`session_id`. The id replaces any value ORBIT inherited from the shell that
+started it. `CLAUDE_ENV_FILE` is not supported.
+
+`matcher` limits a hook to some tools (for the other events, to the subject in
+the table above). Write names separated by `|` or `,`, with `*` (or `.*`) as a
+wildcard: `Write|Edit`, `mcp__github__*`. Each name is compared whole.
+
+A matcher may also be a regular expression, as in Claude Code. One that
+contains any of `^ $ ( ) [ ] { } + ? \` is also searched as one, anywhere in the
+name and case-sensitively, so write `^…$` to pin it: `mcp__.*(exa|tavily)`
+matches `mcp__tavily__search`, and `^(startup|resume)$` matches those two
+session sources and nothing longer. Claude Code hooks registered with such
+matchers (`WebSearch|WebFetch|mcp__.*(exa|tavily)`) run unchanged. The language
+is Rust's `regex`, which has no look-around and no back-references. A name list
+never turns into a regular expression by accident: `Bash` still means exactly
+`Bash`, and a name that happens to contain one of those characters (`[id].tsx`)
+still matches itself.
+
+A pattern that is not a valid regular expression is not silent. ORBIT names it
+among the hook trouble when the hooks load (once for each hook, with the reason
+and the hook's command), `orbit doctor` reports it as invalid, and `/hooks`
+flags it. Until you fix it only the plain names in it can match, so a hook that
+depends on the pattern does not run. Without a matcher the hook runs for every
+tool.
 
 Standard output may be JSON, in ORBIT's form or Claude Code's:
 
@@ -438,18 +498,41 @@ Standard output may be JSON, in ORBIT's form or Claude Code's:
 ```
 
 - A deny or block stops the action; for `UserPromptSubmit` it refuses the prompt.
+  A deny that gives no reason takes the hook's `systemMessage` as its reason, which
+  is where hookify's rules explain a block, so what you and the model are told is
+  that text. A `systemMessage` on a hook that does not deny is not shown.
 - `updatedInput` (or ORBIT's `{"type": "rewrite", "input": …}`) on `PreToolUse`
   replaces the tool input. Permission rules are evaluated on the rewritten
   input; the transcript keeps the model's original call.
 - For `SessionStart` and `UserPromptSubmit`, `additionalContext`, or plain text
   printed by a hook that exits 0, is given to the model as context (up to
-  8 KiB).
+  8 KiB in all, unless `hook_context_max_bytes` says otherwise, below).
 - An `ask` decision on `PreToolUse` opens the approval card, unless you already
   approved that same call. Where nothing can ask (headless runs, background
   agents) it is a denial.
 - A `Stop` hook that blocks (exit 2 or a deny) sends its reason back to the
-  model, which keeps working. This happens at most three times a turn, and the
-  payload's `stop_hook_active` is true once it has happened.
+  model, which keeps working. This happens at most three times a turn unless
+  `stop_hook_max_continuations` says otherwise, and the payload's
+  `stop_hook_active` is true once it has happened.
+
+A turn cannot be held forever: a stop hook may send the model back to work 3
+times a turn, and no more. A guard that needs longer raises that with a
+top-level key in `$ORBIT_HOME/settings.toml` (above any `[table]`), or in a
+`--settings` TOML file, which wins for that run:
+
+```toml
+stop_hook_max_continuations = 150
+```
+
+It takes a whole number from 0 to 1000; `0` means a block is never obeyed. Each
+continuation also uses one of the turn's rounds, so a limit of 150 needs a round
+limit above it. A turn has 100 rounds in the terminal chat, which has no setting
+for that; `--max-turns` sets it for a headless run. Only your
+own settings count: a project's `.orbit/settings.toml` cannot raise it. When the
+limit, or the round limit, ends a turn while a hook still blocks, ORBIT says so
+(in the transcript in the terminal chat, on standard error at the end of a
+headless run). A value it cannot use keeps the default and is reported the same
+way, and so is the key written under a `[table]`, where it is not read.
 
 Two more keys narrow or detach a hook:
 
@@ -528,6 +611,87 @@ subagent is given. A hook that runs past its `timeout_secs` is stopped and
 blocks nothing; the chat says so in a line, and a headless run on standard
 error.
 
+
+### Give hooks more room
+
+What hooks add to the model's context at one event (a `SessionStart` or
+`UserPromptSubmit` hook, a `SubagentStart` hook, a tool hook's feedback) is
+bounded: 8 KiB for all the hooks of that event together, the first hook first.
+A set of hooks that prints more loses the later ones. Hooks that print as much as
+yours may need a larger bound, which is a top-level key in your own settings
+(above any `[table]`, in `$ORBIT_HOME/settings.toml` or a `--settings` TOML
+file, which wins for that run):
+
+```toml
+hook_context_max_bytes = 65536
+```
+
+It takes a whole number of bytes from 0 to 262144 (256 KiB); `0` means hooks add
+no context. Only your own settings count: a project's `.orbit/settings.toml`
+cannot raise it, because the text is not yours. What does not fit is cut at a
+character boundary and the context ends in a line that says so
+(`… (hook context cut at 8192 bytes)`), so the model knows it has part of it.
+You are told once per run, with each hook's size in the order the hooks ran,
+which is the order `/hooks` lists them, so the hooks that were cut can be
+recognised. A value that cannot be used keeps the default and is reported with
+the rest of the hook trouble.
+
+### Run the hooks of an imported plugin
+
+An imported plugin's command hooks never run on their own: they come in a
+package, not from you. To run them, name the plugin in your own settings,
+above any `[table]`:
+
+```toml
+plugin_hooks = ["hookify", "semgrep@8f3a1c9d"]
+```
+
+A plugin's hook is a program that runs with your privileges, outside the Bash
+sandbox, each time its event fires, so name only plugins whose code you trust, and
+pin the digest of the copy you looked at. Importing one runs nothing.
+
+A name matches an imported, enabled, user-scope plugin (`orbit plugin list`).
+An `@` and the first 8 or more hex digits of its digest pin the stored copy you
+looked at, so an upgrade cannot slip in under the same name. Only your own
+settings count (`$ORBIT_HOME/settings.toml`, then a `--settings` TOML file,
+which adds to it): a project's `.orbit/settings.toml` cannot switch a plugin's
+hooks on, a plugin imported for one project never contributes any, and `--bare`
+runs none.
+
+The hook runs from the stored copy. `CLAUDE_PLUGIN_ROOT` is that folder and
+`CLAUDE_PLUGIN_DATA` is a private state folder for the plugin (made when one of
+its hooks first runs, never by looking at it), next to what every hook gets.
+`${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` written in a command are
+replaced by those paths, as Claude Code does. `matcher`, `timeout`, `if` and
+`async` are kept.
+
+Some hooks are left out, each named with its reason and never run in some other
+form: `asyncRewake` (it wakes the model when a background hook finishes, and
+ORBIT has nothing that does that), a handler written for a shell other than
+bash, `once` on an event other than `SessionStart`, `SessionEnd` and `Setup`,
+and an event ORBIT does not have. A plugin you named that is not imported, not
+enabled, damaged or not the pinned copy runs nothing and is reported once per
+run. `orbit doctor` has a `plugins.hooks` check that lists, for each named
+plugin, the events that run and what was left out (never a command), and
+`/hooks` marks each of these hooks `(plugin NAME)`.
+
+A plugin's hooks are checked against the stored copy's digest when they are
+first resolved in a run, and again whenever the store changes (an import, upgrade,
+enable, disable or remove), not before every call.
+
+#### A damaged stored copy
+
+A hook must not write inside `CLAUDE_PLUGIN_ROOT`: that folder is the verified
+copy, and what a hook keeps belongs in `CLAUDE_PLUGIN_DATA`. ORBIT points Python's
+bytecode cache (`PYTHONPYCACHEPREFIX`) at a folder in that data folder, so a Python
+hook that imports a file beside it does not change its copy. Anything else that
+changes a file in the copy makes it fail its check (`store_file_unsafe` or
+`store_package_tampered`), the plugin's hooks stop running, and ORBIT says so once
+per run. `orbit plugin remove NAME` does not clear that, because the package
+folder is kept and an identical import is refused. To restore the plugin, remove it,
+delete its folder under `$ORBIT_HOME/plugins/portable/packages/NAME/` (the folder
+and its files are read-only; `chmod -R u+rwx` first), and import it again.
+
 ### Use your Claude Code configuration
 
 Put `claude_compat = true` at the top of `$ORBIT_HOME/settings.toml` (before any
@@ -537,12 +701,15 @@ files:
 - hooks from `~/.claude/settings.json`, and from `.claude/settings.json` and
   `.claude/settings.local.json` in a trusted project;
 - skills from `~/.claude/skills/`;
-- commands from `~/.claude/commands/`.
+- commands from `~/.claude/commands/`;
+- your user memory file, `~/.claude/CLAUDE.md`, as an instruction file (see
+  [Write project instructions](#write-project-instructions)).
 
 `$CLAUDE_CONFIG_DIR` replaces `~/.claude` when set. `command`, `http`,
 `prompt`, `agent` and `mcp_tool` handlers are taken, with their `if` and
 `async` settings, and the `statusLine` command is used when ORBIT's own
-`status_line` is not set. Hooks get `CLAUDE_PROJECT_DIR` set to the working directory. The
+`status_line` is not set. Hooks get `CLAUDE_PROJECT_DIR` set to the working directory, and the session's
+id as `CLAUDE_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`. The
 `transcript_path` they receive is ORBIT's session file, which is not in Claude
 Code's transcript format. This is off by default because those files were
 written for another program.
@@ -588,10 +755,41 @@ stopped after 3 seconds. Colour escapes are removed: the bar draws plain text.
 
 ## Write project instructions
 
-ORBIT reads, in this order: `/etc/orbit/ORBIT.md`, `$ORBIT_HOME/ORBIT.md`, then in
-the working directory `ORBIT.md`, `.orbit/ORBIT.md`, `.orbit/ORBIT.local.md`,
-`AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md`. Each file is
-capped at 200 lines or 25 KB.
+ORBIT reads, in this order: `/etc/orbit/ORBIT.md`, your Claude Code user file
+`~/.claude/CLAUDE.md` (only with `claude_compat`; `$CLAUDE_CONFIG_DIR/CLAUDE.md`
+when that is set), `$ORBIT_HOME/ORBIT.md`, then in the working directory
+`ORBIT.md`, `.orbit/ORBIT.md`, `.orbit/ORBIT.local.md`, `AGENTS.md`, `CLAUDE.md`,
+`.claude/CLAUDE.md` and `CLAUDE.local.md`. A later file has the last word, so
+`ORBIT.md` in your home can correct what `~/.claude/CLAUDE.md` says. Only regular
+files are read (a named pipe or a folder with one of these names is skipped), at
+most 1 MiB of each, and a file that two names reach, through a link or because
+`AGENTS.md` points at `CLAUDE.md`, is read once.
+
+A link may not lead just anywhere. A file in the working directory arrives with
+the repository, and the prompt goes to the provider, so a link in one must stay
+inside the working directory (a link from a sub-folder up to the repository root
+does not); and no instruction file, yours included, may lead to what the
+deny-read list names (`~/.ssh`, `.env`, `*.pem`, `id_rsa*` and the rest). A file
+that does is refused before any of it is read. ORBIT names it once per run
+(`/work/repo/CLAUDE.md is not read: its real path /home/you/.ssh/id_ed25519 is on
+the deny-read list`), `/memory` lists it with the reason, and `orbit doctor`
+counts it apart from the files read. Your own files, `ORBIT.md` in your home and
+the Claude Code user file, may be links to anything else (a dotfiles repository,
+say), and `AGENTS.md` pointing at `CLAUDE.md` inside one project is unchanged.
+Imported files already followed the same rule.
+
+Each file is capped at 200 lines or 25 KB, and a cut is never silent. The text
+the model reads ends in `… (truncated at 200 lines)` or `… (truncated at 25 KB)`;
+ORBIT names the file once per run (`/home/you/.claude/CLAUDE.md is cut: ORBIT
+reads the first 200 of its 231 lines`); `/memory` marks it; and `orbit doctor` has
+an `instructions` check that counts the files read and names each one the cap
+cuts, without showing any of their text. Imported files and rules are held to the
+same cap and named the same way.
+
+Without `claude_compat`, link the file instead:
+`ln -s ~/.claude/CLAUDE.md ~/.orbit/ORBIT.md`. `/memory add` and `/memory remove`
+refuse a linked file rather than follow the link; edit the file it points to.
+`orbit migrate --from claude` lists the user file as a source, and says what reads it.
 
 A file can import another with `@path`, relative to itself (or `~/…`), up to five
 levels deep and 24 files in all. An import is honoured only when the target is a
@@ -903,10 +1101,57 @@ A git marketplace is cloned (shallow) under `$ORBIT_HOME/marketplaces/`; a
 directory is read where it is. Nothing is fetched except when you add or
 update one. `install NAME@MARKETPLACE` hands the plugin's directory to the
 ordinary importer, so the package is stored as an immutable snapshot, no
-package code runs, and its hooks, credentials and MCP servers are not
-activated. Plugin sources other than a path inside the marketplace or a git
+package code runs, its hooks stay off until you name the plugin
+([`plugin_hooks`](#run-the-hooks-of-an-imported-plugin)), and its credentials
+and MCP servers are not activated. Plugin sources other than a path inside the marketplace or a git
 repository are refused. The same commands work in the terminal chat as
 `/plugin …`; a plugin installed there is used by sessions started afterwards.
+
+## Import the plugins Claude Code has enabled
+
+```console
+$ orbit plugin import --from-claude --dry-run    # what would happen; writes nothing
+$ orbit plugin import --from-claude              # import them
+$ orbit plugin import --from-claude --only hookify --only semgrep
+```
+
+This reads two records in Claude Code's config folder (`$CLAUDE_CONFIG_DIR`,
+else `~/.claude`): `plugins/installed_plugins.json` (format version 2; another
+version is refused, not guessed at) and the `enabledPlugins` map of
+`settings.json`. Nothing else in that folder is read, and it is where Claude Code
+keeps its credentials. Each plugin that is enabled and installed for you goes
+through the ordinary importer, read the way Claude Code reads plugins
+(`--lenient`, below), at user scope. Nothing runs, and nothing is written outside
+`$ORBIT_HOME/plugins`.
+
+One line per plugin says what happened and what it holds: `imported`, `already`
+(the stored copy is identical), `changed` (Claude Code's copy has moved on; ORBIT's
+is left as it is, and the line gives the `orbit plugin upgrade` command that takes
+the new one), `kept` (ORBIT holds it with other settings, for example disabled, and
+leaves it), `refused` with its code (the importer's, or `install_path_outside`
+for an install path that is not inside Claude Code's plugin folder: a path in a
+registry is no reason to copy some other folder into a store), or `skipped` with
+the reason (not installed for the user, or a second marketplace's copy of a name
+that was already imported). One refusal does not stop the others. A plugin's command hooks and MCP servers are counted and
+marked as staying off; the last line says how to turn hooks on.
+
+Importing everything has a cost. ORBIT checks each stored copy against its digest
+whenever it builds a session's skill list and when the Skill tool or a plugin
+command runs, so a store of seventy plugins (118 MiB here) is verified at every
+start: about half a second with a release build on the machine this was measured
+on, and several times that with a debug build. The import itself took half a
+minute. `orbit plugin disable NAME` takes a plugin out of that without removing it.
+
+`--lenient` is also a flag of `orbit plugin inspect`, `import` and `upgrade`. A
+strict read refuses the whole plugin for one skill, command or agent file it cannot
+parse; a lenient read leaves that file out and names it (`component_skipped`).
+It reads YAML the way Claude Code does when a value holds a colon or a bracket
+(`argument-hint: [--strict] [--json]`), accepts a list for `argument-hint`, a
+`.mcp.json` without the `mcpServers` wrapper, and a `hooks.json` that also lists
+`modules`, and skips symbolic links, `node_modules`, `.venv`, `venv` and
+`__pycache__` instead of refusing the package. The choice is stored with the
+plugin, and an upgrade keeps it. A package is at most 64 MiB with files of at most
+16 MiB, and the store holds 256 MiB in all.
 
 ## Keep a session running with serve and attach
 

@@ -132,6 +132,10 @@ pub enum Msg {
         winner_seats: Vec<String>,
         final_text: String,
     },
+    /// The saved conversation no longer has a Council reply to show.
+    CouncilCleared {
+        session_id: String,
+    },
     SessionProjection(SessionProjection),
     /// Transient owning identity only; the reducer never retains this operation.
     OrdinaryTurnEnded {

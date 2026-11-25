@@ -33,6 +33,7 @@ pub mod context_budget;
 pub mod diff;
 pub mod dispatch;
 pub mod hooks;
+pub mod plugin_hooks;
 pub mod retry;
 pub mod routing;
 pub mod skills;

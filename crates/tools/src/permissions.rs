@@ -418,6 +418,10 @@ pub fn evaluate_with_server(
 /// fallback rule — when the shell sandbox cannot start on this
 /// machine, every Bash command asks, whatever the mode (bypass
 /// excepted). Returns (verdict, sandbox_up) so the UI can say why.
+///
+/// `sandbox_off`: the operator switched the sandbox off in their own
+/// settings. That is a choice, not a failure, so the fallback rule does not
+/// apply: the mode and the rules decide.
 pub fn evaluate_live(
     mode: PermissionMode,
     rules: &RuleSet,
@@ -425,14 +429,17 @@ pub fn evaluate_live(
     argument: &str,
     is_read_only_tool: bool,
     is_readonly_command: bool,
+    sandbox_off: bool,
 ) -> (Verdict, bool) {
     use std::sync::OnceLock;
     static UP: OnceLock<bool> = OnceLock::new();
-    let up = *UP.get_or_init(|| {
-        matches!(
-            crate::sandbox::ShellSandbox::probe(),
-            crate::sandbox::SandboxStatus::Confined
-        )
+    let up = counts_as_up(sandbox_off, || {
+        *UP.get_or_init(|| {
+            matches!(
+                crate::sandbox::ShellSandbox::probe(),
+                crate::sandbox::SandboxStatus::Confined
+            )
+        })
     });
     let verdict = evaluate(
         mode,
@@ -442,10 +449,23 @@ pub fn evaluate_live(
         is_read_only_tool,
         is_readonly_command,
     );
+    (fallback_rule(up, tool, mode, verdict), up)
+}
+
+/// Does the fallback rule treat the sandbox as up? A sandbox the operator
+/// switched off themselves does, whatever this machine has; otherwise it is
+/// the probe's answer (asked only when it is needed).
+fn counts_as_up(operator_switched_off: bool, probe_confined: impl FnOnce() -> bool) -> bool {
+    operator_switched_off || probe_confined()
+}
+
+/// A Bash command that would run without a working sandbox asks, whatever
+/// the mode but bypass. Only an allow is turned into an ask.
+fn fallback_rule(up: bool, tool: &str, mode: PermissionMode, verdict: Verdict) -> Verdict {
     if !up && tool == "Bash" && mode != PermissionMode::Bypass && verdict == Verdict::Allow {
-        (Verdict::Ask, up)
+        Verdict::Ask
     } else {
-        (verdict, up)
+        verdict
     }
 }
 
@@ -866,5 +886,76 @@ mod tests {
             ),
             Verdict::Ask
         );
+    }
+
+    #[test]
+    fn a_missing_sandbox_makes_bash_ask_in_every_mode_but_bypass() {
+        use PermissionMode::*;
+        for mode in [Default, AcceptEdits, DontAsk, Auto] {
+            assert_eq!(
+                fallback_rule(false, "Bash", mode, Verdict::Allow),
+                Verdict::Ask,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            fallback_rule(false, "Bash", Bypass, Verdict::Allow),
+            Verdict::Allow
+        );
+        assert_eq!(
+            fallback_rule(true, "Bash", Default, Verdict::Allow),
+            Verdict::Allow,
+            "with the sandbox up nothing changes"
+        );
+        assert_eq!(
+            fallback_rule(false, "Read", Default, Verdict::Allow),
+            Verdict::Allow,
+            "only Bash is affected"
+        );
+        assert_eq!(
+            fallback_rule(false, "Bash", Default, Verdict::Deny("no".into())),
+            Verdict::Deny("no".into())
+        );
+    }
+
+    #[test]
+    fn running_without_the_sandbox_by_choice_is_not_a_missing_sandbox() {
+        // The operator switched it off: "up" for the fallback rule, whatever
+        // this machine has; the probe is not even asked.
+        assert!(counts_as_up(true, || panic!("the probe is not needed")));
+        assert!(!counts_as_up(false, || false), "a machine without one");
+        assert!(counts_as_up(false, || true));
+        // So an allowed Bash call stays allowed in every mode.
+        let up = counts_as_up(true, || false);
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::DontAsk,
+            PermissionMode::Auto,
+        ] {
+            assert_eq!(
+                fallback_rule(up, "Bash", mode, Verdict::Allow),
+                Verdict::Allow,
+                "{mode:?}"
+            );
+        }
+        // The same call where there is no sandbox and nobody chose that:
+        let missing = counts_as_up(false, || false);
+        assert_eq!(
+            fallback_rule(missing, "Bash", PermissionMode::DontAsk, Verdict::Allow),
+            Verdict::Ask
+        );
+        // And the live wrapper reports it as up.
+        let none = RuleSet { rules: Vec::new() };
+        let (_, up) = evaluate_live(
+            PermissionMode::DontAsk,
+            &none,
+            "Bash",
+            "ls",
+            false,
+            true,
+            true,
+        );
+        assert!(up);
     }
 }

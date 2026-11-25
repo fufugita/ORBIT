@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "orbit plugin inspect PATH [--format portable|claude|codex|hermes] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin import|install PATH [--scope user|project] [--no-enable] [--format FORMAT] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin install NAME@MARKETPLACE [the import flags]\norbit plugin marketplace add SOURCE | list | update [NAME] | remove NAME [--json]\norbit plugin list [--json]\norbit plugin status ID [--scope user|project] [--json]\norbit plugin enable|disable|remove ID [--scope user|project] [--revision REV] [--json]\norbit plugin upgrade ID PATH [--scope user|project] [--revision REV] [--format FORMAT] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]";
+pub(crate) const USAGE: &str = "orbit plugin inspect PATH [--format portable|claude|codex|hermes] [--lenient] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin import|install PATH [--scope user|project] [--no-enable] [--format FORMAT] [--lenient] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]\norbit plugin import --from-claude [--dry-run] [--only NAME]... [--json]\norbit plugin install NAME@MARKETPLACE [the import flags]\norbit plugin marketplace add SOURCE | list | update [NAME] | remove NAME [--json]\norbit plugin list [--json]\norbit plugin status ID [--scope user|project] [--json]\norbit plugin enable|disable|remove ID [--scope user|project] [--revision REV] [--json]\norbit plugin upgrade ID PATH [--scope user|project] [--revision REV] [--format FORMAT] [--lenient] [--model-map SOURCE=TARGET] [--tool-map SOURCE=TARGET] [--json]";
 const WITHHELD: &str = "[configured literal]";
 const MAX_TEXT: usize = 8192;
 const MAX_REPORT: usize = 256 * 1024;
@@ -45,6 +45,10 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
         );
     }
     let operation = words[0];
+    // Everything Claude Code has installed and enabled, in one go.
+    if operation == "import" && words[1..].contains(&"--from-claude") {
+        return crate::plugin_bulk::command(home, project, &words[1..]);
+    }
     if operation == "marketplace" {
         return crate::marketplace::command(home, project, &words[1..]);
     }
@@ -89,6 +93,15 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
                     return Err(usage("duplicate --no-enable flag"));
                 }
                 no_enable = true;
+            }
+            // Read the package as Claude Code reads it, leaving out and naming what cannot be read
+            // (a skill, command or agent whose file does not parse, a link, a dependency folder)
+            // instead of refusing the whole plugin. Kept with the plugin.
+            "--lenient" => {
+                if options.lenient {
+                    return Err(usage("duplicate --lenient flag"));
+                }
+                options.lenient = true;
             }
             "--format" => {
                 if options.format.is_some() {
@@ -173,6 +186,8 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
         if options.format.is_some() {
             retained.format = options.format;
         }
+        // An upgrade keeps how the plugin was imported; the flag can add leniency, not take it away.
+        retained.lenient |= options.lenient;
         retained.model_map.extend(options.model_map);
         retained.tool_map.extend(options.tool_map);
         let receipt = store
@@ -203,7 +218,7 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
     report("plugin inspect", "inspection", &inspected)
 }
 
-fn open_store(home: &Path, project: &Path) -> Result<PluginStore, CliError> {
+pub(crate) fn open_store(home: &Path, project: &Path) -> Result<PluginStore, CliError> {
     let trusted =
         orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
     PluginStore::open(home, project, trusted).map_err(compat_error)
@@ -330,14 +345,114 @@ fn compat_error(error: CompatError) -> CliError {
     }
 }
 
+/// A snapshot of many plugins is a list: each entry says who it is, what state it is in and what it
+/// holds (counts), and `plugin status ID` gives the whole record of one. The full records of
+/// seventy plugins are far past what a report can show, and used to use up the display budget
+/// before it reached a single name.
+fn compact_snapshot(snapshot: &mut Value) -> usize {
+    let Some(entries) = snapshot.get_mut("entries").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let made = entries.len();
+    for entry in entries {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let mut counts = Map::new();
+        if let Some(Value::Array(components)) = object.remove("components") {
+            for component in &components {
+                let kind = component["kind"]["type"].as_str().unwrap_or("other");
+                let seen = counts.get(kind).and_then(Value::as_u64).unwrap_or(0);
+                counts.insert(kind.to_owned(), json!(seen + 1));
+            }
+        }
+        object.insert("component_counts".into(), Value::Object(counts));
+        for (field, count) in [
+            ("requirements", "requirement_count"),
+            ("diagnostics", "diagnostic_count"),
+        ] {
+            let n = match object.remove(field) {
+                Some(Value::Array(items)) => items.len(),
+                _ => 0,
+            };
+            object.insert(count.into(), json!(n));
+        }
+        if let Some(source) = object.get_mut("source").and_then(Value::as_object_mut) {
+            source.remove("files");
+        }
+        if let Some(manifest) = object.get_mut("manifest").and_then(Value::as_object_mut) {
+            manifest.remove("source_metadata");
+            manifest.remove("description");
+        }
+    }
+    made
+}
+
+/// The literals to hide in a report: the whole record's, or for a list the store's own fields and
+/// each plugin's own, merged.
+fn literals_of(rendered: &Value, field: &str) -> LiteralCatalog {
+    let snapshot = match field {
+        "snapshot" if rendered.get("entries").is_some() => Some(rendered),
+        "receipt" => rendered
+            .get("snapshot")
+            .filter(|s| s.get("entries").is_some()),
+        _ => None,
+    };
+    let Some(snapshot) = snapshot else {
+        return LiteralCatalog::collect(rendered);
+    };
+    let mut parts = Vec::new();
+    if field == "receipt"
+        && let Some(plugin) = rendered.get("plugin")
+    {
+        parts.push(LiteralCatalog::collect(plugin));
+    }
+    parts.push(LiteralCatalog::collect(&json!({
+        "revision": snapshot.get("revision"),
+        "diagnostics": snapshot.get("diagnostics"),
+    })));
+    for entry in snapshot["entries"].as_array().into_iter().flatten() {
+        parts.push(LiteralCatalog::collect(entry));
+    }
+    LiteralCatalog::merge(parts)
+}
+
+/// `30 skills, 2 agents, 5 commands, 4 command hooks, 1 MCP server`, for what a plugin holds.
+pub(crate) fn components_phrase(counts: &Map<String, Value>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (kind, label) in [
+        ("skill", "skill"),
+        ("agent", "agent"),
+        ("command", "command"),
+        ("hook", "command hook"),
+        ("mcp", "MCP server"),
+    ] {
+        let n = counts.get(kind).and_then(Value::as_u64).unwrap_or(0);
+        if n > 0 {
+            parts.push(format!("{n} {label}{}", if n == 1 { "" } else { "s" }));
+        }
+    }
+    parts.join(", ")
+}
+
 fn report(command: &str, field: &str, record: &impl serde::Serialize) -> Result<Value, CliError> {
-    let rendered = serde_json::to_value(record)
+    let mut rendered = serde_json::to_value(record)
         .map_err(|_| CliError::ConfigInvalid("plugin record serialization failed".into()))?;
-    let literals = LiteralCatalog::collect(&rendered);
+    // What counts as a configured literal is learned from the whole records (their source metadata
+    // says what an option value really is), so it is collected before a list is made compact, one
+    // plugin at a time so a long list does not share one collection's bounds.
+    let literals = literals_of(&rendered, field);
+    let entries = match field {
+        "snapshot" => compact_snapshot(&mut rendered),
+        // An import's receipt carries the whole store beside the plugin it just took in.
+        "receipt" => rendered.get_mut("snapshot").map_or(0, compact_snapshot),
+        _ => 0,
+    };
     let mut budget = DisplayBudget {
-        nodes: 4096,
-        text: 64 * 1024,
-        work: 1024 * 1024,
+        // A list of plugins is a line each: the budget grows with the number of them.
+        nodes: 4096 + 64 * entries,
+        text: 64 * 1024 + 512 * entries,
+        work: 1024 * 1024 + 4096 * entries,
         truncated: false,
     };
     // Typed mode starts only at a serialized compatibility DTO. Its serde-owned
@@ -354,7 +469,7 @@ fn report(command: &str, field: &str, record: &impl serde::Serialize) -> Result<
     Ok(report)
 }
 
-fn usage(message: &str) -> CliError {
+pub(crate) fn usage(message: &str) -> CliError {
     CliError::Usage(format!("{message}; {USAGE}"))
 }
 
@@ -439,6 +554,29 @@ struct LiteralCatalog {
 }
 
 impl LiteralCatalog {
+    /// Several catalogs as one, within the bounds one collection has: 128 values, 16 KiB in all.
+    fn merge(parts: Vec<Self>) -> Self {
+        let mut values = BTreeSet::new();
+        let (mut total, mut complete) = (0usize, true);
+        for part in parts {
+            complete &= part.complete;
+            for value in part.values {
+                if values.contains(&value) {
+                    continue;
+                }
+                if values.len() == 128 || total.saturating_add(value.len()) > 16 * 1024 {
+                    complete = false;
+                    continue;
+                }
+                total += value.len();
+                values.insert(value);
+            }
+        }
+        let mut values: Vec<String> = values.into_iter().collect();
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        Self { values, complete }
+    }
+
     fn collect(value: &Value) -> Self {
         struct Collection {
             nodes: usize,
@@ -770,6 +908,9 @@ pub fn human_report(value: &Value) -> String {
     if let Some(text) = crate::marketplace::human_report(value) {
         return text;
     }
+    if value.get("bulk").is_some() {
+        return crate::plugin_bulk::human_report(value);
+    }
     if value.get("command").and_then(Value::as_str) == Some("plugin help") {
         return format!(
             "{USAGE}\nManage local snapshots without executing package code. Runtime readiness remains unchecked.\n"
@@ -794,14 +935,19 @@ pub fn human_report(value: &Value) -> String {
         ];
         if let Some(entries) = value["snapshot"]["entries"].as_array() {
             for plugin in entries.iter().take(128) {
+                let holds = plugin["component_counts"]
+                    .as_object()
+                    .map(components_phrase)
+                    .filter(|holds| !holds.is_empty());
                 lines.push(format!(
-                    "  {} [{}], version {}, enabled in index: {}",
+                    "  {} [{}], version {}, enabled in index: {}{}",
                     text(&plugin["id"]["name"]),
                     text(&plugin["id"]["scope"]),
                     plugin["manifest"]["version"]
                         .as_str()
                         .unwrap_or("unspecified"),
-                    plugin["enabled"].as_bool().unwrap_or(false)
+                    plugin["enabled"].as_bool().unwrap_or(false),
+                    holds.map(|holds| format!(" ({holds})")).unwrap_or_default()
                 ));
             }
             if entries.is_empty() {
@@ -899,7 +1045,7 @@ fn append_diagnostics(lines: &mut Vec<String>, diagnostics: &Value) {
     }
 }
 
-fn human_lines(mut lines: Vec<String>, truncated: bool) -> String {
+pub(crate) fn human_lines(mut lines: Vec<String>, truncated: bool) -> String {
     if truncated {
         lines.push("Display truncated; source files were not changed.".into());
     }
@@ -927,4 +1073,68 @@ fn human_lines(mut lines: Vec<String>, truncated: bool) -> String {
     }
     output.push('\n');
     output
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn entry(n: usize) -> Value {
+        json!({
+            "id": {"name": format!("plugin-{n}"), "scope": "user"},
+            "manifest": {"id": format!("plugin-{n}"), "name": format!("plugin-{n}"), "version": "1.0.0",
+                "description": "d", "license": null, "source_metadata": {"k": "v"}},
+            "source": {"format": "claude", "manifest_path": null, "inferred_name": null,
+                "source_digest": "a".repeat(64), "files": (0..20).map(|f| json!({"path": format!("f{f}"), "size": 1})).collect::<Vec<_>>()},
+            "enabled": true,
+            "digest": "a".repeat(64),
+            "options": {"format": null, "model_map": (0..10).map(|m| (format!("model-{m}"), json!("target"))).collect::<Map<String, Value>>(), "tool_map": {}, "lenient": true},
+            "components": (0..10).map(|c| json!({"id": format!("c{c}"), "kind": {"type": if c < 8 {"skill"} else {"hook"}}, "compatibility": "exact"})).collect::<Vec<_>>(),
+            "requirements": [],
+            "diagnostics": [{"code": "component_skipped", "severity": "warning"}],
+        })
+    }
+
+    #[test]
+    fn a_list_as_long_as_a_report_can_hold_is_shown_in_full_and_compactly() {
+        let snapshot = json!({
+            "revision": "r".repeat(64),
+            "entries": (0..128).map(entry).collect::<Vec<_>>(),
+            "diagnostics": [],
+        });
+        let report = report("plugin list", "snapshot", &snapshot).unwrap();
+        assert_eq!(
+            report["display_truncated"], false,
+            "the budget grows with the list"
+        );
+        let entries = report["snapshot"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 128);
+        for (n, entry) in entries.iter().enumerate() {
+            assert_eq!(entry["id"]["name"], format!("plugin-{n}"), "{entry}");
+            assert_eq!(entry["component_counts"], json!({"skill": 8, "hook": 2}));
+            assert_eq!(entry["diagnostic_count"], 1);
+            assert!(entry.get("components").is_none() && entry["source"].get("files").is_none());
+            assert!(
+                entry["manifest"].get("description").is_none(),
+                "the list is not the place for prose"
+            );
+        }
+        // The human list is a line each, with what the plugin holds.
+        let text = human_report(&report);
+        assert!(text.contains("plugin-127 [user], version 1.0.0, enabled in index: true (8 skills, 2 command hooks)"), "{text}");
+        assert!(!text.contains("withheld"));
+    }
+
+    #[test]
+    fn a_list_past_what_a_report_can_hold_says_it_was_cut() {
+        let snapshot = json!({
+            "revision": "r".repeat(64),
+            "entries": (0..140).map(entry).collect::<Vec<_>>(),
+            "diagnostics": [],
+        });
+        let report = report("plugin list", "snapshot", &snapshot).unwrap();
+        assert_eq!(report["display_truncated"], true);
+        assert_eq!(report["snapshot"]["entries"].as_array().unwrap().len(), 128);
+        assert!(human_report(&report).contains("Display truncated"));
+    }
 }

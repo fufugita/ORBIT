@@ -91,20 +91,131 @@ fn write(path: &Path, value: &Value) -> Result<(), CliError> {
         })
 }
 
+/// Does this name a credential? A flag (`--api-key`), a variable (`API_KEY`) or a header
+/// (`Authorization`, `X-Api-Key`): judged by its words, so `--keyboard` is not one.
+fn secret_name(name: &str) -> bool {
+    name.trim_start_matches('-')
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "key"
+                    | "keys"
+                    | "apikey"
+                    | "token"
+                    | "tokens"
+                    | "secret"
+                    | "secrets"
+                    | "password"
+                    | "passwd"
+                    | "credential"
+                    | "credentials"
+                    | "auth"
+                    | "authorization"
+                    | "bearer"
+                    | "cookie"
+            )
+        })
+}
+
+/// A URL as a listing shows it: the values in its query (tavily's hosted server takes its key
+/// there), any user information and the fragment are left out.
+fn hide_url_secrets(url: &str) -> String {
+    let url = url.split('#').next().unwrap_or("");
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{scheme}://<hidden>@{host}{path}"),
+                None => format!("{scheme}://{authority}{path}"),
+            }
+        }
+        None => base.to_owned(),
+    };
+    match query {
+        None => base,
+        Some(query) => {
+            let pairs: Vec<String> = query
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| match pair.split_once('=') {
+                    Some((name, _)) => format!("{name}=<hidden>"),
+                    None => "<hidden>".to_owned(),
+                })
+                .collect();
+            format!("{base}?{}", pairs.join("&"))
+        }
+    }
+}
+
+/// One word of a command line, cut at 100 characters: a launcher can be one 1,667
+/// character inline script.
+fn cut(text: &str) -> String {
+    let mut shown: String = text.chars().take(100).collect();
+    if text.chars().count() > 100 {
+        shown.push('…');
+    }
+    shown
+}
+
+/// The value of a `--header` argument: its name, and not its value when the name is a credential.
+fn header_argument(value: &str) -> String {
+    match value.split_once(':') {
+        Some((name, _)) if secret_name(name) => format!("{}: <hidden>", name.trim()),
+        _ => cut(value),
+    }
+}
+
+/// Where a server runs, as the list shows it. A command line carries secrets as readily as an
+/// environment does (`--api-key X`, `TOKEN=X`, an `Authorization` header, a URL with a key in
+/// its query), and `orbit mcp list` is the kind of output that gets pasted.
+fn shown_target(server: &McpServerConfig) -> String {
+    match server.transport {
+        McpTransport::Stdio => {
+            let mut words = vec![cut(&server.command)];
+            let (mut hide_next, mut header_next) = (false, false);
+            for arg in &server.args {
+                if std::mem::take(&mut hide_next) {
+                    words.push("<hidden>".to_owned());
+                    continue;
+                }
+                if std::mem::take(&mut header_next) {
+                    words.push(header_argument(arg));
+                    continue;
+                }
+                if arg.contains("://") {
+                    words.push(hide_url_secrets(arg));
+                    continue;
+                }
+                if arg.starts_with('-') && !arg.contains('=') {
+                    hide_next = secret_name(arg);
+                    header_next = matches!(arg.as_str(), "--header" | "--headers" | "-H");
+                } else if let Some((name, _)) = arg.split_once('=')
+                    && secret_name(name)
+                {
+                    words.push(format!("{name}=<hidden>"));
+                    continue;
+                }
+                words.push(cut(arg));
+            }
+            words.join(" ")
+        }
+        _ => hide_url_secrets(server.url.as_deref().unwrap_or("")),
+    }
+}
+
 /// A server as the list shows it: where it runs, never the values of its
-/// environment or headers.
+/// environment or headers, nor what its URL or command line keeps secret.
 fn summary(name: &str, scope: &str, server: &McpServerConfig) -> Value {
     json!({
         "name": name,
         "scope": scope,
         "transport": server.transport,
-        "target": match server.transport {
-            McpTransport::Stdio => std::iter::once(server.command.as_str())
-                .chain(server.args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => server.url.clone().unwrap_or_default(),
-        },
+        "target": shown_target(server),
         "enabled": server.enabled,
         "env": server.env.keys().collect::<Vec<_>>(),
         "headers": server.headers.keys().collect::<Vec<_>>(),
@@ -145,12 +256,14 @@ fn listed(home: &Path, project: &Path) -> Result<Vec<Value>, CliError> {
 
 /// `orbit mcp …`.
 pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, CliError> {
-    // `--json` is ours only before a `--`: after it, every word belongs to
-    // the server's own command line.
+    // After `--`, every word belongs to the server's own command line.
     let own = args
         .iter()
         .position(|word| word == "--")
         .unwrap_or(args.len());
+    let help = args[..own]
+        .iter()
+        .any(|word| matches!(word.as_str(), "--help" | "-h"));
     let words: Vec<&str> = args
         .iter()
         .enumerate()
@@ -158,7 +271,7 @@ pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, Cl
         .map(|(_, word)| word.as_str())
         .collect();
     match words.as_slice() {
-        [] | ["help"] | ["--help"] | ["-h"] => Ok(
+        words if help || words.is_empty() || words == ["help"] => Ok(
             json!({"schema":"orbit.cli/v1", "command":"mcp help", "status":"ok", "usage": USAGE}),
         ),
         ["list"] => Ok(
@@ -490,6 +603,190 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A key in a URL's query (tavily's hosted MCP asked for one), a token after `--api-key`, a
+    /// bearer in a header argument: the listing says where a server runs, never what opens it.
+    #[test]
+    fn a_listing_does_not_show_what_a_url_or_an_argument_keeps_secret() {
+        let dir = scratch();
+        run(
+            &dir,
+            &[
+                "add",
+                "--transport",
+                "http",
+                "tavily",
+                "https://mcp.tavily.com/mcp?tavilyApiKey=SECRET-URL&mode=full",
+            ],
+        )
+        .unwrap();
+        run(
+            &dir,
+            &[
+                "add",
+                "bridge",
+                "--",
+                "npx",
+                "-y",
+                "mcp-remote",
+                "https://host.example/mcp?token=SECRET-ARG-URL",
+                "--header",
+                "Authorization: Bearer SECRET-HEADER",
+                "--header",
+                "Accept: application/json",
+                "https://alice:SECRET-USERINFO@host.example/sse#SECRET-FRAGMENT",
+                "-H",
+                "X-Api-Key: SECRET-DASH-H",
+                "--headers",
+                "Cookie: SECRET-HEADERS-FLAG",
+            ],
+        )
+        .unwrap();
+        run(
+            &dir,
+            &[
+                "add",
+                "keyed",
+                "--",
+                "server",
+                "--api-key",
+                "SECRET-FLAG",
+                "--region=eu",
+                "--password=SECRET-EQ",
+                "--token",
+                "SECRET-TOKEN",
+                "--keyboard",
+                "azerty",
+                "API_KEY=SECRET-ENV",
+            ],
+        )
+        .unwrap();
+        run(
+            &dir,
+            &["add", "script", "--", "node", "-e", &"x".repeat(300)],
+        )
+        .unwrap();
+        let listed = run(&dir, &["list", "--json"]).unwrap();
+        let human = human_report(&listed);
+        for secret in [
+            "SECRET-URL",
+            "SECRET-ARG-URL",
+            "SECRET-HEADER",
+            "SECRET-USERINFO",
+            "SECRET-FRAGMENT",
+            "SECRET-DASH-H",
+            "SECRET-HEADERS-FLAG",
+            "SECRET-FLAG",
+            "SECRET-EQ",
+            "SECRET-TOKEN",
+            "SECRET-ENV",
+        ] {
+            assert!(!listed.to_string().contains(secret), "{secret}: JSON");
+            assert!(!human.contains(secret), "{secret}: text");
+        }
+        let target = |name: &str| {
+            run(&dir, &["get", name]).unwrap()["server"]["target"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            target("tavily"),
+            "https://mcp.tavily.com/mcp?tavilyApiKey=<hidden>&mode=<hidden>"
+        );
+        assert_eq!(
+            target("bridge"),
+            "npx -y mcp-remote https://host.example/mcp?token=<hidden> \
+             --header Authorization: <hidden> --header Accept: application/json \
+             https://<hidden>@host.example/sse -H X-Api-Key: <hidden> --headers Cookie: <hidden>"
+        );
+        assert_eq!(
+            target("keyed"),
+            "server --api-key <hidden> --region=eu --password=<hidden> --token <hidden> \
+             --keyboard azerty API_KEY=<hidden>"
+        );
+        let script = target("script");
+        assert!(
+            script.ends_with('…') && script.chars().count() < 120,
+            "{script}"
+        );
+        // `add` echoes through the same listing.
+        let added = run(
+            &dir,
+            &[
+                "add",
+                "later",
+                "--transport",
+                "http",
+                "https://x.example/mcp?key=SECRET-ADD",
+            ],
+        )
+        .unwrap();
+        assert!(!added.to_string().contains("SECRET-ADD"), "{added}");
+        // What is written is what a session runs.
+        let loaded =
+            orbit_mcp::McpConfig::try_load_at(&dir.join("home"), &dir.join("project"), false)
+                .unwrap();
+        assert!(
+            loaded.servers["tavily"]
+                .url
+                .as_deref()
+                .is_some_and(|url| url.contains("SECRET-URL"))
+        );
+        assert!(
+            loaded.servers["keyed"]
+                .args
+                .contains(&"SECRET-FLAG".to_owned())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A credential is recognised by one of its words, whatever the spelling around it, and a
+    /// word that merely contains one (`keyboard`, `author`) is not a credential.
+    #[test]
+    fn secret_names_are_judged_by_their_words() {
+        for secret in [
+            "--api-key",
+            "API_KEY",
+            "--apikey",
+            "X-Api-Key",
+            "--keys",
+            "--auth-token",
+            "--access_token",
+            "--tokens",
+            "--client-secret",
+            "SECRETS",
+            "PASSWORD",
+            "--passwd",
+            "--credential",
+            "--credentials",
+            "--auth",
+            "Authorization",
+            "MY_BEARER",
+            "Cookie",
+        ] {
+            assert!(secret_name(secret), "{secret} should be a credential name");
+        }
+        for plain in [
+            "--keyboard",
+            "--monkey",
+            "--author",
+            "--authority",
+            "--tokenizer",
+            "--region",
+            "--verbose",
+            "-y",
+            "PATH",
+            "HOME",
+            "Accept",
+            "Content-Type",
+        ] {
+            assert!(
+                !secret_name(plain),
+                "{plain} should not be a credential name"
+            );
+        }
     }
 
     #[test]

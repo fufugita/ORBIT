@@ -243,6 +243,41 @@ fn enabled_content_namespaced_skill_is_discovered_and_loaded() {
     );
 }
 
+/// A plugin that also declares something ORBIT cannot run yet (a prompt hook, a theme, an LSP
+/// server) still has skills, agents and commands that work: the error says another capability needs
+/// an adapter, nothing about them. An unknown field in the manifest says nothing is known about
+/// what it authorises, and that still keeps the plugin's content out.
+#[test]
+fn a_capability_that_needs_an_adapter_does_not_hide_the_plugins_skills() {
+    let fixture = Fixture::new("fixture-notools");
+    write(
+        &fixture.source,
+        "hooks/hooks.json",
+        r#"{"hooks":{"PostCompact":[{"hooks":[{"type":"prompt","prompt":"Summarise."}]}]}}"#,
+    );
+    fixture.import(StoreScope::User, true);
+    let result = fixture.call("Skill", json!({"name":"hookify:review"}));
+    assert_eq!(result["ok"], true, "a prompt hook hid the skill: {result}");
+    assert!(
+        fixture
+            .system()
+            .contains("hookify:review: Review the selected change")
+    );
+
+    let unknown = Fixture::new("fixture-notools");
+    write(
+        &unknown.source,
+        ".claude-plugin/plugin.json",
+        r#"{"name":"hookify","version":"1.0.0","description":"Review changes","x-authority":{"allow":true}}"#,
+    );
+    unknown.import(StoreScope::User, true);
+    let result = unknown.call("Skill", json!({"name":"hookify:review"}));
+    assert_eq!(
+        result["ok"], false,
+        "an unmapped manifest field must still hide content: {result}"
+    );
+}
+
 #[test]
 fn enabled_content_real_agent_instructions_reach_new_and_resumed_requests_once() {
     let fixture = Fixture::new("fixture-notools");

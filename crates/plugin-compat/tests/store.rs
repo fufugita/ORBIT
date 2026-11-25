@@ -1398,3 +1398,193 @@ fn known_invalid_project_candidate_creates_neither_scope_nor_lock() {
     assert!(!home.exists());
     assert!(!project.join(".orbit").exists());
 }
+
+fn second_package(root: &Path, name: &str) -> PathBuf {
+    let source = root.join(format!("source-{name}"));
+    fs::create_dir(&source).unwrap();
+    package(&source, name);
+    source
+}
+
+#[test]
+fn a_revision_reads_no_package_and_changes_with_the_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let empty = store.current_revision().unwrap();
+    assert!(!empty.is_empty());
+    assert_eq!(
+        empty,
+        store.current_revision().unwrap(),
+        "stable while nothing changes"
+    );
+    store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    let imported = store.current_revision().unwrap();
+    assert_ne!(imported, empty);
+    store.disable(&id(StoreScope::User), &imported).unwrap();
+    let disabled = store.current_revision().unwrap();
+    assert_ne!(disabled, imported);
+    // It does not verify packages: a damaged one changes nothing here.
+    let package_file = files(&home)
+        .into_keys()
+        .find(|path| path.ends_with("LICENSE"))
+        .unwrap();
+    let mut mode = fs::metadata(home.join(&package_file))
+        .unwrap()
+        .permissions();
+    mode.set_mode(0o600);
+    fs::set_permissions(home.join(&package_file), mode).unwrap();
+    fs::write(home.join(&package_file), "tampered").unwrap();
+    assert_eq!(store.current_revision().unwrap(), disabled);
+}
+
+#[test]
+fn a_named_query_loads_only_the_enabled_plugins_it_is_asked_for() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let two = second_package(temp.path(), "two");
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let options = InspectOptions::default();
+    store
+        .import(&source, &options, StoreScope::User, true)
+        .unwrap();
+    store
+        .import(&two, &options, StoreScope::User, true)
+        .unwrap();
+    let names = |names: &[&str]| -> Vec<String> {
+        store
+            .active_named(names)
+            .unwrap()
+            .plugins
+            .iter()
+            .map(|active| active.plugin.id.name.clone())
+            .collect()
+    };
+    assert_eq!(names(&["sample"]), ["sample"]);
+    assert_eq!(names(&["two", "sample"]).len(), 2);
+    assert!(
+        names(&["missing"]).is_empty(),
+        "an unknown name is not an error"
+    );
+    assert!(names(&[]).is_empty());
+    // A plugin that is not enabled is not active, named or not.
+    let revision = store.current_revision().unwrap();
+    store
+        .disable(
+            &PluginId {
+                name: "two".into(),
+                scope: StoreScope::User,
+            },
+            &revision,
+        )
+        .unwrap();
+    assert_eq!(names(&["two", "sample"]), ["sample"]);
+    // A damaged package nobody asked about is not even looked at.
+    let damaged = files(&home)
+        .into_keys()
+        .find(|path| {
+            path.to_string_lossy().contains("packages/sample/") && path.ends_with("LICENSE")
+        })
+        .unwrap();
+    let mut mode = fs::metadata(home.join(&damaged)).unwrap().permissions();
+    mode.set_mode(0o600);
+    fs::set_permissions(home.join(&damaged), mode).unwrap();
+    fs::write(home.join(&damaged), "tampered").unwrap();
+    store
+        .enable(
+            &PluginId {
+                name: "two".into(),
+                scope: StoreScope::User,
+            },
+            &store.current_revision().unwrap(),
+        )
+        .unwrap();
+    let only_two = store.active_named(&["two"]).unwrap();
+    assert_eq!(only_two.plugins.len(), 1);
+    assert!(
+        only_two.diagnostics.is_empty(),
+        "{:?}",
+        only_two.diagnostics
+    );
+    let everyone = store.active().unwrap();
+    assert_eq!(everyone.plugins.len(), 1, "the damaged one is left out");
+    assert!(
+        !everyone.diagnostics.is_empty(),
+        "and the full query says why"
+    );
+}
+
+#[test]
+fn a_package_the_importer_accepts_is_one_the_store_keeps_and_verifies() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    // Past the limits the store once had on its own (8 MiB for a file, 32 MiB for a package) and
+    // inside the importer's (16 MiB and 64 MiB): what the importer takes, the store must hold and
+    // read back, or an import "succeeds" into a copy that never verifies.
+    for part in 0..4u8 {
+        write(
+            &source,
+            &format!("data/part-{part}.bin"),
+            vec![part; 10 * 1024 * 1024],
+        );
+    }
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let receipt = store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    assert!(!receipt.reused);
+    let fresh = PluginStore::open(&home, &project, true).unwrap();
+    let held = fresh.status(&id(StoreScope::User)).unwrap().unwrap();
+    assert_eq!(
+        held.digest, receipt.plugin.digest,
+        "the stored copy verifies"
+    );
+    let active = fresh.active().unwrap();
+    assert_eq!(active.plugins.len(), 1);
+    assert!(active.diagnostics.is_empty(), "{:?}", active.diagnostics);
+}
+
+#[test]
+fn the_store_budget_holds_a_realistic_set_of_plugins_and_still_has_an_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    for name in ["second", "third", "fourth"] {
+        let package = second_package(temp.path(), name);
+        store
+            .import(&package, &InspectOptions::default(), StoreScope::User, true)
+            .unwrap();
+    }
+    // The budget counts what the index says each package holds: set those sizes in MiB.
+    let set_sizes = |sizes: &[u64]| {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(index(&home)).unwrap()).unwrap();
+        for (entry, mib) in value["entries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(sizes)
+        {
+            entry["source_bytes"] = json!(mib * 1024 * 1024);
+        }
+        fs::write(index(&home), serde_json::to_vec(&value).unwrap()).unwrap();
+    };
+    // Four packages of 45 MiB: 180 MiB, more than the store once allowed in all.
+    set_sizes(&[45, 45, 45, 45]);
+    let package = second_package(temp.path(), "fifth");
+    store
+        .import(&package, &InspectOptions::default(), StoreScope::User, true)
+        .expect("a 180 MiB store has room for one more");
+    // Four packages at the per-package ceiling fill the budget exactly; the store says it is full.
+    set_sizes(&[64, 64, 64, 64, 0]);
+    let package = second_package(temp.path(), "sixth");
+    let error = store
+        .import(&package, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap_err();
+    assert_eq!(error.code, "store_plugin_limit");
+}

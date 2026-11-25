@@ -17,6 +17,14 @@ pub struct InspectOptions {
     pub format: Option<PluginFormat>,
     pub model_map: BTreeMap<String, String>,
     pub tool_map: BTreeMap<String, String>,
+    /// Read the package the way Claude Code reads it, and leave out what cannot be read, saying
+    /// so, instead of refusing the whole package: a skill, command or agent with front matter or
+    /// a name that does not parse, a symbolic link, a dependency folder (`node_modules`, a
+    /// virtualenv). The operator chooses it per plugin; it is kept with the plugin so a later
+    /// load reads the package the same way. Never relaxes a limit or a refusal that guards the
+    /// package as a whole (identity, paths, collisions, hard links, special files).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lenient: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

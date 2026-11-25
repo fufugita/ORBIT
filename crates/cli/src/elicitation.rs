@@ -559,6 +559,7 @@ mod tests {
             run_async: false,
             http: None,
             handler: None,
+            origin: None,
         }
     }
 
@@ -567,6 +568,7 @@ mod tests {
         let hooks = |list: Vec<orbit_engine::hooks::HookConfig>| Hooks {
             hooks: list,
             project_trusted: false,
+            context_limit: None,
         };
         let never = Script::new(vec![CardReply::Yes]);
         // A hook answers: no card is shown.

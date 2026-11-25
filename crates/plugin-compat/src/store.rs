@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 const MAX_INDEX_BYTES: usize = 256 * 1024;
 const MAX_PLUGINS: usize = 256;
-const MAX_STORE_BYTES: u64 = 128 * 1024 * 1024;
+/// Everything the store holds, in all. A realistic set of plugins (seventy of them, with their
+/// bundled tools) is about 120 MiB, so this leaves room to grow; verifying the store costs time in
+/// proportion to it, which is what keeps it bounded at all.
+const MAX_STORE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +108,10 @@ struct Record {
     source_bytes: u64,
     enabled: bool,
     options: InspectOptions,
+    /// What a lenient read left out of the stored copy, as `code:path`, at most
+    /// `MAX_NAMED_SKIPS`: the copy has none of it, so this is how a later load can still say so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
 }
 
 impl Record {
@@ -118,6 +125,12 @@ impl Record {
             source_bytes: source_bytes(&inspection.source),
             enabled,
             options: options.clone(),
+            skipped: inspection
+                .diagnostics
+                .iter()
+                .filter_map(crate::formats::skip_to_record)
+                .take(crate::formats::MAX_NAMED_SKIPS)
+                .collect(),
         }
     }
 }
@@ -201,12 +214,37 @@ impl PluginStore {
         Ok(result)
     }
 
+    /// The revision of the store as it stands: it changes with every import, upgrade, enable,
+    /// disable and remove, and reading it loads no package.
+    pub fn current_revision(&self) -> Result<String, CompatError> {
+        let (revision, _, _) = self.stable_indices()?;
+        Ok(revision)
+    }
+
+    /// The enabled plugins with these names, loaded and verified; a package it was not asked
+    /// about is not read at all.
+    pub fn active_named(&self, names: &[&str]) -> Result<ActivationSnapshot, CompatError> {
+        self.active_matching(|name| names.contains(&name))
+    }
+
     pub fn active(&self) -> Result<ActivationSnapshot, CompatError> {
+        self.active_matching(|_| true)
+    }
+
+    fn active_matching(
+        &self,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<ActivationSnapshot, CompatError> {
         let (revision, user, project) = self.stable_indices()?;
         let mut plugins = Vec::new();
         let mut diagnostics = self.trust_diagnostics();
         for (scope, view) in [(StoreScope::User, &user), (StoreScope::Project, &project)] {
-            for record in view.index.entries.iter().filter(|record| record.enabled) {
+            for record in view
+                .index
+                .entries
+                .iter()
+                .filter(|record| record.enabled && wanted(&record.name))
+            {
                 match self.load(view, scope, record) {
                     Ok(plugin) => {
                         let root = view
@@ -281,7 +319,8 @@ impl PluginStore {
             .ok_or_else(|| error("store_package_missing"))?
             .child(expected_digest, false)?
             .ok_or_else(|| error("store_package_missing"))?;
-        let tree = SourceTree::read_named(&root.held_path()?, record.inferred_name.as_deref())?;
+        let tree =
+            SourceTree::read_named(&root.held_path()?, record.inferred_name.as_deref(), false)?;
         check_private_tree(&root, &tree)?;
         if tree.source_digest != expected_digest {
             return Err(error("store_package_tampered"));
@@ -340,7 +379,7 @@ impl PluginStore {
     ) -> Result<ImportReceipt, CompatError> {
         self.check_mutation_scope(id)?;
         self.assert_revision(expected_revision)?;
-        let tree = SourceTree::read_named(source, None)?;
+        let tree = SourceTree::read_named(source, None, options.lenient)?;
         let inspection = crate::formats::normalize(&tree, options)?;
         if inspection.manifest.id != id.name {
             return Err(error("store_identity_mismatch"));
@@ -574,7 +613,7 @@ impl PluginStore {
         if scope == StoreScope::Project && !self.project_trusted {
             return Err(error("store_project_untrusted"));
         }
-        let tree = SourceTree::read_named(source, None)?;
+        let tree = SourceTree::read_named(source, None, options.lenient)?;
         let inspection = crate::formats::normalize(&tree, options)?;
         validate_id(&inspection.manifest.id)?;
         self.project_anchor.check()?;
@@ -754,7 +793,8 @@ impl PluginStore {
         let root = names
             .child(&record.digest, false)?
             .ok_or_else(|| error("store_package_missing"))?;
-        let tree = SourceTree::read_named(&root.held_path()?, record.inferred_name.as_deref())?;
+        let tree =
+            SourceTree::read_named(&root.held_path()?, record.inferred_name.as_deref(), false)?;
         check_private_tree(&root, &tree)?;
         if tree.source_digest != record.digest
             || tree.files.iter().map(|file| file.size).sum::<u64>() != record.source_bytes
@@ -774,6 +814,13 @@ impl PluginStore {
             return Err(error("store_package_tampered"));
         }
         root.check()?;
+        let mut diagnostics = inspection.diagnostics;
+        diagnostics.extend(
+            record
+                .skipped
+                .iter()
+                .filter_map(|entry| crate::formats::recorded_skip(entry)),
+        );
         Ok(StoredPlugin {
             id: PluginId {
                 name: record.name.clone(),
@@ -786,7 +833,7 @@ impl PluginStore {
             options: record.options.clone(),
             components: inspection.components,
             requirements: inspection.requirements,
-            diagnostics: inspection.diagnostics,
+            diagnostics,
         })
     }
 
@@ -947,7 +994,7 @@ fn decode_index(bytes: &[u8]) -> Result<Index, CompatError> {
                 .digest
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            || record.source_bytes > 32 * 1024 * 1024
+            || record.source_bytes > crate::inspect::MAX_TREE_BYTES
             || !names.insert(record.name.to_ascii_lowercase())
         {
             return Err(error("store_index_corrupt"));
@@ -1007,7 +1054,7 @@ fn check_private_tree(root: &Directory, tree: &SourceTree) -> Result<(), CompatE
         let parent = descend(root, parent, false)?;
         parent.verify_package_mode(name, file.executable)?;
         let bytes = parent
-            .read(name, 8 * 1024 * 1024)?
+            .read(name, crate::inspect::MAX_FILE_BYTES as usize)?
             .ok_or_else(|| error("store_package_missing"))?;
         if bytes
             != *tree
@@ -1026,7 +1073,8 @@ fn verify_tree(
     expected: &PluginSource,
     options: &InspectOptions,
 ) -> Result<(), CompatError> {
-    let tree = SourceTree::read_named(&root.held_path()?, expected.inferred_name.as_deref())?;
+    let tree =
+        SourceTree::read_named(&root.held_path()?, expected.inferred_name.as_deref(), false)?;
     check_private_tree(root, &tree)?;
     let mut options = options.clone();
     options.format = Some(expected.format);

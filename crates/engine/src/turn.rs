@@ -1075,20 +1075,28 @@ fn run_turn_inner(
 
     executor.begin_turn(config);
     let mut user = user_message(prompt);
-    if let Some(context) = crate::hooks::prompt_context(&submitted) {
-        // What the hooks added rides with the prompt, marked as theirs.
-        user.content = format!("{prompt}\n\n<hook-context>\n{context}\n</hook-context>");
-    }
-
-    if let Some(blocks) = &options.user_blocks {
-        user.blocks = Some(blocks.clone());
+    user.blocks = options.user_blocks.clone();
+    if let Some(context) = hooks.prompt_context(&submitted) {
+        let suffix = format!("\n\n<hook-context>\n{context}\n</hook-context>");
+        user.content.push_str(&suffix);
+        if let Some(blocks) = &mut user.blocks {
+            // Structured providers use the blocks in place of the flattened text.
+            let text = if blocks.is_empty() {
+                user.content.clone()
+            } else {
+                suffix
+            };
+            blocks.push(orbit_adapter::types::ContentBlock::Text { text });
+        }
     }
     let mut current_user_index = transcript.len();
     transcript.push(user);
 
     let mut round: u32 = 0;
-    // How often a Stop hook has sent the model back to work this turn.
-    const MAX_STOP_CONTINUATIONS: u32 = 3;
+    // How often a Stop hook has sent the model back to work this turn, and
+    // how often it may: 3, unless the operator's settings raise it
+    // (`stop_hook_max_continuations`).
+    let stop_limit = crate::hooks::stop_continuation_limit(home);
     let mut stop_continuations: u32 = 0;
     // Compaction latch: once this turn has compacted, do not compact
     // again until the transcript grows past the threshold by NEW
@@ -1519,8 +1527,9 @@ fn run_turn_inner(
             // E9: Stop fires when the turn ends its reply — the
             // main loop's natural pause point. A hook that blocks (exit 2
             // or a deny) sends its reason back as the next instruction and
-            // the model keeps working, at most MAX_STOP_CONTINUATIONS times
-            // a turn; the payload says when that has already happened.
+            // the model keeps working, at most `stop_limit` times a turn; the
+            // payload says when that has already happened, and the operator
+            // is told when a hook is overruled.
             // A subagent's turn ends with SubagentStop instead, and a
             // background agent's with TeammateIdle after it: each can send
             // the agent back to work the same way.
@@ -1549,19 +1558,23 @@ fn run_turn_inner(
                     fired
                 }
             };
-            if let Some(reason) = crate::hooks::blocked(&stop)
-                && stop_continuations < MAX_STOP_CONTINUATIONS
-                && round + 1 < options.max_rounds
-            {
-                stop_continuations += 1;
-                transcript.push(crate::user_message(format!(
-                    "<stop-hook>\n{reason}\n</stop-hook>"
-                )));
-                events(FrontendEvent::Status {
-                    text: "a stop hook asked the model to continue".into(),
-                });
-                round += 1;
-                continue;
+            if let Some(reason) = crate::hooks::blocked(&stop) {
+                if stop_continuations < stop_limit && round + 1 < options.max_rounds {
+                    stop_continuations += 1;
+                    transcript.push(crate::user_message(format!(
+                        "<stop-hook>\n{reason}\n</stop-hook>"
+                    )));
+                    events(FrontendEvent::Status {
+                        text: "a stop hook asked the model to continue".into(),
+                    });
+                    round += 1;
+                    continue;
+                }
+                crate::hooks::note_stop_hook_not_obeyed(
+                    stop_continuations,
+                    stop_limit,
+                    options.max_rounds,
+                );
             }
             report.final_text = o.output.clone();
             report.ok = true;
@@ -3422,21 +3435,12 @@ mod usage_observation_owner_tests {
 mod prompt_hook_tests {
     use super::*;
 
-    /// A cancelled turn with `hook` as the home's only UserPromptSubmit
-    /// hook: the result and the transcript, without reaching a provider.
-    fn submit(hook: &str) -> (Result<TurnReport, String>, Vec<ChatMessage>) {
-        let home = std::env::temp_dir().join(format!("orbit-prompt-hook-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            home.join("settings.toml"),
-            format!("[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = \"{hook}\"\n"),
-        )
-        .unwrap();
-        let config = TurnConfig {
+    fn config(kind: crate::dispatch::ProviderKind) -> TurnConfig {
+        TurnConfig {
             provider_id: "test".into(),
             gate: "http://127.0.0.1:1".into(),
             model: "test".into(),
-            kind: crate::dispatch::ProviderKind::OpenAiCompatible,
+            kind,
             credential_env: None,
             billing: None,
             pricing: None,
@@ -3446,14 +3450,27 @@ mod prompt_hook_tests {
             supported_efforts: None,
             first_byte_timeout_ms: None,
             idle_timeout_ms: None,
-        };
+        }
+    }
+
+    /// A cancelled turn with `hook` as the home's only UserPromptSubmit
+    /// hook: the result and the transcript, without reaching a provider.
+    fn submit(hook: &str, options: &TurnOptions) -> (Result<TurnReport, String>, Vec<ChatMessage>) {
+        let home = std::env::temp_dir().join(format!("orbit-prompt-hook-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            format!("[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = \"{hook}\"\n"),
+        )
+        .unwrap();
+        let config = config(crate::dispatch::ProviderKind::OpenAiCompatible);
         let cancel = orbit_provider_http::CancelToken::new();
         cancel.cancel();
         let mut transcript = vec![user_message("earlier turn")];
         let result = run_turn(
             &home,
             &config,
-            &TurnOptions::default(),
+            options,
             "ship it",
             &mut transcript,
             &mut NoopExecutor,
@@ -3466,7 +3483,8 @@ mod prompt_hook_tests {
 
     #[test]
     fn a_user_prompt_hook_can_refuse_the_prompt_before_it_enters_the_transcript() {
-        let (result, transcript) = submit("echo freeze in effect >&2; exit 2");
+        let (result, transcript) =
+            submit("echo freeze in effect >&2; exit 2", &TurnOptions::default());
         let error = result.unwrap_err();
         assert!(
             error.starts_with("prompt blocked by hook: freeze in effect"),
@@ -3476,8 +3494,79 @@ mod prompt_hook_tests {
     }
 
     #[test]
+    fn structured_prompt_hook_context_survives_replay_in_both_wire_formats() {
+        use crate::dispatch::{
+            ProviderKind, prepare_provider_request, request_preparation_context,
+        };
+        use orbit_adapter::types::ContentBlock;
+
+        let options = TurnOptions {
+            user_blocks: Some(vec![
+                ContentBlock::Text {
+                    text: "ship ".into(),
+                },
+                ContentBlock::Image {
+                    data: "cGl4ZWxz".into(),
+                    media_type: "image/png".into(),
+                },
+                ContentBlock::Text { text: "it".into() },
+            ]),
+            ..Default::default()
+        };
+        let (result, transcript) = submit("echo branch is release-7", &options);
+        assert!(result.unwrap().interrupted);
+        let saved = serde_json::to_vec(transcript.last().unwrap()).unwrap();
+        let restored: ChatMessage = serde_json::from_slice(&saved).unwrap();
+        let suffix = "\n\n<hook-context>\nbranch is release-7\n</hook-context>";
+        assert_eq!(restored.content, format!("ship it{suffix}"));
+
+        for (kind, image_type) in [
+            (ProviderKind::Anthropic, "image"),
+            (ProviderKind::OpenAiCompatible, "image_url"),
+        ] {
+            let context = request_preparation_context(&config(kind), None, &[]).unwrap();
+            let request = prepare_provider_request(
+                &context,
+                "ship it",
+                Some(vec![restored.clone()]),
+                "test",
+                &options.session_id,
+            )
+            .unwrap();
+            let body = request.rendered_body().unwrap();
+            let parts = body.as_json()["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0]["text"], "ship ");
+            assert_eq!(parts[1]["type"], image_type);
+            assert_eq!(parts[2]["text"], "it");
+            assert_eq!(parts[3]["text"], suffix);
+        }
+    }
+
+    #[test]
+    fn empty_user_blocks_keep_the_flattened_prompt_with_its_hook_context() {
+        let options = TurnOptions {
+            user_blocks: Some(Vec::new()),
+            ..Default::default()
+        };
+        let (result, transcript) = submit("echo branch is release-7", &options);
+        assert!(result.unwrap().interrupted);
+        let user = transcript.last().unwrap();
+        assert_eq!(
+            user.blocks.as_deref(),
+            Some(
+                [orbit_adapter::types::ContentBlock::Text {
+                    text: user.content.clone()
+                }]
+                .as_slice()
+            )
+        );
+        assert!(user.content.starts_with("ship it\n\n<hook-context>"));
+    }
+
+    #[test]
     fn what_a_user_prompt_hook_prints_rides_with_the_prompt() {
-        let (result, transcript) = submit("echo branch is release-7");
+        let (result, transcript) = submit("echo branch is release-7", &TurnOptions::default());
         assert!(result.unwrap().interrupted);
         let prompt = &transcript.last().unwrap().content;
         assert_eq!(

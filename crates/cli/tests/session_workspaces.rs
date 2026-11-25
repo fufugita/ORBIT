@@ -680,7 +680,9 @@ fn tui_startup_child() {
         let mut fenced = false;
         while std::time::Instant::now() < deadline {
             match bus.try_recv() {
-                Some(orbit_hud_tui::msg::Msg::Status(text)) => {
+                // The explanation follows the refreshed projection as a
+                // persistent message, so the terminal's redraw cannot erase it.
+                Some(orbit_hud_tui::msg::Msg::SystemMessage(text)) => {
                     refused |=
                         text.contains("another workspace") || text.contains("--adopt-workspace");
                 }

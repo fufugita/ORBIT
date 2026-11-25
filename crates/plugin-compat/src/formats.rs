@@ -1,5 +1,5 @@
 use crate::CompatError;
-use crate::inspect::SourceTree;
+use crate::inspect::{SkippedKind, SourceTree};
 use crate::model::*;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -12,7 +12,84 @@ const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.jso
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_METADATA_NODES: usize = 8192;
 
+/// The inspection of a package, with a warning for everything a lenient read left out of it.
 pub(crate) fn normalize(
+    tree: &SourceTree,
+    options: &InspectOptions,
+) -> Result<Inspection, CompatError> {
+    let mut inspection = normalize_format(tree, options)?;
+    for entry in tree.skipped.iter().take(MAX_NAMED_SKIPS) {
+        inspection
+            .diagnostics
+            .push(skipped_diagnostic(entry.kind, &entry.path));
+    }
+    if tree.skipped.len() > MAX_NAMED_SKIPS {
+        inspection.diagnostics.push(diagnostic(
+            "source_entry_skipped",
+            DiagnosticSeverity::Info,
+            None,
+            None,
+            "More links and dependency folders were left out than are listed here",
+            None,
+        ));
+    }
+    Ok(inspection)
+}
+
+/// How many left-out links and dependency folders an inspection names one by one.
+pub(crate) const MAX_NAMED_SKIPS: usize = 16;
+
+fn skipped_diagnostic(kind: SkippedKind, path: &str) -> Diagnostic {
+    let (code, message) = match kind {
+        SkippedKind::Link => (
+            "source_entry_skipped",
+            "A symbolic link was not followed and is not part of the package",
+        ),
+        SkippedKind::Dependencies => (
+            "source_dependencies_skipped",
+            "A dependency folder is not part of the package; whatever needs it will not find it in the stored copy",
+        ),
+    };
+    diagnostic(
+        code,
+        DiagnosticSeverity::Warning,
+        None,
+        Some(path),
+        message,
+        None,
+    )
+}
+
+/// What the store keeps of a left-out entry (`code:path`), as a diagnostic again: the stored copy
+/// has no link and no dependency folder in it, so a later load cannot see that they were there.
+pub(crate) fn recorded_skip(entry: &str) -> Option<Diagnostic> {
+    let (code, path) = entry.split_once(':')?;
+    let kind = match code {
+        "source_entry_skipped" => SkippedKind::Link,
+        "source_dependencies_skipped" => SkippedKind::Dependencies,
+        _ => return None,
+    };
+    Some(skipped_diagnostic(kind, path))
+}
+
+/// The `code:path` the store keeps for a diagnostic that records a left-out entry.
+pub(crate) fn skip_to_record(diagnostic: &Diagnostic) -> Option<String> {
+    (diagnostic.severity == DiagnosticSeverity::Warning
+        && matches!(
+            diagnostic.code.as_str(),
+            "source_entry_skipped" | "source_dependencies_skipped"
+        ))
+    .then(|| {
+        Some(format!(
+            "{}:{}",
+            diagnostic.code,
+            diagnostic.source_path.as_deref()?
+        ))
+    })
+    .flatten()
+}
+
+fn normalize_format(
     tree: &SourceTree,
     options: &InspectOptions,
 ) -> Result<Inspection, CompatError> {
@@ -1561,7 +1638,9 @@ fn normalize_claude(
             .map(|(parent, _)| parent)
             .unwrap_or("");
         let directory_name = parent.rsplit('/').next().unwrap_or("");
-        normalize_skill(tree, options, &mut inspection, &path, directory_name)?;
+        leave_out_when_lenient(&mut inspection, options, &path, |inspection| {
+            normalize_skill(tree, options, inspection, &path, directory_name)
+        })?;
     }
     normalize_claude_commands(
         tree,
@@ -1586,7 +1665,9 @@ fn normalize_claude(
         }
     };
     for path in agents {
-        normalize_claude_agent(tree, options, &mut inspection, &path)?;
+        leave_out_when_lenient(&mut inspection, options, &path, |inspection| {
+            normalize_claude_agent(tree, options, inspection, &path)
+        })?;
     }
     if tree.contains("hooks/hooks.json") {
         claude_hook_file(tree, &mut inspection, "hooks/hooks.json")?;
@@ -1932,7 +2013,7 @@ fn normalize_claude_agent(
     inspection: &mut Inspection,
     path: &str,
 ) -> Result<(), CompatError> {
-    let document = crate::parse_frontmatter(tree.text(path)?)?;
+    let document = frontmatter_of(tree.text(path)?, options.lenient)?;
     let object = document
         .frontmatter
         .as_object()
@@ -1991,12 +2072,73 @@ fn normalize_claude_agent(
     )
 }
 
-fn markdown_document(text: &str) -> Result<crate::FrontmatterDocument, CompatError> {
-    match crate::parse_frontmatter(text) {
+fn frontmatter_of(text: &str, lenient: bool) -> Result<crate::FrontmatterDocument, CompatError> {
+    if lenient {
+        crate::parse_frontmatter_lenient(text)
+    } else {
+        crate::parse_frontmatter(text)
+    }
+}
+
+fn markdown_document(text: &str, lenient: bool) -> Result<crate::FrontmatterDocument, CompatError> {
+    match frontmatter_of(text, lenient) {
         Err(error) if error.code == "frontmatter_missing" => Ok(crate::FrontmatterDocument {
             frontmatter: Value::Object(Map::new()),
             body: text.trim().to_owned(),
         }),
+        result => result,
+    }
+}
+
+/// Failures that belong to one component's own file: what a lenient import leaves that component
+/// out for. Everything that guards the package as a whole (identity, paths, collisions, hook and
+/// MCP declarations, limits) is not on this list and still refuses the import.
+fn component_local(code: &str) -> bool {
+    code.starts_with("yaml_")
+        || matches!(
+            code,
+            "component_id_invalid"
+                | "component_field_invalid"
+                | "component_field_unmapped"
+                | "frontmatter_missing"
+                | "frontmatter_unterminated"
+                | "frontmatter_size_limit"
+                | "document_size_limit"
+                | "source_text_invalid"
+        )
+}
+
+/// Run one component's normalizer. When the import is lenient and it fails for a reason that is
+/// local to the component, put the inspection back as it was, leave the component out and say so.
+fn leave_out_when_lenient(
+    inspection: &mut Inspection,
+    options: &InspectOptions,
+    path: &str,
+    attempt: impl FnOnce(&mut Inspection) -> Result<(), CompatError>,
+) -> Result<(), CompatError> {
+    let before = (
+        inspection.components.len(),
+        inspection.requirements.len(),
+        inspection.diagnostics.len(),
+    );
+    match attempt(inspection) {
+        Err(error) if options.lenient && component_local(&error.code) => {
+            inspection.components.truncate(before.0);
+            inspection.requirements.truncate(before.1);
+            inspection.diagnostics.truncate(before.2);
+            inspection.diagnostics.push(diagnostic(
+                "component_skipped",
+                DiagnosticSeverity::Warning,
+                None,
+                Some(path),
+                &format!(
+                    "A component was left out ({}): {}",
+                    error.code, error.message
+                ),
+                Some("Correct the file, or import without --lenient to see the refusal"),
+            ));
+            Ok(())
+        }
         result => result,
     }
 }
@@ -2024,15 +2166,14 @@ fn normalize_claude_commands(
                     if !path.ends_with(".md") {
                         return Err(failure("component_path_invalid"));
                     }
-                    let document = markdown_document(tree.text(&path)?)?;
+                    let document = markdown_document(tree.text(&path)?, options.lenient)?;
                     (document, Some(path))
                 } else {
                     (
-                        markdown_document(&required_string(
-                            object,
-                            "content",
-                            "component_field_invalid",
-                        )?)?,
+                        markdown_document(
+                            &required_string(object, "content", "component_field_invalid")?,
+                            options.lenient,
+                        )?,
                         None,
                     )
                 };
@@ -2070,15 +2211,17 @@ fn normalize_claude_commands(
                     .unwrap_or("")
                     .strip_suffix(".md")
                     .unwrap_or("");
-                add_claude_command(
-                    options,
-                    inspection,
-                    name,
-                    markdown_document(tree.text(&path)?)?,
-                    &path,
-                    Some(path.clone()),
-                    None,
-                )?;
+                leave_out_when_lenient(inspection, options, &path, |inspection| {
+                    add_claude_command(
+                        options,
+                        inspection,
+                        name,
+                        markdown_document(tree.text(&path)?, options.lenient)?,
+                        &path,
+                        Some(path.clone()),
+                        None,
+                    )
+                })?;
             }
         }
     }
@@ -2150,7 +2293,7 @@ fn add_claude_command(
         description,
         prompt: Some(document.body),
         native_callback: None,
-        argument_hint: optional_string(&object, "argument-hint", "component_field_invalid")?,
+        argument_hint: argument_hint(&object)?,
         allowed_tools: mapped_tools(&object, "allowed-tools", options)?,
         model: mapped_model(&object, options, inspection, &id)?,
         effort: checked_effort(&object)?,
@@ -2223,13 +2366,65 @@ fn claude_hook_file(
     let object = raw
         .as_object()
         .ok_or_else(|| failure("hook_field_invalid"))?;
-    check_keys(object, &["hooks", "description"], "hook_field_invalid")?;
+    check_keys(
+        object,
+        &["hooks", "description", "modules"],
+        "hook_field_invalid",
+    )?;
     optional_string(object, "description", "hook_field_invalid")?;
-    let events = object
-        .get("hooks")
-        .and_then(Value::as_object)
-        .ok_or_else(|| failure("hook_field_invalid"))?;
+    let modules = object.get("modules");
+    if let Some(modules) = modules {
+        claude_hook_modules(tree, inspection, modules, path)?;
+    }
+    let events = match (object.get("hooks"), modules) {
+        (Some(events), _) => events
+            .as_object()
+            .ok_or_else(|| failure("hook_field_invalid"))?,
+        // A file that is only modules has no command hooks to read.
+        (None, Some(_)) => return Ok(()),
+        (None, None) => return Err(failure("hook_field_invalid")),
+    };
     claude_hook_events(inspection, events, path)
+}
+
+/// `modules`: TypeScript files Claude Code loads into its own process to register hooks. They need
+/// Claude Code's runtime, so they are kept as source and never run; the file's command hooks are
+/// still read. A warning, not an error: an error with no component would make every skill, agent
+/// and command of the plugin unavailable.
+fn claude_hook_modules(
+    tree: &SourceTree,
+    inspection: &mut Inspection,
+    modules: &Value,
+    path: &str,
+) -> Result<(), CompatError> {
+    let modules = modules
+        .as_array()
+        .ok_or_else(|| failure("hook_field_invalid"))?;
+    // A module is named relative to the folder that holds the hooks file (`hooks/fast-jev.ts`).
+    let folder = path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    for module in modules {
+        let module = module
+            .as_str()
+            .ok_or_else(|| failure("hook_field_invalid"))?;
+        let module = package_path(module, false)?;
+        require_path(
+            tree,
+            &if folder.is_empty() {
+                module
+            } else {
+                format!("{folder}/{module}")
+            },
+        )?;
+    }
+    inspection.diagnostics.push(diagnostic(
+        "hook_modules_unsupported",
+        DiagnosticSeverity::Warning,
+        None,
+        Some(path),
+        "Hook modules need Claude Code's own runtime; they are kept as source and are not run",
+        Some("Use the command hooks of this plugin, or port the module's behaviour"),
+    ));
+    Ok(())
 }
 
 fn claude_hook_declaration(
@@ -2307,6 +2502,11 @@ fn claude_hook_events(
                         return Err(failure("hook_field_invalid"));
                     }
                 }
+                // The platform variants of the command, the shell it is written for and its `if`
+                // filter are understood when the hook is activated.
+                for key in ["if", "shell", "powershell", "commandWindows"] {
+                    optional_string(hook, key, "hook_field_invalid")?;
+                }
                 unknown_component_fields(
                     inspection,
                     hook,
@@ -2318,6 +2518,10 @@ fn claude_hook_events(
                         "async",
                         "once",
                         "asyncRewake",
+                        "if",
+                        "shell",
+                        "powershell",
+                        "commandWindows",
                     ],
                     &id,
                     path,
@@ -2410,15 +2614,21 @@ fn collect_legacy_mcp_file(
     let object = raw
         .as_object()
         .ok_or_else(|| failure("mcp_field_invalid"))?;
-    check_keys(
-        object,
-        &["mcpServers", "$schema", "description"],
-        "mcp_field_invalid",
-    )?;
-    let map = object
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .ok_or_else(|| failure("mcp_field_invalid"))?;
+    let map = match object.get("mcpServers") {
+        Some(wrapped) => {
+            check_keys(
+                object,
+                &["mcpServers", "$schema", "description"],
+                "mcp_field_invalid",
+            )?;
+            wrapped
+                .as_object()
+                .ok_or_else(|| failure("mcp_field_invalid"))?
+        }
+        // Claude Code also reads the servers written straight at the top of the file, which is how
+        // most of the official plugins ship them (and `{}` for a plugin that has none).
+        None => object,
+    };
     collect_legacy_mcp_map(inspection, servers, map, path, from_default)
 }
 
@@ -2659,12 +2869,12 @@ fn normalize_skill(
     path: &str,
     directory_name: &str,
 ) -> Result<(), CompatError> {
-    let document = crate::parse_frontmatter(tree.text(path)?)?;
+    let claude = inspection.source.format == PluginFormat::Claude;
+    let document = frontmatter_of(tree.text(path)?, claude && options.lenient)?;
     let object = document
         .frontmatter
         .as_object()
         .ok_or_else(|| failure("component_field_invalid"))?;
-    let claude = inspection.source.format == PluginFormat::Claude;
     let source_name = if claude {
         optional_string(object, "name", "component_field_invalid")?
             .unwrap_or_else(|| directory_name.to_owned())
@@ -2775,9 +2985,10 @@ fn normalize_skill(
     {
         return Err(failure("component_field_invalid"));
     }
-    for field in ["license", "compatibility", "argument-hint"] {
+    for field in ["license", "compatibility"] {
         optional_string(object, field, "component_field_invalid")?;
     }
+    argument_hint(object)?;
     let spec = SkillSpec {
         name: format!("{}:{source_name}", inspection.manifest.id),
         description,
@@ -2954,6 +3165,25 @@ fn optional_string(
                 .ok_or_else(|| failure(code))
         })
         .transpose()
+}
+
+/// `argument-hint`: text, or a short list of words, which is what YAML makes of `[setup|restore]`.
+/// A list is shown the way it was written, in brackets.
+fn argument_hint(object: &Map<String, Value>) -> Result<Option<String>, CompatError> {
+    match object.get("argument-hint") {
+        Some(Value::Array(words)) if (1..=32).contains(&words.len()) => {
+            let words = words
+                .iter()
+                .map(|word| {
+                    word.as_str()
+                        .filter(|word| !word.is_empty() && word.len() <= 128)
+                        .ok_or_else(|| failure("component_field_invalid"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(format!("[{}]", words.join(", "))))
+        }
+        _ => optional_string(object, "argument-hint", "component_field_invalid"),
+    }
 }
 
 fn optional_list(
@@ -3275,4 +3505,48 @@ fn failure(code: &'static str) -> CompatError {
         _ => "Manifest field has an invalid type or value",
     };
     CompatError::new(code, message)
+}
+
+#[cfg(test)]
+mod lenient_policy_tests {
+    use super::component_local;
+
+    #[test]
+    fn only_what_belongs_to_one_components_own_file_is_left_out_leniently() {
+        // The file's own trouble: its front matter, its name, its fields, its bytes.
+        for code in [
+            "yaml_invalid",
+            "yaml_alias_unsupported",
+            "yaml_duplicate_key",
+            "component_id_invalid",
+            "component_field_invalid",
+            "component_field_unmapped",
+            "frontmatter_missing",
+            "frontmatter_unterminated",
+            "frontmatter_size_limit",
+            "document_size_limit",
+            "source_text_invalid",
+        ] {
+            assert!(component_local(code), "{code} is the component's own");
+        }
+        // What guards the package as a whole stays a refusal: leaving something out would decide
+        // silently what the plugin is.
+        for code in [
+            "component_id_collision",
+            "component_path_invalid",
+            "plugin_id_invalid",
+            "plugin_manifest_missing",
+            "manifest_field_invalid",
+            "hook_field_invalid",
+            "mcp_field_invalid",
+            "mcp_auth_invalid",
+            "source_entry_type",
+            "source_file_limit",
+            "source_total_limit",
+            "source_entry_limit",
+            "store_namespace_collision",
+        ] {
+            assert!(!component_local(code), "{code} guards the package");
+        }
+    }
 }

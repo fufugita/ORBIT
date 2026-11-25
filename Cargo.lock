@@ -3044,6 +3044,7 @@ dependencies = [
  "orbit-plugin-compat",
  "orbit-provider-http",
  "orbit-tools",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

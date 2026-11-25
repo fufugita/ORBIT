@@ -74,7 +74,13 @@ from other tools, plugins and skills, subagents.
    cards, one field at a time, not a form. Channels work for stdio servers
    named with `--channels`; one named with `--channel-permissions` as well
    can answer approval prompts. Sign-in has only been run against a
-   local test server.
+   local test server. A set of 29 real servers (27 stdio, 2 HTTP) was
+   started together: 27 came up in about 6 s on the first prompt, 801 tools,
+   each server's tool count equal to a direct handshake; the other two needed
+   an application that was not running and a sign-in. Three servers that did
+   not start before now do: one prints a dotenv banner on standard output, one
+   answers a notification with an error that has no `id`, one sends a 3.5 MB
+   tool list.
 7. **Scheduling and `Monitor` need an open session.** `CronCreate`,
    `CronList`, `CronDelete`, `ScheduleWakeup` and `Monitor` deliver only while
    a terminal session is open and idle in that directory. A `Monitor` or
@@ -97,6 +103,10 @@ from other tools, plugins and skills, subagents.
 | Feature | ORBIT | Notes |
 |---|---|---|
 | `CLAUDE.md` and `AGENTS.md` are read | Present | `engine/src/context.rs`, alongside `ORBIT.md` (system, user, project, local) |
+| User-level `~/.claude/CLAUDE.md` | Present | Read with `claude_compat` (or link it as `~/.orbit/ORBIT.md`), after the managed file and before ORBIT's own user file. User-level `~/.claude/rules/*.md` and the parent folders' `CLAUDE.md` files are not read |
+| Instruction file caps | Present | 200 lines or 25 KB per file, a cut marked in the text and named once per run; `/memory` and `orbit doctor` (`instructions`) show it. A file reached by two names is read once; a pipe or folder is skipped |
+| Links in instruction files | Present | ORBIT's own rule, not compared with Claude Code: a project's instruction and rule files must resolve inside the project, and no instruction file may lead to the deny-read list (the rule `@path` imports already had); a refused file is not read, is named once per run, is listed by `/memory` and is counted apart by `orbit doctor`. Your own files may be links to anything else |
+| Hook context size | Present | 8 KiB in all for the hooks of one event by default; `hook_context_max_bytes` (0 to 256 KiB) in your own settings sets it; a cut is marked in the context and named once per run |
 | `@path` imports inside instruction files | Present | Inside the project or the importing file's folder only; five levels |
 | Path-scoped rules (`.claude/rules`) | Present | Delivered with the first Read, Edit or Write of a matching file |
 | Auto memory | Present | `context.rs` loads and caps a memory index; write path not checked |
@@ -106,7 +116,7 @@ from other tools, plugins and skills, subagents.
 
 | Feature | ORBIT | Notes |
 |---|---|---|
-| `--continue`, `--resume`, `/resume` picker | Present | Also `/sessions`; sessions are bound to their workspace |
+| `--continue`, `--resume`, `/resume` picker | Present | Also `/sessions`; sessions are bound to their workspace. The picker lists every saved session except unnamed ones without a turn (the one in use stays). A row this folder cannot resume says so (`other folder`, `not bound to a folder`), and choosing it prints the reason. It has no search or filter |
 | Fork a session | Present | `--fork-session` at launch; `/fork` in the chat continues in a copy and keeps the original |
 | Name or rename a session | Partial | `/rename`; the name shows in `/sessions` only |
 | Export or copy the transcript | Partial | `/copy` (last reply) and `/export [file]` (Markdown of what the pane shows); `orbit export --to` is an encrypted bundle, a different feature |
@@ -212,6 +222,8 @@ version.
 | Rules that match tool arguments | Unverified | MCP grants are per tool, not per argument |
 | Folder trust | Present | ORBIT only |
 | Sandboxed Bash | Unverified | `crates/sandbox` exists; boundary not reviewed |
+| Run Bash without the sandbox | Present | `[sandbox] enabled = false` in your own settings (never a project's; the model has no parameter for it). `inherit_env = ["SSH_AUTH_SOCK"]` copies named variables into such commands. Needed for `docker` (the sandbox's user namespace drops your `docker` group), `ssh` with your agent and `ps` on the host. `/sandbox`, `/status`, the welcome line and the approval card say it is off; a command file's `` !`cmd` `` still needs the sandbox |
+| The model cannot rewrite ORBIT's own settings | Present | Write and Edit refuse `settings.toml`, `settings.local.toml`, `permissions.toml`, `permission-overrides.toml`, `mcp.json` and `providers.toml` in ORBIT's home, in every mode, links and `..` included. Until 24 Nov a model in bypass mode could write hooks, rules or the sandbox's own settings there |
 | Managed (organisation) settings | Partial | `/etc/orbit/ORBIT.md`; no policy delivery |
 
 ## Hooks
@@ -220,13 +232,15 @@ version.
 |---|---|---|
 | Events | Present | All 33. `Setup` fires for `--init`, `--init-only` and `--maintenance`; `TeammateIdle` when a background agent finishes a turn |
 | Command handlers, exit code 2 blocks | Present | 60 s default timeout |
-| Matchers | Partial | Name lists and `*` wildcards; not full regular expressions |
+| Matchers | Partial | Name lists with `*` wildcards as before, and regular expressions searched anywhere in the name as Claude Code does (`^…$` pins one): a matcher with any of `^ $ ( ) [ ] { } + ? \` is also read as one, so `WebSearch\|WebFetch\|mcp__.*(exa\|tavily)` and `^(startup\|resume)$` run unchanged. The dialect is Rust's `regex`: no look-around or back-references. A pattern that does not compile is reported (hook trouble when the hooks load, `orbit doctor`, `/hooks`) and only its plain names match, as in Claude Code, which only logs it. A pattern without those characters stays a name list, so `Web*` is a prefix here, where Claude Code reads it as a regular expression |
 | `if` conditions | Present | `Tool(pattern)` on the tool and its main argument |
-| JSON output: decisions, rewritten input, added context | Partial | ORBIT's schema and Claude Code's `hookSpecificOutput` / `decision`; `ask` opens the approval card. SessionStart and UserPromptSubmit feed model context; PreToolUse, PostToolUse and PostToolUseFailure append bounded context to the tool result; SubagentStart adds context to the child input. Tool events carry the original `tool_use_id`; failure events include `is_interrupt`. Cancelled calls suppress failure hooks. Other event outcomes need individual review |
+| JSON output: decisions, rewritten input, added context | Partial | ORBIT's schema and Claude Code's `hookSpecificOutput` / `decision`; `ask` opens the approval card. SessionStart and UserPromptSubmit feed model context; PreToolUse, PostToolUse and PostToolUseFailure append bounded context to the tool result; SubagentStart adds context to the child input. Tool events carry the original `tool_use_id`; failure events include `is_interrupt`. Cancelled calls suppress failure hooks. Other event outcomes need individual review. A deny with no reason takes `systemMessage` as its reason (hookify's block message); `systemMessage` on a hook that does not deny is not shown |
 | `SessionStart` in interactive sessions | Partial | Fires at launch and after committed clear, interactive resume and fork; context is replaced for the new owner and model costs are saved before publication. Async Prompt/Agent lifecycle handlers are refused; async command/HTTP attachment hooks remain available. `SessionEnd` runs on actual exit, not clear/resume cleanup |
 | HTTP handlers | Present | Through `curl`; blocks only via the response body |
 | Prompt, agent and MCP-tool handlers | Partial | Model checks use the `explore` role (or the hook's `model`) and durable housekeeping accounting; the agent may only Read, Grep and Glob inside the working directories. A child session without its own managed hook accounting reports an error instead of sending an untracked model request |
-| Blocking `SubagentStop`, `PreCompact`, `TeammateIdle` | Present | A blocked subagent continues, at most three times a turn; blocked compaction is skipped while the request still fits |
+| Blocking `SubagentStop`, `PreCompact`, `TeammateIdle` | Present | A blocked subagent continues, at most three times a turn unless `stop_hook_max_continuations` raises it; blocked compaction is skipped while the request still fits |
+| Stop-hook continuation limit | Partial | A blocking `Stop` hook sends the model back to work at most 3 times a turn by default, so a hook that never lets go cannot hold a turn. `stop_hook_max_continuations` (0 to 1000, your own settings only) changes it, and ORBIT says when the limit or the round limit overruled a hook |
+| Hook environment | Partial | `CLAUDE_PROJECT_DIR`, and the session id as `CLAUDE_SESSION_ID`, `CLAUDE_CODE_SESSION_ID` and `ORBIT_SESSION_ID`; a valid id replaces one inherited from the shell. No `CLAUDE_ENV_FILE`. A plugin's hooks also get `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PLUGIN_DATA` |
 | Async hooks | Present | Started and not awaited |
 
 At cold launch, the TUI currently infers `startup` versus `resume` from the saved
@@ -243,6 +257,10 @@ previous conversation's ID.
 | Per-tool allow, ask, deny | Present | |
 | Project servers behind folder trust | Present | |
 | `mcp add/list/remove` commands, `/mcp` | Present | `orbit mcp add | list | get | remove` (and `/mcp add …` in chat for values without spaces); a trusted project's `.mcp.json` is read |
+| Credentials in `orbit mcp list` and `get` | Present | URL query values and user information, the word after a credential flag, `NAME=value` arguments of a credential name and credential header values show as `<hidden>`; a command-line word is cut at 100 characters; the file keeps what it was given |
+| Servers that print a banner or answer a notification | Present | A standard-output line that is not JSON and does not begin with `{` is skipped, and a reply with no `id` is ignored, as the official clients do; a cut-off `{…` frame, JSON that is not an object and `"id": null` stay errors. The last skipped line is quoted when a server ends or never answers |
+| Large replies | Present | A server's stdio frame, HTTP body, SSE stream and `tools/list` (summed over pages) may be 16 MiB; ORBIT's own requests stay within 1 MiB; the model sees at most 64 KiB of a result |
+| Many servers on the first prompt | Present | The enabled servers are started together, eight at a time, and listed in configuration order; one that fails costs only itself |
 | OAuth sign-in | Partial | `/mcp login <server>`: authorization code + PKCE with discovery and dynamic registration; no client secrets or device flow; not yet run against a real provider |
 | Resources | Present | List and read; no subscriptions |
 | Prompts | Partial | `/mcp prompts`, `/mcp prompt <server> <name>`; text content only |
@@ -261,8 +279,9 @@ previous conversation's ID.
 | Dynamic workflows | Missing | |
 | Skills (`SKILL.md`) | Present | `.orbit/skills`, via the `Skill` tool |
 | Skills and commands as `/name` | Partial | User, project and plugin skills (`/plugin:skill`), `.orbit/commands`, `.claude/commands`, in the terminal and the plain chat, with completion. In a command file `` !`command` `` runs sandboxed when `allowed-tools` covers it, and `allowed-tools` cover the turn it starts; `model:` picks the model for that turn and `argument-hint:` is shown in the `/` list. `disable-model-invocation` is not read: the model cannot start a command file here, only skills |
-| Plugins | Partial | `orbit plugin import` reads Claude, Codex and Hermes formats; hooks, auth and MCP from a plugin are withheld |
-| Marketplaces | Present | `orbit plugin marketplace add | list | update | remove` and `orbit plugin install NAME@MARKETPLACE` (also `/plugin …`). A marketplace is fetched only when added or updated; installing goes through the ordinary importer, so a plugin's hooks, credentials and MCP servers stay withheld |
+| Plugins | Partial | `orbit plugin import` reads Claude, Codex and Hermes formats; `--lenient` reads a plugin the way Claude Code does, and `orbit plugin import --from-claude` brings in everything Claude Code has enabled. A plugin's command hooks run only when you name it in `plugin_hooks`. Withheld: its MCP servers, auth, prompt, agent and HTTP hooks, `asyncRewake`, LSP servers, output styles, themes and `userConfig` |
+| Plugin hooks | Partial | Command hooks of an imported plugin run from the stored copy when named in `plugin_hooks` (optionally pinned to a digest); `matcher`, `timeout`, `if` and `async` are kept. Opt in, where Claude Code runs every enabled plugin's hooks; not run, and named: `asyncRewake`, a non-bash `shell`, `once` outside `SessionStart`, `SessionEnd` and `Setup`, an event ORBIT lacks |
+| Marketplaces | Present | `orbit plugin marketplace add | list | update | remove` and `orbit plugin install NAME@MARKETPLACE` (also `/plugin …`). A marketplace is fetched only when added or updated; installing goes through the ordinary importer, so a plugin's hooks stay off until named in `plugin_hooks`, and its credentials and MCP servers stay withheld |
 | Mods (panes, commands, tool rules in code) | Partial | Declarative panes and signed content; no executable API by design |
 
 ## Models and output
@@ -281,7 +300,7 @@ previous conversation's ID.
 | Feature | ORBIT | Notes |
 |---|---|---|
 | `-p` with text, JSON and stream-JSON output | Present | |
-| Piped input | Present | `git diff \| orbit -p "review this"` puts the piped text before the prompt; `echo "question" \| orbit -p` uses it as the prompt. A pipe or a redirected file only, 1 MiB at most. A pipe that the program which started the run still holds, and never writes to, is given a quarter of a second and then ignored |
+| Piped input | Present | `git diff \| orbit -p "review this"` puts the piped text before the prompt; `echo "question" \| orbit -p` uses it as the prompt. Both `-p` and `--print` accept up to 1 MiB of raw input from a pipe or redirected file. Model routing limits the assembled prompt to 256 KiB. A pipe that the program which started the run still holds, and never writes to, is given a quarter of a second and then ignored |
 | `--max-turns`, `--json-schema`, `--permission-mode`, `--allowedTools`, `--disallowedTools` | Present | Plus `--max-cost` |
 | `--append-system-prompt`, `--mcp-config` | Present | Also `--append-system-prompt-file`, `--output-style` |
 | `--settings` | Present | One more settings file for the run: TOML (hooks, permission rules, `output_style`, `status_line`) or a Claude Code `settings.json` (its hooks and `statusLine`) |

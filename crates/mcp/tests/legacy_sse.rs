@@ -583,7 +583,7 @@ fn invalid_and_oversized_message_events_retire_without_replay() {
                     "large" => event(
                         events,
                         "message",
-                        &"x".repeat(orbit_mcp::MAX_FRAME_BYTES + 1),
+                        &"x".repeat(orbit_mcp::MAX_REPLY_BYTES + 1),
                     ),
                     "case" => event(events, "Message", "{}"),
                     _ => unreachable!(),

@@ -210,14 +210,18 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
     // available the command runs confined — writes only in the
     // working dirs + session temp, no network. When it is not, the
     // result SAYS the command ran unsandboxed so the operator and the
-    // permission layer can see it (the executor forces an ask).
+    // permission layer can see it (the executor forces an ask). The
+    // operator's own settings can also switch confinement off
+    // (`[sandbox] enabled = false`); the result says so the same way.
+    let additions = crate::sandbox::SandboxAdditions::load(&cx.home);
     let mut sandbox = crate::sandbox::ShellSandbox::standard(&cx.writable_dirs(), &cx.session_id)
-        .with_additions(&crate::sandbox::SandboxAdditions::load(&cx.home), &cx.home);
+        .with_additions(&additions, &cx.home);
     sandbox.read_dirs.extend(cx.readable_dirs());
-    let sandboxed = matches!(
-        crate::sandbox::ShellSandbox::probe(),
-        crate::sandbox::SandboxStatus::Confined
-    );
+    let sandboxed = !additions.switched_off()
+        && matches!(
+            crate::sandbox::ShellSandbox::probe(),
+            crate::sandbox::SandboxStatus::Confined
+        );
 
     let mut child = if sandboxed {
         let mut cmd = sandbox.wrap(command, &cx.cwd());
@@ -241,7 +245,7 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
             // TUI's keystrokes. Own process group: Esc/TaskStop can kill
             // the whole tree.
             .env_clear()
-            .envs(env_allowlist())
+            .envs(unconfined_env(&additions, &|name| std::env::var(name).ok()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -391,13 +395,15 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
             std::env::temp_dir().join(format!("orbit-bash-{}.log", ulid::Ulid::new()))
         });
 
+    let additions = crate::sandbox::SandboxAdditions::load(&cx.home);
     let mut sandbox = crate::sandbox::ShellSandbox::standard(&cx.writable_dirs(), &cx.session_id)
-        .with_additions(&crate::sandbox::SandboxAdditions::load(&cx.home), &cx.home);
+        .with_additions(&additions, &cx.home);
     sandbox.read_dirs.extend(cx.readable_dirs());
-    let sandboxed = matches!(
-        crate::sandbox::ShellSandbox::probe(),
-        crate::sandbox::SandboxStatus::Confined
-    );
+    let sandboxed = !additions.switched_off()
+        && matches!(
+            crate::sandbox::ShellSandbox::probe(),
+            crate::sandbox::SandboxStatus::Confined
+        );
 
     let spawn = |cmd: &mut std::process::Command| -> std::io::Result<std::process::Child> {
         cmd.stdin(Stdio::null())
@@ -419,7 +425,7 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
             .arg(command)
             .current_dir(cx.cwd())
             .env_clear()
-            .envs(env_allowlist());
+            .envs(unconfined_env(&additions, &|name| std::env::var(name).ok()));
         match spawn(&mut plain) {
             Ok(c) => c,
             Err(e) => return ToolResult::err(&format!("cannot spawn bash: {e}")),
@@ -637,12 +643,44 @@ fn pump<R: std::io::Read + Send + 'static>(
 /// The environment a Bash child may see: an explicit allowlist, never
 /// ORBIT's own environment (provider keys must not leak into tool
 /// results via printenv).
-fn env_allowlist() -> Vec<(String, String)> {
+/// The environment of a command that runs without the sandbox. A child never
+/// inherits ORBIT's own environment (provider keys included): it gets an
+/// allowlist, then what the operator's `[sandbox]` table adds — the variables
+/// named in `inherit_env` copied from ORBIT's environment, the `env` values,
+/// and `path` first on PATH. `ambient` reads ORBIT's own environment.
+fn unconfined_env(
+    additions: &crate::sandbox::SandboxAdditions,
+    ambient: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     const ALLOW: &[&str] = &["PATH", "HOME", "LANG", "TERM", "TMPDIR", "SHELL"];
-    ALLOW
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut set = |name: &str, value: String| match env.iter_mut().find(|(known, _)| known == name)
+    {
+        Some(entry) => entry.1 = value,
+        None => env.push((name.to_owned(), value)),
+    };
+    for name in ALLOW
         .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect()
+        .copied()
+        .chain(additions.inherit_env.iter().map(String::as_str))
+    {
+        if let Some(value) = ambient(name) {
+            set(name, value);
+        }
+    }
+    for (name, value) in &additions.env {
+        set(name, value.clone());
+    }
+    if !additions.path.is_empty() {
+        let mut dirs = additions.path.clone();
+        if let Some(path) = ambient("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+        if let Ok(joined) = std::env::join_paths(dirs) {
+            set("PATH", joined.to_string_lossy().into_owned());
+        }
+    }
+    env
 }
 
 /// TaskStop: stop a background command by id.
@@ -1640,6 +1678,169 @@ mod cancel_tests {
             .and_then(|value| value.parse().ok())
             .ok_or_else(invalid)?;
         Ok(Some((start_ticks, state)))
+    }
+}
+
+#[cfg(test)]
+mod sandbox_switch_tests {
+    use super::*;
+
+    /// A home that is also the working directory, with this `settings.toml`.
+    fn cx_with(settings: Option<&str>) -> (ToolContext, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("orbit-bash-switch-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(dir.join("settings.toml"), text).unwrap();
+        }
+        (
+            ToolContext::new(dir.clone(), "bash-switch-test".into(), dir.clone()),
+            dir,
+        )
+    }
+
+    fn payload(r: &ToolResult) -> serde_json::Value {
+        serde_json::from_str(&r.payload).expect("payload is JSON")
+    }
+
+    /// The sandbox works here, or this machine is allowed not to have one.
+    fn confinement_here() -> bool {
+        if matches!(
+            crate::sandbox::ShellSandbox::probe(),
+            crate::sandbox::SandboxStatus::Confined
+        ) {
+            return true;
+        }
+        assert!(
+            std::env::var_os("ORBIT_REQUIRE_SANDBOX").is_none(),
+            "release validation requires a working shell sandbox"
+        );
+        false
+    }
+
+    /// Whether a command can see this very test process. Only the host can:
+    /// the sandbox has a process namespace of its own.
+    fn sees_the_test_process() -> String {
+        format!(
+            "kill -0 {} 2>/dev/null && echo HOST-PROCESS-VISIBLE || echo host-process-hidden",
+            std::process::id()
+        )
+    }
+
+    #[test]
+    fn the_operators_switch_runs_commands_on_the_host() {
+        let (cx, dir) = cx_with(Some("[sandbox]\nenabled = false\n"));
+        let result = payload(&run_command(&sees_the_test_process(), 20, &cx));
+        assert_eq!(result["sandboxed"], false, "{result}");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("HOST-PROCESS-VISIBLE"),
+            "{result}"
+        );
+        let background = payload(&run_command_backgrounded("true", &cx));
+        assert_eq!(background["sandboxed"], false, "{background}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_the_switch_commands_stay_in_the_sandbox() {
+        if !confinement_here() {
+            return;
+        }
+        let (cx, dir) = cx_with(None);
+        let result = payload(&run_command(&sees_the_test_process(), 20, &cx));
+        assert_eq!(result["sandboxed"], true, "{result}");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("host-process-hidden"),
+            "{result}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_project_cannot_switch_the_sandbox_off() {
+        if !confinement_here() {
+            return;
+        }
+        // The operator's home says nothing; the project's own settings ask.
+        let (cx, dir) = cx_with(None);
+        std::fs::create_dir_all(dir.join(".orbit")).unwrap();
+        std::fs::write(
+            dir.join(".orbit/settings.toml"),
+            "[sandbox]\nenabled = false\n",
+        )
+        .unwrap();
+        let result = payload(&run_command(&sees_the_test_process(), 20, &cx));
+        assert_eq!(result["sandboxed"], true, "{result}");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("host-process-hidden"),
+            "{result}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn ambient(name: &str) -> Option<String> {
+        match name {
+            "PATH" => Some("/usr/bin:/bin".into()),
+            "HOME" => Some("/home/op".into()),
+            "LANG" => Some("C.UTF-8".into()),
+            "SSH_AUTH_SOCK" => Some("/run/user/1/agent.sock".into()),
+            "XDG_RUNTIME_DIR" => Some("/run/user/1".into()),
+            "PROVIDER_API_KEY" => Some("sk-secret".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_unconfined_command_gets_the_allowlist_and_what_the_operator_names() {
+        let additions = crate::sandbox::SandboxAdditions {
+            inherit_env: vec!["SSH_AUTH_SOCK".into(), "NOT_SET_HERE".into()],
+            env: vec![
+                ("TOOL_HOME".into(), "/opt/tools".into()),
+                ("LANG".into(), "en_US.UTF-8".into()),
+            ],
+            path: vec![std::path::PathBuf::from("/opt/tools/bin")],
+            ..Default::default()
+        };
+        let env: std::collections::HashMap<String, String> =
+            unconfined_env(&additions, &ambient).into_iter().collect();
+        assert_eq!(env["HOME"], "/home/op");
+        assert_eq!(env["SSH_AUTH_SOCK"], "/run/user/1/agent.sock");
+        assert!(
+            !env.contains_key("XDG_RUNTIME_DIR"),
+            "not named, not passed"
+        );
+        assert!(
+            !env.contains_key("PROVIDER_API_KEY"),
+            "ORBIT's own secrets reach no child unless the operator names them"
+        );
+        assert!(!env.contains_key("NOT_SET_HERE"));
+        assert_eq!(env["TOOL_HOME"], "/opt/tools");
+        assert_eq!(env["LANG"], "en_US.UTF-8", "the operator's own value wins");
+        assert_eq!(env["PATH"], "/opt/tools/bin:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn without_a_table_an_unconfined_command_gets_what_it_always_did() {
+        let env = unconfined_env(&crate::sandbox::SandboxAdditions::default(), &ambient);
+        let mut names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["HOME", "LANG", "PATH"],
+            "the allowlisted names that are set"
+        );
+        assert_eq!(
+            env.iter().find(|(name, _)| name == "PATH").unwrap().1,
+            "/usr/bin:/bin"
+        );
     }
 }
 

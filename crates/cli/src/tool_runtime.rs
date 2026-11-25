@@ -1048,6 +1048,46 @@ fn execute_call_decided(
         }
     };
 
+    // PreToolUse for every call that does not run through the registry;
+    // registry tools fire it inside `execute_wave1`. Hooks are the operator's
+    // policy layer: an MCP call, a subagent spawn or a skill load must not
+    // slip past them just because it is dispatched by a branch below. A
+    // hook's added context rides along on MCP results; the other branches
+    // keep the block, ask and rewrite semantics and drop the context.
+    let (args, pre_context) = if orbit_tools::is_wave1(&call.name) {
+        (args, Vec::new())
+    } else {
+        let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+        let gate = {
+            let mut confirm = |reason: &str| -> bool {
+                confirm_hook_ask(call, &args, tool_cx, operator_asked, approval, reason)
+            };
+            pre_tool_gate(&hooks, call, &args, tool_cx, &mut confirm)
+        };
+        match gate {
+            PreToolGate::Refused(output) => {
+                let status = if orbit_tools::result_is_denial(&output) {
+                    "denied"
+                } else if orbit_tools::result_is_error(&output) {
+                    "error"
+                } else {
+                    "ok"
+                };
+                record_result(
+                    home,
+                    session_id,
+                    decision_id,
+                    call,
+                    status,
+                    &output,
+                    tool_cx,
+                )?;
+                return Ok((output, None));
+            }
+            PreToolGate::Proceed { args, context } => (args, context),
+        }
+    };
+
     // Discovery may start configured servers or contact their endpoints. It
     // shares the normal scope, approval and durable verdict boundary.
     if call.name == "McpToolSearch" {
@@ -1326,7 +1366,7 @@ fn execute_call_decided(
 
     // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
     if call.name.starts_with("mcp__") {
-        let output = match &mcp_plan {
+        let mut output = match &mcp_plan {
             Some(Ok(plan)) => execute_mcp(home, call, &args, tool_cx, plan),
             _ => tool_denial("MCP dispatch has no validated captured plan"),
         };
@@ -1337,6 +1377,22 @@ fn execute_call_decided(
         } else {
             "ok"
         };
+        if status != "denied" && !tool_cx.is_cancelled() {
+            let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+            let mut feedback = pre_context;
+            feedback.extend(post_tool_feedback(&hooks, call, &args, &output));
+            output = append_hook_feedback(output, &feedback);
+            if output.len() > MAX_RESULT_BYTES
+                && let Ok(body) = serde_json::from_str::<serde_json::Value>(&output)
+            {
+                let field = if body.get("result").is_some() {
+                    "result"
+                } else {
+                    "error"
+                };
+                output = bounded_mcp_output(body, field);
+            }
+        }
         record_result(
             home,
             session_id,
@@ -1374,40 +1430,9 @@ fn execute_call_decided(
         // A PreToolUse hook may answer `ask`: the operator confirms, unless
         // they already approved this very call.
         let mut confirm = |reason: &str| -> bool {
-            if tool_cx.is_cancelled() {
-                return false;
-            }
-            if operator_asked {
-                return true;
-            }
-            let reason: String = reason
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(200)
-                .collect();
-            let request = ApprovalRequest {
-                call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                summary: format!("{} — hook asks: {reason}", safe_call_summary(call)),
-                risk: crate::tools::call_risk(&call.name, &args),
-                // The summary is one clipped line: the hook's reason is
-                // also given whole, above what the call would do.
-                preview: std::iter::once(" a hook asks:".to_owned())
-                    .chain(crate::tools::wrap_for_card(&reason))
-                    .chain(crate::tools::approval_preview(&call.name, &args))
-                    .collect(),
-                grant: None,
-                input: args.clone(),
-                relay: false,
-            };
-            if tool_cx.is_cancelled() {
-                return false;
-            }
-            let verdict = approval.ask(&request, false);
-            !tool_cx.is_cancelled() && verdict != ApprovalVerdict::Deny
+            confirm_hook_ask(call, &args, tool_cx, operator_asked, approval, reason)
         };
-        let (mut output, file_change) =
-            execute_wave1(home, scope, call, &args, tool_cx, &mut confirm);
+        let (output, file_change) = execute_wave1(home, scope, call, &args, tool_cx, &mut confirm);
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -1415,30 +1440,6 @@ fn execute_call_decided(
         } else {
             "ok"
         };
-        // E9: PostToolUseFailure fires for the error path (the plain
-        // PostToolUse fires inside execute_wave1 with ok=true/false).
-        // A denial (status "denied") is not a failure — the tool never
-        // ran (D9), and PermissionRequest already covered the moment.
-        if status == "error" {
-            let interrupted = tool_cx.is_cancelled();
-            if !interrupted {
-                let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
-                let outcomes = hooks.fire(
-                    orbit_engine::hooks::HookEvent::PostToolUseFailure,
-                    &serde_json::json!({
-                        "tool": call.name,
-                        "tool_use_id": call.id,
-                        "arguments": args,
-                        "ok": false,
-                        "error": output.chars().take(4_000).collect::<String>(),
-                        "is_interrupt": interrupted,
-                    }),
-                );
-                if let Some(context) = orbit_engine::hooks::added_context(&outcomes) {
-                    output = append_hook_feedback(output, &[context]);
-                }
-            }
-        }
         record_result(
             home,
             session_id,
@@ -2010,11 +2011,18 @@ fn pattern_layer_verdict_with_plan(
             "ListAgents" | "AgentSendMessage" | "AgentOutput" | "AgentStop"
         ) || crate::tools::is_schedule_tool(tool_name)
         {
-            let pattern = args
-                .get("agent_id")
-                .or_else(|| args.get("agent"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let pattern = if matches!(tool_name, "AgentOutput" | "AgentStop") {
+                // The executors resolve their target the same way.
+                match crate::tools::agent_target(args) {
+                    Ok(target) => target.unwrap_or(""),
+                    Err(reason) => return PatternOutcome::Deny(reason),
+                }
+            } else {
+                args.get("agent_id")
+                    .or_else(|| args.get("agent"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+            };
             if tool_name == "AgentSendMessage"
                 && scope.mode == orbit_tools::permissions::PermissionMode::Plan
             {
@@ -2058,6 +2066,12 @@ fn pattern_layer_verdict_with_plan(
                 false,
             ) {
                 Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask
+                    if rules.evaluate(tool_name, pattern)
+                        == Some(orbit_tools::permissions::RuleEffect::Ask) =>
+                {
+                    PatternOutcome::ExplicitAsk
+                }
                 Verdict::Ask => PatternOutcome::Ask,
                 Verdict::Deny(reason) => PatternOutcome::Deny(reason),
             };
@@ -2750,7 +2764,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 fn sandbox_refusal() -> String {
     tool_denial(
         "refused: the shell sandbox is unavailable on this machine \
-(bubblewrap missing); set ORBIT_ALLOW_UNSANDBOXED_BASH=1 to run Bash unsandboxed",
+(bubblewrap missing); set ORBIT_ALLOW_UNSANDBOXED_BASH=1, or `[sandbox] enabled = false` in the operator's settings.toml, to run Bash unsandboxed",
     )
 }
 
@@ -2981,9 +2995,170 @@ fn append_hook_feedback(output: String, feedback: &[String]) -> String {
     serde_json::Value::Object(body).to_string()
 }
 
+/// Report one post-tool event using the executed input and the scanned result.
+fn post_tool_feedback(
+    hooks: &orbit_engine::hooks::Hooks,
+    call: &crate::PendingToolCall,
+    args: &serde_json::Value,
+    output: &str,
+) -> Vec<String> {
+    use orbit_engine::hooks::HookEvent;
+
+    const MAX_HOOK_RESPONSE: usize = 256 * 1024;
+    let body = serde_json::from_str::<serde_json::Value>(output).ok();
+    let value = |key| body.as_ref().and_then(|body| body.get(key));
+    if value("denied").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Vec::new();
+    }
+    let failed = value("ok").and_then(serde_json::Value::as_bool) == Some(false);
+    // The dispatcher's routing marker is not an input: the server never
+    // receives it, and a hook reports the input that was actually used.
+    let mut arguments = args.clone();
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove(crate::tools::MCP_RESOURCE_MARK);
+    }
+    let mut payload = serde_json::json!({
+        "tool": call.name,
+        "tool_use_id": call.id,
+        "arguments": arguments,
+        "ok": !failed,
+    });
+    let event = if failed {
+        let error = value("error")
+            .or_else(|| value("result"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(output);
+        payload["error"] = error.chars().take(4_000).collect::<String>().into();
+        payload["is_interrupt"] = false.into();
+        HookEvent::PostToolUseFailure
+    } else {
+        payload["tool_response"] = if output.len() <= MAX_HOOK_RESPONSE {
+            body.unwrap_or_else(|| serde_json::Value::String(output.to_owned()))
+        } else {
+            serde_json::json!({ "truncated": true, "bytes": output.len() })
+        };
+        HookEvent::PostToolUse
+    };
+    let outcomes = hooks.fire(event, &payload);
+    let mut feedback = Vec::new();
+    if event == HookEvent::PostToolUse
+        && let Some(reason) = orbit_engine::hooks::blocked(&outcomes)
+    {
+        feedback.push(format!(
+            "A PostToolUse hook reported a problem after this call: {}",
+            reason.trim()
+        ));
+    }
+    feedback.extend(hooks.added_context(&outcomes));
+    feedback
+}
+
 #[cfg(test)]
 mod hook_feedback_tests {
-    use super::append_hook_feedback;
+    use super::{PreToolGate, append_hook_feedback, post_tool_feedback, pre_tool_gate};
+
+    /// The marker must also stay out of what a PreToolUse hook is told, and
+    /// survive a hook's rewrite: without it an unwrapped resource read would be
+    /// dispatched as an ordinary tool call.
+    #[cfg(unix)]
+    #[test]
+    fn pre_hooks_never_see_the_resource_routing_field_and_a_rewrite_keeps_it() {
+        let mark = crate::tools::MCP_RESOURCE_MARK;
+        let home =
+            std::env::temp_dir().join(format!("orbit-resource-pre-hook-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let capture = home.join("payload.json");
+        std::fs::write(
+            home.join("hook.py"),
+            r#"import json,sys
+event = json.load(sys.stdin)
+open(sys.argv[1], 'w').write(json.dumps(event))
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+    "permissionDecision": "allow", "updatedInput": {"uri": "file:///other.md"}}}))
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"python3 '{}' '{}'\"\n",
+                home.join("hook.py").display(),
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let hooks = orbit_engine::hooks::Hooks::load(&home, false);
+        let call = crate::PendingToolCall {
+            index: 0,
+            id: "resource-call".into(),
+            name: "mcp__docs__resources_read".into(),
+            arguments: Vec::new(),
+        };
+        let arguments = serde_json::json!({ mark: "read", "uri": "file:///guide.md" });
+        let tool_cx = orbit_tools::ToolContext::new(home.clone(), "pre-hook".into(), home.clone());
+        let mut never_asked = |_: &str| false;
+        match pre_tool_gate(&hooks, &call, &arguments, &tool_cx, &mut never_asked) {
+            PreToolGate::Proceed { args, .. } => assert_eq!(
+                args,
+                serde_json::json!({ mark: "read", "uri": "file:///other.md" })
+            ),
+            PreToolGate::Refused(output) => panic!("the hook allowed the call: {output}"),
+        }
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(
+            payload["tool_input"],
+            serde_json::json!({"uri": "file:///guide.md"})
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The marker routes an unwrapped resource call inside the dispatcher. The
+    /// server never receives it, so a hook must not be told it was an input.
+    #[cfg(unix)]
+    #[test]
+    fn post_hooks_never_see_the_dispatchers_resource_routing_field() {
+        let mark = crate::tools::MCP_RESOURCE_MARK;
+        let home = std::env::temp_dir().join(format!("orbit-resource-hook-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let capture = home.join("payload.json");
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"PostToolUse\"\ncommand = \"cat > '{}'\"\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let hooks = orbit_engine::hooks::Hooks::load(&home, false);
+        for (tool, arguments, reported) in [
+            (
+                "mcp__docs__resources_read",
+                serde_json::json!({ mark: "read", "uri": "file:///guide.md" }),
+                serde_json::json!({"uri": "file:///guide.md"}),
+            ),
+            (
+                "mcp__docs__resources_list",
+                serde_json::json!({ mark: "list" }),
+                serde_json::json!({}),
+            ),
+        ] {
+            let call = crate::PendingToolCall {
+                index: 0,
+                id: "resource-call".into(),
+                name: tool.into(),
+                arguments: Vec::new(),
+            };
+            let feedback =
+                post_tool_feedback(&hooks, &call, &arguments, r#"{"ok":true,"result":{}}"#);
+            assert!(feedback.is_empty(), "{tool}: {feedback:?}");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+            assert_eq!(payload["tool_input"], reported, "{tool}");
+            std::fs::remove_file(&capture).unwrap();
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn later_hook_context_preserves_result_fields_and_bounds_utf8_feedback() {
@@ -3017,6 +3192,130 @@ mod hook_feedback_tests {
     }
 }
 
+/// A PreToolUse hook answered `ask`: the operator confirms, unless they
+/// already approved this very call. Nothing that cannot ask (a headless
+/// run, a background agent) can confirm, so there it is a denial.
+fn confirm_hook_ask(
+    call: &crate::PendingToolCall,
+    args: &serde_json::Value,
+    tool_cx: &orbit_tools::ToolContext,
+    operator_asked: bool,
+    approval: &mut dyn ApprovalChannel,
+    reason: &str,
+) -> bool {
+    if tool_cx.is_cancelled() {
+        return false;
+    }
+    if operator_asked {
+        return true;
+    }
+    let reason: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let request = ApprovalRequest {
+        call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        summary: format!("{} — hook asks: {reason}", safe_call_summary(call)),
+        risk: crate::tools::call_risk(&call.name, args),
+        // The summary is one clipped line: the hook's reason is
+        // also given whole, above what the call would do.
+        preview: std::iter::once(" a hook asks:".to_owned())
+            .chain(crate::tools::wrap_for_card(&reason))
+            .chain(crate::tools::approval_preview(&call.name, args))
+            .collect(),
+        grant: None,
+        input: args.clone(),
+        relay: false,
+    };
+    if tool_cx.is_cancelled() {
+        return false;
+    }
+    let verdict = approval.ask(&request, false);
+    !tool_cx.is_cancelled() && verdict != ApprovalVerdict::Deny
+}
+
+/// What PreToolUse decided for a call that does not run through
+/// `execute_wave1` (which fires the same event for registry tools).
+enum PreToolGate {
+    /// A hook refused the call, or the operator declined its confirmation:
+    /// the result to record, and nothing runs.
+    Refused(String),
+    /// Run the call with these arguments (a hook may have rewritten them).
+    /// `context` is what hooks asked to add to the result.
+    Proceed {
+        args: serde_json::Value,
+        context: Vec<String>,
+    },
+}
+
+/// Fire PreToolUse for a call outside the registry (an MCP tool, a subagent,
+/// a skill, a scheduler call ...) with the semantics registry tools get from
+/// `execute_wave1`: a hook may deny, ask for confirmation, rewrite the input
+/// or add context. Hooks are the operator's policy layer and must see every
+/// call; a tool does not escape them by being dispatched elsewhere.
+fn pre_tool_gate(
+    hooks: &orbit_engine::hooks::Hooks,
+    call: &crate::PendingToolCall,
+    args: &serde_json::Value,
+    tool_cx: &orbit_tools::ToolContext,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> PreToolGate {
+    // The dispatcher's routing marker is not an input: the server never
+    // receives it, so a hook sees (and may rewrite) only the real input.
+    let mut visible = args.clone();
+    let marker = visible
+        .as_object_mut()
+        .and_then(|object| object.remove(crate::tools::MCP_RESOURCE_MARK));
+    let pre = hooks.fire(
+        orbit_engine::hooks::HookEvent::PreToolUse,
+        &serde_json::json!({
+            "tool": call.name,
+            "tool_use_id": call.id,
+            "arguments": visible,
+        }),
+    );
+    if tool_cx.is_cancelled() {
+        return PreToolGate::Refused(tool_error("cancelled by user"));
+    }
+    if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
+        return PreToolGate::Refused(tool_denial(&format!("blocked by hook: {reason}")));
+    }
+    if let Some(reason) = orbit_engine::hooks::asks(&pre) {
+        let confirmed = confirm(&reason);
+        if tool_cx.is_cancelled() {
+            return PreToolGate::Refused(tool_error("cancelled by user"));
+        }
+        if !confirmed {
+            return PreToolGate::Refused(tool_denial(&format!(
+                "a hook asked for confirmation and it was declined: {reason}"
+            )));
+        }
+    }
+    let mut effective = match orbit_engine::hooks::rewritten_input(&pre) {
+        Some(rewritten) => {
+            if !rewritten.is_object() {
+                return PreToolGate::Refused(tool_error(
+                    "a PreToolUse hook rewrote the input to something that is not a JSON object",
+                ));
+            }
+            if rewritten.to_string().len() > MAX_ARGUMENT_BYTES {
+                return PreToolGate::Refused(tool_error("tool arguments exceed 64 KiB"));
+            }
+            rewritten
+        }
+        None => visible,
+    };
+    if let (Some(marker), Some(object)) = (marker, effective.as_object_mut()) {
+        object.insert(crate::tools::MCP_RESOURCE_MARK.to_owned(), marker);
+    }
+    PreToolGate::Proceed {
+        args: effective,
+        context: hooks.added_context(&pre).into_iter().collect(),
+    }
+}
+
 /// Execute one Wave 1 call through the orbit-tools registry with the
 /// live permission layer: modes, pattern rules, folder trust, deny-read
 /// and the secret scanner. The verdict above (whole-tool rules +
@@ -3039,7 +3338,6 @@ fn execute_wave1(
     // to block) every call, whatever the machine's sandbox state. It
     // fires once per call. A hook may also rewrite the input; every gate
     // below, and the tool itself, then sees the rewritten input.
-    // PostToolUse sees the result.
     let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
     let pre = hooks.fire(
         orbit_engine::hooks::HookEvent::PreToolUse,
@@ -3174,15 +3472,17 @@ fn execute_wave1(
 
     // S3: when the shell sandbox cannot run on this machine, a Bash
     // command must not execute unsandboxed on an allow verdict. The
-    // operator opts in explicitly (ORBIT_ALLOW_UNSANDBOXED_BASH=1) or
-    // the call is refused with the reason. Read-only commands are
-    // still safe to run bare.
+    // operator opts in explicitly (ORBIT_ALLOW_UNSANDBOXED_BASH=1, or
+    // `[sandbox] enabled = false` in their own settings, which is a
+    // choice rather than a failure) or the call is refused with the
+    // reason. Read-only commands are still safe to run bare.
     let sandbox_up = call.name != "Bash"
         || is_ro_cmd
         || matches!(
             orbit_tools::sandbox::ShellSandbox::probe(),
             orbit_tools::sandbox::SandboxStatus::Confined
         )
+        || orbit_tools::sandbox::SandboxAdditions::load(home).switched_off()
         || std::env::var("ORBIT_ALLOW_UNSANDBOXED_BASH")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -3315,43 +3615,9 @@ fn execute_wave1(
     };
     let result = orbit_tools::finish(result, &cx, &call.id);
 
-    // PostToolUse: the hook sees the (scanned) result, as `tool_response`
-    // (Claude Code's name for it). A very large result is not copied to
-    // every hook: it is summarised by its size.
-    const MAX_HOOK_RESPONSE: usize = 256 * 1024;
-    let tool_response = if result.payload.len() <= MAX_HOOK_RESPONSE {
-        serde_json::from_str::<serde_json::Value>(&result.payload)
-            .unwrap_or_else(|_| serde_json::Value::String(result.payload.clone()))
-    } else {
-        serde_json::json!({ "truncated": true, "bytes": result.payload.len() })
-    };
-    let post = hooks.fire(
-        orbit_engine::hooks::HookEvent::PostToolUse,
-        &serde_json::json!({
-            "tool": call.name,
-            "tool_use_id": call.id,
-            "arguments": args,
-            "ok": !result.is_error,
-            "tool_response": tool_response,
-        }),
-    );
-    // What the hooks around this call want the model to know rides on the
-    // result: context a PreToolUse or PostToolUse hook added, and what a
-    // PostToolUse hook reported when it blocked (exit code 2, or
-    // `decision: "block"`) - a failed lint or test run after an edit, say.
-    // The call has already run; the report is for the model to act on.
-    let mut hook_feedback: Vec<String> = Vec::new();
-    if let Some(context) = orbit_engine::hooks::added_context(&pre) {
-        hook_feedback.push(context);
-    }
-    if let Some(reason) = orbit_engine::hooks::blocked(&post) {
-        hook_feedback.push(format!(
-            "A PostToolUse hook reported a problem after this call: {}",
-            reason.trim()
-        ));
-    }
-    if let Some(context) = orbit_engine::hooks::added_context(&post) {
-        hook_feedback.push(context);
+    let mut hook_feedback: Vec<_> = hooks.added_context(&pre).into_iter().collect();
+    if !cx.is_cancelled() {
+        hook_feedback.extend(post_tool_feedback(&hooks, call, args, &result.payload));
     }
 
     // M11: a successful checkpointed write carries a real diff — the
@@ -3901,6 +4167,218 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn mcp_post_tool_hooks_report_exactly_one_scanned_outcome() {
+        let fixture = Fixture::new();
+        let script = fixture.home.join("post-tool.py");
+        std::fs::write(
+            &script,
+            r#"import json,sys
+event = json.load(sys.stdin)
+name = event["hook_event_name"]
+assert event["tool_input"] == {"fixture": True}
+assert "abcdefghijklmnopqrstuvwxyz" not in json.dumps(event)
+if name == "PostToolUseFailure":
+    assert event["error"]
+    assert event["is_interrupt"] is False
+    assert "tool_response" not in event
+else:
+    assert event["tool_response"]["ok"] is True
+print(json.dumps({"hookSpecificOutput":{"additionalContext":name}}))
+"#,
+        )
+        .unwrap();
+        let script = script.to_string_lossy().replace('\'', "'\\''");
+        let command = format!("python3 '{script}'");
+        std::fs::write(
+            fixture.home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"PostToolUse\"\ncommand = {command:?}\n\
+                 [[hooks]]\nevent = \"PostToolUseFailure\"\ncommand = {command:?}\n"
+            ),
+        )
+        .unwrap();
+        for (tool, event, status) in [
+            ("error", "PostToolUseFailure", "error"),
+            ("server_error", "PostToolUseFailure", "error"),
+            ("structured", "PostToolUse", "ok"),
+            ("large", "PostToolUse", "ok"),
+        ] {
+            let out =
+                fixture.call_with_args(tool, json!({"fixture":true}), &PermissionScope::default());
+            assert_eq!(out["hook_feedback"], event, "{tool}");
+            assert_eq!(fixture.status(), status);
+        }
+        let scope = PermissionScope::from_flags(None, None, Some(&fixture.wire("error")));
+        let out = fixture.call_with_args("error", json!({"fixture":true}), &scope);
+        assert_eq!(out["denied"], true);
+        assert!(out.get("hook_feedback").is_none());
+        assert_eq!(fixture.log().matches("tools/call").count(), 4);
+    }
+
+    impl Fixture {
+        /// Install a PreToolUse hook for tools matching `matcher`. It appends every event it
+        /// receives to the returned file and answers with `reply`.
+        fn pre_tool_hook(&self, matcher: &str, reply: Value) -> PathBuf {
+            let script = self.home.join("pre-tool.py");
+            std::fs::write(
+                &script,
+                r#"import json,sys
+event = json.load(sys.stdin)
+with open(sys.argv[1], 'a') as log:
+    log.write(json.dumps(event) + "\n")
+print(open(sys.argv[2]).read())
+"#,
+            )
+            .unwrap();
+            let events = self.home.join("pre-tool-events.jsonl");
+            let reply_file = self.home.join("pre-tool-reply.json");
+            std::fs::write(&reply_file, reply.to_string()).unwrap();
+            let quoted = |path: &PathBuf| path.to_string_lossy().replace('\'', "'\\''");
+            let command = format!(
+                "python3 '{}' '{}' '{}'",
+                quoted(&script),
+                quoted(&events),
+                quoted(&reply_file)
+            );
+            std::fs::write(
+                self.home.join("settings.toml"),
+                format!(
+                    "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = {matcher:?}\ncommand = {command:?}\n"
+                ),
+            )
+            .unwrap();
+            events
+        }
+    }
+
+    fn pre_tool_reply(decision: &str, extra: Value) -> Value {
+        let mut output = json!({"hookEventName": "PreToolUse"});
+        if !decision.is_empty() {
+            output["permissionDecision"] = decision.into();
+        }
+        for (key, value) in extra.as_object().unwrap() {
+            output[key] = value.clone();
+        }
+        json!({ "hookSpecificOutput": output })
+    }
+
+    #[test]
+    fn pre_tool_use_hook_refuses_an_mcp_call_before_the_server_sees_it() {
+        let fixture = Fixture::new();
+        let events = fixture.pre_tool_hook(
+            "mcp__*",
+            pre_tool_reply("deny", json!({"permissionDecisionReason": "egress policy"})),
+        );
+        let args = json!({"query": "x"});
+        let out = fixture.call_with_args("echo", args.clone(), &PermissionScope::default());
+        assert_eq!(out["denied"], true, "{out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .contains("blocked by hook: egress policy"),
+            "{out}"
+        );
+        assert!(
+            !fixture.log().contains("tools/call"),
+            "a refused call must never reach the server: {}",
+            fixture.log()
+        );
+        assert_eq!(fixture.status(), "denied");
+        // The hook saw the call under its real name and the input the server would get.
+        let first = std::fs::read_to_string(events).unwrap();
+        let event: Value = serde_json::from_str(first.lines().next().unwrap()).unwrap();
+        assert_eq!(event["hook_event_name"], "PreToolUse");
+        assert_eq!(event["tool_name"], fixture.wire("echo"));
+        assert_eq!(event["tool_input"], args);
+    }
+
+    #[test]
+    fn pre_tool_use_hook_rewrites_what_the_mcp_server_receives() {
+        let fixture = Fixture::new();
+        fixture.pre_tool_hook(
+            "mcp__*",
+            pre_tool_reply("allow", json!({"updatedInput": {"query": "rewritten"}})),
+        );
+        let out = fixture.call_with_args(
+            "echo",
+            json!({"query": "original"}),
+            &PermissionScope::default(),
+        );
+        assert_eq!(out["ok"], true, "{out}");
+        let received: Value = serde_json::from_str(out["result"].as_str().unwrap()).unwrap();
+        assert_eq!(received, json!({"query": "rewritten"}));
+    }
+
+    #[test]
+    fn pre_tool_use_context_travels_with_the_mcp_result() {
+        let fixture = Fixture::new();
+        fixture.pre_tool_hook(
+            "mcp__*",
+            pre_tool_reply("", json!({"additionalContext": "pre-note"})),
+        );
+        let out =
+            fixture.call_with_args("echo", json!({"query": "x"}), &PermissionScope::default());
+        assert_eq!(out["ok"], true, "{out}");
+        assert!(
+            out["hook_feedback"].as_str().unwrap().contains("pre-note"),
+            "{out}"
+        );
+        assert_eq!(fixture.log().matches("tools/call").count(), 1);
+    }
+
+    #[test]
+    fn a_pre_tool_use_hook_that_asks_is_a_denial_when_nothing_can_answer() {
+        let fixture = Fixture::new();
+        fixture.pre_tool_hook(
+            "mcp__*",
+            pre_tool_reply("ask", json!({"permissionDecisionReason": "confirm egress"})),
+        );
+        let out =
+            fixture.call_with_args("echo", json!({"query": "x"}), &PermissionScope::default());
+        assert_eq!(out["denied"], true, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("declined"), "{out}");
+        assert!(!fixture.log().contains("tools/call"), "{}", fixture.log());
+    }
+
+    #[test]
+    fn pre_tool_use_hooks_also_gate_non_registry_tools_that_are_not_mcp() {
+        let fixture = Fixture::new();
+        fixture.pre_tool_hook(
+            "ListAgents",
+            pre_tool_reply("deny", json!({"permissionDecisionReason": "no listing"})),
+        );
+        let call = crate::PendingToolCall {
+            index: 0,
+            id: format!("call-{}", ulid::Ulid::new()),
+            name: "ListAgents".into(),
+            arguments: b"{}".to_vec(),
+        };
+        let (output, _) = execute_call(
+            &fixture.home,
+            "mcp-owner",
+            "decision",
+            &call,
+            true,
+            false,
+            &mut StdApprovalChannel::new(false),
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+            &fixture.cx,
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(out["denied"], true, "{out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .contains("blocked by hook: no listing"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn structured_only_content_is_visible_and_scanned() {
         let fixture = Fixture::new();
         let out = fixture.call("structured", &PermissionScope::default());
@@ -4058,6 +4536,42 @@ for line in sys.stdin:
             fixture.log().matches("spawn").count(),
             1,
             "discovery session must be reused"
+        );
+    }
+
+    /// A server that is disabled, that has no tool allowed, or that the command or skill being
+    /// run was given no tool of, is not started to list its tools.
+    #[test]
+    fn discovery_does_not_start_a_disabled_hidden_or_empty_allowlist_server() {
+        let declared = |fixture: &Fixture| {
+            crate::tools::session_tool_definitions_with_context(&fixture.home, &fixture.cx, None)
+                .iter()
+                .any(|tool| tool.name.starts_with("mcp__"))
+        };
+        for extra in [json!({"enabled": false}), json!({"tools": []})] {
+            let fixture = Fixture::new();
+            fixture.config(extra.clone());
+            assert!(!declared(&fixture), "{extra}");
+            assert!(fixture.log().is_empty(), "{extra}: its process was started");
+            // Nothing was asked of it, so `/mcp` must not call it running.
+            assert_eq!(
+                crate::tools::mcp_state_text(&fixture.server),
+                None,
+                "{extra}"
+            );
+        }
+        let fixture = Fixture::new();
+        crate::plugin_content::restrict_context(&fixture.cx, Some(&["Read".to_owned()])).unwrap();
+        assert!(!declared(&fixture), "a ceiling with no tool of the server");
+        assert!(fixture.log().is_empty(), "a hidden server was started");
+        assert_eq!(crate::tools::mcp_state_text(&fixture.server), None);
+        // The same server with nothing in the way is started once, declared and called running.
+        let fixture = Fixture::new();
+        assert!(declared(&fixture));
+        assert_eq!(fixture.log().matches("spawn").count(), 1);
+        assert_eq!(
+            crate::tools::mcp_state_text(&fixture.server).as_deref(),
+            Some("running · 6 tools")
         );
     }
 
@@ -5906,6 +6420,91 @@ mod grant_tests {
         assert_eq!(events, ["intent", "verdict", "result"]);
     }
 
+    #[test]
+    fn configured_control_asks_take_precedence_over_convenience_grants() {
+        let (home, project) = dirs("explicit-control-asks");
+        std::fs::write(
+            home.join("settings.toml"),
+            "[permissions]\nask = [\"EnterWorktree\", \"CronList\", \"AgentOutput(fixture)\"]\n",
+        )
+        .unwrap();
+        let scope = PermissionScope::from_flags(None, None, None);
+        for (tool, args) in [
+            ("EnterWorktree", br#"{"name":"fixture"}"#.as_slice()),
+            ("CronList", b"{}".as_slice()),
+            ("AgentOutput", br#"{"agent_id":"fixture"}"#.as_slice()),
+        ] {
+            for auto_tools in [false, true] {
+                let mut grants = AutoGrants::new();
+                if !auto_tools {
+                    grants.grant(tool);
+                }
+                let mut pending = call(tool, args);
+                pending.id = ulid::Ulid::new().to_string();
+                let mut approval = Scripted::new(&[ApprovalVerdict::Deny]);
+                let output = run_with_auto(
+                    &home,
+                    &project,
+                    &pending,
+                    &mut approval,
+                    &mut grants,
+                    &scope,
+                    auto_tools,
+                );
+                assert!(orbit_tools::result_is_denial(&output), "{tool}: {output}");
+                assert_eq!(approval.asked.len(), 1, "{tool}: {output}");
+                assert_eq!(approval.asked[0].tool_name, tool);
+                assert_call_ledger(&home, &pending, &output, false, "denied");
+            }
+        }
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn conflicting_agent_aliases_are_refused_before_any_permission_decision() {
+        let (home, project) = dirs("conflicting-agent-aliases");
+        std::fs::write(
+            home.join("settings.toml"),
+            "[permissions]\nask = [\"AgentOutput(victim)\", \"AgentStop(victim)\"]\n",
+        )
+        .unwrap();
+        let scope = PermissionScope::from_flags(None, None, None);
+        for tool in ["AgentOutput", "AgentStop"] {
+            // The executors act on `agent`. A permission check that decided
+            // `agent_id` instead would clear a different agent from the one
+            // that is touched, and miss the explicit ask above.
+            let mut conflicting = call(tool, br#"{"agent":"victim","agent_id":"other"}"#);
+            conflicting.id = ulid::Ulid::new().to_string();
+            let mut approval = Scripted::new(&[ApprovalVerdict::AllowOnce]);
+            let output = run(
+                &home,
+                &project,
+                &conflicting,
+                &mut approval,
+                &mut AutoGrants::new(),
+                &scope,
+            );
+            assert!(orbit_tools::result_is_denial(&output), "{tool}: {output}");
+            assert!(output.contains("different agents"), "{tool}: {output}");
+            assert!(approval.asked.is_empty(), "{tool}: {output}");
+            // Aliases that agree are still decided by the explicit ask rule.
+            let mut agreeing = call(tool, br#"{"agent":"victim","agent_id":"victim"}"#);
+            agreeing.id = ulid::Ulid::new().to_string();
+            let mut approval = Scripted::new(&[ApprovalVerdict::Deny]);
+            let output = run(
+                &home,
+                &project,
+                &agreeing,
+                &mut approval,
+                &mut AutoGrants::new(),
+                &scope,
+            );
+            assert!(orbit_tools::result_is_denial(&output), "{tool}: {output}");
+            assert_eq!(approval.asked.len(), 1, "{tool}: {output}");
+        }
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn failure_hook_context_reaches_only_failed_tool_results_and_the_ledger() {
@@ -5918,8 +6517,10 @@ mod grant_tests {
                  assert event['hook_event_name']=={expected_event:?}\n\
                  assert event['tool_name']=='Read'\n\
                  assert event['tool_use_id'] in ('c1','success')\n\
-                 assert event['hook_event_name']!='PostToolUseFailure' or event['is_interrupt'] is False\n\
-                 print(json.dumps({{'hookSpecificOutput':{{'additionalContext':{context:?}}}}}))"
+                 if {expected_event:?}=='PostToolUseFailure':\n\x20   assert event['is_interrupt'] is False\n\x20   assert event['tool_input']=={{'file_path':'missing.txt'}}\n\
+                 output={{'additionalContext':{context:?}}}\n\
+                 if {expected_event:?}=='PreToolUse' and event['tool_use_id']=='c1':\n\x20   output['updatedInput']={{'file_path':'missing.txt'}}\n\
+                 print(json.dumps({{'hookSpecificOutput':output}}))"
             );
             format!("python3 -c '{}'", script.replace('\'', "'\\''"))
         };
@@ -5946,14 +6547,14 @@ mod grant_tests {
         let scope = PermissionScope::from_flags(Some("bypass"), Some("Read"), None);
         let mut channel = Scripted::new(&[]);
         let mut grants = AutoGrants::new();
-        let failed = call("Read", br#"{"file_path":"missing.txt"}"#);
+        let failed = call("Read", br#"{"file_path":"before-rewrite.txt"}"#);
         let output = run(&home, &project, &failed, &mut channel, &mut grants, &scope);
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(orbit_tools::result_is_error(&output));
         assert!(!orbit_tools::result_is_denial(&output));
         assert_eq!(
             value["hook_feedback"],
-            "pre context\npost context\nfailure context",
+            "pre context\nfailure context",
             "{}",
             output.chars().take(2_000).collect::<String>()
         );
@@ -6538,6 +7139,153 @@ mod grant_tests {
             assert_call_ledger(&home, &call, &output, false, "denied");
             std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
         }
+    }
+
+    /// Four servers that each wait, before they answer `initialize`, until all four have been
+    /// started. Started one after another, the first would wait for servers that never start
+    /// (29 real servers took 22.5 s that way on the first turn). A fifth server that dies at once
+    /// takes nothing with it.
+    #[cfg(unix)]
+    #[test]
+    fn mcp_servers_are_started_together_and_one_that_dies_costs_only_itself() {
+        const SERVER: &str = r#"
+import json, os, sys, time
+folder, me, total, lag = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get('method')
+    if method == 'initialize':
+        open(os.path.join(folder, me), 'w').write('started')
+        until = time.time() + 20
+        while len(os.listdir(folder)) < total and time.time() < until: time.sleep(0.02)
+        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}}}
+    elif 'id' not in msg: continue
+    elif method == 'tools/list':
+        time.sleep(lag)
+        result = {'tools': [{'name': 'tool-' + me, 'description': 'rendezvous', 'inputSchema': {'type': 'object'}}]}
+    else: result = {}
+    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}) + '\n'); sys.stdout.flush()
+"#;
+        let (home, project) = dirs("parallel-start");
+        let rendezvous = home.join("rendezvous");
+        std::fs::create_dir_all(&rendezvous).unwrap();
+        let tag = ulid::Ulid::new().to_string().to_lowercase();
+        let names: Vec<String> = (0..4).map(|i| format!("rv{i}-{tag}")).collect();
+        let mut servers: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .enumerate()
+            .map(|(at, name)| {
+                // The first server lists its tools last, the last one first: the answers
+                // arrive in the reverse of the order they are wanted in.
+                let lag = format!("{:.1}", (3 - at) as f64 * 0.4);
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "command": "python3",
+                        "args": ["-u", "-c", SERVER, rendezvous.to_string_lossy(), name, "4", lag],
+                        "timeout_ms": 20_000,
+                        "initialize_timeout_ms": 4_000
+                    }),
+                )
+            })
+            .collect();
+        let down = format!("down-{tag}");
+        servers.insert(
+            down.clone(),
+            serde_json::json!({
+                "command": "/bin/sh",
+                "args": ["-c", "exit 3"],
+                "timeout_ms": 5_000,
+                "initialize_timeout_ms": 2_000
+            }),
+        );
+        std::fs::write(
+            home.join("mcp.json"),
+            serde_json::json!({ "servers": servers }).to_string(),
+        )
+        .unwrap();
+        let cx = orbit_tools::ToolContext::new(home.clone(), "s1".into(), project.clone());
+        let started = std::time::Instant::now();
+        let found: Vec<String> = crate::tools::mcp_tool_definitions(&home, &cx, None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        let expected: Vec<String> = names
+            .iter()
+            .map(|name| format!("mcp__{name}__tool-{name}"))
+            .collect();
+        assert_eq!(found, expected, "after {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            crate::tools::mcp_state_text(&down).is_some_and(|text| text.contains("not available")),
+            "{:?}",
+            crate::tools::mcp_state_text(&down)
+        );
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    /// The servers answer in whatever order they like; their tools are declared in the order of
+    /// the configuration, every turn, so the prompt does not change from one turn to the next
+    /// (a provider's prompt cache would miss). Here the first server and the last four answer at
+    /// once and the seven between them take a while: the worker that is free first goes on to
+    /// the later servers while the others are still waiting.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_keeps_the_order_of_the_configuration_whatever_the_order_of_the_answers() {
+        const SERVER: &str = r#"
+import json, sys, time
+me, lag = sys.argv[1], float(sys.argv[2])
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get('method')
+    if 'id' not in msg: continue
+    if method == 'initialize':
+        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}}}
+    elif method == 'tools/list':
+        time.sleep(lag)
+        result = {'tools': [{'name': 'tool-' + me, 'description': 'order', 'inputSchema': {'type': 'object'}}]}
+    else: result = {}
+    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}) + '\n'); sys.stdout.flush()
+"#;
+        let (home, project) = dirs("keep-order");
+        let tag = ulid::Ulid::new().to_string().to_lowercase();
+        let names: Vec<String> = (0..12).map(|i| format!("ord{i:02}-{tag}")).collect();
+        let servers: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .enumerate()
+            .map(|(at, name)| {
+                let lag = if (1..=7).contains(&at) { "0.8" } else { "0.0" };
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "command": "python3",
+                        "args": ["-u", "-c", SERVER, name, lag],
+                        "timeout_ms": 20_000,
+                        "initialize_timeout_ms": 5_000
+                    }),
+                )
+            })
+            .collect();
+        std::fs::write(
+            home.join("mcp.json"),
+            serde_json::json!({ "servers": servers }).to_string(),
+        )
+        .unwrap();
+        let cx = orbit_tools::ToolContext::new(home.clone(), "s1".into(), project.clone());
+        let found: Vec<String> = crate::tools::mcp_tool_definitions(&home, &cx, None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        let expected: Vec<String> = names
+            .iter()
+            .map(|name| format!("mcp__{name}__tool-{name}"))
+            .collect();
+        assert_eq!(found, expected);
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
     }
 
     #[cfg(unix)]

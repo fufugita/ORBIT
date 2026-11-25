@@ -7,7 +7,7 @@ mod inspect;
 mod model;
 mod store;
 
-pub use frontmatter::{FrontmatterDocument, parse_frontmatter};
+pub use frontmatter::{FrontmatterDocument, parse_frontmatter, parse_frontmatter_lenient};
 pub use inspect::inspect;
 pub use model::*;
 pub use store::{
