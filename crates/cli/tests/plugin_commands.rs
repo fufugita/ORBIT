@@ -2018,6 +2018,120 @@ fn bulk_import_is_repeatable_previews_without_writing_and_never_overwrites() {
     assert_eq!(revision(&fixture), off);
 }
 
+const REVIEW_SKILL: &str = "---\nname: review\ndescription: Review a change\n---\nbody\n";
+
+/// One enabled plugin, as Claude Code keeps it while sessions run: `.in_use/<pid>` for each of them.
+fn plugin_in_use_by(fixture: &Fixture, pids: &[&str]) -> PathBuf {
+    let marker_files: Vec<(String, String)> = pids
+        .iter()
+        .map(|pid| (format!(".in_use/{pid}"), format!("{{\"pid\":{pid}}}\n")))
+        .collect();
+    let mut files = vec![("skills/review/SKILL.md", REVIEW_SKILL)];
+    files.extend(marker_files.iter().map(|(p, t)| (p.as_str(), t.as_str())));
+    let dir = fixture.claude_plugin("alpha@market-a", &files);
+    fixture.claude_registry(
+        &[("alpha@market-a", dir.as_path(), "user")],
+        &[("alpha@market-a", json!(true))],
+    );
+    dir
+}
+
+/// One session ends and another starts: Claude Code's folder changes, the plugin does not.
+fn sessions_come_and_go(dir: &Path, ended: &str, started: &str) {
+    fs::remove_file(dir.join(".in_use").join(ended)).unwrap();
+    fs::write(
+        dir.join(".in_use").join(started),
+        format!("{{\"pid\":{started}}}\n"),
+    )
+    .unwrap();
+}
+
+fn holds_a_session_marker(root: &Path) -> bool {
+    fs::read_dir(root).unwrap().flatten().any(|entry| {
+        entry.file_name() == ".in_use"
+            || (entry.path().is_dir() && holds_a_session_marker(&entry.path()))
+    })
+}
+
+#[test]
+fn claude_codes_session_markers_do_not_make_a_plugin_look_changed() {
+    let fixture = managed_fixture();
+    let dir = plugin_in_use_by(&fixture, &["4242"]);
+    let first = fixture.bulk(&[]);
+    assert_eq!(entry(&first, "alpha")["status"], "imported", "{first}");
+    assert!(
+        !holds_a_session_marker(&fixture.home.join("plugins")),
+        "the stored copy holds no marker"
+    );
+    let revision = |fixture: &Fixture| {
+        let listed = fixture.run(&["plugin", "list", "--json"]);
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        listed["snapshot"]["revision"].as_str().unwrap().to_owned()
+    };
+    let settled = revision(&fixture);
+
+    sessions_come_and_go(&dir, "4242", "9001");
+    let preview = fixture.bulk(&["--dry-run"]);
+    assert_eq!(entry(&preview, "alpha")["status"], "already", "{preview}");
+    let run = fixture.bulk(&[]);
+    assert_eq!(entry(&run, "alpha")["status"], "already", "{run}");
+    assert_eq!(run["bulk"]["summary"]["changed"], 0);
+    assert_eq!(revision(&fixture), settled, "nothing was written");
+
+    // A change to the plugin itself is still a change.
+    fs::write(
+        dir.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Changed\n---\nnew body\n",
+    )
+    .unwrap();
+    let moved = fixture.bulk(&["--dry-run"]);
+    assert_eq!(entry(&moved, "alpha")["status"], "changed", "{moved}");
+}
+
+#[test]
+fn a_copy_held_with_markers_differs_from_claude_codes_only_by_them() {
+    // An earlier build stored the markers it found. Such a copy must not be called changed because
+    // sessions have come and gone since, and the hint to replace it would break a plugin pin.
+    let fixture = managed_fixture();
+    let dir = plugin_in_use_by(&fixture, &["4242"]);
+    let strict = fixture.run(&[
+        "plugin",
+        "import",
+        dir.to_str().unwrap(),
+        "--format",
+        "claude",
+        "--json",
+    ]);
+    success(&strict);
+    assert!(
+        holds_a_session_marker(&fixture.home.join("plugins")),
+        "this copy holds the marker it was stored with"
+    );
+    let revision = |fixture: &Fixture| {
+        let listed = fixture.run(&["plugin", "list", "--json"]);
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        listed["snapshot"]["revision"].as_str().unwrap().to_owned()
+    };
+    let settled = revision(&fixture);
+
+    sessions_come_and_go(&dir, "4242", "9001");
+    // Held without `--lenient`, so it is kept as it is; what it is not, is changed.
+    let preview = fixture.bulk(&["--dry-run"]);
+    assert_eq!(entry(&preview, "alpha")["status"], "kept", "{preview}");
+    let run = fixture.bulk(&[]);
+    assert_eq!(entry(&run, "alpha")["status"], "kept", "{run}");
+    assert_eq!(run["bulk"]["summary"]["changed"], 0);
+    assert_eq!(revision(&fixture), settled, "nothing was written");
+
+    fs::write(
+        dir.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Changed\n---\nnew body\n",
+    )
+    .unwrap();
+    let moved = fixture.bulk(&["--dry-run"]);
+    assert_eq!(entry(&moved, "alpha")["status"], "changed", "{moved}");
+}
+
 #[test]
 fn bulk_import_refuses_unreadable_registries_and_ambiguous_commands_without_writing() {
     let fixture = managed_fixture();

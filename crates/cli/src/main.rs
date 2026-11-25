@@ -3805,6 +3805,13 @@ fn fire_session_end(home: &Path, reason: &str) {
         orbit_engine::hooks::HookEvent::SessionEnd,
         &serde_json::json!({ "reason": reason }),
     );
+    // The process ends next. A hook that was started without waiting for it still has to be sent
+    // what it is owed, so it is waited for, for a few seconds at most.
+    if let Some(line) =
+        orbit_engine::hooks::finish_async_hooks(orbit_engine::hooks::ASYNC_HOOK_EXIT_GRACE)
+    {
+        eprintln!("{line}");
+    }
     // A run without a screen names hook trouble on standard error.
     for problem in orbit_engine::hooks::take_hook_problems() {
         eprintln!("{problem}");
@@ -9480,5 +9487,38 @@ mod completions_tests {
             }
         }
         assert!(emit_completions("powershell").is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_end_tests {
+    use std::os::unix::fs::DirBuilderExt;
+
+    /// A headless run leaves right after its `SessionEnd` hooks are fired, so an async hook among
+    /// them has to have its payload by the time `fire_session_end` returns.
+    #[test]
+    fn the_end_of_a_headless_session_waits_for_its_async_hooks() {
+        let home = std::env::temp_dir().join(format!("orbit-session-end-{}", ulid::Ulid::new()));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        let out = home.join("payload.json");
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"SessionEnd\"\ncommand = \"sleep 0.3; cat > '{}'\"\nasync = true\ntimeout_secs = 20\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        super::fire_session_end(&home, "ended");
+        let body = std::fs::read_to_string(&out).unwrap_or_default();
+        let payload: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("the hook's stdin was {body:?}: {error}"));
+        assert_eq!(payload["hook_event_name"], "SessionEnd");
+        assert_eq!(payload["reason"], "ended");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

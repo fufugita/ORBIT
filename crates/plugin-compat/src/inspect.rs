@@ -55,9 +55,37 @@ fn is_dependency_directory(name: &str) -> bool {
     matches!(name, "node_modules" | ".venv" | "venv" | "__pycache__")
 }
 
+/// The folder at the top of a plugin in which Claude Code keeps one file per running session
+/// (`.in_use/<pid>`). It lists processes, not the plugin, and changes whenever a session starts or
+/// ends, so a package that took it in would have a different digest every time.
+const SESSION_MARKERS: &str = ".in_use";
+
+/// A file inside that folder. A strict read takes these in as content, so a copy stored by a build that
+/// did is read back whole; they are told apart only to compare it with a lenient read of its source.
+fn is_session_marker(path: &str) -> bool {
+    path.strip_prefix(SESSION_MARKERS)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// What names a package in the store: its files, in path order, with their sizes, modes and hashes.
+fn digest_of<'a>(files: impl IntoIterator<Item = &'a SourceFile>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"orbit-plugin-source-v1\0");
+    for file in files {
+        digest.update((file.path.len() as u64).to_be_bytes());
+        digest.update(file.path.as_bytes());
+        digest.update(file.size.to_be_bytes());
+        digest.update([u8::from(file.executable)]);
+        digest.update(file.sha256.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
 impl SourceTree {
     /// `lenient`: symbolic links and dependency folders are left out and listed in `skipped`
-    /// instead of refusing the package. Special files, hard links and every limit still refuse it.
+    /// instead of refusing the package, and so is Claude Code's `.in_use` folder at the top, which
+    /// is not part of the plugin and is not listed. Special files, hard links and every limit still
+    /// refuse it.
     pub(crate) fn read_named(
         source: &Path,
         inferred_name: Option<&str>,
@@ -117,24 +145,27 @@ impl SourceTree {
             return Err(failure("source_changed"));
         }
         inventory.files.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut digest = Sha256::new();
-        digest.update(b"orbit-plugin-source-v1\0");
-        for file in &inventory.files {
-            digest.update((file.path.len() as u64).to_be_bytes());
-            digest.update(file.path.as_bytes());
-            digest.update(file.size.to_be_bytes());
-            digest.update([u8::from(file.executable)]);
-            digest.update(file.sha256.as_bytes());
-        }
+        let source_digest = digest_of(&inventory.files);
         Ok(Self {
             files: inventory.files,
             bytes: inventory.bytes,
-            source_digest: hex::encode(digest.finalize()),
+            source_digest,
             scm_excluded: inventory.scm_excluded,
             directories: inventory.directory_paths,
             directory_name,
             skipped: inventory.skipped,
         })
+    }
+
+    /// The digest this package has when it is read leniently: the same files without Claude Code's
+    /// session markers. A copy stored before those were left out differs from its own source only by
+    /// them, and this is how that is told from a change to the plugin.
+    pub(crate) fn lenient_digest(&self) -> String {
+        digest_of(
+            self.files
+                .iter()
+                .filter(|file| !is_session_marker(&file.path)),
+        )
     }
 
     pub(crate) fn text(&self, path: &str) -> Result<&str, CompatError> {
@@ -236,6 +267,9 @@ impl Inventory {
                 return Err(failure("source_changed"));
             }
             match FileType::from_raw_mode(actual.st_mode) {
+                // Not walked, not hashed, not stored and not reported: it is no part of the plugin.
+                FileType::Directory
+                    if self.lenient && prefix.is_empty() && name == SESSION_MARKERS => {}
                 FileType::Directory if self.lenient && is_dependency_directory(&name) => {
                     self.skipped.push(SkippedEntry {
                         path: path.clone(),

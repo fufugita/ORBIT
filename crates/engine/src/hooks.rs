@@ -1051,7 +1051,11 @@ impl Hooks {
                 if h.run_async {
                     let (hook, body) = ((*h).clone(), body.clone());
                     let runner = current_handler_runner();
+                    // Counted here and released when the hook is over, so that a process that
+                    // ends next can wait for it (see `finish_async_hooks`).
+                    let running = ASYNC_HOOKS.start();
                     std::thread::spawn(move || {
+                        let _running = running;
                         let _runner_scope = runner.map(handler_runner_scope);
                         let _ = run_hook(&hook, &body);
                     });
@@ -1109,6 +1113,102 @@ pub fn take_hook_problems() -> Vec<String> {
         .lock()
         .map(|mut problems| std::mem::take(&mut *problems))
         .unwrap_or_default()
+}
+
+/// How long a process that is ending waits for async hooks that are still running.
+pub const ASYNC_HOOK_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// The async hooks this process has started and not yet seen finish.
+struct AsyncHooks {
+    running: std::sync::Mutex<usize>,
+    idle: std::sync::Condvar,
+}
+
+/// One async hook that is running. Dropping it says the hook is over, whether it finished or its
+/// thread is unwinding.
+struct AsyncHookRun(&'static AsyncHooks);
+
+static ASYNC_HOOKS: AsyncHooks = AsyncHooks::new();
+
+impl AsyncHooks {
+    const fn new() -> Self {
+        Self {
+            running: std::sync::Mutex::new(0),
+            idle: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Never held while anything else runs, so a poisoned lock holds a count that is still right.
+    fn count(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Count one more running hook. The caller does this before the hook's thread exists: counted
+    /// by the thread itself, a hook would be missed by a process that ends in the very next
+    /// instruction, which is the case that matters.
+    fn start(&'static self) -> AsyncHookRun {
+        *self.count() += 1;
+        AsyncHookRun(self)
+    }
+
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        *self.count()
+    }
+
+    /// Wait until no hook is running, or until `grace` has passed.
+    fn wait(&self, grace: Duration) -> Option<String> {
+        let grace = grace.min(Duration::from_secs(3600));
+        let deadline = std::time::Instant::now() + grace;
+        let mut running = self.count();
+        while *running > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Some(still_running_line(*running, grace));
+            }
+            running = self
+                .idle
+                .wait_timeout(running, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        None
+    }
+}
+
+impl Drop for AsyncHookRun {
+    fn drop(&mut self) {
+        let mut running = self.0.count();
+        *running = running.saturating_sub(1);
+        if *running == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+fn still_running_line(count: usize, grace: Duration) -> String {
+    let waited = if grace.subsec_millis() == 0 && grace.as_secs() > 0 {
+        format!("{} s", grace.as_secs())
+    } else {
+        format!("{} ms", grace.as_millis())
+    };
+    let (hooks, were) = if count == 1 {
+        ("hook", "was")
+    } else {
+        ("hooks", "were")
+    };
+    format!(
+        "{count} async {hooks} {were} still running after {waited}; ORBIT is ending and does not wait longer"
+    )
+}
+
+/// Wait for the async hooks this process started, up to `grace`. A process that is about to end
+/// calls this so it does not end under a hook that has not yet received its payload. Returns a line
+/// for the operator when some are still running at the end of the wait.
+pub fn finish_async_hooks(grace: Duration) -> Option<String> {
+    ASYNC_HOOKS.wait(grace)
 }
 
 /// Opt-in for reading the operator's own Claude Code configuration (hooks in
@@ -3766,6 +3866,141 @@ mcp_input = "{"allow":false}"
         );
         assert_eq!(blocked(&outcomes), None);
         assert_eq!(outcomes[0].stdout.trim(), "ran");
+    }
+
+    /// An async hook that records what it was sent, after a pause: the shape of a hook that is
+    /// still starting when the process that fired it is ready to end.
+    fn recording_async_hook(command: String) -> Hooks {
+        Hooks {
+            hooks: vec![HookConfig {
+                event: "SessionEnd".into(),
+                command,
+                timeout_secs: Some(20),
+                matcher: None,
+                condition: None,
+                run_async: true,
+                http: None,
+                handler: None,
+                origin: None,
+            }],
+            project_trusted: false,
+            context_limit: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_waits_for_async_hooks_lets_them_receive_their_payload() {
+        let dir = test_dir("async-payload");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("payload.json");
+        let hooks = recording_async_hook(format!("sleep 0.3; cat > '{}'", out.display()));
+        // What a process does at its end: fire, wait, leave.
+        let outcomes = hooks.fire(
+            HookEvent::SessionEnd,
+            &serde_json::json!({"reason": "ended"}),
+        );
+        assert!(outcomes.is_empty(), "an async hook reports no outcome");
+        finish_async_hooks(Duration::from_secs(30));
+        let body = std::fs::read_to_string(&out).unwrap_or_default();
+        let payload: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("the hook's stdin was {body:?}: {error}"));
+        assert_eq!(payload["hook_event_name"], "SessionEnd");
+        assert_eq!(payload["reason"], "ended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_async_hook_is_counted_before_fire_returns() {
+        // A process that ends in the very next instruction must still see the hook, so it is
+        // counted by the caller, not by the thread that has perhaps not started yet.
+        let hooks = recording_async_hook("sleep 1".into());
+        hooks.fire(HookEvent::SessionEnd, &serde_json::json!({}));
+        let left = finish_async_hooks(Duration::from_millis(20));
+        assert!(
+            left.as_deref()
+                .is_some_and(|line| line.contains("async hook")),
+            "{left:?}"
+        );
+    }
+
+    #[test]
+    fn waiting_for_async_hooks_ends_at_the_grace_and_says_how_many_are_left() {
+        static LOCAL: AsyncHooks = AsyncHooks::new();
+        let (first, second) = (LOCAL.start(), LOCAL.start());
+        assert_eq!(LOCAL.running(), 2);
+        let started = std::time::Instant::now();
+        let left = LOCAL.wait(Duration::from_millis(200));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(190) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        let line = left.expect("two hooks were still running");
+        assert!(line.contains("2 async hooks were still running"), "{line}");
+        assert!(line.contains("200 ms"), "{line}");
+        drop(first);
+        let line = LOCAL.wait(Duration::from_millis(50)).expect("one is left");
+        assert!(line.contains("1 async hook was still running"), "{line}");
+        drop(second);
+        assert_eq!(LOCAL.wait(Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn the_wait_ends_when_the_last_async_hook_finishes_not_at_the_grace() {
+        static LOCAL: AsyncHooks = AsyncHooks::new();
+        let run = LOCAL.start();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(run);
+        });
+        let started = std::time::Instant::now();
+        let left = LOCAL.wait(Duration::from_secs(30));
+        let waited = started.elapsed();
+        release.join().unwrap();
+        assert_eq!(left, None);
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[test]
+    fn the_line_names_the_wait_in_whole_seconds_when_it_is_whole() {
+        let line = still_running_line(1, Duration::from_secs(5));
+        assert!(
+            line.starts_with("1 async hook was still running after 5 s;"),
+            "{line}"
+        );
+        let line = still_running_line(3, Duration::from_millis(1500));
+        assert!(
+            line.starts_with("3 async hooks were still running after 1500 ms;"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn with_no_async_hooks_running_the_wait_is_over_at_once() {
+        static LOCAL: AsyncHooks = AsyncHooks::new();
+        let started = std::time::Instant::now();
+        assert_eq!(LOCAL.wait(Duration::from_secs(30)), None);
+        assert_eq!(LOCAL.wait(Duration::MAX), None, "a huge grace is bounded");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_async_hook_whose_thread_unwinds_is_not_counted_for_ever() {
+        static LOCAL: AsyncHooks = AsyncHooks::new();
+        let run = LOCAL.start();
+        assert_eq!(LOCAL.running(), 1);
+        let crashed = std::thread::spawn(move || {
+            let _run = run;
+            panic!("a hook's thread failed");
+        })
+        .join();
+        assert!(crashed.is_err());
+        assert_eq!(LOCAL.running(), 0);
+        assert_eq!(LOCAL.wait(Duration::from_secs(5)), None);
     }
 
     #[test]

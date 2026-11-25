@@ -20,9 +20,12 @@ pub struct InspectOptions {
     /// Read the package the way Claude Code reads it, and leave out what cannot be read, saying
     /// so, instead of refusing the whole package: a skill, command or agent with front matter or
     /// a name that does not parse, a symbolic link, a dependency folder (`node_modules`, a
-    /// virtualenv). The operator chooses it per plugin; it is kept with the plugin so a later
-    /// load reads the package the same way. Never relaxes a limit or a refusal that guards the
-    /// package as a whole (identity, paths, collisions, hard links, special files).
+    /// virtualenv). It also leaves out, without listing it, the `.in_use` folder at the top of a
+    /// Claude Code plugin, which holds one file per running session: not part of the plugin, and
+    /// different every time a session starts or ends. The operator chooses it per plugin; it is
+    /// kept with the plugin so a later load reads the package the same way. Never relaxes a limit
+    /// or a refusal that guards the package as a whole (identity, paths, collisions, hard links,
+    /// special files).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lenient: bool,
 }

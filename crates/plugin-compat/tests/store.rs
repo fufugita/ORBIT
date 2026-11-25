@@ -1,4 +1,4 @@
-use orbit_plugin_compat::{InspectOptions, PluginId, PluginStore, StoreScope};
+use orbit_plugin_compat::{InspectOptions, PluginId, PluginStore, StoreScope, inspect};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -1587,4 +1587,152 @@ fn the_store_budget_holds_a_realistic_set_of_plugins_and_still_has_an_end() {
         .import(&package, &InspectOptions::default(), StoreScope::User, true)
         .unwrap_err();
     assert_eq!(error.code, "store_plugin_limit");
+}
+
+// ------------------------------------------------------------------------------------ session markers
+
+/// A plugin folder as Claude Code keeps it: the manifest, one skill, and `.in_use/<pid>` for every
+/// session that has it loaded.
+fn claude_package(root: &Path, markers: &[&str]) {
+    write(
+        root,
+        ".claude-plugin/plugin.json",
+        serde_json::to_vec(&json!({"name":"sample","description":"A package","license":"MIT"}))
+            .unwrap(),
+    );
+    write(
+        root,
+        "skills/review/SKILL.md",
+        "---\nname: review\ndescription: Review the selected change\n---\nThe body.\n",
+    );
+    for pid in markers {
+        write(
+            root,
+            &format!(".in_use/{pid}"),
+            format!("{{\"pid\":{pid}}}\n"),
+        );
+    }
+}
+
+fn lenient() -> InspectOptions {
+    InspectOptions {
+        lenient: true,
+        ..InspectOptions::default()
+    }
+}
+
+#[test]
+fn a_held_copy_with_session_markers_is_the_same_package_as_its_source_without_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, _) = roots(temp.path());
+    let source = temp.path().join("claude-source");
+    claude_package(&source, &["1226279"]);
+    // Names that look like the markers' but are not them are the plugin's own.
+    write(&source, ".in_use_not", "not a marker");
+    write(&source, "docs/.in_use/9", "nested, not a marker");
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    // An earlier build read the folder as it was, markers and all.
+    let held = store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    // Sessions come and go in Claude Code's folder; the plugin does not change.
+    fs::remove_file(source.join(".in_use/1226279")).unwrap();
+    write(&source, ".in_use/3089150", "{\"pid\":3089150}\n");
+    let fresh = inspect(&source, &lenient()).unwrap().source.source_digest;
+    assert_ne!(
+        held.plugin.digest, fresh,
+        "the copy still holds the marker it was stored with"
+    );
+    assert_eq!(
+        store.lenient_digest(&id(StoreScope::User)).unwrap(),
+        fresh,
+        "without it, it is the package the source is"
+    );
+
+    // A real change is still a change.
+    write(
+        &source,
+        "skills/review/SKILL.md",
+        "---\nname: review\ndescription: Review the selected change\n---\nA new body.\n",
+    );
+    let moved = inspect(&source, &lenient()).unwrap().source.source_digest;
+    assert_ne!(store.lenient_digest(&id(StoreScope::User)).unwrap(), moved);
+}
+
+#[test]
+fn a_copy_stored_with_the_markers_left_out_has_one_digest_whatever_the_markers_were() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, _) = roots(temp.path());
+    let source = temp.path().join("claude-source");
+    claude_package(&source, &["1", "2", "3"]);
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let held = store
+        .import(&source, &lenient(), StoreScope::User, true)
+        .unwrap();
+    assert!(
+        !held
+            .plugin
+            .source
+            .files
+            .iter()
+            .any(|file| file.path.starts_with(".in_use")),
+        "the copy holds no marker"
+    );
+    let root = store.active().unwrap().plugins[0].root.clone();
+    assert!(!root.join(".in_use").exists(), "and none is on disk");
+    // The stored digest is what the source has with no marker at all, and importing again after the
+    // markers moved finds the same package.
+    let bare = temp.path().join("bare");
+    claude_package(&bare, &[]);
+    assert_eq!(
+        held.plugin.digest,
+        inspect(&bare, &lenient()).unwrap().source.source_digest
+    );
+    assert_eq!(
+        store.lenient_digest(&id(StoreScope::User)).unwrap(),
+        held.plugin.digest,
+        "nothing to leave out"
+    );
+    fs::remove_dir_all(source.join(".in_use")).unwrap();
+    write(&source, ".in_use/99", "{\"pid\":99}\n");
+    let again = store
+        .import(&source, &lenient(), StoreScope::User, true)
+        .unwrap();
+    assert!(again.reused, "the same package");
+}
+
+#[test]
+fn the_digest_without_markers_is_only_given_for_a_copy_that_still_verifies() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, _) = roots(temp.path());
+    let source = temp.path().join("claude-source");
+    claude_package(&source, &["7"]);
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    // Nothing held under another name.
+    assert!(
+        store
+            .lenient_digest(&PluginId {
+                name: "nothing-here".into(),
+                scope: StoreScope::User
+            })
+            .is_err()
+    );
+    // A stored file that no longer matches what was recorded gives no digest.
+    let root = store.active().unwrap().plugins[0].root.clone();
+    let skill = root.join("skills/review/SKILL.md");
+    fs::set_permissions(&skill, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&skill, b"Tampered bytes\n").unwrap();
+    fs::set_permissions(&skill, fs::Permissions::from_mode(0o400)).unwrap();
+    let before = files(&home);
+    assert_eq!(
+        store
+            .lenient_digest(&id(StoreScope::User))
+            .unwrap_err()
+            .code,
+        "store_package_tampered"
+    );
+    assert_eq!(before, files(&home), "and nothing was written");
 }

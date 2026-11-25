@@ -14,7 +14,7 @@ use crate::CliError;
 use crate::plugin_commands::{components_phrase, human_lines, open_store, usage};
 use orbit_plugin_compat::{
     CompatError, ComponentKind, DiagnosticSeverity, InspectOptions, Inspection, PluginFormat,
-    PluginId, PluginStore, StoreScope,
+    PluginId, PluginStore, StoreScope, StoredPlugin,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -444,25 +444,22 @@ fn import_from(
             name: stored_name,
             scope: StoreScope::User,
         };
+        let fresh = inspection.source.source_digest.as_str();
         let (status, code, hint, reason) = if request.dry_run {
             match store.status(&id) {
                 Ok(None) => ("would_import", None, None, None),
-                Ok(Some(held)) if held.digest != inspection.source.source_digest => {
-                    ("changed", None, upgrade_hint(&id.name, path), None)
-                }
-                Ok(Some(held)) if held.options != options || !held.enabled => {
-                    ("kept", None, None, Some(KEPT))
-                }
-                Ok(Some(_)) => ("already", None, None, None),
+                Ok(Some(held)) => judge(&store, &held, &options, fresh, path),
                 Err(error) => ("refused", Some(code_of(&error)), None, None),
             }
         } else {
             match store.import(path, &options, StoreScope::User, true) {
                 Ok(receipt) if receipt.reused => ("already", None, None, None),
                 Ok(_) => ("imported", None, None, None),
-                Err(error) if error.code == "store_upgrade_required" => {
-                    ("changed", None, upgrade_hint(&id.name, path), None)
-                }
+                // Held, and not the same bytes: a change, unless only session markers differ.
+                Err(error) if error.code == "store_upgrade_required" => match store.status(&id) {
+                    Ok(Some(held)) => judge(&store, &held, &options, fresh, path),
+                    _ => ("changed", None, upgrade_hint(&id.name, path), None),
+                },
                 Err(error) if error.code == "store_state_conflict" => {
                     ("kept", None, None, Some(KEPT))
                 }
@@ -534,6 +531,37 @@ fn import_from(
             "plugins": entries,
         },
     }))
+}
+
+type Verdict = (
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<&'static str>,
+);
+
+/// What a plugin ORBIT holds is to the copy Claude Code has now. Claude Code keeps a list of its
+/// running sessions inside the plugin folder (`.in_use`), which changes whenever one starts or ends;
+/// a copy stored by a build that took it in differs from its own source by that alone, and is not
+/// a plugin that has moved on.
+fn judge(
+    store: &PluginStore,
+    held: &StoredPlugin,
+    options: &InspectOptions,
+    fresh: &str,
+    path: &Path,
+) -> Verdict {
+    if held.digest != fresh
+        && !store
+            .lenient_digest(&held.id)
+            .is_ok_and(|without_markers| without_markers == fresh)
+    {
+        ("changed", None, upgrade_hint(&held.id.name, path), None)
+    } else if held.options != *options || !held.enabled {
+        ("kept", None, None, Some(KEPT))
+    } else {
+        ("already", None, None, None)
+    }
 }
 
 const KEPT: &str = "ORBIT already holds it with other settings (disabled, or imported without --lenient); it is left as it is";

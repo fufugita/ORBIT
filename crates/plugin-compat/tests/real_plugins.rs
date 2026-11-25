@@ -6,7 +6,7 @@ use orbit_plugin_compat::{
 };
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
 fn write(root: &Path, path: &str, bytes: impl AsRef<[u8]>) {
@@ -704,6 +704,163 @@ fn lenient_leaves_dependency_folders_out_of_the_package() {
         ]
     );
     assert!(package_wide_errors(&inspected).is_empty());
+}
+
+// ------------------------------------------------------------------------------------ session markers
+
+fn digest_of(root: &Path, options: &InspectOptions) -> String {
+    inspect(root, options).unwrap().source.source_digest
+}
+
+fn paths_of(inspection: &Inspection) -> Vec<String> {
+    let mut paths: Vec<_> = inspection
+        .source
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Claude Code keeps `.in_use/<pid>` at the top of every plugin folder a running session has loaded.
+/// It lists processes, not the plugin, and it changes whenever a session starts or ends.
+#[test]
+fn lenient_leaves_claude_codes_session_markers_out_so_the_digest_holds_still() {
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path());
+    write(
+        temp.path(),
+        "skills/ok/SKILL.md",
+        "---\nname: ok\ndescription: d\n---\nbody\n",
+    );
+    let bare = digest_of(temp.path(), &lenient());
+
+    write(temp.path(), ".in_use/1226279", "{\"pid\":1226279}\n");
+    write(temp.path(), ".in_use/3089150", "{\"pid\":3089150}\n");
+    let marked = inspect(temp.path(), &lenient()).unwrap();
+    assert_eq!(
+        paths_of(&marked),
+        [".claude-plugin/plugin.json", "skills/ok/SKILL.md"],
+        "no marker is taken into the package"
+    );
+    assert_eq!(marked.source.source_digest, bare, "markers do not count");
+    assert!(package_wide_errors(&marked).is_empty());
+    assert!(
+        marked.diagnostics.iter().all(|d| d
+            .source_path
+            .as_deref()
+            .is_none_or(|path| !path.starts_with(".in_use"))),
+        "it is not plugin content, so it is not reported as lost: {:?}",
+        marked.diagnostics
+    );
+
+    // One session ends and another starts.
+    fs::remove_file(temp.path().join(".in_use/1226279")).unwrap();
+    write(temp.path(), ".in_use/42", "{\"pid\":42}\n");
+    assert_eq!(digest_of(temp.path(), &lenient()), bare);
+
+    // A strict read keeps them as content. A copy an earlier build stored is read this way, and
+    // must go on verifying against the digest it was stored under.
+    let strict = inspect(temp.path(), &InspectOptions::default()).unwrap();
+    assert!(
+        paths_of(&strict).contains(&".in_use/42".to_owned()),
+        "{:?}",
+        paths_of(&strict)
+    );
+    write(temp.path(), ".in_use/43", "{\"pid\":43}\n");
+    assert_ne!(
+        strict.source.source_digest,
+        digest_of(temp.path(), &InspectOptions::default()),
+        "a strict read counts the markers"
+    );
+}
+
+#[test]
+fn only_a_folder_named_in_use_at_the_top_is_left_out() {
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path());
+    write(temp.path(), ".in_use/1", "the markers");
+    // Everything else with a similar name is the plugin's own content.
+    write(temp.path(), "skills/ok/.in_use/1", "nested");
+    write(temp.path(), "docs/.in_use", "a file of that name");
+    write(temp.path(), ".in_use_not/1", "another name");
+    let inspected = inspect(temp.path(), &lenient()).unwrap();
+    assert_eq!(
+        paths_of(&inspected),
+        [
+            ".claude-plugin/plugin.json",
+            ".in_use_not/1",
+            "docs/.in_use",
+            "skills/ok/.in_use/1"
+        ]
+    );
+    // Each of them moves the digest, which the markers do not.
+    let settled = inspected.source.source_digest;
+    write(temp.path(), ".in_use/2", "more markers");
+    assert_eq!(digest_of(temp.path(), &lenient()), settled);
+    for (path, original) in [
+        ("skills/ok/.in_use/1", "nested"),
+        ("docs/.in_use", "a file of that name"),
+        (".in_use_not/1", "another name"),
+    ] {
+        write(temp.path(), path, "changed content");
+        assert_ne!(digest_of(temp.path(), &lenient()), settled, "{path}");
+        write(temp.path(), path, original);
+        assert_eq!(digest_of(temp.path(), &lenient()), settled, "{path}");
+    }
+
+    // The names differ by case on a case-sensitive disk: another name, so content.
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path());
+    write(temp.path(), ".IN_USE/1", "another case");
+    assert!(paths_of(&inspect(temp.path(), &lenient()).unwrap()).contains(&".IN_USE/1".to_owned()));
+    // A top-level file of that name is content too, and a link is still left out and named.
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path());
+    write(temp.path(), ".in_use", "a file, not the markers");
+    assert!(paths_of(&inspect(temp.path(), &lenient()).unwrap()).contains(&".in_use".to_owned()));
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path());
+    symlink("elsewhere", temp.path().join(".in_use")).unwrap();
+    let linked = inspect(temp.path(), &lenient()).unwrap();
+    assert_eq!(
+        warnings(&linked, "source_entry_skipped")
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
+        [Some(".in_use".to_owned())]
+    );
+}
+
+/// What names a package in the store. A change to how it is worked out would make every copy already
+/// stored read as damaged, so the value for a fixed package is written down: it is what the build that
+/// stored the first copies gave it.
+#[test]
+fn the_digest_of_a_package_is_the_one_every_earlier_build_gave_it() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        ".claude-plugin/plugin.json",
+        r#"{"name":"golden","description":"A fixed package","license":"MIT"}"#,
+    );
+    write(
+        temp.path(),
+        "skills/ok/SKILL.md",
+        "---\nname: ok\ndescription: d\n---\nbody\n",
+    );
+    write(temp.path(), "scripts/run.sh", "#!/bin/sh\necho hi\n");
+    fs::set_permissions(
+        temp.path().join("scripts/run.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    for options in [InspectOptions::default(), lenient()] {
+        assert_eq!(
+            digest_of(temp.path(), &options),
+            "285a1eff950889093addd8c802e297fa3432611f140d4ba04f03e0c8a5e110f4"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- limits

@@ -338,6 +338,39 @@ impl PluginStore {
         Ok(bytes)
     }
 
+    /// The digest a held copy has once Claude Code's session markers are left out of it, as a lenient
+    /// read of its source leaves them out. A copy stored before they were left out differs from its
+    /// own source only by them.
+    ///
+    /// Only a copy that verifies has one: it is read and checked as every other read of it is.
+    pub fn lenient_digest(&self, id: &PluginId) -> Result<String, CompatError> {
+        validate_id(&id.name)?;
+        let (revision, user, project) = self.stable_indices()?;
+        let view = scoped_view(id.scope, &user, &project);
+        let record = &view.index.entries[record_position(view, id)?];
+        self.load(view, id.scope, record)?;
+        let root = view
+            .directory
+            .as_ref()
+            .ok_or_else(|| error("store_package_missing"))?
+            .child("packages", false)?
+            .ok_or_else(|| error("store_package_missing"))?
+            .child(&id.name, false)?
+            .ok_or_else(|| error("store_package_missing"))?
+            .child(&record.digest, false)?
+            .ok_or_else(|| error("store_package_missing"))?;
+        let tree =
+            SourceTree::read_named(&root.held_path()?, record.inferred_name.as_deref(), false)?;
+        check_private_tree(&root, &tree)?;
+        if tree.source_digest != record.digest {
+            return Err(error("store_package_tampered"));
+        }
+        let digest = tree.lenient_digest();
+        root.check()?;
+        self.assert_revision(&revision)?;
+        Ok(digest)
+    }
+
     /// Enable only the verified package observed by the caller.
     pub fn enable(
         &self,

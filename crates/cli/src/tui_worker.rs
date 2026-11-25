@@ -4666,6 +4666,14 @@ pub fn fire_session_end(home: &std::path::Path) {
             orbit_engine::hooks::HookEvent::SessionEnd,
             &serde_json::json!({ "frontend": "tui", "reason": "exit" }),
         );
+    // The process ends once this returns, and a hook started without waiting for it (`async`)
+    // would otherwise be left without what it is owed. The screen has closed: standard error.
+    if let Some(line) =
+        orbit_engine::hooks::finish_async_hooks(orbit_engine::hooks::ASYNC_HOOK_EXIT_GRACE)
+    {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "orbit: {line}");
+    }
 }
 
 fn statusline_description(home: &std::path::Path) -> String {
@@ -11590,6 +11598,34 @@ if event["hook_event_name"] == "SessionStart":
             "{}",
             row("legacy-unbound").model
         );
+    }
+
+    /// The process ends once the screen's `SessionEnd` hooks are fired, so an async hook among them
+    /// must have its payload by the time `fire_session_end` returns.
+    #[test]
+    fn the_screens_end_waits_for_its_async_hooks() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::the_screens_end_waits_for_its_async_hooks",
+        ) {
+            return;
+        }
+        let home = TestHome::new();
+        let out = home.join("payload.json");
+        std::fs::write(
+            home.join("settings.toml"),
+            format!(
+                "[[hooks]]\nevent = \"SessionEnd\"\ncommand = \"sleep 0.3; cat > '{}'\"\nasync = true\ntimeout_secs = 20\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fire_session_end(&home);
+        let body = std::fs::read_to_string(&out).unwrap_or_default();
+        let payload: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("the hook's stdin was {body:?}: {error}"));
+        assert_eq!(payload["hook_event_name"], "SessionEnd");
+        assert_eq!(payload["frontend"], "tui");
+        assert_eq!(payload["reason"], "exit");
     }
 
     #[test]

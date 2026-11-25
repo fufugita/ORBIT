@@ -604,7 +604,10 @@ provider, an unreadable answer, a timeout) is reported and blocks nothing.
 `if` takes `Tool(pattern)` (or a bare tool name; several separated by `|`) and
 is matched against the tool and its main argument: a Bash command, a file path
 or a URL. `async = true` starts the hook without waiting, so it can neither
-block nor add context. Every payload carries `session_id`,
+block nor add context. When a session ends, ORBIT waits up to 5 seconds for async
+hooks that are still running, so a hook started just before the end still receives
+its payload; one that runs longer is left to finish on its own, and a line on
+standard error says how many were still running. Every payload carries `session_id`,
 `transcript_path` and `permission_mode`, in the chat and in headless runs
 alike. `UserPromptSubmit` fires for a prompt you submit, not for the task a
 subagent is given. A hook that runs past its `timeout_secs` is stopped and
@@ -1125,7 +1128,8 @@ through the ordinary importer, read the way Claude Code reads plugins
 `$ORBIT_HOME/plugins`.
 
 One line per plugin says what happened and what it holds: `imported`, `already`
-(the stored copy is identical), `changed` (Claude Code's copy has moved on; ORBIT's
+(the stored copy is identical, or differs only by the session markers described
+under `--lenient` below), `changed` (Claude Code's copy has moved on; ORBIT's
 is left as it is, and the line gives the `orbit plugin upgrade` command that takes
 the new one), `kept` (ORBIT holds it with other settings, for example disabled, and
 leaves it), `refused` with its code (the importer's, or `install_path_outside`
@@ -1149,7 +1153,14 @@ It reads YAML the way Claude Code does when a value holds a colon or a bracket
 (`argument-hint: [--strict] [--json]`), accepts a list for `argument-hint`, a
 `.mcp.json` without the `mcpServers` wrapper, and a `hooks.json` that also lists
 `modules`, and skips symbolic links, `node_modules`, `.venv`, `venv` and
-`__pycache__` instead of refusing the package. The choice is stored with the
+`__pycache__` instead of refusing the package. It also leaves out `.in_use`, the
+folder at the top of a plugin in which Claude Code keeps one file per running
+session. That folder is no part of the plugin and changes whenever a session starts
+or ends, so taking it in would change the plugin's digest each time, and the
+digest is what a `plugin_hooks` pin names. It is not listed as left out, and a
+strict read still takes it as content. A copy stored by an earlier build holds
+those files: it keeps verifying under its own digest, and `import --from-claude`
+does not call it changed for them. The choice is stored with the
 plugin, and an upgrade keeps it. A package is at most 64 MiB with files of at most
 16 MiB, and the store holds 256 MiB in all.
 
