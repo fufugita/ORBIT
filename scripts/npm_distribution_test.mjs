@@ -22,7 +22,7 @@ async function scenario(name, run) {
   scenarios[name] = {passed: true, assertions: checks - before};
   console.log(`PASS ${name}: ${checks - before} assertions`);
 }
-const version = '0.2.3';
+const version = '0.2.4';
 const target = 'x86_64-unknown-linux-gnu';
 const armTarget = 'aarch64-unknown-linux-gnu';
 const wrapperMetadata = JSON.parse(fs.readFileSync(path.join(repository, 'packaging/npm/package.json'), 'utf8'));
