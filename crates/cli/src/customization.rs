@@ -1038,6 +1038,8 @@ const COUNCIL_STATE_MAX_BYTES: u64 = 64 * 1024;
 /// pause up to seven minutes between the phases of a trial council, so this
 /// must outlast the longest quiet stretch, not just one model call.
 const COUNCIL_STALE_SECS: f64 = 420.0;
+/// How long a triage verdict stays on the pane before it settles back to idle.
+const COUNCIL_TRIAGED_SECS: f64 = 20.0;
 const COUNCIL_SEATS: [&str; 4] = ["KARINA", "GISELLE", "WINTER", "NINGNING"];
 
 /// Where the MAGI engine publishes its state. The location comes from the
@@ -2063,7 +2065,10 @@ fn council_parse(value: &serde_json::Value, now: f64) -> CouncilSnapshot {
     // The engine's own quiet rule: a state older than two minutes is idle.
     let stale = published_at.is_none_or(|ts| now - ts > COUNCIL_STALE_SECS);
     let mut phase = clean(value.get("phase"), 16);
-    if stale {
+    if stale
+        // The verdict line of a triage has its moment, then the pane settles.
+        || (phase == "TRIAGED" && published_at.is_some_and(|ts| now - ts > COUNCIL_TRIAGED_SECS))
+    {
         phase = "IDLE".into();
     }
     let raw_seats: &[serde_json::Value] = value
@@ -2141,7 +2146,10 @@ fn parse_seat(
     // What the seat is doing, in the pane's terms. A quiet council rests
     // whatever the last run left behind.
     let quiet = matches!(phase, "IDLE" | "TRIAGE" | "TRIAGED" | "FAIL");
-    let activity = if quiet {
+    let activity = if status == "error" && phase != "IDLE" {
+        // A seat that lost its signal says so, in a failed council too.
+        "lost"
+    } else if quiet {
         "resting"
     } else {
         match status.as_str() {

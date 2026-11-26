@@ -149,9 +149,22 @@ layout shows a built-in pane Council state is refreshed once a second;
 Reactor follows live turn updates at the animation cadence. Other panes refresh
 on `r`. The browser renders them as text and refreshes on demand. In the
 terminal they are coloured from the active palette: seat identity, verdicts,
-and the meters. When the council pane is wide and tall enough (about 15
-columns per seat, up to four seats) it draws one card per seat: lab, model, an
-equaliser while the seat deliberates, and its verdict. When the reactor pane
+and the meters. The council pane follows the standalone MAGI pane. From 44
+columns it draws four cards side by side, one per seat: an accent name plate,
+the provider, the model (cut with an ellipsis when it is long), a body that
+shows what the seat is doing (a twinkling field at rest, scanning bars during
+triage, a sweep while it connects, bars while it deliberates, a large stamp of
+its verdict once it has voted) and a footer: YES, NO or HOLD, with a crown on
+the seats that carried the last council's choice. Narrower, the fourth seat
+becomes a one-line chip below three cards, and a pane too narrow for cards lists
+the seats. A strip beneath names the majority, the winner and the judge's
+conclusion; the footer shows the phase and the record of past councils, and the
+header the local time. The pane keeps the standalone pane's pace: eight frames
+a second while a council runs (the verdict included), six for the triage verdict
+and for a failure, two at rest so the field still twinkles and the cursor still
+blinks, and one every five seconds after ten quiet minutes; a terminal that is
+not focused, or `reduced_motion`, stops it. A triage verdict settles back to
+idle after 20 seconds. When the reactor pane
 is at least 50 columns wide it draws the selected scene beside the meters, with
 the output rate in large digits when they fit; the scene moves faster during a
 turn. `reduced_motion` holds both still; `glyphs: ascii` keeps the plain text.

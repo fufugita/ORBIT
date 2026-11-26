@@ -77,6 +77,14 @@ impl Verdict {
             Verdict::Hold => "HOLD",
         }
     }
+    /// The word the engine writes for this verdict.
+    pub fn engine(self) -> &'static str {
+        match self {
+            Verdict::Approve => "APPROVE",
+            Verdict::Reject => "REJECT",
+            Verdict::Hold => "CONDITIONAL",
+        }
+    }
     fn rank(self) -> u8 {
         match self {
             Verdict::Approve => 0,
@@ -85,6 +93,14 @@ impl Verdict {
         }
     }
 }
+
+/// How often the pane redraws, by phase (see `Phase::beat_ms`).
+const BEAT_RUNNING_MS: u64 = 125;
+const BEAT_SETTLED_MS: u64 = 167;
+const BEAT_AT_REST_MS: u64 = 500;
+const BEAT_DEEP_REST_MS: u64 = 5_000;
+/// A pane that has rested this long drops to its slowest beat.
+pub const BEAT_DEEP_REST_AFTER_MS: u64 = 600_000;
 
 /// The council's phase, in the engine's own vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +112,28 @@ pub struct Phase {
 }
 
 impl Phase {
-    pub fn is_quiet(&self) -> bool {
-        matches!(self.name.as_str(), "IDLE" | "TRIAGE" | "TRIAGED" | "FAIL") || self.name.is_empty()
+    /// No council is running: the cards rest, and the strip remembers the
+    /// last one. Triage is not resting; the bench is being consulted then.
+    pub fn is_resting(&self) -> bool {
+        matches!(self.name.as_str(), "IDLE" | "FAIL") || self.name.is_empty()
+    }
+    /// Milliseconds between redraws. The standalone pane runs at eight frames
+    /// a second while a council runs, six for the triage verdict and for a
+    /// failure, two at rest, and one every five seconds once it has rested for
+    /// ten minutes; the embedded pane keeps the same pace. `rested_ms` is how
+    /// long the council has been idle.
+    pub fn beat_ms(&self, rested_ms: u64) -> u64 {
+        match self.name.as_str() {
+            "" | "IDLE" if rested_ms >= BEAT_DEEP_REST_AFTER_MS => BEAT_DEEP_REST_MS,
+            "" | "IDLE" => BEAT_AT_REST_MS,
+            "TRIAGED" | "FAIL" => BEAT_SETTLED_MS,
+            _ => BEAT_RUNNING_MS,
+        }
+    }
+    /// Nothing is in flight and the last council's conclusion is on show, so
+    /// the pane only keeps time.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.name.as_str(), "" | "IDLE")
     }
     fn hangul(&self) -> &str {
         phase_hangul(&self.name)
@@ -107,7 +143,6 @@ impl Phase {
             "SYNC" => Some("SYNK"),
             "DELIBERATING" => Some("DELIBERATE"),
             "JUDGING" => Some("JUDGE"),
-            "VERDICT" => Some("REACHED"),
             _ => None,
         }
     }
@@ -130,6 +165,29 @@ pub struct CouncilHistory {
     pub tie: bool,
 }
 
+/// Where wall-clock time sits on the process clock the pane animates by, so
+/// the header can show the local time without the pane reading a clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WallOrigin {
+    /// Unix seconds at the process clock's zero.
+    pub epoch_at_zero: f64,
+    /// Local time's distance from UTC, in seconds.
+    pub utc_offset_secs: i32,
+}
+
+impl WallOrigin {
+    /// `HH:MM` local time at `now_ms` on the process clock.
+    pub fn hhmm(self, now_ms: u64) -> String {
+        let local = self.epoch_at_zero + now_ms as f64 / 1_000.0 + f64::from(self.utc_offset_secs);
+        let second_of_day = local.rem_euclid(86_400.0) as u64;
+        format!(
+            "{:02}:{:02}",
+            second_of_day / 3_600,
+            (second_of_day % 3_600) / 60
+        )
+    }
+}
+
 /// Everything the council pane draws from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CouncilState {
@@ -140,6 +198,9 @@ pub struct CouncilState {
     /// Seat names that carried a majority, when the engine names them.
     pub winner_seats: Vec<String>,
     pub history: CouncilHistory,
+    /// The wall clock, when the caller knows it; the header omits the time
+    /// otherwise.
+    pub clock: Option<WallOrigin>,
 }
 
 impl CouncilState {
@@ -206,6 +267,7 @@ impl CouncilState {
                 last_at: snapshot.last_at,
                 tie: snapshot.last_tie,
             },
+            clock: None,
         }
     }
 }
@@ -451,6 +513,8 @@ fn wrap(s: &str, w: i32, maxlines: usize) -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeatMode {
     Resting,
+    /// Triage: the bench is being weighed.
+    Scanning,
     Stamping(Verdict),
     Computing,
     Wiring,
@@ -459,14 +523,19 @@ enum SeatMode {
 }
 
 fn seat_mode(phase: &Phase, seat: &BenchSeat, verdict: Option<Verdict>) -> SeatMode {
-    if phase.is_quiet() || seat.name.is_empty() {
+    // An idle council rests whatever the seats were doing last; a failed one
+    // rests too, except for the seats that lost their signal.
+    if seat.name.is_empty() || phase.name == "IDLE" || phase.name.is_empty() {
         return SeatMode::Resting;
     }
     if seat.activity == SeatActivity::Lost {
         return SeatMode::Lost;
     }
-    if phase.name == "SYNC" {
-        return SeatMode::Wiring;
+    match phase.name.as_str() {
+        "FAIL" => return SeatMode::Resting,
+        "TRIAGE" | "TRIAGED" => return SeatMode::Scanning,
+        "SYNC" => return SeatMode::Wiring,
+        _ => {}
     }
     if let Some(verdict) = verdict {
         return SeatMode::Stamping(verdict);
@@ -483,8 +552,9 @@ fn seat_mode(phase: &Phase, seat: &BenchSeat, verdict: Option<Verdict>) -> SeatM
     SeatMode::Answered
 }
 
-/// Draw the council pane into `(x, y, w, h)`. `text` is the pane's
-/// one-line snapshot, used when the panel is too small for cards.
+/// Draw the council pane into `(x, y, w, h)`. `now_ms` is the process clock
+/// the animation runs by; the wall-clock time in the header comes from the
+/// state's own `clock`, so a test renders the same frame twice.
 pub fn draw_council(
     cv: &mut Cv,
     (x, y, w, h): (i32, i32, i32, i32),
@@ -499,16 +569,17 @@ pub fn draw_council(
     } else {
         (now_ms % 3_600_000) as f32 / 1_000.0
     };
+    let now_secs = now_ms as f64 / 1_000.0;
     let spin = SPIN[(t * 6.0) as usize % SPIN.len()];
     let mut row = y;
 
-    // Header: a mark, the name in shifting warm/cool, and a time.
-    cv.text(x, row, " ▲ ", palette.cool, None);
-    let mut at = x + 3;
+    // Header: a mark, the name in shifting warm/cool, a subtitle when there
+    // is room for it, and the local time.
+    let mut at = cv.bold(x, row, " ▲ ", palette.cool, None);
     for (i, ch) in "MAGI".chars().enumerate() {
         let phase = 0.5 + 0.5 * ((i as f32 * 0.9) - t * 1.5).sin();
         let letter = format!("{ch} ");
-        at = cv.text(
+        at = cv.bold(
             at,
             row,
             &letter,
@@ -516,11 +587,19 @@ pub fn draw_council(
             None,
         );
     }
-    at = cv.text(at, row, "◢", palette.warm, None);
-    let clock = clock_text(now_ms);
-    let clock_at = x + width - text_width(&clock) - 1;
-    if clock_at > at + 1 {
-        cv.text(clock_at, row, &clock, palette.dim, None);
+    at = cv.bold(at, row, "◢", palette.warm, None);
+    let subtitle = " 에스파 의사결정 기구";
+    if width >= (at - x) + text_width(subtitle) + 8 {
+        at = cv.bold(at, row, subtitle, palette.body, None);
+    } else if width >= (at - x) + 9 + 8 {
+        at = cv.bold(at, row, " KWANGYA", palette.body, None);
+    }
+    if let Some(origin) = state.clock {
+        let clock = format!("{} ", origin.hhmm(now_ms));
+        let clock_at = x + width - text_width(&clock);
+        if clock_at > at {
+            cv.text(clock_at, row, &clock, palette.dim, None);
+        }
     }
     row += 1;
 
@@ -566,8 +645,10 @@ pub fn draw_council(
     }
 
     row = y + 2;
-    // The bench fits one row when the pane is wide, two by two when it is
-    // narrow, and draws as a list only when even a pair cannot fit.
+    // The bench is one row of cards when the pane is wide: four when they
+    // fit at ten cells each, otherwise three, with the rest as chips below.
+    // A narrower pane stacks them two by two, and draws a list only when
+    // even a pair cannot fit.
     let seats = if state.seats.is_empty() {
         &state.history.last_seats
     } else {
@@ -578,16 +659,42 @@ pub fn draw_council(
         (0, 0)
     } else if width >= 38 {
         let columns = (if (width - 4) / 4 >= 10 { 4 } else { 3 }).min(seat_count);
-        (columns, seat_count.div_ceil(columns))
+        (columns, 1)
     } else if (width - 2) / 2 >= 13 && h >= 13 {
         let columns = 2.min(seat_count);
         (columns, seat_count.div_ceil(columns))
     } else {
         (0, 1)
     };
-    let extra: Vec<&BenchSeat> = state.seats.iter().skip(columns.max(4)).collect();
+    // Seats the cards leave out: the fourth when only three fit, and any seat
+    // past the bench.
+    let chips: Vec<(String, String, SeatActivity)> = seats
+        .iter()
+        .take(4)
+        .enumerate()
+        // A one-row bench leaves out the seats its cards could not hold; a
+        // pane that lists the bench holds all four, and a stack holds them too.
+        .skip(if rows_of_cards == 1 && columns > 0 {
+            columns
+        } else {
+            4
+        })
+        .map(|(index, seat)| {
+            (
+                format!("{}·{:02}", seat.name, index + 1),
+                seat.lab.clone(),
+                seat.activity,
+            )
+        })
+        .chain(
+            state
+                .extra_seats
+                .iter()
+                .map(|seat| (seat.name.clone(), seat.lab.clone(), seat.activity)),
+        )
+        .collect();
     let keys_row = h >= 20 && width >= 40;
-    let fixed = 2 + usize::from(!extra.is_empty()) + 2 + usize::from(keys_row);
+    let fixed = 2 + usize::from(!chips.is_empty()) + 2 + usize::from(keys_row);
     let body_rows = h as usize;
     let panel_h = body_rows
         .saturating_sub(fixed + strip_lines.len().max(1))
@@ -596,14 +703,14 @@ pub fn draw_council(
     if columns > 0 && panel_h >= 6 {
         // The cards fill the width they are given: as wide as four (or two)
         // fit, as tall as the body allows, so the pane adapts to any size.
-        let panel_h = (panel_h.min(if rows_of_cards == 2 { 16 } else { 30 })) as i32;
+        let panel_h = (panel_h.min(if rows_of_cards == 1 { 24 } else { 16 })) as i32;
         let columns = columns as i32;
         let card_w = ((width - 1 - (columns - 1)) / columns).clamp(1, 30);
         let used = columns * card_w + (columns - 1);
         let left = ((width - used) / 2).max(1);
         for index in 0..(columns as usize * rows_of_cards).min(seat_count) {
             let seat = seats.get(index);
-            let verdict = seat.and_then(|seat| resolved_verdict(state, index, seat));
+            let verdict = seat.and_then(|seat| resolved_verdict(state, index, seat, now_secs));
             let mode = seat.map_or(SeatMode::Resting, |seat| {
                 seat_mode(&state.phase, seat, verdict)
             });
@@ -613,12 +720,14 @@ pub fn draw_council(
                 .map(|at| (at as i64).rem_euclid(1_000) as f32)
                 .unwrap_or(0.0)
                 + index as f32 * 37.0;
+            let crown = seat.is_some_and(|seat| state.winner_seats.contains(&seat.name));
             let cards = seat_card(
                 index,
                 seat,
                 mode,
                 verdict,
                 state.history.last_seats.get(index),
+                crown,
                 t,
                 card_w,
                 panel_h,
@@ -634,11 +743,11 @@ pub fn draw_council(
                     break;
                 }
                 let mut at = cx;
-                for (text, colour, bold) in runs {
-                    at = if *bold {
-                        cv.bold(at, cy + offset as i32, text, *colour, None)
+                for run in runs {
+                    at = if run.bold {
+                        cv.bold(at, cy + offset as i32, &run.text, run.fg, run.bg)
                     } else {
-                        cv.text(at, cy + offset as i32, text, *colour, None)
+                        cv.text(at, cy + offset as i32, &run.text, run.fg, run.bg)
                     };
                 }
             }
@@ -648,7 +757,7 @@ pub fn draw_council(
         // A narrow pane lists the bench instead.
         for index in 0..seat_count {
             let seat = seats.get(index);
-            let verdict = seat.and_then(|seat| resolved_verdict(state, index, seat));
+            let verdict = seat.and_then(|seat| resolved_verdict(state, index, seat, now_secs));
             let mode = seat.map_or(SeatMode::Resting, |seat| {
                 seat_mode(&state.phase, seat, verdict)
             });
@@ -668,6 +777,7 @@ pub fn draw_council(
                     palette.verdict_colour(verdict),
                 ),
                 SeatMode::Computing => (format!("심의중 {spin}"), accent),
+                SeatMode::Scanning => (format!("선별중 {spin}"), accent),
                 SeatMode::Wiring => ("SYNK".into(), accent),
                 SeatMode::Answered => ("응답완료".into(), accent),
                 SeatMode::Lost => ("신호없음".into(), NO),
@@ -691,20 +801,18 @@ pub fn draw_council(
         }
     }
 
-    // Seats past the bench, as one chip each.
-    if !extra.is_empty() {
+    // Seats the cards left out, as one chip each.
+    if !chips.is_empty() {
         let mut at = x + 1;
-        for (offset, seat) in extra.iter().enumerate() {
-            let index = columns.max(4) + offset;
-            let (dot, colour) = match seat.activity {
-                SeatActivity::Answered | SeatActivity::Working => ("●", OK),
+        for (name, lab, activity) in &chips {
+            let (dot, colour) = match activity {
+                SeatActivity::Answered => ("●", OK),
                 SeatActivity::Lost => ("×", NO),
                 _ => ("○", palette.mute()),
             };
-            let name = format!("{}·{:02} ", seat.name, index + 1);
-            at = cv.text(at, row, &name, palette.mute(), None);
-            at = cv.text(at, row, &format!("{} ", seat.lab), palette.body, None);
-            at = cv.text(at, row, &format!(" {dot}  ",), colour, None);
+            at = cv.text(at, row, &format!("{name} "), palette.mute(), None);
+            at = cv.text(at, row, lab, palette.body, None);
+            at = cv.text(at, row, &format!(" {dot}  "), colour, None);
         }
         row += 1;
     }
@@ -718,8 +826,10 @@ pub fn draw_council(
         row += 1;
     }
 
-    // Footer: a rule, the phase, the record.
-    let tail = 3.min(h - 1);
+    // Footer: a rule, the phase, the record. The standalone pane keeps a third
+    // row under them for its key hints where it is wide and tall enough, so
+    // there the last row stays empty; elsewhere the phase sits on the last row.
+    let tail = (if keys_row { 3 } else { 2 }).min(h - 1);
     if tail >= 2 {
         let rule_row = y + h - tail;
         if rule_row > row {
@@ -761,27 +871,19 @@ pub fn draw_council(
             );
         }
         at = cv.text(at, row, &format!(" {blink}"), colour, None);
-        let _ = at;
         if state.history.seen > 0 {
             let mut record = format!("기록 {}/{}", state.history.finished, state.history.seen);
-            if let Some(at) = state.history.last_at {
-                let age = (now_ms as f64 / 1_000.0 - at).max(0.0);
+            if let Some(last_at) = state.history.last_at {
+                let age = (now_secs - last_at).max(0.0);
                 record.push_str(&format!(" · {}", age_text(age)));
             }
             let record_at = x + width - text_width(&record) - 1;
-            if record_at > row_at_after_state(width, x, palette) {
+            if record_at >= at + 2 {
                 cv.text(record_at, row, &record, palette.dim, None);
             }
         }
     }
     true
-}
-
-/// A crude lower bound on where the phase words ended, so the record does
-/// not overprint them.
-fn row_at_after_state(width: i32, x: i32, _palette: BenchPalette) -> i32 {
-    // Conservative: reserve a third of the width for the phase.
-    x + (width / 3).max(20)
 }
 
 fn age_text(seconds: f64) -> String {
@@ -794,10 +896,29 @@ fn age_text(seconds: f64) -> String {
     }
 }
 
-/// The verdict drawn for a seat: what the live state says, else what the
-/// record says it landed.
-fn resolved_verdict(state: &CouncilState, index: usize, seat: &BenchSeat) -> Option<Verdict> {
+/// How recent a finished council's record must be to count as this council.
+const SAME_COUNCIL_SECS: f64 = 30.0;
+
+/// The verdict drawn for a seat: what the live state says. Only when a council
+/// has just reached its verdict, and the record is the one it wrote, may the
+/// record fill in a seat the state file left bare. At any other time the
+/// record belongs to an earlier council, and showing its votes would stamp
+/// seats that have not answered yet.
+fn resolved_verdict(
+    state: &CouncilState,
+    index: usize,
+    seat: &BenchSeat,
+    now_secs: f64,
+) -> Option<Verdict> {
     seat.verdict.or_else(|| {
+        let this_council = state.phase.name == "VERDICT"
+            && state
+                .history
+                .last_at
+                .is_some_and(|at| (now_secs - at).abs() < SAME_COUNCIL_SECS);
+        if !this_council {
+            return None;
+        }
         state
             .history
             .last_seats
@@ -953,22 +1074,30 @@ fn narration(
         )),
         _ => {}
     }
-    if state.phase.is_quiet() {
+    if state.phase.is_resting() {
         // The winner STAYS after the council ends: the record of who won the
         // choice outlives the VERDICT phase, until the next council replaces it.
         if !state.winner_seats.is_empty() {
-            let colour = state
-                .history
-                .last_seats
-                .iter()
-                .find_map(|seat| seat.verdict.map(|v| palette.verdict_colour(v)))
+            // The verdict the winners carried, from the record's seats.
+            let carried = state
+                .winner_seats
+                .first()
+                .and_then(|name| {
+                    state
+                        .history
+                        .last_seats
+                        .iter()
+                        .find(|seat| &seat.name == name)
+                })
+                .and_then(|seat| seat.verdict);
+            let colour = carried
+                .map(|verdict| palette.verdict_colour(verdict))
                 .unwrap_or(OK);
-            strip.push((
-                "승자".into(),
-                colour,
-                state.winner_seats.join(" · "),
-                colour,
-            ));
+            let mut body = state.winner_seats.join(" · ");
+            if let Some(verdict) = carried {
+                body.push_str(&format!(" → {}", verdict.engine()));
+            }
+            strip.push(("승자".into(), colour, body, colour));
         } else if state.history.tie {
             strip.push((
                 "무승자".into(),
@@ -989,8 +1118,52 @@ fn narration(
     strip
 }
 
+/// One styled stretch of a card row.
+#[derive(Debug, Clone, PartialEq)]
+struct Run {
+    text: String,
+    fg: Rgb,
+    bg: Option<Rgb>,
+    bold: bool,
+}
+
+fn run(text: impl Into<String>, fg: Rgb, bold: bool) -> Run {
+    Run {
+        text: text.into(),
+        fg,
+        bg: None,
+        bold,
+    }
+}
+
+/// Dark text on an accent block, like the standalone pane's name plates.
+fn chip(text: impl Into<String>, ink: Rgb, block: Rgb) -> Run {
+    Run {
+        text: text.into(),
+        fg: ink,
+        bg: Some(block),
+        bold: true,
+    }
+}
+
+/// The seat's role in the bench's own language.
+fn role_hangul(role: &str) -> &str {
+    match role {
+        "LEAD" => "총괄",
+        "EDGE" => "반론",
+        "EXACT" => "검증",
+        "BOLD" => "확장",
+        // The roles of a council convened in this terminal, in the same voice.
+        "SKEPTIC" => "반론",
+        "BUILDER" => "구현",
+        "RISK" => "위험",
+        other => other,
+    }
+}
+
 /// One seat card: name plate, lab, model, a body that shows what the seat is
-/// doing, and the footer (its verdict, or what it is waiting on).
+/// doing, and the footer (its verdict, or what it is waiting on). `crown`
+/// marks a resting seat that carried the last council's choice.
 #[allow(clippy::too_many_arguments)]
 fn seat_card(
     index: usize,
@@ -998,12 +1171,13 @@ fn seat_card(
     mode: SeatMode,
     _verdict: Option<Verdict>,
     last: Option<&BenchSeat>,
+    crown: bool,
     t: f32,
     w: i32,
     h: i32,
     seed: f32,
     palette: BenchPalette,
-) -> Vec<Vec<(String, Rgb, bool)>> {
+) -> Vec<Vec<Run>> {
     let accent = seat_accent(index, palette);
     let live = !matches!(mode, SeatMode::Resting);
     let inner = (w - 2).max(0);
@@ -1020,7 +1194,12 @@ fn seat_card(
         .map(|seat| seat.number.clone())
         .unwrap_or_else(|| format!("{:02}", index + 1));
     let mut rows = Vec::new();
-    // Name plate, in the accent block; shorter forms when the card is thin.
+    // Name plate, an accent block; shorter forms when the card is thin.
+    let plate_colour = if live {
+        accent
+    } else {
+        palette.soft_accent(accent)
+    };
     let mut top = None;
     for tag in [
         format!(" {name}·{number} "),
@@ -1031,16 +1210,11 @@ fn seat_card(
         number.clone(),
     ] {
         let rest = inner - text_width(&tag);
-        let chip_colour = if live {
-            accent
-        } else {
-            palette.soft_accent(accent)
-        };
         if rest >= 2 && tag.starts_with(' ') && tag.contains('·') {
             top = Some(vec![
-                ("╭─".to_string(), edge, false),
-                (tag, chip_colour, false),
-                (
+                run("╭─", edge, false),
+                chip(tag, palette.on_accent, plate_colour),
+                run(
                     format!("{}╮", "─".repeat((rest - 1).max(0) as usize)),
                     edge,
                     false,
@@ -1049,9 +1223,9 @@ fn seat_card(
         } else if rest >= 0 {
             let left = rest / 2;
             top = Some(vec![
-                (format!("╭{}", "─".repeat(left as usize)), edge, false),
-                (tag, chip_colour, false),
-                (
+                run(format!("╭{}", "─".repeat(left as usize)), edge, false),
+                chip(tag, palette.on_accent, plate_colour),
+                run(
                     format!("{}╮", "─".repeat((rest - left) as usize)),
                     edge,
                     false,
@@ -1062,9 +1236,8 @@ fn seat_card(
             break;
         }
     }
-    // The chip's text is laid over the accent, so it does not use `edge`.
     rows.push(top.unwrap_or_else(|| {
-        vec![(
+        vec![run(
             format!("╭{}╮", "─".repeat(inner.max(0) as usize)),
             edge,
             false,
@@ -1076,13 +1249,13 @@ fn seat_card(
         .or_else(|| last.map(|last| last.lab.clone()))
         .unwrap_or_else(|| "ae".into());
     rows.push(vec![
-        ("│".into(), edge, false),
-        (
+        run("│", edge, false),
+        run(
             fit_centre(&lab, inner),
             if live { palette.body } else { palette.mute() },
             live,
         ),
-        ("│".into(), edge, false),
+        run("│", edge, false),
     ]);
     if h >= 11 {
         let model = seat
@@ -1091,27 +1264,42 @@ fn seat_card(
             .or_else(|| last.map(|last| last.model.clone()))
             .unwrap_or_default();
         let (line, colour) = if live {
+            // A name too long for the card is cut with an ellipsis, as the
+            // standalone pane cuts it; the dash is only for a seat with no
+            // model at all.
+            let shown = short_model(&model);
             (
-                first_fit(&[short_model(&model), "—".into()], inner),
+                if shown.is_empty() {
+                    "—".to_string()
+                } else {
+                    shown
+                },
                 palette.mute(),
             )
         } else {
             let role = seat
                 .map(|seat| seat.role.clone())
                 .filter(|role| !role.is_empty())
-                .unwrap_or_else(|| "LEAD".into());
+                .unwrap_or_else(|| {
+                    ["LEAD", "EDGE", "EXACT", "BOLD"]
+                        .get(index)
+                        .copied()
+                        .unwrap_or("LEAD")
+                        .into()
+                });
+            let tag = role_hangul(&role).to_string();
             (
-                first_fit(&[format!("{role} · {}", index + 1), role], inner),
+                first_fit(&[format!("{tag} · {role}"), tag.clone()], inner),
                 palette.half_accent(accent),
             )
         };
         rows.push(vec![
-            ("│".into(), edge, false),
-            (fit_centre(&line, inner), colour, false),
-            ("│".into(), edge, false),
+            run("│", edge, false),
+            run(fit_centre(&line, inner), colour, false),
+            run("│", edge, false),
         ]);
     }
-    rows.push(vec![(
+    rows.push(vec![run(
         format!("├{}┤", "─".repeat(inner.max(0) as usize)),
         edge,
         false,
@@ -1135,6 +1323,20 @@ fn seat_card(
             false,
             fit_centre(
                 &format!("심의중 {}", SPIN[(t * 6.0) as usize % SPIN.len()]),
+                inner,
+            ),
+            accent,
+            false,
+        ),
+        SeatMode::Scanning => (
+            equaliser(seed, t, inner, body_rows, 0.35),
+            accent,
+            false,
+            first_fit(
+                &[
+                    format!("선별중 {}", SPIN[(t * 6.0) as usize % SPIN.len()]),
+                    "선별중".to_string(),
+                ],
                 inner,
             ),
             accent,
@@ -1172,25 +1374,37 @@ fn seat_card(
             true,
         ),
         SeatMode::Resting => {
-            let foot = match last.and_then(|last| last.verdict) {
+            let (foot, foot_colour, foot_bold) = match last.and_then(|last| last.verdict) {
                 Some(verdict) => {
-                    let confidence = last
-                        .and_then(|last| last.confidence)
-                        .map(|confidence| format!(" {confidence}"))
-                        .unwrap_or_default();
-                    first_fit(
-                        &[
-                            format!("최근 {}{confidence}", verdict.hangul()),
-                            verdict.hangul().to_string(),
-                        ],
-                        inner,
-                    )
+                    let kr = verdict.hangul();
+                    if crown {
+                        (
+                            first_fit(
+                                &[format!("♛ 승자 {kr}"), format!("♛ {kr}"), "♛".to_string()],
+                                inner,
+                            ),
+                            palette.verdict_colour(verdict),
+                            true,
+                        )
+                    } else {
+                        let mut options = match last.and_then(|last| last.confidence) {
+                            Some(confidence) => {
+                                vec![
+                                    format!("최근 {kr} {confidence}"),
+                                    format!("{kr} {confidence}"),
+                                ]
+                            }
+                            None => vec![format!("최근 {kr}")],
+                        };
+                        options.push(kr.to_string());
+                        (
+                            first_fit(&options, inner),
+                            palette.half_accent(palette.verdict_colour(verdict)),
+                            false,
+                        )
+                    }
                 }
-                None => "대기".to_string(),
-            };
-            let foot_colour = match last.and_then(|last| last.verdict) {
-                Some(verdict) => palette.half_accent(palette.verdict_colour(verdict)),
-                None => palette.mute(),
+                None => ("대기".to_string(), palette.mute(), false),
             };
             (
                 stars(seed, t, inner, body_rows),
@@ -1198,28 +1412,28 @@ fn seat_card(
                 false,
                 foot,
                 foot_colour,
-                false,
+                foot_bold,
             )
         }
     };
     for line in body {
         rows.push(vec![
-            ("│".into(), edge, false),
-            (line, body_colour, bold),
-            ("│".into(), edge, false),
+            run("│", edge, false),
+            run(line, body_colour, bold),
+            run("│", edge, false),
         ]);
     }
-    rows.push(vec![(
+    rows.push(vec![run(
         format!("├{}┤", "─".repeat(inner.max(0) as usize)),
         edge,
         false,
     )]);
     rows.push(vec![
-        ("│".into(), edge, false),
-        (fit_centre(&foot, inner), foot_colour, foot_bold),
-        ("│".into(), edge, false),
+        run("│", edge, false),
+        run(fit_centre(&foot, inner), foot_colour, foot_bold),
+        run("│", edge, false),
     ]);
-    rows.push(vec![(
+    rows.push(vec![run(
         format!("╰{}╯", "─".repeat(inner.max(0) as usize)),
         edge,
         false,
@@ -1255,15 +1469,6 @@ fn short_model(model: &str) -> String {
     trimmed.to_string()
 }
 
-fn clock_text(now_ms: u64) -> String {
-    // Local time from the epoch milliseconds the caller lends; no clock read
-    // here, so a test renders the same frame twice.
-    let seconds = now_ms / 1_000;
-    let day = (seconds / 86_400) % 86_400;
-    // UTC, marked, rather than pretending to know the zone offset.
-    format!("{:02}:{:02}Z", (day / 3_600) % 24, (day % 3_600) / 60)
-}
-
 fn gradient_rule(cv: &mut Cv, x: i32, y: i32, w: i32, ch: char, stops: [Rgb; 3]) {
     let chunks = (w.clamp(1, 12)).max(1);
     for i in 0..chunks {
@@ -1292,12 +1497,16 @@ fn stars(seed: f32, t: f32, w: i32, rows: i32) -> Vec<String> {
     for r in 0..rows {
         let mut line = String::new();
         for c in 0..w.max(0) {
-            let noise = noise(r as u32, c as u32, seed as u32);
-            if noise >= 0.07 {
+            let pick = noise(r as u32, c as u32, seed as u32);
+            if pick >= 0.07 {
                 line.push(' ');
                 continue;
             }
-            let phase = (t * (0.5 + noise * 2.0) + noise * std::f32::consts::TAU).sin();
+            // Each star twinkles at its own rate from its own offset, so the
+            // field shimmers instead of blinking as one.
+            let rate = noise(r as u32, c as u32, (seed as u32).wrapping_add(0x51ED));
+            let offset = noise(c as u32, r as u32, (seed as u32).wrapping_add(0xA17));
+            let phase = (t * (0.5 + rate) + offset * std::f32::consts::TAU).sin();
             line.push(if phase > 0.75 {
                 '+'
             } else if phase > -0.3 {
@@ -1383,69 +1592,130 @@ fn centred_text(lines: &[String], w: i32, rows: i32) -> Vec<String> {
     out
 }
 
-/// A verdict drawn large. Each verdict has a small bitmap; the bitmap is
-/// scaled to the card with quadrant blocks (two by two sub-cells per cell),
-/// so the same three words read at any panel size without a font.
-fn seal(word: &str, w: i32, rows: i32) -> Vec<String> {
-    let Some(bitmap) = seal_bitmap(word) else {
-        return centred_text(&[word.to_string()], w, rows);
-    };
-    // Below this the half-block art is mush; the word itself reads better.
-    if w < 11 || rows < 3 {
-        return centred_text(&[word.to_string()], w, rows);
+/// Pixels along a side of a stored glyph.
+const GLYPH_SIDE: usize = 32;
+
+/// The stored glyph of one syllable of a verdict word.
+fn glyph(syllable: char) -> Option<&'static [&'static str; GLYPH_SIDE]> {
+    match syllable {
+        '승' => Some(&GLYPH_C2B9),
+        '인' => Some(&GLYPH_C778),
+        '거' => Some(&GLYPH_AC70),
+        '부' => Some(&GLYPH_BD80),
+        '보' => Some(&GLYPH_BCF4),
+        '류' => Some(&GLYPH_B958),
+        _ => None,
     }
-    // One bitmap pixel per cell across, two per cell down, drawn with half
-    // blocks. The bitmap already sits in that aspect, so the art keeps its
-    // shape without resampling.
-    let bw = bitmap[0].chars().count() as i32;
-    let bh = bitmap.len() as i32;
-    let art_h = ((bh + 1) / 2).min(rows.max(1));
-    // Two cells per pixel keeps the words large; when the card is narrower
-    // than the bitmap, sample it down instead of cutting its right side.
-    let scale = if w >= bw * 2 { 2 } else { 1 };
-    let art_w = w.min(bw * scale);
-    let step = bw as f32 / (art_w / scale).max(1) as f32;
-    let ink = |sx: i32, sy: i32| -> bool {
-        bitmap
-            .get(sy as usize)
-            .and_then(|row| row.chars().nth(sx as usize))
-            .is_some_and(|ch| ch == '#')
-    };
-    let mut art = Vec::new();
-    for cy in 0..art_h {
-        let mut line = String::new();
-        for cx in 0..art_w {
-            let sx = ((cx / scale) as f32 * step) as i32;
-            let top = ink(sx.min(bw - 1), cy * 2);
-            let bottom = ink(sx.min(bw - 1), cy * 2 + 1);
-            line.push(match (top, bottom) {
-                (true, true) => '█',
-                (true, false) => '▀',
-                (false, true) => '▄',
-                (false, false) => ' ',
-            });
-        }
-        art.push(line);
-    }
-    // Centre the art in the card's body.
-    let pad_x = ((w - art_w) / 2).max(0) as usize;
-    let pad_y = ((rows - art_h) / 2).max(0);
-    let mut out = Vec::new();
-    for _ in 0..pad_y {
-        out.push(" ".repeat(w.max(0) as usize));
-    }
-    for line in art {
-        let mut row = " ".repeat(pad_x);
-        row.push_str(&line);
-        out.push(fit(&row, w, Align::Left));
-    }
-    while out.len() < rows.max(0) as usize {
-        out.push(" ".repeat(w.max(0) as usize));
-    }
-    out.truncate(rows.max(0) as usize);
-    out
 }
 
+/// The quadrant blocks, indexed by which sub-pixels are lit:
+/// top-left 1, top-right 2, bottom-left 4, bottom-right 8.
+const QUADRANTS: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+/// A verdict word drawn large in a box of `w` by `rows` cells, with quadrant
+/// blocks (two by two sub-pixels a cell). The syllables go side by side or
+/// stacked, whichever gives the larger glyph; each is sized to 98% of the
+/// smaller side of its slot and centred in it, and a sub-pixel is lit when
+/// the glyph covers more than a third of it. That is how the standalone pane
+/// draws its stamps, from the same face; here the glyphs are stored
+/// (`ported_seal.rs`), so a seat card needs no font and no image library.
+/// A box too small for the glyphs to read, or a word with no stored glyphs,
+/// gets the word itself.
+fn seal(word: &str, w: i32, rows: i32) -> Vec<String> {
+    let plain = || centred_text(&[word.to_string()], w, rows);
+    let glyphs: Option<Vec<&'static [&'static str; GLYPH_SIDE]>> =
+        word.chars().map(glyph).collect();
+    let Some(glyphs) = glyphs.filter(|glyphs| !glyphs.is_empty()) else {
+        return plain();
+    };
+    if w < 6 || rows < 3 {
+        return plain();
+    }
+    let count = glyphs.len() as f64;
+    // A square-pixel canvas: a cell is two pixels wide and four tall.
+    let (canvas_w, canvas_h) = (f64::from(2 * w), f64::from(4 * rows));
+    let side_by_side = (canvas_w / count).min(canvas_h);
+    let stacked = canvas_w.min(canvas_h / count);
+    let (slot, stacked) = if stacked > side_by_side {
+        (stacked, true)
+    } else {
+        (side_by_side, false)
+    };
+    let size = slot * 0.98;
+    if size < 12.0 {
+        return plain();
+    }
+    let (columns, grid_rows) = (2 * w as usize, 2 * rows as usize);
+    let mut ink = vec![0.0f64; columns * grid_rows];
+    let step = size / GLYPH_SIDE as f64;
+    for (index, glyph) in glyphs.iter().enumerate() {
+        let middle = index as f64 + 0.5;
+        let (cx, cy) = if stacked {
+            (canvas_w / 2.0, canvas_h * middle / count)
+        } else {
+            (canvas_w * middle / count, canvas_h / 2.0)
+        };
+        let (x0, y0) = (cx - size / 2.0, cy - size / 2.0);
+        let cover: Vec<[f64; GLYPH_SIDE]> = glyph
+            .iter()
+            .map(|row| {
+                let mut line = [0.0; GLYPH_SIDE];
+                for (pixel, digit) in line.iter_mut().zip(row.chars()) {
+                    *pixel = f64::from(digit.to_digit(16).unwrap_or(0)) / 15.0;
+                }
+                line
+            })
+            .collect();
+        for gy in 0..grid_rows {
+            // A sub-pixel is one canvas pixel wide and two tall.
+            let (ya, yb) = ((2 * gy) as f64, (2 * gy + 2) as f64);
+            if yb <= y0 || ya >= y0 + size {
+                continue;
+            }
+            let v_lo = ((ya - y0) / step).floor().max(0.0) as usize;
+            let v_hi = (((yb - y0) / step).floor().max(0.0) as usize).min(GLYPH_SIDE - 1);
+            for gx in 0..columns {
+                let (xa, xb) = (gx as f64, (gx + 1) as f64);
+                if xb <= x0 || xa >= x0 + size {
+                    continue;
+                }
+                let u_lo = ((xa - x0) / step).floor().max(0.0) as usize;
+                let u_hi = (((xb - x0) / step).floor().max(0.0) as usize).min(GLYPH_SIDE - 1);
+                let mut covered = 0.0;
+                for (v, line) in cover.iter().enumerate().take(v_hi + 1).skip(v_lo) {
+                    let down = yb.min(y0 + (v + 1) as f64 * step) - ya.max(y0 + v as f64 * step);
+                    if down <= 0.0 {
+                        continue;
+                    }
+                    for (u, pixel) in line.iter().enumerate().take(u_hi + 1).skip(u_lo) {
+                        let across =
+                            xb.min(x0 + (u + 1) as f64 * step) - xa.max(x0 + u as f64 * step);
+                        if across > 0.0 {
+                            covered += pixel * across * down;
+                        }
+                    }
+                }
+                ink[gy * columns + gx] += covered / 2.0;
+            }
+        }
+    }
+    let lit = |gx: usize, gy: usize| ink[gy * columns + gx] > 88.0 / 255.0;
+    (0..rows as usize)
+        .map(|r| {
+            (0..w as usize)
+                .map(|c| {
+                    let index = usize::from(lit(2 * c, 2 * r))
+                        | usize::from(lit(2 * c + 1, 2 * r)) << 1
+                        | usize::from(lit(2 * c, 2 * r + 1)) << 2
+                        | usize::from(lit(2 * c + 1, 2 * r + 1)) << 3;
+                    QUADRANTS[index]
+                })
+                .collect()
+        })
+        .collect()
+}
 // ── the reactor's council bench ─────────────────────────────────────
 
 /// The council seen from the reactor: a compact bench on the panel's bottom
@@ -1532,18 +1802,6 @@ pub fn draw_council_bench(
     }
 }
 
-/// Bitmaps for the three verdicts, 24 by 12 cells, drawn from a glyph grid
-/// at one resolution. `#` is ink, `.` is paper. Kept in the source so the
-/// seal needs neither a font nor a dependency.
-fn seal_bitmap(word: &str) -> Option<&'static [&'static str]> {
-    match word {
-        "승인" => Some(&SEAL_APPROVE),
-        "거부" => Some(&SEAL_REJECT),
-        "보류" => Some(&SEAL_HOLD),
-        _ => None,
-    }
-}
-
 include!("ported_seal.rs");
 
 #[cfg(test)]
@@ -1577,6 +1835,7 @@ mod tests {
             extra_seats: Vec::new(),
             winner_seats: Vec::new(),
             history: CouncilHistory::default(),
+            clock: None,
         }
     }
 
@@ -1632,26 +1891,132 @@ mod tests {
         }
     }
 
+    const GOLDEN_APPROVE_8X17: [&str; 17] = [
+        "        ",
+        "        ",
+        "   ▗▖   ",
+        " ▄█▀▀█▖ ",
+        "▝▀▜██▛▀▘",
+        " ▐█▄▄█▌ ",
+        "        ",
+        "        ",
+        "        ",
+        "        ",
+        "        ",
+        " ▟▛█▖▐█ ",
+        " █▄▟▛▐█ ",
+        "  █  ▝▀ ",
+        "  ▀▀▀▀▀ ",
+        "        ",
+        "        ",
+    ];
+    const GOLDEN_HOLD_10X12: [&str; 12] = [
+        "          ",
+        " ▐█▄▄▄▄█▖ ",
+        " ▐█▀▀▀▀█▌ ",
+        " ▝▀▀█▛▀▀▘ ",
+        " ████████ ",
+        "          ",
+        "  ▄▄▄▄▄▄  ",
+        "  ██████  ",
+        "  █▙▄▄▄▄▖ ",
+        " ████████ ",
+        "  ▐█  █▌  ",
+        "   ▀  ▀   ",
+    ];
+    const GOLDEN_REJECT_28X17: [&str; 17] = [
+        "                 ▗▄▄        ",
+        "       ▐███████  ▐██        ",
+        "            ▐█▌  ▐██        ",
+        "           ▗██▚█████        ",
+        "          ▄██▘ ▀▀▜██        ",
+        "       ▄▟██▛▘    ▐██        ",
+        "       ▀▛▀       ▐██        ",
+        "                 ▐██        ",
+        "                            ",
+        "        ▐██      ██▌        ",
+        "        ▐██████████▌        ",
+        "        ▐██▄▄▄▄▄▄██▌        ",
+        "        ▝▀▀▀▀▀▀▀▀▀▀▘        ",
+        "       ██████████████       ",
+        "            ▝██             ",
+        "             ██             ",
+        "             ▀▀             ",
+    ];
+
     #[test]
     fn the_seal_draws_quadrant_blocks_in_the_requested_box() {
         for word in ["승인", "거부", "보류"] {
-            let art = seal(word, 16, 6);
-            assert_eq!(art.len(), 6, "{word}");
-            assert!(art.iter().all(|line| text_width(line) == 16), "{word}");
-            assert!(
-                art.iter().any(|line| line.chars().any(|ch| ch != ' ')),
-                "{word} drew nothing"
-            );
-            assert!(
-                art.iter()
-                    .all(|line| line.chars().all(|ch| " ▀▄█".contains(ch))),
-                "{word} drew outside the half-block set"
-            );
+            for (w, rows) in [(8, 17), (10, 12), (16, 6), (28, 17)] {
+                let art = seal(word, w, rows);
+                assert_eq!(art.len(), rows as usize, "{word} {w}x{rows}");
+                assert!(art.iter().all(|line| text_width(line) == w), "{word}");
+                assert!(
+                    art.iter().any(|line| line.chars().any(|ch| ch != ' ')),
+                    "{word} {w}x{rows} drew nothing"
+                );
+                assert!(
+                    art.iter()
+                        .all(|line| line.chars().all(|ch| QUADRANTS.contains(&ch))),
+                    "{word} {w}x{rows} drew outside the quadrant set"
+                );
+            }
         }
-        // An unknown word falls back to plain text rather than nothing.
+        // An unknown word, or a box too small for glyphs, gets the word itself.
         let art = seal("???", 10, 3);
         assert_eq!(art.len(), 3);
         assert!(art.iter().any(|line| line.contains('?')));
+        for (w, rows) in [(5, 8), (8, 2), (6, 4)] {
+            let art = seal("승인", w, rows);
+            assert!(
+                art.iter().any(|line| line.contains("승인")),
+                "{w}x{rows} is too small for glyphs: {art:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_card_stacks_the_syllables_and_a_wide_one_sets_them_side_by_side() {
+        // Eight cells wide and tall: the two syllables sit one above the other,
+        // with the middle of the box between them empty.
+        let tall = seal("승인", 8, 17);
+        let inked: Vec<usize> = tall
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.chars().any(|ch| ch != ' '))
+            .map(|(row, _)| row)
+            .collect();
+        assert!(inked.first().is_some_and(|row| *row <= 3), "{tall:?}");
+        assert!(inked.last().is_some_and(|row| *row >= 13), "{tall:?}");
+        assert!(
+            tall[8].trim().is_empty(),
+            "the middle row separates them\n{}",
+            tall.join("\n")
+        );
+        // Forty cells by ten rows: one row of two syllables, each in half the width.
+        let wide = seal("보류", 40, 10);
+        let left: usize = wide
+            .iter()
+            .map(|line| line.chars().take(20).filter(|ch| *ch != ' ').count())
+            .sum();
+        let right: usize = wide
+            .iter()
+            .map(|line| line.chars().skip(20).filter(|ch| *ch != ' ').count())
+            .sum();
+        assert!(
+            left > 10 && right > 10,
+            "{left} {right}\n{}",
+            wide.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_seal_matches_the_prototype_it_was_ported_from() {
+        // Golden stamps from the prototype in the parity harness, which matches
+        // the standalone pane's own stamps in 86 to 97% of cells.
+        assert_eq!(seal("승인", 8, 17), GOLDEN_APPROVE_8X17, "승인 8x17");
+        assert_eq!(seal("보류", 10, 12), GOLDEN_HOLD_10X12, "보류 10x12");
+        assert_eq!(seal("거부", 28, 17), GOLDEN_REJECT_28X17, "거부 28x17");
     }
 
     #[test]
@@ -1837,6 +2202,7 @@ mod tests {
             SeatMode::Resting,
             None,
             state.history.last_seats.first(),
+            false,
             1.0,
             24,
             12,
@@ -1844,8 +2210,456 @@ mod tests {
             palette,
         );
         let footer_row = &card[card.len() - 2];
-        let footer: String = footer_row.iter().map(|(text, _, _)| text.clone()).collect();
+        let footer: String = footer_row.iter().map(|run| run.text.clone()).collect();
         assert!(footer.contains("최근"), "{footer}");
+    }
+
+    // ── parity with the standalone pane, on states the engine really writes ──
+
+    fn engine_bench(phase: &str) -> CouncilState {
+        let mut state = bench();
+        state.phase.name = phase.into();
+        let models = [
+            "claude-haiku-5-5",
+            "claude-deepseek-v4-pro",
+            "claude-glm-5.3-flash",
+            "claude-minimax-m3",
+        ];
+        let labs = ["ANTHROPIC", "DEEPSEEK", "ZHIPU", "MINIMAX"];
+        for (index, seat) in state.seats.iter_mut().enumerate() {
+            seat.model = models[index].into();
+            seat.lab = labs[index].into();
+        }
+        state
+    }
+
+    /// The record of an earlier council: four verdicts with a confidence each.
+    fn last_council(state: &mut CouncilState) {
+        let verdicts = [
+            Verdict::Approve,
+            Verdict::Reject,
+            Verdict::Approve,
+            Verdict::Hold,
+        ];
+        let confidences = [70, 75, 80, 85];
+        state.history.last_seats = state.seats.clone();
+        for (index, seat) in state.history.last_seats.iter_mut().enumerate() {
+            seat.activity = SeatActivity::Resting;
+            seat.verdict = Some(verdicts[index]);
+            seat.confidence = Some(confidences[index]);
+        }
+        state.history.finished = 3;
+        state.history.seen = 3;
+        state.history.last_at = Some(-10_000.0);
+    }
+
+    #[test]
+    fn a_resting_star_field_twinkles_star_by_star() {
+        // Each star has its own rate and offset, so the number showing at any
+        // moment stays near its average. Sharing one draw between the pick,
+        // the rate and the offset made the whole field blink on and off
+        // together, and every card looked empty for seconds at a time.
+        let counts: Vec<usize> = (0..120)
+            .map(|step| {
+                stars(71.0, step as f32 * 0.5, 40, 20)
+                    .iter()
+                    .flat_map(|line| line.chars())
+                    .filter(|ch| *ch != ' ')
+                    .count()
+            })
+            .collect();
+        let mean = counts.iter().sum::<usize>() as f32 / counts.len() as f32;
+        let low = *counts.iter().min().unwrap() as f32;
+        let high = *counts.iter().max().unwrap() as f32;
+        assert!(mean > 20.0, "expected a field of stars, mean {mean}");
+        assert!(low >= mean * 0.6, "the field went dark: {low} of {mean}");
+        assert!(high <= mean * 1.4, "the field flared: {high} of {mean}");
+    }
+
+    #[test]
+    fn a_model_name_too_long_for_the_card_is_cut_with_an_ellipsis() {
+        let state = engine_bench("DELIBERATING");
+        let text = render_council_text(&state, 46, 33);
+        for cut in ["haiku-5…", "deepsee…", "glm-5.3…", "minimax…"] {
+            assert!(text.contains(cut), "missing {cut} in\n{text}");
+        }
+        assert!(
+            !text.contains('—'),
+            "a dash stands for a seat with no model, not for a long name"
+        );
+        let mut bare = engine_bench("DELIBERATING");
+        bare.seats[0].model.clear();
+        assert!(render_council_text(&bare, 46, 33).contains('—'));
+    }
+
+    #[test]
+    fn seats_that_have_not_answered_never_wear_the_last_councils_votes() {
+        let mut state = engine_bench("DELIBERATING");
+        last_council(&mut state);
+        for (index, verdict) in [(0, Verdict::Approve), (2, Verdict::Hold)] {
+            state.seats[index].activity = SeatActivity::Answered;
+            state.seats[index].verdict = Some(verdict);
+        }
+        for index in [1, 3] {
+            state.seats[index].activity = SeatActivity::Working;
+            state.seats[index].verdict = None;
+        }
+        let text = render_council_text(&state, 46, 33);
+        assert_eq!(text.matches("심의중").count(), 2, "{text}");
+        assert!(text.contains(" YES ") && text.contains(" HOLD "), "{text}");
+        assert!(
+            !text.contains(" NO "),
+            "the seat that rejected last time has not voted yet\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_record_fills_in_a_bare_seat_only_in_the_verdict_phase() {
+        let mut state = engine_bench("VERDICT");
+        last_council(&mut state);
+        state.seats[3].verdict = None;
+        state.history.last_at = Some(3.9);
+        let bare = state.seats[3].clone();
+        assert_eq!(
+            resolved_verdict(&state, 3, &bare, 4.0),
+            Some(Verdict::Hold),
+            "the record this council just wrote"
+        );
+        state.history.last_at = Some(-100.0);
+        assert_eq!(
+            resolved_verdict(&state, 3, &bare, 4.0),
+            None,
+            "an older council"
+        );
+        state.history.last_at = Some(3.9);
+        state.phase.name = "DELIBERATING".into();
+        assert_eq!(resolved_verdict(&state, 3, &bare, 4.0), None, "still live");
+    }
+
+    #[test]
+    fn every_phase_maps_a_seat_to_the_card_the_standalone_pane_draws() {
+        let mut state = engine_bench("IDLE");
+        let seat = state.seats[1].clone();
+        let mode = |phase: &str, seat: &BenchSeat, verdict| {
+            seat_mode(
+                &Phase {
+                    name: phase.into(),
+                    note: String::new(),
+                },
+                seat,
+                verdict,
+            )
+        };
+        assert_eq!(
+            mode("IDLE", &seat, Some(Verdict::Reject)),
+            SeatMode::Resting
+        );
+        assert_eq!(mode("FAIL", &seat, None), SeatMode::Resting);
+        assert_eq!(mode("TRIAGE", &seat, None), SeatMode::Scanning);
+        assert_eq!(mode("TRIAGED", &seat, None), SeatMode::Scanning);
+        assert_eq!(mode("SYNC", &seat, None), SeatMode::Wiring);
+        assert_eq!(
+            mode("VOTING", &seat, Some(Verdict::Reject)),
+            SeatMode::Stamping(Verdict::Reject)
+        );
+        assert_eq!(mode("VOTING", &seat, None), SeatMode::Answered);
+        // A seat that lost its signal says so, in a failed council too.
+        state.seats[1].activity = SeatActivity::Lost;
+        assert_eq!(mode("FAIL", &state.seats[1], None), SeatMode::Lost);
+        assert_eq!(mode("IDLE", &state.seats[1], None), SeatMode::Resting);
+    }
+
+    #[test]
+    fn triage_scans_the_bench_and_shows_only_the_triage_line() {
+        let mut state = engine_bench("TRIAGED");
+        state.phase.note = "QUICK".into();
+        last_council(&mut state);
+        state.history.last_final = "old news".into();
+        state.winner_seats = vec!["KARINA".into()];
+        state.seats.clear(); // the engine lists no seats while it triages
+        let text = render_council_text(&state, 46, 33);
+        assert_eq!(text.matches("선별중").count(), 4, "{text}");
+        assert!(text.contains("→ QUICK"), "{text}");
+        assert!(
+            !text.contains("승자") && !text.contains("old news"),
+            "the last council waits until triage is over\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_idle_card_remembers_the_confidence_and_crowns_the_winner() {
+        let mut state = engine_bench("IDLE");
+        last_council(&mut state);
+        state.seats.clear();
+        state.winner_seats = vec!["KARINA".into(), "WINTER".into()];
+        let text = render_council_text(&state, 46, 33);
+        assert_eq!(text.matches("♛ 승인").count(), 2, "{text}");
+        assert!(
+            text.contains("거부 75") && text.contains("보류 85"),
+            "{text}"
+        );
+        for tag in ["총괄", "반론", "검증", "확장"] {
+            assert!(text.contains(tag), "the role {tag} in the bench's language");
+        }
+        assert!(
+            text.contains("KARINA · WINTER → APPROVE"),
+            "the winner line names what they carried\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_phase_line_names_the_engines_phase() {
+        let mut state = engine_bench("VERDICT");
+        for seat in &mut state.seats {
+            seat.verdict = Some(Verdict::Approve);
+        }
+        let text = render_council_text(&state, 46, 33);
+        assert!(text.contains("VERDICT"), "{text}");
+        assert!(!text.contains("REACHED"), "{text}");
+    }
+
+    #[test]
+    fn the_wall_clock_origin_gives_local_time_on_any_side_of_midnight() {
+        let origin = WallOrigin {
+            epoch_at_zero: 0.0,
+            utc_offset_secs: 0,
+        };
+        assert_eq!(origin.hhmm(3_660_000), "01:01");
+        let behind = WallOrigin {
+            epoch_at_zero: 0.0,
+            utc_offset_secs: -3 * 3_600,
+        };
+        assert_eq!(behind.hhmm(60_000), "21:01", "three hours behind UTC");
+        let ahead = WallOrigin {
+            epoch_at_zero: 86_400.0 - 60.0,
+            utc_offset_secs: 5_400,
+        };
+        assert_eq!(ahead.hhmm(0), "01:29");
+    }
+
+    #[test]
+    fn the_header_shows_the_local_time_and_a_subtitle_when_they_fit() {
+        let mut state = engine_bench("IDLE");
+        // 2026-11-26 14:49 UTC, in a zone three hours behind it; the frame
+        // clock reads four seconds.
+        let epoch = chrono::NaiveDate::from_ymd_opt(2026, 11, 26)
+            .unwrap()
+            .and_hms_opt(14, 49, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp() as f64;
+        state.clock = Some(WallOrigin {
+            epoch_at_zero: epoch - 4.0,
+            utc_offset_secs: -3 * 3_600,
+        });
+        let wide = render_council_text(&state, 46, 33);
+        let head = wide.lines().next().unwrap();
+        assert!(head.contains("11:49"), "{head}");
+        assert!(head.contains("에스파 의사결정 기구"), "{head}");
+        let medium = render_council_text(&state, 30, 24);
+        let head = medium.lines().next().unwrap();
+        assert!(head.contains("KWANGYA") && head.contains("11:49"), "{head}");
+        let narrow = render_council_text(&state, 24, 24);
+        let head = narrow.lines().next().unwrap();
+        assert!(
+            head.contains("11:49") && !head.contains("KWANGYA"),
+            "{head}"
+        );
+        // Without a clock to show, the header shows none rather than a wrong one.
+        state.clock = None;
+        let head = render_council_text(&state, 46, 33)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(!head.contains(':'), "{head}");
+    }
+
+    #[test]
+    fn under_forty_four_columns_the_fourth_seat_is_a_chip_not_a_second_row() {
+        let state = engine_bench("DELIBERATING");
+        let three = render_council_text(&state, 42, 33);
+        let rows_of_cards = three.lines().filter(|line| line.contains('╭')).count();
+        assert_eq!(rows_of_cards, 1, "{three}");
+        assert!(three.contains("NINGNING·04"), "{three}");
+        assert!(
+            three.contains("KARINA") && three.contains("WINTER"),
+            "{three}"
+        );
+        let four = render_council_text(&state, 44, 33);
+        assert_eq!(
+            four.lines().filter(|line| line.contains('╭')).count(),
+            1,
+            "{four}"
+        );
+        assert!(
+            four.contains("NINGNING") && !four.contains("NINGNING·04"),
+            "four cards fit at 44 columns, so there is no chip\n{four}"
+        );
+    }
+
+    #[test]
+    fn a_failed_council_marks_the_seat_that_lost_its_signal() {
+        let mut state = engine_bench("FAIL");
+        state.phase.note = "TimeoutError: all seats errored".into();
+        state.seats[0].activity = SeatActivity::Lost;
+        for seat in &mut state.seats[1..] {
+            seat.activity = SeatActivity::Resting;
+        }
+        let text = render_council_text(&state, 46, 33);
+        assert!(
+            text.contains("신호없음") && text.contains("ERROR"),
+            "{text}"
+        );
+        assert!(text.contains("고장"), "{text}");
+        assert_eq!(
+            text.matches("ERROR").count(),
+            1,
+            "only the lost seat: {text}"
+        );
+    }
+
+    #[test]
+    fn seats_past_the_bench_are_chips_under_the_cards() {
+        let mut state = engine_bench("DELIBERATING");
+        state.extra_seats = vec![BenchSeat {
+            name: "ae·05".into(),
+            number: String::new(),
+            role: String::new(),
+            lab: "MISTRAL".into(),
+            model: String::new(),
+            activity: SeatActivity::Answered,
+            verdict: None,
+            confidence: None,
+        }];
+        let text = render_council_text(&state, 46, 33);
+        assert!(text.contains("ae·05 MISTRAL ●"), "{text}");
+        // Four cards fit here, so the chip row is only the fifth seat.
+        assert!(!text.contains("NINGNING·04"), "{text}");
+    }
+
+    #[test]
+    fn a_pane_that_lists_the_bench_names_each_seat_once() {
+        // Too narrow for cards: one line a seat, and no chip repeating them.
+        let state = engine_bench("VERDICT");
+        let text = render_council_text(&state, 26, 33);
+        assert!(!text.contains('╭'), "no cards at 26 columns\n{text}");
+        for name in ["KARINA", "GISELLE", "WINTER", "NINGNING"] {
+            assert_eq!(text.matches(name).count(), 1, "{name}\n{text}");
+        }
+        assert!(!text.contains("ANTHROPIC"), "no chip row\n{text}");
+    }
+
+    #[test]
+    fn a_council_convened_here_gets_hangul_tags_for_its_roles() {
+        let mut state = engine_bench("IDLE");
+        for (seat, role) in state
+            .seats
+            .iter_mut()
+            .zip(["LEAD", "SKEPTIC", "BUILDER", "RISK"])
+        {
+            seat.role = role.into();
+        }
+        let text = render_council_text(&state, 100, 33);
+        for tag in [
+            "총괄 · LEAD",
+            "반론 · SKEPTIC",
+            "구현 · BUILDER",
+            "위험 · RISK",
+        ] {
+            assert!(text.contains(tag), "{tag}\n{text}");
+        }
+        assert!(!text.contains("SKEPTIC · SKEPTIC"), "{text}");
+    }
+
+    #[test]
+    fn the_footer_sits_where_the_standalone_pane_puts_it() {
+        let state = engine_bench("VERDICT");
+        let last_rows = |width: u16, height: u16| -> Vec<String> {
+            let text = render_council_text(&state, width, height);
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len() - 3..]
+                .iter()
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+        // Wide and tall: rule, phase, then the row the standalone pane gives its keys.
+        let wide = last_rows(46, 33);
+        assert!(
+            wide[0].starts_with('─') && wide[1].starts_with("PHASE") && wide[2].is_empty(),
+            "{wide:?}"
+        );
+        // Narrow: no key row, so the phase is on the very last row.
+        let narrow = last_rows(26, 33);
+        assert!(
+            narrow[1].starts_with('─') && narrow[2].starts_with("PHASE"),
+            "{narrow:?}"
+        );
+        // Short: the same.
+        let short = last_rows(46, 18);
+        assert!(
+            short[1].starts_with('─') && short[2].starts_with("PHASE"),
+            "{short:?}"
+        );
+    }
+
+    #[test]
+    fn the_pane_redraws_at_the_standalone_panes_pace() {
+        let phase = |name: &str| Phase {
+            name: name.into(),
+            note: String::new(),
+        };
+        // Eight a second whenever a council runs, the verdict on screen included.
+        for running in [
+            "TRIAGE",
+            "SYNC",
+            "DELIBERATING",
+            "VOTING",
+            "JUDGING",
+            "VERDICT",
+        ] {
+            assert_eq!(phase(running).beat_ms(0), 125, "{running}");
+        }
+        // Six for the triage verdict and for a failure.
+        assert_eq!(phase("TRIAGED").beat_ms(0), 167);
+        assert_eq!(phase("FAIL").beat_ms(0), 167);
+        // Two at rest, and one in five seconds after ten quiet minutes.
+        assert_eq!(phase("IDLE").beat_ms(0), 500);
+        assert_eq!(phase("").beat_ms(BEAT_DEEP_REST_AFTER_MS - 1), 500);
+        assert_eq!(phase("IDLE").beat_ms(BEAT_DEEP_REST_AFTER_MS), 5_000);
+        // A council that runs again is not rested, however long it rested.
+        assert_eq!(phase("SYNC").beat_ms(3_600_000), 125);
+        assert!(phase("IDLE").is_idle() && phase("").is_idle());
+        assert!(!phase("FAIL").is_idle() && !phase("VERDICT").is_idle());
+    }
+
+    #[test]
+    fn name_plates_are_accent_blocks_with_dark_ink() {
+        use ratatui::{buffer::Buffer, layout::Rect, style::Color};
+        let state = engine_bench("DELIBERATING");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 46, 33));
+        let mut cv = Cv::new(&mut buffer);
+        let palette = BenchPalette::from_shell(&cv.palette);
+        assert!(draw_council(
+            &mut cv,
+            (0, 0, 46, 33),
+            &state,
+            palette,
+            4_000,
+            true
+        ));
+        let (row, column) = (2..6)
+            .find_map(|row| {
+                (0..46u16)
+                    .find(|column| buffer[(*column, row)].symbol() == "K")
+                    .map(|column| (row, column))
+            })
+            .expect("KARINA's plate");
+        let cell = &buffer[(column, row)];
+        let accent = seat_accent(0, palette);
+        assert_eq!(cell.bg, Color::Rgb(accent.0, accent.1, accent.2));
+        let ink = palette.on_accent;
+        assert_eq!(cell.fg, Color::Rgb(ink.0, ink.1, ink.2));
     }
 }
 
@@ -1876,6 +2690,7 @@ mod bench_tests {
             extra_seats: Vec::new(),
             winner_seats: Vec::new(),
             history: CouncilHistory::default(),
+            clock: None,
         }
     }
 

@@ -1031,6 +1031,31 @@ fn crossed_beat(previous_ms: u64, now_ms: u64, period_ms: u64) -> bool {
     previous_ms / period_ms != now_ms / period_ms
 }
 
+/// The beat of a Council pane that is on screen, in milliseconds. A council
+/// that is running, settling or failing keeps its phase's own beat; an idle
+/// one starts its rest clock the moment it goes quiet, so a pane left alone
+/// for ten minutes slows to one frame in five seconds, and any new phase puts
+/// it back at full pace. `text_pane_moving` is for a pane fed as text, which
+/// moves while a council is on the bench.
+fn council_pane_beat(
+    council: Option<&crate::proto::ported::CouncilState>,
+    text_pane_moving: bool,
+    rest_since: &mut Option<u64>,
+    now_ms: u64,
+) -> Option<u64> {
+    let Some(state) = council else {
+        *rest_since = None;
+        return text_pane_moving.then_some(125);
+    };
+    if state.phase.is_idle() {
+        rest_since.get_or_insert(now_ms);
+    } else {
+        *rest_since = None;
+    }
+    let rested = now_ms.saturating_sub(rest_since.unwrap_or(now_ms));
+    Some(state.phase.beat_ms(rested))
+}
+
 /// The default conversation, its steady insertion caret and ordinary settled
 /// messages have no periodic motion. Other pane layouts and tool cards can
 /// still animate independently of a foreground turn.
@@ -1101,6 +1126,66 @@ mod frame_cadence_tests {
             .filter(|tick| crossed_beat(tick * 16, (tick + 1) * 16, reactor_beat_ms(false)))
             .count();
         assert!((5..=7).contains(&crossings), "{crossings}");
+    }
+
+    #[test]
+    fn the_council_pane_keeps_the_standalone_panes_pace_and_slows_after_ten_quiet_minutes() {
+        use crate::proto::ported::{BenchSeat, CouncilHistory, CouncilState, Phase};
+        let council = |phase: &str| CouncilState {
+            phase: Phase {
+                name: phase.into(),
+                note: String::new(),
+            },
+            seats: Vec::<BenchSeat>::new(),
+            extra_seats: Vec::new(),
+            winner_seats: Vec::new(),
+            history: CouncilHistory::default(),
+            clock: None,
+        };
+        let mut rest = None;
+        // A running council moves eight times a second and has no rest clock.
+        assert_eq!(
+            council_pane_beat(Some(&council("DELIBERATING")), false, &mut rest, 1_000),
+            Some(125)
+        );
+        assert_eq!(rest, None);
+        // At rest it draws twice a second, from the moment it went quiet.
+        assert_eq!(
+            council_pane_beat(Some(&council("IDLE")), false, &mut rest, 2_000),
+            Some(500)
+        );
+        assert_eq!(rest, Some(2_000));
+        assert_eq!(
+            council_pane_beat(Some(&council("IDLE")), false, &mut rest, 601_999),
+            Some(500)
+        );
+        // Ten minutes on, one frame in five seconds. The clock never restarts
+        // while the council stays idle.
+        assert_eq!(
+            council_pane_beat(Some(&council("IDLE")), false, &mut rest, 602_000),
+            Some(5_000)
+        );
+        assert_eq!(rest, Some(2_000));
+        // Any new phase is back at full pace and clears the clock.
+        assert_eq!(
+            council_pane_beat(Some(&council("TRIAGE")), false, &mut rest, 700_000),
+            Some(125)
+        );
+        assert_eq!(rest, None);
+        assert_eq!(
+            council_pane_beat(Some(&council("IDLE")), false, &mut rest, 700_100),
+            Some(500),
+            "the next rest starts from zero"
+        );
+        // A failure and a triage verdict are not rest: six a second.
+        assert_eq!(
+            council_pane_beat(Some(&council("FAIL")), false, &mut rest, 800_000),
+            Some(167)
+        );
+        assert_eq!(rest, None);
+        // A pane fed as text moves only while it shows a council at work.
+        assert_eq!(council_pane_beat(None, true, &mut rest, 900_000), Some(125));
+        assert_eq!(council_pane_beat(None, false, &mut rest, 900_000), None);
     }
 
     #[test]
@@ -1857,6 +1942,8 @@ fn run_proto_inner(
     let mut reading = ReadState::new(&scenario);
     let mut exit_code = 0;
     let mut council_pane_ms = 0u64;
+    // When the council last went quiet, for the pane's slowest beat.
+    let mut council_rest_since: Option<u64> = None;
     let mut reactor_pane_ms = 0u64;
     let mut reactor_pane_dirty = true;
     // Opt-in completion bell: ORBIT_BELL=1 rings the terminal bell when a
@@ -2478,22 +2565,37 @@ fn run_proto_inner(
             );
             request_saved_sessions(&tui, &mut scenario, &command_sink, now_ms);
             // External Council activity can animate even while chat is idle.
-            let council_animating = !tui.reduced
-                && scenario
-                    .custom_panes
-                    .get("council")
-                    .is_some_and(|pane| pane.text.contains("심의중") || pane.text.contains("SYNK"))
-                && (0..tui.app.tree.panel_count())
-                    .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("council"));
+            // The pane keeps the standalone pane's pace (`Phase::beat_ms`):
+            // eight frames a second while a council runs, six for the triage
+            // verdict and a failure, two at rest, one every five seconds after
+            // ten quiet minutes. The spinner, the equaliser, the sweep, the
+            // twinkling field, the shimmer in the header and the cursor move
+            // with it. Only the fast beats keep the 16 ms loop awake; a pane
+            // at rest is drawn from the ordinary idle tick.
+            let council_in_layout = (0..tui.app.tree.panel_count())
+                .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("council"));
+            let council_beat = if tui.reduced || !council_in_layout {
+                None
+            } else {
+                council_pane_beat(
+                    scenario.council.as_ref(),
+                    scenario.custom_panes.get("council").is_some_and(|pane| {
+                        pane.text.contains("심의중") || pane.text.contains("SYNK")
+                    }),
+                    &mut council_rest_since,
+                    now_ms,
+                )
+            };
+            let council_animating = council_beat.is_some_and(|beat| beat <= 200);
             let reactor_beat = reactor_beat_ms(scenario.turn_live || scenario.compacting);
-            overlay_dirty |=
-                (focused && council_animating && crossed_beat(previous_ms, now_ms, 125))
-                    || (focused
-                        && !tui.reduced
-                        && crossed_beat(previous_ms, now_ms, reactor_beat)
-                        && (0..tui.app.tree.panel_count()).any(|index| {
-                            tui.app.tree.custom_id_at(index).as_deref() == Some("reactor")
-                        }));
+            overlay_dirty |= (focused
+                && council_beat.is_some_and(|beat| crossed_beat(previous_ms, now_ms, beat)))
+                || (focused
+                    && !tui.reduced
+                    && crossed_beat(previous_ms, now_ms, reactor_beat)
+                    && (0..tui.app.tree.panel_count()).any(|index| {
+                        tui.app.tree.custom_id_at(index).as_deref() == Some("reactor")
+                    }));
             active_tick = animating
                 || council_animating
                 || scenario.is_busy()
@@ -12927,6 +13029,11 @@ fn council_for_display(
         .as_secs_f64();
     let offset = epoch_secs - now_ms as f64 / 1_000.0;
     state.history.last_at = state.history.last_at.map(|at| at - offset);
+    // The same translation tells the header what the clock on the wall says.
+    state.clock = Some(crate::proto::ported::WallOrigin {
+        epoch_at_zero: offset,
+        utc_offset_secs: chrono::Local::now().offset().local_minus_utc(),
+    });
     state
 }
 

@@ -1263,6 +1263,59 @@ fn external_council_state_and_history_are_gated_before_display_bounds() {
 }
 
 #[test]
+fn a_triaged_council_settles_back_to_idle_after_twenty_seconds() {
+    let f = Fixture::new();
+    let path = f.root.join("state.json");
+    std::fs::write(
+        &path,
+        br#"{"ts":1000.0,"phase":"TRIAGED","note":"QUICK","seats":[]}"#,
+    )
+    .unwrap();
+    // The verdict line of a triage has its moment, then the pane settles.
+    let fresh = council_snapshot_state(&path, 1019.0).unwrap();
+    assert_eq!(
+        (fresh.phase.as_str(), fresh.note.as_str()),
+        ("TRIAGED", "QUICK")
+    );
+    let settled = council_snapshot_state(&path, 1021.0).unwrap();
+    assert_eq!(settled.phase, "IDLE");
+    // Other phases keep their own clock: a deliberation is live for minutes.
+    std::fs::write(
+        &path,
+        br#"{"ts":1000.0,"phase":"DELIBERATING","seats":[{"model":"m","status":"computing"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        council_snapshot_state(&path, 1100.0).unwrap().phase,
+        "DELIBERATING"
+    );
+}
+
+#[test]
+fn a_failed_council_keeps_the_seats_that_lost_their_signal() {
+    let f = Fixture::new();
+    let path = f.root.join("state.json");
+    std::fs::write(
+        &path,
+        br#"{"ts":1000.0,"phase":"FAIL","note":"all seats errored","seats":[
+            {"model":"claude-haiku-5-5","status":"error"},
+            {"model":"claude-glm-5.3-flash","status":"reported"}]}"#,
+    )
+    .unwrap();
+    let failed = council_snapshot_state(&path, 1001.0).unwrap();
+    assert_eq!(failed.seats[0].activity, "lost");
+    assert_eq!(failed.seats[1].activity, "resting");
+    // An idle council shows nothing from the run before it.
+    std::fs::write(
+        &path,
+        br#"{"ts":1000.0,"phase":"IDLE","seats":[{"model":"m","status":"error"}]}"#,
+    )
+    .unwrap();
+    let idle = council_snapshot_state(&path, 1001.0).unwrap();
+    assert_eq!(idle.seats[0].activity, "resting");
+}
+
+#[test]
 fn council_pane_uses_bound_session_and_never_falls_back_to_foreign_state() {
     const CHILD: &str = "ORBIT_COUNCIL_BINDING_TEST_CHILD";
     const TEST: &str = "council_pane_uses_bound_session_and_never_falls_back_to_foreign_state";
