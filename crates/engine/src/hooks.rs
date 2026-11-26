@@ -1044,38 +1044,75 @@ impl Hooks {
         .find_map(|key| body.get(*key).and_then(serde_json::Value::as_str))
         .map(str::to_owned);
         let body = serde_json::Value::Object(body);
-        self.matching(event, subject.as_deref())
-            .iter()
+        let selected: Vec<&HookConfig> = self
+            .matching(event, subject.as_deref())
+            .into_iter()
             .filter(|h| condition_accepts(h.condition.as_deref(), &body))
-            .filter_map(|h| {
-                if h.run_async {
-                    let (hook, body) = ((*h).clone(), body.clone());
-                    let runner = current_handler_runner();
-                    // Counted here and released when the hook is over, so that a process that
-                    // ends next can wait for it (see `finish_async_hooks`).
-                    let running = ASYNC_HOOKS.start();
-                    std::thread::spawn(move || {
-                        let _running = running;
-                        let _runner_scope = runner.map(handler_runner_scope);
-                        let _ = run_hook(&hook, &body);
-                    });
-                    None
-                } else {
-                    let outcome = run_hook(h, &body);
-                    if outcome.exit_code == -2 {
-                        note_hook_problem(format!(
-                            "a {} hook ran past its {} s limit and was stopped; what it guards went ahead · {}",
-                            event.as_str(),
-                            h.timeout_secs
-                                .or_else(|| h.handler.as_ref().map(HookHandler::default_timeout_secs))
-                                .unwrap_or(60),
-                            hook_label(h)
-                        ));
-                    }
-                    Some(outcome)
-                }
+            .collect();
+        // Asynchronous hooks start at once and are never waited for.
+        for h in selected.iter().filter(|h| h.run_async) {
+            let (hook, body) = ((*h).clone(), body.clone());
+            let runner = current_handler_runner();
+            // Counted here and released when the hook is over, so that a process that
+            // ends next can wait for it (see `finish_async_hooks`).
+            let running = ASYNC_HOOKS.start();
+            std::thread::spawn(move || {
+                let _running = running;
+                let _runner_scope = runner.map(handler_runner_scope);
+                let _ = run_hook(&hook, &body);
+            });
+        }
+        let waited: Vec<&HookConfig> = selected.into_iter().filter(|h| !h.run_async).collect();
+        let outcomes = run_side_by_side(&waited, &body);
+        for (h, outcome) in waited.iter().zip(&outcomes) {
+            if outcome.exit_code == -2 {
+                note_hook_problem(format!(
+                    "a {} hook ran past its {} s limit and was stopped; what it guards went ahead · {}",
+                    event.as_str(),
+                    h.timeout_secs
+                        .or_else(|| h.handler.as_ref().map(HookHandler::default_timeout_secs))
+                        .unwrap_or(60),
+                    hook_label(h)
+                ));
+            }
+        }
+        outcomes
+    }
+}
+
+/// Run the hooks of one event that the caller waits for, side by side, the way
+/// Claude Code does: a guard stack then costs its slowest guard rather than the
+/// sum of all of them (every Bash call paid two or three process starts, one
+/// after another). Outcomes come back in the configured order, so "the first
+/// block wins" reads exactly as before, and a hook still runs even when an
+/// earlier one blocks.
+fn run_side_by_side(hooks: &[&HookConfig], body: &serde_json::Value) -> Vec<HookOutcome> {
+    match hooks {
+        [] => Vec::new(),
+        [only] => vec![run_hook(only, body)],
+        _ => {
+            let runner = current_handler_runner();
+            std::thread::scope(|scope| {
+                let running: Vec<_> = hooks
+                    .iter()
+                    .map(|hook| {
+                        let runner = runner.clone();
+                        scope.spawn(move || {
+                            let _runner_scope = runner.map(handler_runner_scope);
+                            run_hook(hook, body)
+                        })
+                    })
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect()
             })
-            .collect()
+        }
     }
 }
 
@@ -3866,6 +3903,48 @@ mcp_input = "{"allow":false}"
         );
         assert_eq!(blocked(&outcomes), None);
         assert_eq!(outcomes[0].stdout.trim(), "ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waited_hooks_run_side_by_side_and_report_in_configured_order() {
+        let hook = |command: &str| HookConfig {
+            event: "PreToolUse".into(),
+            command: command.into(),
+            timeout_secs: Some(10),
+            matcher: None,
+            condition: None,
+            run_async: false,
+            http: None,
+            handler: None,
+            origin: None,
+        };
+        let hooks = Hooks {
+            hooks: vec![
+                hook("sleep 0.6; echo first"),
+                hook("sleep 0.6; echo second; exit 2"),
+                hook("sleep 0.6; echo third"),
+            ],
+            project_trusted: false,
+            context_limit: None,
+        };
+        let started = std::time::Instant::now();
+        let outcomes = hooks.fire(
+            HookEvent::PreToolUse,
+            &serde_json::json!({"tool": "Bash", "arguments": {"command": "ls"}}),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "three 0.6 s hooks took {elapsed:?}: they ran one after another"
+        );
+        let said: Vec<&str> = outcomes.iter().map(|o| o.stdout.trim()).collect();
+        assert_eq!(said, ["first", "second", "third"], "configured order");
+        assert_eq!(
+            outcomes.iter().map(|o| o.exit_code).collect::<Vec<_>>(),
+            [0, 2, 0],
+            "a hook after a blocking one still ran"
+        );
     }
 
     /// An async hook that records what it was sent, after a pause: the shape of a hook that is

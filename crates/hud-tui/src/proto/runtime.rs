@@ -987,6 +987,46 @@ fn ui_poll_timeout(elapsed: Duration, active: bool, dirty: bool) -> Duration {
     interval.saturating_sub(elapsed)
 }
 
+/// How often the Reactor art is redrawn when nothing else is moving: about
+/// six frames a second at rest, and faster while a turn streams. The scene is
+/// computed from the clock at draw time, so this beat is its frame rate
+/// whenever no turn animation is running.
+const REACTOR_LIVE_BEAT_MS: u64 = 50;
+const REACTOR_IDLE_BEAT_MS: u64 = 160;
+
+fn reactor_beat_ms(turn_active: bool) -> u64 {
+    if turn_active {
+        REACTOR_LIVE_BEAT_MS
+    } else {
+        REACTOR_IDLE_BEAT_MS
+    }
+}
+
+/// The terminal window or tab title: a status mark, then the session's title.
+/// `?` means the session is waiting for you, `●` that it is working.
+fn terminal_title(session_title: &str, busy: bool, needs_you: bool) -> String {
+    let mark = if needs_you {
+        "?"
+    } else if busy {
+        "●"
+    } else {
+        "✦"
+    };
+    let flat: String = session_title
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let name = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() || name == "New session" {
+        return format!("{mark} ORBIT");
+    }
+    let mut shown: String = name.chars().take(48).collect();
+    if name.chars().count() > 48 {
+        shown.push('…');
+    }
+    format!("{mark} ORBIT · {shown}")
+}
+
 fn crossed_beat(previous_ms: u64, now_ms: u64, period_ms: u64) -> bool {
     previous_ms / period_ms != now_ms / period_ms
 }
@@ -1050,6 +1090,40 @@ mod frame_cadence_tests {
         assert_eq!(ui_poll_timeout(ms(30), false, true), Duration::ZERO);
         assert_eq!(ui_poll_timeout(ms(3), true, false), ms(13));
         assert_eq!(ui_poll_timeout(ms(120), false, false), Duration::ZERO);
+    }
+
+    #[test]
+    fn reactor_redraws_about_six_times_a_second_at_rest_and_faster_while_working() {
+        assert_eq!(reactor_beat_ms(false), 160);
+        assert_eq!(reactor_beat_ms(true), 50);
+        // at rest the beat is crossed 6 or 7 times in a second of 16 ms ticks
+        let crossings = (0..62u64)
+            .filter(|tick| crossed_beat(tick * 16, (tick + 1) * 16, reactor_beat_ms(false)))
+            .count();
+        assert!((5..=7).contains(&crossings), "{crossings}");
+    }
+
+    #[test]
+    fn the_terminal_title_says_what_the_session_is_and_whether_it_needs_you() {
+        assert_eq!(terminal_title("New session", false, false), "✦ ORBIT");
+        assert_eq!(terminal_title("", false, false), "✦ ORBIT");
+        assert_eq!(
+            terminal_title("fix the login bug", true, false),
+            "● ORBIT · fix the login bug"
+        );
+        assert_eq!(
+            terminal_title("fix the login bug", true, true),
+            "? ORBIT · fix the login bug"
+        );
+        // control characters never reach the terminal, so a prompt cannot end the title early
+        assert_eq!(
+            terminal_title("a\u{1b}]0;evil\u{7}b\nc", false, false),
+            "✦ ORBIT · a ]0;evil b c"
+        );
+        let long = "x".repeat(80);
+        let title = terminal_title(&long, false, false);
+        assert_eq!(title.chars().count(), "✦ ORBIT · ".chars().count() + 49);
+        assert!(title.ends_with('…'));
     }
 
     #[test]
@@ -1763,6 +1837,9 @@ fn run_proto_inner(
     let bell_enabled =
         notify_enabled || std::env::var("ORBIT_BELL").is_ok_and(|value| value == "1");
     let mut bell_turn_end = scenario.turn_ended_ms;
+    // Whether the terminal has focus (CSI ? 1004 reports). A terminal that
+    // sends no reports stays "focused", so nothing changes for it.
+    let mut focused = true;
     loop {
         let timeout = ui_poll_timeout(last_tick.elapsed(), active_tick, overlay_dirty);
         // A deleted terminal (closed window, dead PTY) makes poll/read
@@ -2051,7 +2128,12 @@ fn run_proto_inner(
                     });
                     overlay_dirty = true;
                 }
-                _ => {}
+                // In the background nothing animates; coming back paints at once.
+                Event::FocusLost => focused = false,
+                Event::FocusGained => {
+                    focused = true;
+                    overlay_dirty = true;
+                }
             }
         }
         if want_copy_mode {
@@ -2306,7 +2388,8 @@ fn run_proto_inner(
             // Anything that moves keeps the 16 ms redraw alive: the
             // startup window, a live turn, the first-prompt orbit, a
             // fresh message, a breathing approval card.
-            let animating = !tui.reduced
+            let animating = focused
+                && !tui.reduced
                 && (scenario.is_turning()
                     || now_ms < 2200
                     || scenario.first_prompt_waiting
@@ -2341,17 +2424,15 @@ fn run_proto_inner(
                     .is_some_and(|pane| pane.text.contains("심의중") || pane.text.contains("SYNK"))
                 && (0..tui.app.tree.panel_count())
                     .any(|index| tui.app.tree.custom_id_at(index).as_deref() == Some("council"));
-            let reactor_beat = if scenario.turn_live || scenario.compacting {
-                125
-            } else {
-                1_000
-            };
-            overlay_dirty |= (council_animating && crossed_beat(previous_ms, now_ms, 125))
-                || (!tui.reduced
-                    && crossed_beat(previous_ms, now_ms, reactor_beat)
-                    && (0..tui.app.tree.panel_count()).any(|index| {
-                        tui.app.tree.custom_id_at(index).as_deref() == Some("reactor")
-                    }));
+            let reactor_beat = reactor_beat_ms(scenario.turn_live || scenario.compacting);
+            overlay_dirty |=
+                (focused && council_animating && crossed_beat(previous_ms, now_ms, 125))
+                    || (focused
+                        && !tui.reduced
+                        && crossed_beat(previous_ms, now_ms, reactor_beat)
+                        && (0..tui.app.tree.panel_count()).any(|index| {
+                            tui.app.tree.custom_id_at(index).as_deref() == Some("reactor")
+                        }));
             active_tick = animating
                 || council_animating
                 || scenario.is_busy()
@@ -2378,6 +2459,13 @@ fn run_proto_inner(
                 let mut frame_hits = Vec::new();
                 let mut conversation_frame = None;
                 let read_input = reading.input();
+                // One frame is one synchronized update (CSI ? 2026): a terminal
+                // that supports it shows the whole frame at once instead of
+                // tearing while a large redraw is still arriving.
+                let _ = crossterm::queue!(
+                    guard.terminal.backend_mut(),
+                    crossterm::terminal::BeginSynchronizedUpdate
+                );
                 let done = guard
                     .terminal
                     .draw(|f| {
@@ -2395,7 +2483,12 @@ fn run_proto_inner(
                             read_input.as_ref(),
                         );
                     })
-                    .ok();
+                    .ok()
+                    .map(|frame| frame.buffer.clone());
+                let _ = crossterm::execute!(
+                    guard.terminal.backend_mut(),
+                    crossterm::terminal::EndSynchronizedUpdate
+                );
                 let Some(done) = done else {
                     // The terminal is gone (closed window, dead PTY): leave the
                     // loop and let the normal shutdown run — never panic here.
@@ -2404,8 +2497,13 @@ fn run_proto_inner(
                     break;
                 };
                 reading.commit(conversation_frame);
+                guard.set_title(&terminal_title(
+                    &scenario.session_title(),
+                    scenario.turn_live || scenario.compacting,
+                    scenario.approval_pending.is_some(),
+                ));
                 last_paint_ms = now_ms;
-                last_buf = Some(done.buffer.clone());
+                last_buf = Some(done);
                 last_palette_frame =
                     capture_palette_frame(&scenario, overlay, &palette_query, &frame_hits);
                 tui.hits = frame_hits;
@@ -2551,14 +2649,20 @@ fn handle_key_with_read(
     {
         let control_only =
             k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
-        let composer_control = control_only
-            && matches!(c, 'r' | 'w')
-            && tui.focus == Focus::Conversation
+        let alt_only =
+            k.modifiers.contains(KeyModifiers::ALT) && !k.modifiers.contains(KeyModifiers::CONTROL);
+        let composer_owns_keys = tui.focus == Focus::Conversation
             && overlay.is_none()
             && !tui.app.arranging
             && tui.app.picker.is_none()
             && scenario.approval_call_id.is_none();
-        if !composer_control {
+        // Ctrl+R/W as before; Ctrl+A/E/U/K/B/F and Alt+B/F/D are the usual
+        // line-editing chords.
+        let composer_control = control_only
+            && matches!(c, 'r' | 'w' | 'a' | 'e' | 'u' | 'k' | 'b' | 'f')
+            && composer_owns_keys;
+        let composer_alt = alt_only && matches!(c, 'b' | 'f' | 'd') && composer_owns_keys;
+        if !(composer_control || composer_alt) {
             return false;
         }
     }
@@ -3045,7 +3149,9 @@ fn handle_key_with_read(
                     // A command that has to wait for the turn stays in the
                     // composer, so Enter after the turn runs it as typed.
                     if scenario.is_busy()
-                        && !runs_while_busy(text.split(' ').next().unwrap_or(""))
+                        && !runs_while_busy(canonical_command(
+                            text.split(' ').next().unwrap_or(""),
+                        ))
                     {
                         *toast = Some(Toast {
                             text: "wait for the active work to finish; draft retained".into(),
@@ -3183,11 +3289,30 @@ fn handle_key_with_read(
                     }
                 }
             }
+            KeyCode::Backspace if k.modifiers.contains(KeyModifiers::ALT) => {
+                // Alt+Backspace takes a word, as Ctrl+W does.
+                if super::composer::delete_previous_word(composer, &mut tui.composer_cursor) {
+                    finish_history_navigation(history_idx, history_draft);
+                }
+                *completion_sel = 0;
+            }
             KeyCode::Backspace => {
                 if super::composer::delete_before_cursor(composer, &mut tui.composer_cursor) {
                     finish_history_navigation(history_idx, history_draft);
                 }
                 *completion_sel = 0;
+            }
+            KeyCode::Left
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                super::composer::move_word_left(composer, &mut tui.composer_cursor);
+            }
+            KeyCode::Right
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                super::composer::move_word_right(composer, &mut tui.composer_cursor);
             }
             KeyCode::Delete if k.modifiers.is_empty() => {
                 if super::composer::delete_at_cursor(composer, &mut tui.composer_cursor) {
@@ -3219,14 +3344,45 @@ fn handle_key_with_read(
             _ => {}
         }
         if let KeyCode::Char(c) = k.code {
-            if k.modifiers.contains(KeyModifiers::CONTROL)
+            let control_only = k.modifiers.contains(KeyModifiers::CONTROL)
                 && !k
                     .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
-                && c == 'w'
-            {
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+            let alt_only = k.modifiers.contains(KeyModifiers::ALT)
+                && !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+            if control_only && c == 'w' {
                 if super::composer::delete_previous_word(composer, &mut tui.composer_cursor) {
                     finish_history_navigation(history_idx, history_draft);
+                }
+            } else if control_only && matches!(c, 'a' | 'e' | 'b' | 'f') {
+                match c {
+                    'a' => super::composer::move_home(composer, &mut tui.composer_cursor),
+                    'e' => super::composer::move_end(composer, &mut tui.composer_cursor),
+                    'b' => super::composer::move_left(composer, &mut tui.composer_cursor),
+                    _ => super::composer::move_right(composer, &mut tui.composer_cursor),
+                }
+            } else if control_only && matches!(c, 'u' | 'k') {
+                let changed = if c == 'u' {
+                    super::composer::delete_to_line_start(composer, &mut tui.composer_cursor)
+                } else {
+                    super::composer::delete_to_line_end(composer, &mut tui.composer_cursor)
+                };
+                if changed {
+                    finish_history_navigation(history_idx, history_draft);
+                }
+                *completion_sel = 0;
+            } else if alt_only && matches!(c, 'b' | 'f' | 'd') {
+                match c {
+                    'b' => super::composer::move_word_left(composer, &mut tui.composer_cursor),
+                    'f' => super::composer::move_word_right(composer, &mut tui.composer_cursor),
+                    _ => {
+                        if super::composer::delete_next_word(composer, &mut tui.composer_cursor) {
+                            finish_history_navigation(history_idx, history_draft);
+                        }
+                        *completion_sel = 0;
+                    }
                 }
             } else if k
                 .modifiers
@@ -4580,6 +4736,7 @@ fn runs_while_busy(cmd: &str) -> bool {
     matches!(
         cmd,
         "/help"
+            | "/quit"
             | "/usage"
             | "/stats"
             | "/diff"
@@ -4594,6 +4751,10 @@ fn runs_while_busy(cmd: &str) -> bool {
             | "/copy"
             | "/export"
             | "/find"
+            | "/version"
+            | "/login"
+            | "/logout"
+            | "/provider"
     )
 }
 
@@ -4646,6 +4807,30 @@ fn focus_diff_panel(tui: &mut Tui) -> Result<(), String> {
     Ok(())
 }
 
+/// Names other harnesses use for commands ORBIT already has. They run the same
+/// command, unless the session defines a command file or skill of that name
+/// itself: the person's own `/bug` is never replaced by an alias.
+fn canonical_command(cmd: &str) -> &str {
+    let canonical = match cmd {
+        "/quit" | "/exit" | "/q" => "/quit",
+        "/hotkeys" | "/shortcuts" | "/keys" => "/help",
+        "/bug" => "/feedback",
+        "/compress" => "/compact",
+        "/plugins" => "/plugin",
+        "/branch" => "/fork",
+        "/settings" => "/config",
+        "/title" => "/rename",
+        "/pwd" => "/status",
+        "/about" => "/version",
+        other => return other,
+    };
+    if super::chrome::all_commands().any(|(name, _)| *name == cmd) {
+        cmd
+    } else {
+        canonical
+    }
+}
+
 /// Run a `/command` or bare `quit`/`exit` (§11.6). TUI-local ones
 /// run at once; the rest go to the worker in order.
 #[allow(clippy::too_many_arguments)]
@@ -4672,6 +4857,12 @@ fn run_command(
         Some((c, a)) => (c, a.trim()),
         None => (text, ""),
     };
+    let cmd = canonical_command(cmd);
+    if cmd == "/quit" {
+        // `/quit` and `/exit` ask the same question Ctrl+C does, mid-turn too.
+        scenario.dismiss_picker();
+        return Some(Overlay::Quit);
+    }
     if scenario.is_busy() && !runs_while_busy(cmd) {
         *toast = Some(Toast {
             text: "wait for the active work to finish".into(),
@@ -4709,6 +4900,36 @@ fn run_command(
             None
         }
         "/help" => Some(Overlay::Help),
+        "/version" => {
+            let model = if scenario.model_id.is_empty() {
+                "none"
+            } else {
+                scenario.model_id.as_str()
+            };
+            let provider = if scenario.provider.is_empty() {
+                "none"
+            } else {
+                scenario.provider.as_str()
+            };
+            let text = format!(
+                "ORBIT {} · model {model} · provider {provider}",
+                env!("CARGO_PKG_VERSION")
+            );
+            notice(scenario, text);
+            None
+        }
+        "/login" | "/logout" | "/provider" => {
+            // A key is never typed into the chat, so sign-in stays a terminal step.
+            notice(
+                scenario,
+                "Provider sign-in happens in a terminal, so no key goes through the chat: \
+                 run `orbit provider login NAME` (or `orbit setup` to add a provider), and \
+                 `orbit provider logout NAME --yes` to remove a saved key. /models lists \
+                 what is configured."
+                    .into(),
+            );
+            None
+        }
         "/sessions" => {
             // The session picker: the worker's SessionsListed opens it.
             // The sidebar stays closed; the picker is the navigation.
@@ -9955,6 +10176,51 @@ mod composer_key_tests {
     }
 
     #[test]
+    fn line_editing_chords_move_and_kill_without_typing_into_the_draft() {
+        let mut k = Keyboard::new();
+        k.type_text("first line\nsecond line here");
+        // Ctrl+A / Ctrl+E: the start and end of the current line
+        k.key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(k.tui.composer_cursor, 11);
+        k.key(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(k.tui.composer_cursor, 27);
+        // Alt+B / Alt+F and Ctrl+Left / Ctrl+Right: by word
+        k.key(KeyCode::Char('b'), KeyModifiers::ALT);
+        assert_eq!(k.tui.composer_cursor, 23, "to the start of 'here'");
+        k.key(KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(k.tui.composer_cursor, 18, "to the start of 'line'");
+        k.key(KeyCode::Char('f'), KeyModifiers::ALT);
+        assert_eq!(k.tui.composer_cursor, 22, "to the end of 'line'");
+        k.key(KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(k.tui.composer_cursor, 27);
+        // Ctrl+B / Ctrl+F: one character
+        k.key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(k.tui.composer_cursor, 26);
+        k.key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(k.tui.composer_cursor, 27);
+        // Alt+Backspace: a word; Alt+D: the next word
+        k.key(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(
+            k.draft, "first line\nsecond line",
+            "the word and its separator, like Ctrl+W"
+        );
+        k.key(KeyCode::Char('b'), KeyModifiers::ALT);
+        k.key(KeyCode::Char('d'), KeyModifiers::ALT);
+        assert_eq!(k.draft, "first line\nsecond ");
+        // Ctrl+K / Ctrl+U: to the end or start of this line only
+        k.key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        k.key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        k.key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(k.draft, "first line\ns");
+        k.key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(k.draft, "first line\n");
+        k.key(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        k.key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(k.draft, "first line\n", "moving never types a letter");
+        k.no_send();
+    }
+
+    #[test]
     fn paste_is_literal_at_the_caret_and_submission_keeps_edge_whitespace() {
         let mut k = Keyboard::new();
         k.type_text("leftright");
@@ -10426,6 +10692,93 @@ mod composer_key_tests {
             assert_eq!(k.overlay, None);
             assert!(k.scenario.approval_call_id.is_some());
         }
+    }
+
+    #[test]
+    fn quit_and_exit_ask_the_ctrl_c_question_even_in_the_middle_of_a_turn() {
+        for name in ["/quit", "/exit", "/q"] {
+            let mut idle = Keyboard::new();
+            idle.type_text(name);
+            idle.plain(KeyCode::Enter);
+            assert_eq!(idle.overlay, Some(Overlay::Quit), "{name}");
+            idle.no_send();
+
+            let mut busy = Keyboard::new();
+            busy.scenario.turn_live = true;
+            busy.type_text(name);
+            busy.plain(KeyCode::Enter);
+            assert_eq!(busy.overlay, Some(Overlay::Quit), "{name} during a turn");
+        }
+    }
+
+    #[test]
+    fn other_harnesses_names_run_the_command_orbit_already_has() {
+        for name in ["/hotkeys", "/shortcuts", "/keys"] {
+            let mut k = Keyboard::new();
+            k.type_text(name);
+            k.plain(KeyCode::Enter);
+            assert_eq!(k.overlay, Some(Overlay::Help), "{name}");
+        }
+        for (typed, forwarded) in [
+            ("/settings", "config"),
+            ("/plugins list", "plugin list"),
+            ("/branch", "fork"),
+            ("/title a better name", "rename a better name"),
+            ("/pwd", "status"),
+        ] {
+            let mut k = Keyboard::new();
+            k.type_text(typed);
+            k.plain(KeyCode::Enter);
+            assert_eq!(
+                k.received_command(),
+                WorkerCommand::Inspect(forwarded.into()),
+                "{typed}"
+            );
+        }
+        let mut k = Keyboard::new();
+        k.type_text("/bug");
+        k.plain(KeyCode::Enter);
+        let answer = &k.scenario.transcript.last().unwrap().text;
+        assert!(
+            answer.contains("https://github.com/fufugita/ORBIT/issues/new"),
+            "{answer}"
+        );
+        k.no_send();
+    }
+
+    #[test]
+    fn a_name_that_is_not_an_alias_still_goes_to_the_worker_which_answers_unknown_names() {
+        let mut k = Keyboard::new();
+        k.type_text("/zzzz");
+        k.plain(KeyCode::Enter);
+        assert_eq!(
+            k.received_command(),
+            WorkerCommand::SlashCommand("zzzz".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn version_and_provider_sign_in_answer_locally_even_during_a_turn() {
+        let mut k = Keyboard::new();
+        k.scenario.turn_live = true;
+        k.type_text("/version");
+        k.plain(KeyCode::Enter);
+        let answer = k.scenario.transcript.last().unwrap().text.clone();
+        assert!(
+            answer.starts_with(&format!("ORBIT {} · model ", env!("CARGO_PKG_VERSION"))),
+            "{answer}"
+        );
+        for name in ["/about", "/login", "/logout", "/provider"] {
+            k.type_text(name);
+            k.plain(KeyCode::Enter);
+        }
+        let answer = &k.scenario.transcript.last().unwrap().text;
+        assert!(answer.contains("orbit provider login NAME"), "{answer}");
+        assert!(
+            answer.contains("orbit provider logout NAME --yes"),
+            "{answer}"
+        );
+        k.no_send();
     }
 
     #[test]

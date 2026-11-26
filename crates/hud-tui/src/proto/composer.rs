@@ -132,6 +132,80 @@ pub fn move_end(text: &str, cursor: &mut usize) {
     *cursor = grapheme_count(&text[..line_end]);
 }
 
+fn is_blank(cluster: &str) -> bool {
+    cluster.chars().all(char::is_whitespace)
+}
+
+/// Alt+B / Ctrl+Left: to the start of the word before the cursor. Blanks
+/// (and line breaks) are skipped first, so a cursor between words lands on the
+/// previous one.
+pub fn move_word_left(text: &str, cursor: &mut usize) {
+    let clusters: Vec<&str> = UnicodeSegmentation::graphemes(text, true).collect();
+    let mut at = (*cursor).min(clusters.len());
+    while at > 0 && is_blank(clusters[at - 1]) {
+        at -= 1;
+    }
+    while at > 0 && !is_blank(clusters[at - 1]) {
+        at -= 1;
+    }
+    *cursor = at;
+}
+
+/// Alt+F / Ctrl+Right: to the end of the word after the cursor.
+pub fn move_word_right(text: &str, cursor: &mut usize) {
+    let clusters: Vec<&str> = UnicodeSegmentation::graphemes(text, true).collect();
+    let mut at = (*cursor).min(clusters.len());
+    while at < clusters.len() && is_blank(clusters[at]) {
+        at += 1;
+    }
+    while at < clusters.len() && !is_blank(clusters[at]) {
+        at += 1;
+    }
+    *cursor = at;
+}
+
+/// Ctrl+U: delete from the start of the current line up to the cursor.
+pub fn delete_to_line_start(text: &mut String, cursor: &mut usize) -> bool {
+    *cursor = clamp_cursor(text, *cursor);
+    let end = cursor_byte_index(text, *cursor);
+    let start = text[..end].rfind('\n').map_or(0, |newline| newline + 1);
+    if start == end {
+        return false;
+    }
+    text.replace_range(start..end, "");
+    *cursor = cursor_for_byte_offset(text, start);
+    true
+}
+
+/// Ctrl+K: delete from the cursor to the end of the current line.
+pub fn delete_to_line_end(text: &mut String, cursor: &mut usize) -> bool {
+    *cursor = clamp_cursor(text, *cursor);
+    let start = cursor_byte_index(text, *cursor);
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |newline| start + newline);
+    if start == end {
+        return false;
+    }
+    text.replace_range(start..end, "");
+    *cursor = cursor_for_byte_offset(text, start);
+    true
+}
+
+/// Alt+D: delete the word after the cursor (up to the end of that word).
+pub fn delete_next_word(text: &mut String, cursor: &mut usize) -> bool {
+    let from = clamp_cursor(text, *cursor);
+    let mut to = from;
+    move_word_right(text, &mut to);
+    if to == from {
+        return false;
+    }
+    let (start, end) = (cursor_byte_index(text, from), cursor_byte_index(text, to));
+    text.replace_range(start..end, "");
+    *cursor = cursor_for_byte_offset(text, start);
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCandidate {
     pub path: String,
@@ -650,6 +724,80 @@ mod tests {
         assert_eq!(search.matched, None);
         search.restore(&mut draft);
         assert_eq!(draft, "unfinished\n日本語");
+    }
+
+    #[test]
+    fn word_moves_skip_blanks_then_the_word_and_keep_grapheme_boundaries() {
+        let text = "alpha  beta\n日本語 gamma";
+        let at = |cursor: usize, f: fn(&str, &mut usize)| {
+            let mut c = cursor;
+            f(text, &mut c);
+            c
+        };
+        let len = grapheme_count(text);
+        assert_eq!(
+            at(len, move_word_left),
+            12 + 4,
+            "from the end to the start of gamma"
+        );
+        assert_eq!(at(16, move_word_left), 12, "to the start of 日本語");
+        assert_eq!(at(12, move_word_left), 7, "across the line break to beta");
+        assert_eq!(at(7, move_word_left), 0);
+        assert_eq!(at(0, move_word_left), 0);
+        assert_eq!(at(0, move_word_right), 5, "to the end of alpha");
+        assert_eq!(at(5, move_word_right), 11, "past blanks to the end of beta");
+        assert_eq!(
+            at(11, move_word_right),
+            15,
+            "across the line break to the end of 日本語"
+        );
+        assert_eq!(at(len, move_word_right), len);
+        assert_eq!(
+            at(len + 40, move_word_left),
+            16,
+            "a stale cursor is clamped first"
+        );
+    }
+
+    #[test]
+    fn line_kills_stay_inside_the_current_line_and_report_whether_they_changed_anything() {
+        let mut text = "one\ntwo three\nfour".to_string();
+        let mut cursor = 10; // "one\n" is 4 graphemes, so 10 sits inside "three"
+        assert!(delete_to_line_start(&mut text, &mut cursor));
+        assert_eq!(text, "one\nree\nfour");
+        assert_eq!(cursor, 4);
+        assert!(
+            !delete_to_line_start(&mut text, &mut cursor),
+            "already at a line start"
+        );
+        assert!(delete_to_line_end(&mut text, &mut cursor));
+        assert_eq!(text, "one\n\nfour");
+        assert_eq!(cursor, 4);
+        assert!(
+            !delete_to_line_end(&mut text, &mut cursor),
+            "already at a line end"
+        );
+        let mut cursor = 1;
+        assert!(delete_to_line_end(&mut text, &mut cursor));
+        assert_eq!(text, "o\n\nfour");
+    }
+
+    #[test]
+    fn deleting_the_next_word_takes_the_word_not_the_blank_after_it() {
+        let mut text = "keep this word".to_string();
+        let mut cursor = 4;
+        assert!(delete_next_word(&mut text, &mut cursor));
+        assert_eq!(text, "keep word");
+        assert_eq!(cursor, 4);
+        let mut cursor = 9;
+        assert!(
+            !delete_next_word(&mut text, &mut cursor),
+            "nothing after the cursor"
+        );
+        let mut emoji = "a 👩🏽‍💻 b".to_string();
+        let mut cursor = 1;
+        assert!(delete_next_word(&mut emoji, &mut cursor));
+        assert_eq!(emoji, "a b");
     }
 }
 

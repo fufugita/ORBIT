@@ -287,20 +287,24 @@ impl TerminalWatchdog {
 }
 
 fn enter_startup_screen<W: Write>(writer: &mut W, mouse_capture: bool) -> io::Result<()> {
+    // Focus reports (CSI ? 1004) let the interface stop animating while the
+    // terminal is in the background; a terminal that lacks them ignores the mode.
     if mouse_capture {
         execute!(
             writer,
             EnterAlternateScreen,
             Hide,
             EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange
         )
     } else {
         execute!(
             writer,
             EnterAlternateScreen,
             Hide,
-            crossterm::event::EnableBracketedPaste
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange
         )
     }
 }
@@ -312,6 +316,7 @@ fn restore_startup_screen<W: Write>(writer: &mut W, mouse_capture: bool) {
     if mouse_capture {
         execute!(writer, DisableMouseCapture).ok();
     }
+    execute!(writer, crossterm::event::DisableFocusChange).ok();
     execute!(writer, DisableBracketedPaste).ok();
     execute!(writer, LeaveAlternateScreen).ok();
 }
@@ -360,6 +365,10 @@ pub struct TerminalGuard {
     /// Whether we enabled mouse capture (§12.4: the prototype does not).
     pub mouse_capture: bool,
     pub terminal: Term,
+    /// Whether this terminal gets window-title updates (see [`titles_enabled_for`]).
+    title_enabled: bool,
+    /// The title last written, so an unchanged one costs nothing.
+    last_title: String,
     /// The terminal-death watchdog (module doc): detects a closed PTY when
     /// the event loop is wedged inside crossterm's read and cannot reach
     /// its signal check. Held so its lifetime reads clearly; the thread
@@ -407,12 +416,48 @@ impl TerminalGuard {
         // only here when stdin is a TTY). Spawned AFTER raw mode + alt
         // screen so a probe failure never leaves a watchdog behind.
         let watchdog = TerminalWatchdog::spawn();
+        let title_enabled = titles_enabled_for(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("ORBIT_NO_TITLE").ok().as_deref(),
+        );
+        if title_enabled {
+            // Save the operator's own title (xterm title stack) so it comes back on exit.
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x1b[22;2t");
+            let _ = out.flush();
+        }
         Ok(Self {
             terminal,
             mouse_capture,
+            title_enabled,
+            last_title: String::new(),
             _watchdog: watchdog,
         })
     }
+
+    /// Set the terminal window or tab title. Nothing is written when titles
+    /// are off for this terminal or the title has not changed.
+    pub fn set_title(&mut self, title: &str) {
+        if !self.title_enabled || self.last_title == title {
+            return;
+        }
+        if execute!(
+            self.terminal.backend_mut(),
+            crossterm::terminal::SetTitle(title)
+        )
+        .is_ok()
+        {
+            self.last_title = title.to_owned();
+        }
+    }
+}
+
+/// Whether to update the terminal title: not on a dumb terminal or the Linux
+/// console, and not when `ORBIT_NO_TITLE` is set to anything but empty or `0`.
+fn titles_enabled_for(term: Option<&str>, opt_out: Option<&str>) -> bool {
+    let opted_out = opt_out.is_some_and(|value| !value.is_empty() && value != "0");
+    let capable = term.is_some_and(|term| !term.is_empty() && term != "dumb" && term != "linux");
+    capable && !opted_out
 }
 
 impl Drop for TerminalGuard {
@@ -423,6 +468,7 @@ impl Drop for TerminalGuard {
                 stdout,
                 Show,
                 DisableMouseCapture,
+                crossterm::event::DisableFocusChange,
                 crossterm::event::DisableBracketedPaste,
                 LeaveAlternateScreen
             )
@@ -431,10 +477,16 @@ impl Drop for TerminalGuard {
             execute!(
                 stdout,
                 Show,
+                crossterm::event::DisableFocusChange,
                 crossterm::event::DisableBracketedPaste,
                 LeaveAlternateScreen
             )
             .ok();
+        }
+        if self.title_enabled {
+            // Give the operator's own title back (pairs with the save at entry).
+            let _ = stdout.write_all(b"\x1b[23;2t");
+            let _ = stdout.flush();
         }
         disable_raw_mode().ok();
     }
@@ -577,6 +629,7 @@ mod tests {
         let mut expected_restore = Vec::new();
         execute!(expected_restore, Show).unwrap();
         execute!(expected_restore, DisableMouseCapture).unwrap();
+        execute!(expected_restore, crossterm::event::DisableFocusChange).unwrap();
         execute!(expected_restore, DisableBracketedPaste).unwrap();
         execute!(expected_restore, LeaveAlternateScreen).unwrap();
         assert!(
@@ -715,5 +768,41 @@ mod tests {
             assert_eq!(take_pending_signal(), Some(sig));
             assert_eq!(take_pending_signal(), None);
         }
+    }
+
+    #[test]
+    fn startup_turns_focus_reports_on_and_restore_turns_them_off() {
+        for mouse in [true, false] {
+            let mut entered = Vec::new();
+            enter_startup_screen(&mut entered, mouse).unwrap();
+            let mut focus_on = Vec::new();
+            execute!(focus_on, crossterm::event::EnableFocusChange).unwrap();
+            assert!(
+                entered.ends_with(&focus_on),
+                "focus reports are the last startup mode (mouse capture {mouse})"
+            );
+            let mut restored = Vec::new();
+            restore_startup_screen(&mut restored, mouse);
+            let mut focus_off = Vec::new();
+            execute!(focus_off, crossterm::event::DisableFocusChange).unwrap();
+            assert!(
+                restored
+                    .windows(focus_off.len())
+                    .any(|window| window == focus_off.as_slice()),
+                "restore must turn focus reports off (mouse capture {mouse})"
+            );
+        }
+    }
+
+    #[test]
+    fn titles_are_written_only_for_capable_terminals_and_can_be_opted_out() {
+        assert!(titles_enabled_for(Some("xterm-256color"), None));
+        assert!(titles_enabled_for(Some("tmux-256color"), Some("")));
+        assert!(titles_enabled_for(Some("xterm-kitty"), Some("0")));
+        assert!(!titles_enabled_for(Some("xterm-256color"), Some("1")));
+        assert!(!titles_enabled_for(Some("dumb"), None));
+        assert!(!titles_enabled_for(Some("linux"), None));
+        assert!(!titles_enabled_for(Some(""), None));
+        assert!(!titles_enabled_for(None, None));
     }
 }

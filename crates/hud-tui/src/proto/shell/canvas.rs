@@ -85,6 +85,11 @@ pub fn segs_width(parts: &[Seg]) -> i32 {
 
 /// Display width of a string in cells.
 pub fn text_width(s: &str) -> i32 {
+    // Printable ASCII is one cell per byte and never joins into a cluster, so
+    // the common case (blanks, borders, labels) skips grapheme segmentation.
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return i32::try_from(s.len()).unwrap_or(i32::MAX);
+    }
     s.graphemes(true).fold(0i32, |width, grapheme| {
         let display = printable_grapheme(grapheme);
         let grapheme_width =
@@ -467,7 +472,12 @@ impl<'a> Cv<'a> {
                 }
                 fill_cells.push((xx, yy));
                 let footprint = (footprint.0, yy, footprint.1);
-                if !footprints.contains(&footprint) {
+                // The scan is row-major and a footprint's cells are contiguous
+                // within one row, so a repeat is always the entry pushed just
+                // before it. Comparing with the last entry keeps a fill linear
+                // in its area; searching every earlier footprint made a
+                // full-pane fill quadratic (about 90 ms a frame at 200x50).
+                if footprints.last() != Some(&footprint) {
                     footprints.push(footprint);
                 }
             }
@@ -898,6 +908,163 @@ mod tests {
             assert_eq!(buf[(x, 0)].symbol(), " ");
             assert_eq!(buf[(x, 0)].bg, c((9, 8, 7)));
         }
+    }
+
+    /// The original `fill`, which searched every earlier footprint. Kept as the
+    /// oracle the linear version must match cell for cell.
+    fn fill_reference(cv: &mut Cv<'_>, x: i32, y: i32, w: i32, h: i32, bg: Rgb) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let x0 = x.max(cv.clip.x as i32);
+        let y0 = y.max(cv.clip.y as i32);
+        let x1 = x.saturating_add(w).min(cv.clip.right() as i32);
+        let y1 = y.saturating_add(h).min(cv.clip.bottom() as i32);
+        let mut fill_cells = Vec::new();
+        let mut footprints = Vec::new();
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let Some(footprint) = cv.glyph_footprint_at(xx, yy) else {
+                    continue;
+                };
+                if !cv.footprint_inside_clip(footprint.0, yy, footprint.1) {
+                    continue;
+                }
+                fill_cells.push((xx, yy));
+                let footprint = (footprint.0, yy, footprint.1);
+                if !footprints.contains(&footprint) {
+                    footprints.push(footprint);
+                }
+            }
+        }
+        for (start, yy, width) in footprints {
+            cv.clear_glyph_footprint(start, yy, width);
+        }
+        for (xx, yy) in fill_cells {
+            let cell = &mut cv.buf[(xx as u16, yy as u16)];
+            cell.set_symbol(" ");
+            cell.set_style(Style::default().bg(c(bg)));
+        }
+    }
+
+    /// Rows of mixed narrow and wide glyphs, laid out the way a transcript is:
+    /// a small deterministic generator, so a failure names the same cells every run.
+    fn mixed_width_buffer(width: u16, height: u16) -> Buffer {
+        const GLYPHS: [&str; 9] = ["a", "界", " ", "é", "x", "字", "·", "漢", "  "];
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        {
+            let mut cv = Cv::new(&mut buf);
+            for row in 0..height as i32 {
+                let mut col = 0;
+                while col < width as i32 {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let glyph = GLYPHS[(state >> 33) as usize % GLYPHS.len()];
+                    col = cv.text(col, row, glyph, (200, 200, 200), None);
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn fill_matches_the_exhaustive_dedupe_reference_on_mixed_width_content() {
+        // (fill rect, clip rect); some start on a wide glyph's continuation
+        // cell, some run past the clip, some are a single cell.
+        let cases = [
+            ((0, 0, 40, 12), Rect::new(0, 0, 40, 12)),
+            ((1, 1, 38, 10), Rect::new(0, 0, 40, 12)),
+            ((3, 2, 21, 7), Rect::new(5, 3, 17, 5)),
+            ((-4, -2, 30, 9), Rect::new(0, 0, 40, 12)),
+            ((7, 4, 1, 1), Rect::new(0, 0, 40, 12)),
+            ((6, 0, 2, 12), Rect::new(0, 0, 40, 12)),
+            ((0, 5, 40, 1), Rect::new(2, 0, 37, 12)),
+            ((20, 3, 60, 40), Rect::new(10, 1, 25, 9)),
+        ];
+        for (index, ((x, y, w, h), clip)) in cases.into_iter().enumerate() {
+            let mut fast = mixed_width_buffer(40, 12);
+            let mut slow = fast.clone();
+            Cv::new(&mut fast).clipped(clip, |cv| cv.fill(x, y, w, h, (9, 8, 7)));
+            Cv::new(&mut slow).clipped(clip, |cv| fill_reference(cv, x, y, w, h, (9, 8, 7)));
+            assert_eq!(
+                fast, slow,
+                "case {index}: fill {x},{y} {w}x{h} clip {clip:?}"
+            );
+        }
+    }
+
+    /// `text_width` without the printable-ASCII shortcut.
+    fn text_width_by_graphemes(s: &str) -> i32 {
+        s.graphemes(true).fold(0i32, |width, grapheme| {
+            let display = printable_grapheme(grapheme);
+            let grapheme_width =
+                i32::try_from(UnicodeWidthStr::width(display.as_ref())).unwrap_or(i32::MAX);
+            width.saturating_add(grapheme_width)
+        })
+    }
+
+    #[test]
+    fn ascii_shortcut_measures_exactly_like_the_grapheme_walk() {
+        let every_printable: String = (0x20u8..0x7f).map(char::from).collect();
+        let samples = [
+            "",
+            " ",
+            "a",
+            "hello world",
+            "  indented  ",
+            every_printable.as_str(),
+            // anything outside printable ASCII must still take the full path
+            "tab\there",
+            "line\nbreak",
+            "bell\u{7}",
+            "del\u{7f}",
+            "caf\u{e9}",
+            "e\u{301}",
+            "界x",
+            "🇧🇷",
+            "👩🏽‍💻",
+            "x\u{200d}y",
+        ];
+        for sample in samples {
+            assert_eq!(
+                text_width(sample),
+                text_width_by_graphemes(sample),
+                "{sample:?}"
+            );
+        }
+        // every single printable ASCII character, and every adjacent pair
+        for a in 0x20u8..0x7f {
+            let one = char::from(a).to_string();
+            assert_eq!(text_width(&one), 1, "{one:?}");
+            for b in 0x20u8..0x7f {
+                let two = format!("{}{}", char::from(a), char::from(b));
+                assert_eq!(text_width(&two), text_width_by_graphemes(&two), "{two:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fill_cost_is_linear_in_the_filled_area() {
+        // 400x120 cells. The old per-cell search over every earlier footprint
+        // made this take seconds (about 1.1 billion comparisons); a linear
+        // fill takes a few milliseconds even unoptimised. The bound is loose
+        // enough for a loaded machine and still far below the quadratic cost.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 400, 120));
+        let started = std::time::Instant::now();
+        {
+            let mut cv = Cv::new(&mut buf);
+            for _ in 0..3 {
+                cv.fill(0, 0, 400, 120, (9, 8, 7));
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "three full fills of 400x120 took {elapsed:?}"
+        );
+        assert_eq!(buf[(399, 119)].bg, c((9, 8, 7)));
     }
 
     #[test]
