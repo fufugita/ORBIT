@@ -1402,6 +1402,7 @@ pub fn draw_pane_at_with_council(
         &FrameSpec {
             num,
             title,
+            subtitle: "",
             ident: palette.cyan,
             focused,
             focus_fx: FocusFx::settled(focused),
@@ -2101,6 +2102,7 @@ NINGNING·04  BOLD  MINIMAX    minimax-m3         ◌ 신호없음\n\
                 &FrameSpec {
                     num: 3,
                     title: "Council",
+                    subtitle: "",
                     ident: palette.cyan,
                     focused: true,
                     focus_fx: FocusFx::settled(true),
@@ -2419,6 +2421,7 @@ cost    $0.8400  turns 12  tools 3\n";
                     &FrameSpec {
                         num: 3,
                         title: "Reactor",
+                        subtitle: "",
                         ident: palette.cyan,
                         focused: true,
                         focus_fx: FocusFx::settled(true),

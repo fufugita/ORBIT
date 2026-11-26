@@ -195,14 +195,20 @@ turn. `reduced_motion` holds both still; `glyphs: ascii` keeps the plain text.
 - `sessions` lists this folder's saved sessions, newest first, two lines each:
   the name (`/rename`) or the first words of the conversation, how long ago it
   was saved, the model and the number of turns. The open session has a filled
-  dot. It is drawn by the terminal only (the browser has no such pane). A
+  dot, its name in bold and the word `open` where the others give their age
+  (the sidebar's row for it does too). It is drawn by the terminal only (the
+  browser has no such pane). A
   click on a row, or `j`/`k` (or the wheel) and `⏎`, resumes that session like
   `/resume`; while a turn is running it waits. `r` lists again at once. The
   list is read from the newest session files only (at most 48 are opened), only
   while the pane or the sidebar is on screen and never during a turn, and at
   most every 5 seconds. The sidebar's SESSIONS section shows the same list
   (the open session, then up to four others, as many as the height allows) and
-  its rows are clickable too, except while the layout is being arranged.
+  its rows are clickable too, except while the layout is being arranged. A
+  click is answered at once with the session it landed on, and the header of
+  the Conversation panel names the open session (its `/rename` name, else the
+  first words of the conversation) for as long as the panel is wide enough to
+  say it. `/sessions` opens with its selection on the open session.
 
 With `glyphs: ascii` every pane prints ASCII marks, and the council and
 reactor panes print English labels.

@@ -148,10 +148,21 @@ impl FocusFx {
     }
 }
 
+/// The cells between a title and its subtitle: " · ".
+const SUBTITLE_GAP: i32 = 3;
+
+/// The least room worth giving a subtitle: with less, a few letters and an
+/// ellipsis say nothing, and the header is better without them.
+pub const MIN_SUBTITLE: i32 = 6;
+
 /// What a panel frame needs.
 pub struct FrameSpec<'a> {
     pub num: usize,
     pub title: &'a str,
+    /// What the panel is about, drawn after the title in the room the title
+    /// and the badge leave. Empty for none; clipped, or left out when fewer
+    /// than `MIN_SUBTITLE` cells remain.
+    pub subtitle: &'a str,
     pub ident: Rgb,
     pub focused: bool,
     pub focus_fx: FocusFx,
@@ -286,10 +297,12 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
     }
     let bw = badge.as_ref().map(|b| pill_width(b)).unwrap_or(0);
     let room = w - 6 - (xx - x) - bw;
+    let shown = clip_text(spec.title, room.max(1));
+    let shown_w = text_width(&shown);
     cv.put(
         xx + 1,
         y + 1,
-        &clip_text(spec.title, room.max(1)),
+        &shown,
         if spec.focused {
             colors.ink
         } else {
@@ -298,6 +311,20 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
         Some(band),
         Modifier::BOLD,
     );
+    // The title keeps its room first; the subtitle takes what is left.
+    let sub_room = room - shown_w - SUBTITLE_GAP;
+    if !spec.subtitle.is_empty() && sub_room >= MIN_SUBTITLE {
+        let at = xx + 1 + shown_w;
+        cv.text(at, y + 1, " · ", colors.faint, Some(band));
+        cv.put(
+            at + SUBTITLE_GAP,
+            y + 1,
+            &clip_text(spec.subtitle, sub_room),
+            colors.ink2,
+            Some(band),
+            Modifier::empty(),
+        );
+    }
     if let Some(b) = &badge {
         let lead = b.first().map(|s| s.fg).unwrap_or(colors.muted);
         pill(
@@ -354,4 +381,85 @@ pub fn empty_state(cv: &mut Cv, inner: Rect, glyph: &str, col: Rgb, title: &str,
 
 pub fn badge(state: BadgeState, extra: Option<&str>, now_ms: u64, reduced: bool) -> Vec<Seg> {
     badge_themed(Palette::default(), state, extra, now_ms, reduced)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    /// The header band's row of a panel `width` cells wide.
+    fn header(width: u16, title: &str, subtitle: &str, badge: bool) -> String {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 6));
+        let mut cv = Cv::new(&mut buf);
+        let colors = cv.palette;
+        let badge = badge.then(|| {
+            vec![
+                Seg::bold("○ ", colors.muted),
+                Seg::new("idle", colors.muted),
+            ]
+        });
+        panel_frame(
+            &mut cv,
+            Rect::new(0, 0, width, 6),
+            &FrameSpec {
+                num: 2,
+                title,
+                subtitle,
+                ident: colors.magenta,
+                focused: true,
+                focus_fx: FocusFx::settled(true),
+                badge,
+                attention: 0.0,
+                footer: vec![],
+                footer_parts: vec![],
+            },
+        );
+        (0..width)
+            .map(|x| buf[(x, 1)].symbol().to_string())
+            .collect()
+    }
+
+    /// The subtitle follows the title, after a dot, with nothing else moved.
+    #[test]
+    fn a_subtitle_follows_the_title_in_the_room_left() {
+        let row = header(70, "Conversation", "Fix the login redirect", true);
+        assert!(
+            row.contains("Conversation · Fix the login redirect"),
+            "{row:?}"
+        );
+        assert!(row.contains("○ idle"), "the badge is still there: {row:?}");
+        let plain = header(70, "Conversation", "", true);
+        assert!(!plain.contains('·'), "no subtitle, no dot: {plain:?}");
+        assert!(plain.contains("Conversation") && plain.contains("○ idle"));
+    }
+
+    /// A subtitle too long for the room is clipped with an ellipsis; it
+    /// never covers the badge, and the title is whole.
+    #[test]
+    fn a_long_subtitle_is_clipped_before_the_badge() {
+        let row = header(
+            46,
+            "Conversation",
+            "A very long first prompt that cannot possibly fit here",
+            true,
+        );
+        assert!(row.contains("Conversation · A very"), "{row:?}");
+        assert!(row.contains('…'), "{row:?}");
+        assert!(row.contains("○ idle"), "the badge is whole: {row:?}");
+    }
+
+    /// With less than the least room, a few letters and an ellipsis say
+    /// nothing, so the header goes without.
+    #[test]
+    fn a_subtitle_is_left_out_when_the_room_is_too_small() {
+        for width in [20u16, 24, 28, 32] {
+            let row = header(width, "Conversation", "Fix the login redirect", true);
+            assert!(!row.contains('·'), "{width} wide: {row:?}");
+        }
+        // The same panel, wide enough for the least room but no more.
+        let least = 6 + 5 + 12 + 3 + MIN_SUBTITLE as u16 + 8;
+        let row = header(least, "Conversation", "Fix the login redirect", true);
+        assert!(row.contains("Conversation · "), "{least} wide: {row:?}");
+    }
 }

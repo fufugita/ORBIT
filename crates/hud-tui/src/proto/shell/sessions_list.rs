@@ -16,6 +16,10 @@ use ratatui::style::Modifier;
 /// The most other sessions the sidebar lists under the open one.
 pub const SIDEBAR_MAX: usize = 4;
 
+/// What the open session's row says where the others give their age. Not
+/// "now": a session saved a moment ago says that too.
+pub const OPEN_TAG: &str = "open";
+
 /// What one row says, apart from where it is drawn.
 #[derive(Debug, PartialEq, Eq)]
 struct RowText {
@@ -31,19 +35,25 @@ fn short_id(id: &str) -> String {
     id.chars().skip(count.saturating_sub(8)).collect()
 }
 
-fn row_text(row: &SavedSession, current: bool) -> RowText {
+/// What a saved session is called in a list or a message about it: its
+/// name or first words on one line, else what it is without either.
+pub fn row_title(row: &SavedSession) -> String {
     // One line, whatever the title holds.
     let title = row.title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = if !title.is_empty() {
+    if !title.is_empty() {
         title
     } else if row.turns == 0 {
         // The session the screen opened on, before anything was said.
         "New session".to_owned()
     } else {
         format!("untitled · {}", short_id(&row.id))
-    };
+    }
+}
+
+fn row_text(row: &SavedSession, current: bool) -> RowText {
+    let title = row_title(row);
     let age = if current {
-        "now".to_owned()
+        OPEN_TAG.to_owned()
     } else {
         row.age.clone()
     };
@@ -91,6 +101,7 @@ pub fn draw_pane(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         &FrameSpec {
             num: inp.num,
             title: "Sessions",
+            subtitle: "",
             ident: colors.magenta,
             focused: inp.focused,
             focus_fx: inp.focus_fx,
@@ -160,7 +171,13 @@ pub fn draw_pane(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                     cv.text(fill_x, yy + line, "▌", colors.magenta, Some(bg));
                 }
             }
-            let text = row_text(row, current);
+            let mut text = row_text(row, current);
+            if current && let Some(live) = inp.s.session_name_or_title() {
+                // The screen's own word for the open session: a rename or a
+                // first prompt is here before the list is read again. With
+                // nothing said yet, the list's own title stands.
+                text.title = live;
+            }
             let (glyph, glyph_colour) = if current {
                 ("●", colors.magenta)
             } else {
@@ -187,17 +204,11 @@ pub fn draw_pane(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 },
             );
             if age_fits {
-                cv.text(
-                    x + w - age_w,
-                    yy,
-                    age,
-                    if current {
-                        colors.magenta
-                    } else {
-                        colors.muted
-                    },
-                    Some(bg),
-                );
+                if current {
+                    cv.bold(x + w - age_w, yy, age, colors.magenta, Some(bg));
+                } else {
+                    cv.text(x + w - age_w, yy, age, colors.muted, Some(bg));
+                }
             }
             if lines == 2 {
                 cv.text(
@@ -351,7 +362,11 @@ mod tests {
         assert_eq!(t.title, "Fix the login", "one line, single spaces");
         assert_eq!(t.age, "5m ago");
         assert_eq!(t.detail, "mock/m1 · 1 turn");
-        assert_eq!(row_text(&row, true).age, "now", "the open session is now");
+        assert_eq!(
+            row_text(&row, true).age,
+            OPEN_TAG,
+            "the open session says so where the others give their age"
+        );
         let untitled = row_text(&saved("session-0123456789abcdef", "", 3, "1h ago"), false);
         assert_eq!(untitled.title, "untitled · 89abcdef");
         assert_eq!(untitled.detail, "mock/m1 · 3 turns");
@@ -376,7 +391,7 @@ mod tests {
             "Rename the config keys",
             "untitled · ession-a",
             "6 turns",
-            "now",
+            OPEN_TAG,
             "2h",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in\n{text}");
@@ -575,5 +590,66 @@ mod tests {
         assert_eq!(sidebar_room(26), 2);
         assert_eq!(sidebar_room(30), 4);
         assert_eq!(sidebar_room(80), SIDEBAR_MAX);
+    }
+
+    /// The first cell of `needle` on row `y`, one cell to a symbol.
+    fn find_cells(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
+        let want: Vec<String> = needle.chars().map(String::from).collect();
+        (0..buf.area.width.saturating_sub(want.len() as u16)).find(|&x| {
+            want.iter()
+                .enumerate()
+                .all(|(i, symbol)| buf[(x + i as u16, y)].symbol() == symbol)
+        })
+    }
+
+    /// Where the others give their age, the open session says so, in bold:
+    /// "now" would not do, a session saved a moment ago says that too.
+    #[test]
+    fn only_the_open_row_says_open_and_it_is_bold() {
+        let mut rows = three();
+        rows[1].age = "just now".into();
+        let s = scenario(rows, "session-c");
+        let (buf, hits) = render_pane(&s, 50, 16);
+        let text = screen(&buf);
+        assert_eq!(
+            text.matches(OPEN_TAG).count(),
+            1,
+            "one row is open:\n{text}"
+        );
+        let first_line = |index: usize| {
+            hits.iter()
+                .find(|h| h.click == Click::Session(index))
+                .map(|h| h.rect.y)
+                .expect("row drawn")
+        };
+        let open_at = find_cells(&buf, first_line(0), OPEN_TAG).expect("the open row says open");
+        let open_cell = &buf[(open_at, first_line(0))];
+        assert!(open_cell.modifier.contains(Modifier::BOLD), "bold");
+        let others_age = find_cells(&buf, first_line(1), "now").expect("a row saved just now");
+        let other_cell = &buf[(others_age, first_line(1))];
+        assert!(
+            !other_cell.modifier.contains(Modifier::BOLD),
+            "another row's age is plain"
+        );
+        assert_ne!(open_cell.fg, other_cell.fg, "the tag has the accent colour");
+    }
+
+    /// The open row says what the screen calls the session: a rename, or a
+    /// first prompt, is there before the list is read again.
+    #[test]
+    fn the_open_row_uses_the_screens_label_not_a_stale_listed_title() {
+        let mut s = scenario(three(), "session-b");
+        s.session_name = Some(("session-b".into(), "Fresh name".into()));
+        let (buf, _) = render_pane(&s, 50, 16);
+        let text = screen(&buf);
+        assert!(text.contains("Fresh name"), "{text}");
+        assert!(
+            !text.contains("Rename the config keys"),
+            "the open row's older listed title is not shown:\n{text}"
+        );
+        assert!(
+            text.contains("Fix the login redirect"),
+            "the others keep their listed titles:\n{text}"
+        );
     }
 }

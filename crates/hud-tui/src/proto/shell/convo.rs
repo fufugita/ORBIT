@@ -2495,9 +2495,14 @@ pub(crate) fn draw_reading(
         "Conversation"
     }
     .to_string();
+    // Which session this is: its `/rename` name, else its first words. A
+    // click on a saved session changes this at once, whatever else is on
+    // screen.
+    let subtitle = s.session_name_or_title().unwrap_or_default();
     let spec = FrameSpec {
         num: inp.num,
         title: &title,
+        subtitle: &subtitle,
         ident: colors.magenta,
         focused: inp.focused,
         focus_fx: inp.focus_fx,

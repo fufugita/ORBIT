@@ -573,6 +573,20 @@ fn publish_council(
     });
 }
 
+/// Tell the screen what the operator called this session (`/rename`), so it
+/// can say which session is open. A session with no name sends an empty one,
+/// which is also how a name is taken away.
+fn emit_session_name(sender: &BusSender, home: &std::path::Path, session_id: &str) {
+    let name = crate::session_names::load(home)
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default();
+    sender.send(Msg::SessionNamed {
+        session_id: session_id.to_owned(),
+        name,
+    });
+}
+
 fn restore_council(
     sender: &BusSender,
     session_id: &str,
@@ -2200,6 +2214,7 @@ fn worker_main_initialized(
         ctx.sender.send(Msg::SystemMessage(notice));
     }
     restore_council(&ctx.sender, &config.session_id, &transcript, &qualification);
+    emit_session_name(&ctx.sender, &config.home, &config.session_id);
     orbit_hud_tui::emit_readiness(&ctx.sender, vec![sandbox_readiness(&config.home)]);
 
     // Locally-queued commands (mod commands re-enter the Prompt flow).
@@ -4263,8 +4278,21 @@ fn worker_main_initialized(
                             let name = what.trim_start_matches("rename").trim();
                             match crate::session_names::set(&config.home, &binding.session_id, name)
                             {
-                                Ok(name) if name.is_empty() => "session name cleared".into(),
-                                Ok(name) => format!("session named \"{name}\" (shown in /sessions)"),
+                                Ok(name) => {
+                                    // The header and the lists say the new name
+                                    // at once, without reading the file again.
+                                    turn_sender.send(Msg::SessionNamed {
+                                        session_id: binding.session_id.clone(),
+                                        name: name.clone(),
+                                    });
+                                    if name.is_empty() {
+                                        "session name cleared".into()
+                                    } else {
+                                        format!(
+                                            "session named \"{name}\" (shown in the header, /sessions, the sidebar and the Sessions pane)"
+                                        )
+                                    }
+                                }
                                 Err(error) => error,
                             }
                         }
@@ -4776,6 +4804,7 @@ fn worker_main_initialized(
         }
         if switching_session {
             restore_council(&ctx.sender, &config.session_id, &transcript, &qualification);
+            emit_session_name(&ctx.sender, &config.home, &config.session_id);
         }
         for text in after_projection
             .into_iter()
@@ -11140,6 +11169,8 @@ if event["hook_event_name"] == "SessionStart":
     struct SessionHookWorker {
         bus: orbit_hud_tui::bus::Bus,
         notices: Vec<String>,
+        /// Every `(session id, name)` the worker said, in order.
+        names: Vec<(String, String)>,
         ordinary_end: Option<Msg>,
         commands: Option<mpsc::Sender<WorkerCommand>>,
         cancel: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
@@ -11176,6 +11207,7 @@ if event["hook_event_name"] == "SessionStart":
             let mut worker = Self {
                 bus,
                 notices: Vec::new(),
+                names: Vec::new(),
                 ordinary_end: None,
                 commands: Some(commands),
                 cancel,
@@ -11198,6 +11230,9 @@ if event["hook_event_name"] == "SessionStart":
                         panic!("session hook worker failed: {error}")
                     }
                     Some(Msg::SystemMessage(text)) => self.notices.push(text),
+                    Some(Msg::SessionNamed { session_id, name }) => {
+                        self.names.push((session_id, name));
+                    }
                     Some(message @ Msg::OrdinaryTurnEnded { .. }) => {
                         self.ordinary_end = Some(message);
                     }
@@ -11206,6 +11241,29 @@ if event["hook_event_name"] == "SessionStart":
                 assert!(
                     std::time::Instant::now() < deadline,
                     "session hook projection absent"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        /// The newest name the worker has said for `session_id`, waiting for
+        /// one when it has not yet (it follows the projection of a switch).
+        fn named(&mut self, session_id: &str) -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some((_, name)) = self.names.iter().rev().find(|(id, _)| id == session_id) {
+                    return name.clone();
+                }
+                match self.bus.try_recv() {
+                    Some(Msg::SessionNamed { session_id, name }) => {
+                        self.names.push((session_id, name));
+                    }
+                    Some(Msg::SystemMessage(text)) => self.notices.push(text),
+                    _ => {}
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no name was said for {session_id}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -11809,6 +11867,78 @@ if event["hook_event_name"] == "SessionStart":
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
+    }
+
+    /// The screen cannot tell which session is open from the first prompt
+    /// alone: a `/rename` name has to reach it, when it is made and when it
+    /// is taken away, and the session's start says it has none.
+    #[test]
+    fn a_rename_tells_the_screen_the_name_at_once_and_clearing_it_says_so() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::a_rename_tells_the_screen_the_name_at_once_and_clearing_it_says_so",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        let id = startup.binding.session_id.clone();
+        worker.command(
+            &startup.binding,
+            WorkerCommand::Inspect("rename login work".into()),
+            1,
+        );
+        worker.command(&startup.binding, WorkerCommand::Inspect("rename".into()), 2);
+        let said: Vec<&str> = worker
+            .names
+            .iter()
+            .filter(|(session, _)| *session == id)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert_eq!(
+            said,
+            ["", "login work", ""],
+            "none at the start, the new name, then none again"
+        );
+        assert!(
+            worker.notices.iter().any(
+                |text| text.contains("session named \"login work\"") && text.contains("header")
+            ),
+            "the notice says where the name shows: {:?}",
+            worker.notices
+        );
+    }
+
+    /// Resuming a named session says its name once the screen has switched,
+    /// and the name is the resumed session's, not the one it left.
+    #[test]
+    fn a_resumed_session_says_its_own_name_after_the_switch() {
+        if !isolated_council_clear_case(
+            "tui_worker::session_tests::a_resumed_session_says_its_own_name_after_the_switch",
+        ) {
+            return;
+        }
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        let initial = lifecycle_fixture(&home, &mock);
+        let mut target = initial.clone();
+        target.session_id = "resume-named".into();
+        drop(fresh_council_worker_lease(&target));
+        crate::session_names::set(&home, "resume-named", "the one I named").unwrap();
+        let (mut worker, startup) = SessionHookWorker::start(initial);
+        assert_eq!(
+            worker.named(&startup.binding.session_id),
+            "",
+            "the session the screen opened on has no name"
+        );
+        let resumed = worker.command(
+            &startup.binding,
+            WorkerCommand::ResumeSession("resume-named".into()),
+            1,
+        );
+        assert_eq!(resumed.binding.session_id, "resume-named");
+        assert_eq!(worker.named("resume-named"), "the one I named");
     }
 
     #[test]

@@ -402,6 +402,14 @@ pub enum Msg {
     /// refused for being unsolicited: the screen asked for it by showing
     /// the list.
     SavedSessions(Vec<SavedSession>),
+    /// What the operator called the session `session_id` (`/rename`); an empty
+    /// `name` means it has none. Sent when a session is restored and when it
+    /// is renamed. The name belongs to the session it names: a message that
+    /// arrives after the screen has moved to another session labels nothing.
+    SessionNamed {
+        session_id: String,
+        name: String,
+    },
     /// The worker restored a session on boot or via `/resume <id>` — replaces
     /// the transcript and counters in one reduce.
     TranscriptLoaded {

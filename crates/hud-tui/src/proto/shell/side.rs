@@ -5,8 +5,9 @@
 use super::canvas::{Cv, Rgb, Seg, clip_text, text_width, tint};
 use super::convo::kind_of;
 use super::frame::{pill, pill_width, star_frame};
+use super::hits::Click;
 use super::motion::{flash, secs};
-use super::sessions_list;
+use super::sessions_list::{self, OPEN_TAG};
 use crate::proto::scenario::{LineKind, Scenario, ToolState};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -53,27 +54,31 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono
         yy += 2;
         let bg = tint(colors.magenta, colors.sidebar, 0.1);
         cv.fill(x, yy, w, 1, bg);
+        // The open session's row answers a click as the others do: it says
+        // which session this is, instead of leaving the click unanswered.
+        if let Some(i) = s.saved_sessions.current_index(&s.session_id) {
+            cv.hit(x, yy, w, 1, Click::Session(i));
+        }
         cv.text(x, yy, "▌", colors.magenta, Some(bg));
+        // The glyph is what the session is doing; the word on the right is
+        // always there, so the open one can be told from the rest at a glance.
+        // (Their ages would say "now" too, for anything saved a moment ago.)
         let (g, gc, right, rc) = if approval {
             ("◆".to_string(), colors.magenta, "needs you", colors.magenta)
         } else if s.turn_live {
             (
                 star_frame(now_ms, reduced).to_string(),
                 colors.cyan,
-                "now",
-                colors.muted,
+                OPEN_TAG,
+                colors.magenta,
             )
         } else if s.turn_report.is_some() {
-            ("✓".to_string(), colors.green, "now", colors.muted)
+            ("✓".to_string(), colors.green, OPEN_TAG, colors.magenta)
         } else {
-            ("○".to_string(), colors.muted, "now", colors.muted)
+            ("●".to_string(), colors.magenta, OPEN_TAG, colors.magenta)
         };
         cv.bold(x + 2, yy, &g, gc, Some(bg));
-        let title = if s.transcript.is_empty() {
-            "New session".to_string()
-        } else {
-            s.session_title()
-        };
+        let title = s.session_label();
         cv.put(
             x + 4,
             yy,
@@ -356,4 +361,138 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono
             yy += 1;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::scenario::TranscriptLine;
+    use ratatui::buffer::Buffer;
+
+    /// The sidebar's rows as text, one string a row.
+    fn rows(s: &Scenario) -> Vec<String> {
+        let (w, h) = (WIDTH, 30);
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        let mut cv = Cv::new(&mut buf);
+        draw(&mut cv, Rect::new(0, 0, w, h), s, 0, false, false);
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    /// The open session's own row: the first under the SESSIONS heading.
+    fn open_row(s: &Scenario) -> String {
+        rows(s)[3].clone()
+    }
+
+    fn prompted(text: &str) -> Scenario {
+        let mut s = Scenario {
+            session_id: "session-open".into(),
+            ..Default::default()
+        };
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::User,
+            text: text.into(),
+            ..Default::default()
+        });
+        s
+    }
+
+    /// The open row had a hollow dot and "now", the same as any session
+    /// saved a moment ago. It is filled and says "open" instead.
+    #[test]
+    fn the_open_session_has_a_filled_dot_and_says_open() {
+        let row = open_row(&prompted("Fix the login redirect"));
+        assert!(row.starts_with('▌'), "{row:?}");
+        assert!(row.contains('●') && !row.contains('○'), "{row:?}");
+        assert!(row.contains("Fix the login red"), "{row:?}");
+        assert!(row.trim_end().ends_with(OPEN_TAG), "{row:?}");
+        assert!(!row.contains("now"), "{row:?}");
+        let new = open_row(&Scenario::default());
+        assert!(
+            new.contains("New session") && new.trim_end().ends_with(OPEN_TAG),
+            "{new:?}"
+        );
+    }
+
+    /// The word stays while the session works, so the open one can still be
+    /// found; only the dot gives way to what it is doing.
+    #[test]
+    fn the_word_stays_while_the_session_works() {
+        let mut s = prompted("Fix the login redirect");
+        s.turn_live = true;
+        let row = open_row(&s);
+        assert!(!row.contains('●') && !row.contains('○'), "{row:?}");
+        assert!(row.trim_end().ends_with(OPEN_TAG), "{row:?}");
+    }
+
+    /// A question to the operator outranks the label: it is what the row
+    /// has to say, and the row is still the open one by its bar.
+    #[test]
+    fn a_waiting_approval_replaces_the_word() {
+        let mut s = prompted("Fix the login redirect");
+        s.approval_pending = Some("Bash(ls)".into());
+        let row = open_row(&s);
+        assert!(row.starts_with('▌') && row.contains("needs you"), "{row:?}");
+        assert!(!row.contains(OPEN_TAG), "{row:?}");
+    }
+
+    /// The open row is a click target like the rest, so that a click on it is
+    /// answered; with the session not in the list yet there is nothing to ask.
+    #[test]
+    fn the_open_row_is_a_click_target_once_the_list_has_it() {
+        let saved = |id: &str| crate::msg::SavedSession {
+            id: id.into(),
+            title: id.into(),
+            model: "m".into(),
+            turns: 1,
+            age: "1m ago".into(),
+            current: false,
+        };
+        let draw_hits = |s: &Scenario| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, WIDTH, 30));
+            let mut cv = Cv::new(&mut buf);
+            draw(&mut cv, Rect::new(0, 0, WIDTH, 30), s, 0, false, false);
+            cv.take_hits()
+        };
+        let mut s = prompted("Fix the login redirect");
+        assert!(
+            !draw_hits(&s)
+                .iter()
+                .any(|hit| matches!(hit.click, Click::Session(_))),
+            "an unlisted session has no row to answer for"
+        );
+        s.saved_sessions
+            .receive(vec![saved("session-other"), saved("session-open")]);
+        let open = s.saved_sessions.current_index("session-open").unwrap();
+        let hits = draw_hits(&s);
+        let on_open_row = hits
+            .iter()
+            .find(|hit| hit.click == Click::Session(open))
+            .expect("the open row is a target");
+        assert_eq!(
+            (
+                on_open_row.rect.y,
+                on_open_row.rect.width,
+                on_open_row.rect.height
+            ),
+            (3, WIDTH, 1),
+            "the whole row, on the line the open session is drawn"
+        );
+    }
+
+    /// A rename shows at once, in place of the first prompt, and a name that
+    /// belongs to another session shows nowhere.
+    #[test]
+    fn the_open_row_wears_the_sessions_name() {
+        let mut s = prompted("Fix the login redirect");
+        s.session_name = Some(("session-open".into(), "login work".into()));
+        assert!(open_row(&s).contains("login work"), "{:?}", open_row(&s));
+        s.session_name = Some(("session-else".into(), "not mine".into()));
+        let row = open_row(&s);
+        assert!(
+            !row.contains("not mine") && row.contains("Fix the login"),
+            "{row:?}"
+        );
+    }
 }

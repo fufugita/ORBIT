@@ -115,6 +115,10 @@ pub struct Scenario {
         std::collections::BTreeMap<String, orbit_frontend_protocol::customization::PaneOutput>,
     /// This folder's saved sessions, for the sidebar and the Sessions pane.
     pub saved_sessions: crate::proto::saved_sessions::SavedSessions,
+    /// The `/rename` name of one session, with that session's id. It counts
+    /// only while the id is the open session's, so a name that arrives late,
+    /// or one left over from before a switch, labels nothing.
+    pub session_name: Option<(String, String)>,
     /// The council engine's state as the pane draws it. Filled from the
     /// session's pane context; `None` when no council has published.
     pub council: Option<crate::proto::ported::CouncilState>,
@@ -967,15 +971,31 @@ impl Scenario {
         self.tasks.is_empty() && self.file_changes.is_empty()
     }
 
-    /// The session title (§13.2): the first prompt's first line,
-    /// else `New session`.
-    pub fn session_title(&self) -> String {
-        for l in &self.transcript {
-            if l.kind == LineKind::User {
-                return l.text.lines().next().unwrap_or("New session").to_string();
-            }
-        }
-        "New session".into()
+    /// What the open session is called, if anything says: the operator's
+    /// `/rename` name, else the first non-empty line of the first prompt
+    /// (§13.2), the same words the saved-sessions list gives it. One line,
+    /// whatever the text holds. `None` before a prompt or a name.
+    pub fn session_name_or_title(&self) -> Option<String> {
+        let named = self
+            .session_name
+            .as_ref()
+            .filter(|(id, name)| *id == self.session_id && !name.trim().is_empty())
+            .map(|(_, name)| name.as_str());
+        let words = named.or_else(|| {
+            self.transcript
+                .iter()
+                .find(|line| line.kind == LineKind::User)
+                .and_then(|line| line.text.lines().find(|text| !text.trim().is_empty()))
+        })?;
+        Some(words.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+
+    /// The open session's title (§13.2): its name or first words, `New
+    /// session` when nothing has named it yet. Every place that says which
+    /// session is open asks this, so they cannot disagree.
+    pub fn session_label(&self) -> String {
+        self.session_name_or_title()
+            .unwrap_or_else(|| "New session".into())
     }
 
     /// Reset the Reactor's observations when the conversation namespace changes.
@@ -1336,6 +1356,81 @@ mod tests {
         assert_eq!(s.selected_hunk(), 0);
         s.file_sel = 9;
         assert_eq!(s.selected_file(), Some(0), "an out-of-range file clamps");
+    }
+
+    fn said(kind: LineKind, text: &str) -> TranscriptLine {
+        TranscriptLine {
+            kind,
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Nothing names a session before its first prompt, and the label says
+    /// so instead of staying blank.
+    #[test]
+    fn an_unnamed_session_with_no_prompt_is_a_new_session() {
+        let mut s = Scenario::default();
+        assert_eq!(s.session_name_or_title(), None);
+        assert_eq!(s.session_label(), "New session");
+        s.transcript.push(said(LineKind::System, "ready"));
+        assert_eq!(
+            s.session_name_or_title(),
+            None,
+            "a system line names nothing"
+        );
+    }
+
+    /// The first non-empty line of the first prompt is the title, on one
+    /// line: the same words the saved-sessions list gives the session.
+    #[test]
+    fn the_first_prompt_titles_a_session_on_one_line() {
+        let mut s = Scenario::default();
+        s.transcript.push(said(LineKind::System, "hello"));
+        s.transcript.push(said(
+            LineKind::User,
+            "\n  \n  Fix   the\tlogin redirect \nthen the tests",
+        ));
+        s.transcript.push(said(LineKind::User, "a second prompt"));
+        assert_eq!(s.session_label(), "Fix the login redirect");
+        assert_eq!(
+            s.session_name_or_title().as_deref(),
+            Some("Fix the login redirect")
+        );
+    }
+
+    /// A `/rename` name beats the first prompt, but only while the name
+    /// belongs to the session that is open: one for another session, or one
+    /// that is empty, leaves the title alone.
+    #[test]
+    fn a_name_beats_the_first_prompt_only_for_the_open_session() {
+        let mut s = Scenario {
+            session_id: "session-b".into(),
+            ..Default::default()
+        };
+        s.transcript
+            .push(said(LineKind::User, "Fix the login redirect"));
+        s.session_name = Some(("session-b".into(), "  login  work\n".into()));
+        assert_eq!(s.session_label(), "login work");
+        s.session_name = Some(("session-a".into(), "someone else's".into()));
+        assert_eq!(
+            s.session_label(),
+            "Fix the login redirect",
+            "a name for another session labels nothing"
+        );
+        s.session_name = Some(("session-b".into(), "   ".into()));
+        assert_eq!(
+            s.session_label(),
+            "Fix the login redirect",
+            "blank is no name"
+        );
+        s.transcript.clear();
+        s.session_name = Some(("session-b".into(), "kept".into()));
+        assert_eq!(
+            s.session_label(),
+            "kept",
+            "a named session needs no prompt to be called something"
+        );
     }
 }
 

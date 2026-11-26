@@ -74,6 +74,7 @@ fn frame<'a>(
         &FrameSpec {
             num: inp.num,
             title: view.title(),
+            subtitle: "",
             ident: ident_themed(colors, view),
             focused: inp.focused,
             focus_fx: inp.focus_fx,
@@ -1068,6 +1069,7 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         &FrameSpec {
             num: inp.num,
             title: &title,
+            subtitle: "",
             ident: if inp.agent == "review" {
                 colors.green
             } else {

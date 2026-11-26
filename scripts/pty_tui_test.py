@@ -1999,9 +1999,17 @@ TUI_GAP_SESSIONS_LIST_CHECKS = {
     "sidebar lists the saved sessions of this folder": False,
     "a mouse click on a sidebar session row resumes that session": False,
     "the resumed session is marked as the open one in the sidebar": False,
+    "the open session in the sidebar has a filled dot and says open": False,
+    "the Conversation header names the session a click resumed": False,
+    "a click on the open session's own row is answered": False,
     "Show what? offers Sessions on the s key": False,
     "the Sessions pane lists the saved sessions on two-line rows": False,
     "a click in the Sessions pane resumes that session and returns the keyboard to the composer": False,
+    "the Sessions pane marks the open session with a filled dot and says open": False,
+    "the Conversation header follows a click in the Sessions pane": False,
+    "/sessions opens with its selection on the open session": False,
+    "a /rename shows in the Conversation header at once": False,
+    "a /rename shows on the sidebar's open row too": False,
 }
 
 
@@ -4463,6 +4471,32 @@ def _tui_gap_run_sessions_list(args):
         check("the resumed session is marked as the open one in the sidebar", marked,
               "\n".join(sidebar(screen))[:1500])
 
+        def header_rows(screen_text):
+            return [row for row in screen_text.splitlines() if "Conversation" in row]
+
+        def header_names(screen_text, text):
+            return any(f"Conversation · {text}" in row for row in header_rows(screen_text))
+
+        # The open row is told from the rest by more than a bar: a filled dot
+        # and the word "open" where the others give their age.
+        open_row = next((row[:30] for row in screen.splitlines()
+                         if row.startswith("▌") and prompts[1] in row[:30]), "")
+        check("the open session in the sidebar has a filled dot and says open",
+              "●" in open_row and open_row.rstrip().endswith("open"), repr(open_row))
+        # And the main screen says it too, whatever the sidebar shows.
+        named, screen = wait_until(lambda text: header_names(text, prompts[1][:7]))
+        check("the Conversation header names the session a click resumed", named,
+              "\n".join(header_rows(screen))[:600])
+        # The one click the list used to leave unanswered: the row already open.
+        open_y = next((y for y, row in enumerate(screen.splitlines())
+                       if row.startswith("▌") and prompts[1] in row[:30]), None)
+        answered = False
+        if open_y is not None:
+            sess.click(8, open_y)
+            answered, screen = wait_until(lambda text: "already on" in text, seconds=6)
+        check("a click on the open session's own row is answered", answered,
+              f"open_y={open_y}; frame={_tui_gap_screen_diagnostic(sess, screen)}")
+
         sess.write(b"\x1b")  # arrange
         sess.read(0.4)
         sess.write(b"v")  # split: "Show what?"
@@ -4504,6 +4538,47 @@ def _tui_gap_run_sessions_list(args):
         check("a click in the Sessions pane resumes that session and returns the keyboard "
               "to the composer", back,
               f"pane_row={pane_row}; frame={_tui_gap_screen_diagnostic(sess, screen)}")
+
+        # The open row of the pane, and the header, followed the click.
+        in_pane_open, screen = wait_until(lambda text: any(
+            re.search(r"●\s+" + re.escape(prompts[2]) + r"\s+open\b", row)
+            for row in text.splitlines()))
+        check("the Sessions pane marks the open session with a filled dot and says open",
+              in_pane_open, "\n".join(row[31:] for row in screen.splitlines())[:1500])
+        # A sidebar and four panels leave the Conversation header no room for a
+        # name at 160 columns, and it leaves the name out rather than clip it
+        # to a few letters; on a wide terminal it fits.
+        sess.resize(50, 260)
+        sess.read(0.8)
+        followed, screen = wait_until(lambda text: header_names(text, prompts[2][:7]))
+        check("the Conversation header follows a click in the Sessions pane", followed,
+              "\n".join(header_rows(screen))[:600])
+
+        # The picker opens on the session the screen is on: its selection bar
+        # and its "(this session)" mark are on one row.
+        sess.write(b"\x7f\x7f")  # take the two typed letters out of the draft
+        sess.read(0.3)
+        sess.type("/sessions")
+        sess.write(b"\r")
+        opened, screen = wait_until(lambda text: "(this session)" in text
+                                    and "SESSIONS" in text)
+        marked_row = next((row for row in screen.splitlines() if "(this session)" in row), "")
+        check("/sessions opens with its selection on the open session",
+              opened and re.search(r"┃▌ \S+\s+\(this session\)", marked_row) is not None,
+              repr(marked_row))
+        sess.write(b"\x1b")  # close the picker
+        sess.read(0.5)
+
+        # A rename reaches the header and the open row at once.
+        sess.type("/rename login work")
+        sess.write(b"\r")
+        renamed, screen = wait_until(lambda text: header_names(text, "login work"))
+        check("a /rename shows in the Conversation header at once", renamed,
+              "\n".join(header_rows(screen))[:600])
+        on_row = any(row.startswith("▌") and "login work" in row[:30]
+                     for row in screen.splitlines())
+        check("a /rename shows on the sidebar's open row too", on_row,
+              "\n".join(sidebar(screen))[:900])
     except Exception as exc:
         check("sessions-list TUI scenario completes", False,
               f"exception_type={type(exc).__name__}", independent=True, prerequisite=True)
@@ -7338,7 +7413,11 @@ def main():
             m = "m" if release else "M"
             sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
         screen = sb.screen_text().split("\n")
-        user_row = next((i for i, l in enumerate(screen) if "hello world" in l), None)
+        # The prompt is on screen twice: in the turn, and in the Conversation
+        # header, which names the session by its first prompt. A person means to
+        # select the turn, which is the lower of the two.
+        user_row = next((i for i in range(len(screen) - 1, -1, -1)
+                         if "hello world" in screen[i]), None)
         if user_row is None:
             check("selection fixture displays the exact prompt and response",
                   prompt_visible and response_visible,

@@ -2661,7 +2661,7 @@ fn run_proto_inner(
                 };
                 reading.commit(conversation_frame);
                 guard.set_title(&terminal_title(
-                    &scenario.session_title(),
+                    &scenario.session_label(),
                     scenario.turn_live || scenario.compacting,
                     scenario.approval_pending.is_some(),
                 ));
@@ -2968,9 +2968,23 @@ fn handle_key_with_read(
                                     Some(WorkerCommand::SetModel(row.value.clone()))
                                 }
                                 // Resuming the session we're already on is a
-                                // no-op: just close.
-                                _ => (row.value != current_id)
-                                    .then_some(WorkerCommand::ResumeSession(row.value.clone())),
+                                // no-op: close, and say which session that is, as a
+                                // click on its row in the list does.
+                                _ if row.value == current_id => {
+                                    *toast = Some(Toast {
+                                        text: format!(
+                                            "already on “{}”",
+                                            super::shell::canvas::clip_text(
+                                                &scenario.session_label(),
+                                                36
+                                            )
+                                        ),
+                                        ok: true,
+                                        shown_ms: now_ms,
+                                    });
+                                    None
+                                }
+                                _ => Some(WorkerCommand::ResumeSession(row.value.clone())),
                             };
                             if let Some(command) = command
                                 && let Err(message) =
@@ -4774,6 +4788,10 @@ fn resume_saved_session(
         return false;
     };
     let id = row.id.clone();
+    // Said back to the operator, so a click is answered with which session it
+    // landed on, before the screen has switched.
+    let named = |title: &str| super::shell::canvas::clip_text(title, 36);
+    let title = named(&super::shell::sessions_list::row_title(row));
     let say = |text: &str, ok: bool| {
         Some(Toast {
             text: text.into(),
@@ -4782,7 +4800,10 @@ fn resume_saved_session(
         })
     };
     if crate::proto::saved_sessions::SavedSessions::is_current(row, &scenario.session_id) {
-        *toast = say("already on this session", true);
+        let open = scenario
+            .session_name_or_title()
+            .map_or_else(|| title.clone(), |live| named(&live));
+        *toast = say(&format!("already on “{open}”"), true);
         false
     } else if scenario.is_busy() {
         *toast = say("wait for this turn to finish first", false);
@@ -4792,6 +4813,7 @@ fn resume_saved_session(
         *toast = say(message, false);
         false
     } else {
+        *toast = say(&format!("resuming “{title}”"), true);
         true
     }
 }
@@ -6973,6 +6995,11 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     .collect(),
             );
         }
+        // The open session's `/rename` name. It comes from a file on disk, so
+        // it is made safe for the terminal like every other row shown.
+        Msg::SessionNamed { session_id, name } => {
+            scenario.session_name = Some((session_id, clean(name)));
+        }
         Msg::SessionsListed(rows) => {
             if rows.is_empty() {
                 push_display_line(
@@ -6985,6 +7012,9 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     EditOrigin::Local,
                 );
             } else {
+                // The list opens on the session the screen is on, so the
+                // selection bar and the "(this session)" mark are together.
+                let open_on = rows.iter().position(|r| r.current).unwrap_or(0);
                 scenario.open_picker(Picker::new(
                     PickerKind::Sessions,
                     rows.into_iter()
@@ -7007,7 +7037,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                             )
                         })
                         .collect(),
-                    0,
+                    open_on,
                 ));
             }
         }
@@ -9067,6 +9097,18 @@ mod click_tests {
         panic!("no {needle:?} on screen\n{}", rows.join("\n"));
     }
 
+    /// Where the last `needle` is on screen. A prompt is named twice now, in
+    /// the Conversation header and in the turn below it; a person who means
+    /// to select the turn aims at the lower one.
+    fn at_last(rows: &[String], needle: &str) -> (u16, u16) {
+        for (y, r) in rows.iter().enumerate().rev() {
+            if let Some(b) = r.find(needle) {
+                return (r[..b].chars().count() as u16, y as u16);
+            }
+        }
+        panic!("no {needle:?} on screen\n{}", rows.join("\n"));
+    }
+
     fn click(tui: &mut Tui, (col, row): (u16, u16), modal: bool, w: u16, h: u16) -> MouseOutcome {
         let m = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -9142,7 +9184,7 @@ mod click_tests {
         let rows: Vec<String> = (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
             .collect();
-        let (col, row) = at(&rows, "make the tests");
+        let (col, row) = at_last(&rows, "make the tests");
         let mk = |kind: crossterm::event::MouseEventKind, c: u16| crossterm::event::MouseEvent {
             kind,
             column: c,
@@ -9269,7 +9311,7 @@ mod click_tests {
             ..Default::default()
         });
         let rows = frame(&mut tui, &s, "", None, w, h);
-        let (c0, r0) = at(&rows, "make the tests");
+        let (c0, r0) = at_last(&rows, "make the tests");
         let (c1, r1) = at(&rows, "a quote");
         // From the gutter mark of the first row to past the last word.
         let text = copied(&mut tui, &s, (c0 - 4, r0), (c1 + 20, r1), w, h);
@@ -10191,6 +10233,8 @@ mod composer_key_tests {
         history_idx: Option<usize>,
         history_draft: Option<HistoryDraft>,
         overlay: Option<Overlay>,
+        /// The toast the last keys raised.
+        toast: Option<Toast>,
         tx: CommandSink,
         rx: std::sync::mpsc::Receiver<WorkerCommand>,
         approvals: ApprovalRegistry,
@@ -10247,6 +10291,7 @@ mod composer_key_tests {
                 history_idx: None,
                 history_draft: None,
                 overlay: None,
+                toast: None,
                 tx,
                 rx,
                 approvals: ApprovalRegistry::new(),
@@ -10275,7 +10320,7 @@ mod composer_key_tests {
                 &mut String::new(),
                 &mut 0,
                 &mut 0,
-                &mut None,
+                &mut self.toast,
                 &mut Vec::new(),
                 &mut self.history,
                 &mut self.history_idx,
@@ -10974,6 +11019,11 @@ mod composer_key_tests {
         k.plain(KeyCode::Enter);
         k.no_send();
         assert!(k.overlay.is_none());
+        assert_eq!(
+            k.toast.as_ref().map(|t| (t.text.as_str(), t.ok)),
+            Some(("already on “New session”", true)),
+            "choosing the open session closes the list and says so"
+        );
         k.list(PickerKind::Sessions);
         k.receive(crate::msg::Msg::SessionsListed(rows));
         k.frame(100, 24);
@@ -11821,11 +11871,43 @@ mod composer_key_tests {
                 &mut toast,
                 10_000
             ));
-            assert!(toast.is_none());
+            assert_eq!(
+                toast.as_ref().map(|t| (t.text.as_str(), t.ok)),
+                Some(("resuming “Rename the config keys”", true)),
+                "the click is answered with the session it landed on"
+            );
             assert!(matches!(
                 k.received_command(),
                 WorkerCommand::ResumeSession(id) if id == "session-b"
             ));
+        }
+
+        /// A click on the open session's own row was the one click the list
+        /// left unanswered.
+        #[test]
+        fn a_click_on_the_open_row_in_the_sidebar_says_which_session_it_is() {
+            let mut k = Keyboard::new();
+            k.tui.app.sidebar = true;
+            k.receive(listed());
+            k.frame(164, 48);
+            assert_eq!(
+                click_row(&mut k, (164, 48), 0),
+                MouseOutcome::Session(0),
+                "the open session is the first listed"
+            );
+            let mut toast = None;
+            assert!(!resume_saved_session(
+                &mut k.scenario,
+                &k.tx,
+                0,
+                &mut toast,
+                10_000
+            ));
+            assert_eq!(
+                toast.as_ref().map(|t| (t.text.as_str(), t.ok)),
+                Some(("already on “Fix the login redirect”", true))
+            );
+            k.no_send();
         }
 
         #[test]
@@ -11856,7 +11938,23 @@ mod composer_key_tests {
             ));
             assert_eq!(
                 toast.as_ref().map(|t| t.text.as_str()),
-                Some("already on this session")
+                Some("already on “Fix the login redirect”"),
+                "the screen has nothing to call it yet, so the list's title stands"
+            );
+            k.no_send();
+            k.scenario.session_name =
+                Some(("session-keyboard-fixture".into(), "login work".into()));
+            assert!(!resume_saved_session(
+                &mut k.scenario,
+                &k.tx,
+                0,
+                &mut toast,
+                9
+            ));
+            assert_eq!(
+                toast.as_ref().map(|t| t.text.as_str()),
+                Some("already on “login work”"),
+                "a rename is what the screen calls it"
             );
             k.no_send();
             // a row that vanished in a refresh asks nothing
@@ -11868,6 +11966,108 @@ mod composer_key_tests {
                 9
             ));
             k.no_send();
+        }
+
+        fn sessions_row(id: &str, current: bool) -> crate::msg::SessionsRow {
+            crate::msg::SessionsRow {
+                id: id.into(),
+                model: "fixture-model".into(),
+                turns: 2,
+                updated_at: "1m ago".into(),
+                current,
+            }
+        }
+
+        /// The list opened on its first row whatever was open, so the
+        /// selection bar and the "(this session)" mark were far apart.
+        #[test]
+        fn the_session_picker_opens_on_the_session_the_screen_is_on() {
+            let mut k = Keyboard::new();
+            k.scenario
+                .begin_picker_request(PickerKind::Sessions)
+                .unwrap();
+            k.receive(Msg::SessionsListed(vec![
+                sessions_row("session-a", false),
+                sessions_row("session-keyboard-fixture", true),
+                sessions_row("session-c", false),
+            ]));
+            let picker = k.scenario.picker.as_ref().expect("the picker opened");
+            assert_eq!(picker.sel, 1, "on the open session");
+            assert!(picker.rows[1].label.contains("(this session)"));
+            assert!(!picker.rows[0].label.contains("(this session)"));
+            // With the open session not among them, it opens at the top.
+            let mut k = Keyboard::new();
+            k.scenario
+                .begin_picker_request(PickerKind::Sessions)
+                .unwrap();
+            k.receive(Msg::SessionsListed(vec![
+                sessions_row("session-a", false),
+                sessions_row("session-c", false),
+            ]));
+            assert_eq!(k.scenario.picker.as_ref().map(|p| p.sel), Some(0));
+        }
+
+        /// The worker's name for the open session reaches the label made
+        /// safe for the terminal, only for that session, and an empty one
+        /// takes it away.
+        #[test]
+        fn a_name_from_the_worker_labels_the_open_session_and_is_made_safe() {
+            let mut k = Keyboard::new();
+            let named = |id: &str, name: &str| Msg::SessionNamed {
+                session_id: id.into(),
+                name: name.into(),
+            };
+            k.receive(named(
+                "session-keyboard-fixture",
+                "login \u{1b}[2J work\u{7}",
+            ));
+            let label = k.scenario.session_label();
+            assert!(
+                label.contains("login") && label.contains("work"),
+                "{label:?}"
+            );
+            assert!(!label.chars().any(char::is_control), "{label:?}");
+            k.receive(named("session-elsewhere", "not this one"));
+            assert_eq!(
+                k.scenario.session_label(),
+                "New session",
+                "the newest name is for another session: it labels nothing here"
+            );
+            k.receive(named("session-keyboard-fixture", "back again"));
+            assert_eq!(k.scenario.session_label(), "back again");
+            k.receive(named("session-keyboard-fixture", ""));
+            assert_eq!(k.scenario.session_label(), "New session", "a cleared name");
+        }
+
+        /// What the operator asked for: after choosing a session there is
+        /// something on the main screen that says which one this is.
+        #[test]
+        fn the_conversation_header_says_which_session_is_open() {
+            let mut k = Keyboard::new();
+            k.scenario.transcript.push(TranscriptLine {
+                kind: LineKind::User,
+                text: "Fix the login redirect".into(),
+                ..Default::default()
+            });
+            let screen = k.frame(150, 40);
+            assert!(
+                screen.contains("Conversation · Fix the login redirect"),
+                "{screen}"
+            );
+            k.receive(Msg::SessionNamed {
+                session_id: "session-keyboard-fixture".into(),
+                name: "login work".into(),
+            });
+            let screen = k.frame(150, 40);
+            assert!(screen.contains("Conversation · login work"), "{screen}");
+            let header = screen
+                .lines()
+                .find(|row| row.contains("Conversation"))
+                .expect("the header row");
+            assert!(
+                !header.contains("Fix the login redirect"),
+                "a name replaces the first prompt in the header (the prompt is still in the conversation below): {header}"
+            );
         }
 
         #[test]
