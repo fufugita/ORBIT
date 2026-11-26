@@ -135,13 +135,14 @@ the current workspace's Read permission and display scanning. Missing, denied,
 stale, and truncated content is labeled. Counts describe local files, not proof
 of a finding. Context snapshots become stale when the session changes.
 
-### Built-in panes: `council` and `reactor`
+### Built-in panes: `council`, `reactor` and `sessions`
 
-Two panes exist without a profile entry, so the default profile keeps
+Three panes exist without a profile entry, so the default profile keeps
 `"panes": []`. Place them with `{"kind":"custom","pane_id":"council"}` (or
-`"reactor"`) in a layout tree, or pick them in the terminal: while arranging,
-`v`/`s`/`p` opens "Show what?", where `9` is Council and `0` is Reactor. A
-profile pane that reuses either id replaces the built-in. While the terminal
+`"reactor"`, `"sessions"`) in a layout tree, or pick them in the terminal:
+while arranging, `v`/`s`/`p` opens "Show what?", where `9` is Council, `0` is
+Reactor and `s` is Sessions. A profile pane that reuses one of these ids
+replaces the built-in. While the terminal
 layout shows a built-in pane Council state is refreshed once a second;
 Reactor follows live turn updates at the animation cadence. Other panes refresh
 on `r`. The browser renders them as text and refreshes on demand. In the
@@ -176,8 +177,28 @@ turn. `reduced_motion` holds both still; `glyphs: ascii` keeps the plain text.
   while text streams it is an estimate marked `≈ … live`; `rate` is a
   sparkline of recent turns. An unpriced or
   incompletely accounted cost is marked `(uncertain)`.
+- `sessions` lists this folder's saved sessions, newest first, two lines each:
+  the name (`/rename`) or the first words of the conversation, how long ago it
+  was saved, the model and the number of turns. The open session has a filled
+  dot. It is drawn by the terminal only (the browser has no such pane). A
+  click on a row, or `j`/`k` (or the wheel) and `⏎`, resumes that session like
+  `/resume`; while a turn is running it waits. `r` lists again at once. The
+  list is read from the newest session files only (at most 48 are opened), only
+  while the pane or the sidebar is on screen and never during a turn, and at
+  most every 5 seconds. The sidebar's SESSIONS section shows the same list
+  (the open session, then up to four others, as many as the height allows) and
+  its rows are clickable too, except while the layout is being arranged.
 
-With `glyphs: ascii` both panes print ASCII marks and English labels.
+With `glyphs: ascii` every pane prints ASCII marks, and the council and
+reactor panes print English labels.
+
+A build only knows the built-in panes it was released with. A saved layout
+that places a pane an older build lacks (for example `sessions` in 0.2.2) makes
+that build stop at start with `invalid customization: layout.tree: custom pane
+reference is unresolved`, and its own `orbit customize reset` cannot repair the
+file. Close the pane in a current build, or delete `~/.orbit/customization.json`
+(its `.bak` is only the previous write). Running an older build against the
+same home as a newer one is where this happens.
 
 ### Run a native Council
 

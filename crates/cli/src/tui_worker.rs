@@ -19,7 +19,7 @@ use orbit_hud_tui::bus::{
 use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::{
     ContextProjection, CostQualification, ManualOutcome, Msg, OrdinaryEnd, OrdinaryPublication,
-    ProjectionReason, SessionProjection, SessionsRow as MsgSessionRow,
+    ProjectionReason, SavedSession, SessionProjection, SessionsRow as MsgSessionRow,
 };
 use orbit_hud_tui::worker::{
     CommandSink, ForegroundKind, ForegroundOperation, ManualAction, SessionBinding, WorkerCommand,
@@ -965,6 +965,13 @@ fn session_opening(transcript: &[ChatMessage]) -> Option<String> {
         opening.push('…');
     }
     Some(format!("“{opening}”"))
+}
+
+/// How a saved session began, for a list that shows it as a title: the same
+/// words as `session_opening`, without the quotation marks the picker wraps
+/// around them (they would only take a column away from the words).
+fn session_title_from_opening(transcript: &[ChatMessage]) -> Option<String> {
+    session_opening(transcript).map(|opening| opening.trim_matches(['“', '”']).to_owned())
 }
 
 /// When a session was last saved, as an age: its stored time is seconds
@@ -3149,6 +3156,40 @@ fn worker_main_initialized(
                         }
                     };
                     turn_sender.send(Msg::SessionsListed(rows));
+                }
+                WorkerCommand::ListSavedSessions => {
+                    // The list the sidebar and the Sessions pane draw. It
+                    // refreshes by itself, so it reads only the newest files
+                    // (see `recent_in_workspace`) and keeps what can be resumed
+                    // in this folder. A failure sends an empty list: the
+                    // screen asked and must not wait for an answer.
+                    let names = crate::session_names::load(&config.home);
+                    let live = binding.session_id.clone();
+                    let rows = crate::sessions::recent_in_workspace(
+                        &config.home,
+                        &tool_cx.working_dir,
+                        crate::sessions::RECENT_SCAN_CAP,
+                        crate::sessions::RECENT_KEEP,
+                        |s| {
+                            s.turns > 0 || s.session_id == live || names.contains_key(&s.session_id)
+                        },
+                    )
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| SavedSession {
+                        id: s.session_id.clone(),
+                        title: names
+                            .get(&s.session_id)
+                            .cloned()
+                            .or_else(|| session_title_from_opening(&s.transcript))
+                            .unwrap_or_default(),
+                        model: s.model.clone(),
+                        turns: s.turns,
+                        age: session_age(&s.updated_at),
+                        current: s.session_id == live,
+                    })
+                    .collect();
+                    turn_sender.send(Msg::SavedSessions(rows));
                 }
                 WorkerCommand::ResumeSession(id) => {
                     let same_id = id.strip_suffix(".json").unwrap_or(&id) == lease.session_id();
@@ -13931,5 +13972,44 @@ mod sandbox_switch_tests {
         assert!(text.contains("enabled = false"), "{text}");
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_dir_all(plain);
+    }
+}
+
+#[cfg(test)]
+mod saved_session_title_tests {
+    use super::*;
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: text.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
+            blocks: None,
+            origin_model: None,
+            origin_provider: None,
+        }
+    }
+
+    #[test]
+    fn a_title_is_the_opening_words_without_the_pickers_quotation_marks() {
+        let transcript = [user("\n  Fix the login redirect\nmore detail")];
+        assert_eq!(
+            session_opening(&transcript).as_deref(),
+            Some("“Fix the login redirect”"),
+            "the picker keeps its quotes"
+        );
+        assert_eq!(
+            session_title_from_opening(&transcript).as_deref(),
+            Some("Fix the login redirect")
+        );
+        let long = [user(&"word ".repeat(30))];
+        let title = session_title_from_opening(&long).unwrap();
+        assert!(
+            title.ends_with('…') && !title.contains(['“', '”']),
+            "{title}"
+        );
+        assert_eq!(session_title_from_opening(&[]), None);
     }
 }

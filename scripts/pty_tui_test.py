@@ -1993,6 +1993,17 @@ TUI_GAP_COMPACT_CHECKS = {
     "post-clear prompt is stored only in the fresh session": False,
 }
 
+TUI_GAP_SESSIONS_LIST_CHECKS = {
+    "sessions-list fixture saves three sessions of this folder": False,
+    "sessions-list TUI boots with a live composer": False,
+    "sidebar lists the saved sessions of this folder": False,
+    "a mouse click on a sidebar session row resumes that session": False,
+    "the resumed session is marked as the open one in the sidebar": False,
+    "Show what? offers Sessions on the s key": False,
+    "the Sessions pane lists the saved sessions on two-line rows": False,
+    "a click in the Sessions pane resumes that session and returns the keyboard to the composer": False,
+}
+
 
 def _tui_gap_skip_scenario(label, expected, reason="owned fixture cleanup was not verified"):
     begin_scenario(expected)
@@ -4227,6 +4238,146 @@ def _tui_gap_run_ordinary_truncated(args):
         finish_tui_gap_scenario()
 
 
+def _tui_gap_run_sessions_list(args):
+    """The saved-sessions list: the sidebar rows, a real mouse click that
+    resumes one, and the Sessions pane picked from "Show what?" with `s`."""
+    label = "coverage-sessions-list"
+    begin_scenario(TUI_GAP_SESSIONS_LIST_CHECKS)
+    work = mock = sess = None
+    try:
+        # Short and different from the first character on: the sidebar clips
+        # a title at 21 columns.
+        prompts = [f"SESS_{n}_LIST_PROMPT" for n in range(3)]
+        work, mock, home, request_log = _tui_gap_fixture(
+            args, label,
+            {"main": [{"text": f"SESSIONS_LIST_REPLY_{n}"} for n in range(3)]},
+        )
+        # Three saved sessions of this folder, made the way a person makes
+        # them: one prompt each through the headless entry point.
+        made = True
+        for prompt in prompts:
+            run = subprocess.run(
+                [args.binary, "--home", home, "--model", "scripted", "-p", prompt],
+                cwd=work, env=synthetic_environment({"ORBIT_HOME": home}),
+                capture_output=True, timeout=90,
+            )
+            made = made and run.returncode == 0
+        files = sorted(Path(home, "sessions").glob("*.json"))
+        if not check("sessions-list fixture saves three sessions of this folder",
+                     made and len(files) >= 3, f"headless_ok={made}; files={len(files)}",
+                     prerequisite=True):
+            return
+
+        sess = PtySession(
+            [args.binary, "--home", home, "--model", "scripted"],
+            env={"ORBIT_HOME": home}, timeout=25, rows=44, cols=160, cwd=work,
+        )
+        boot, screen = sess.wait_for("ORBIT", timeout=15)
+        boot = boot and _tui_gap_wait_composer(sess, timeout=8)[0]
+        if not check("sessions-list TUI boots with a live composer", boot,
+                     screen[-600:], prerequisite=True):
+            return
+        sess.write(b"\x1b")  # arrange
+        sess.read(0.4)
+        sess.write(b"b")  # the sidebar
+        sess.read(0.4)
+        sess.write(b"i")  # back to the composer
+        sess.read(0.4)
+
+        def sidebar(screen_text):
+            return [row[:30] for row in screen_text.splitlines()]
+
+        def wait_until(done, seconds=12):
+            deadline = time.monotonic() + seconds
+            screen_text = sess.screen_text()
+            while time.monotonic() < deadline:
+                sess.read(0.3)
+                screen_text = sess.screen_text()
+                if done(screen_text):
+                    return True, screen_text
+            return False, screen_text
+
+        listed, screen = wait_until(
+            lambda text: all(prompt in "\n".join(sidebar(text)) for prompt in prompts))
+        if not check("sidebar lists the saved sessions of this folder", listed,
+                     "\n".join(sidebar(screen))[:1500], prerequisite=True):
+            return
+
+        # A real SGR mouse press and release on the second session's row.
+        target = next(((row.index(prompts[1]), y) for y, row in enumerate(sidebar(screen))
+                       if prompts[1] in row), None)
+        resumed = False
+        if target is not None:
+            sess.click(target[0] + 2, target[1])
+            resumed, screen = wait_until(lambda text: any(
+                "›" in row and prompts[1] in row for row in text.splitlines()))
+        if not check("a mouse click on a sidebar session row resumes that session",
+                     resumed, f"target={target}; frame={_tui_gap_screen_diagnostic(sess, screen)}",
+                     prerequisite=True):
+            return
+        marked, screen = wait_until(lambda text: any(
+            row.startswith("▌") and prompts[1] in row[:30] for row in text.splitlines()))
+        check("the resumed session is marked as the open one in the sidebar", marked,
+              "\n".join(sidebar(screen))[:1500])
+
+        sess.write(b"\x1b")  # arrange
+        sess.read(0.4)
+        sess.write(b"v")  # split: "Show what?"
+        sess.read(0.8)
+        screen = sess.screen_text()
+        offered = ("SHOW WHAT?" in screen
+                   and re.search(r"\bs\s+Sessions\b", screen) is not None)
+        if not check("Show what? offers Sessions on the s key", offered, screen[-900:],
+                     prerequisite=True):
+            return
+        sess.write(b"s")
+        in_pane, screen = wait_until(lambda text: (
+            all(prompt in "\n".join(row[31:] for row in text.splitlines())
+                for prompt in prompts)
+            and "\n".join(row[31:] for row in text.splitlines()).count("scripted · 1 turn") >= 3))
+        if not check("the Sessions pane lists the saved sessions on two-line rows", in_pane,
+                     "\n".join(row[31:] for row in screen.splitlines())[:1800],
+                     prerequisite=True):
+            return
+
+        # Out of arrange mode, a click on the pane's row for the third
+        # session resumes it, and the keys go back to the composer: typed
+        # text lands in the draft, not in the pane.
+        sess.write(b"i")
+        sess.read(0.6)
+        screen = sess.screen_text()
+        pane_row = next(((row.index(prompts[2], 31), y)
+                         for y, row in enumerate(screen.splitlines())
+                         if prompts[2] in row[31:]), None)
+        back = False
+        if pane_row is not None:
+            sess.click(pane_row[0] + 2, pane_row[1])
+            resumed, screen = wait_until(lambda text: any(
+                "›" in row and prompts[2] in row for row in text.splitlines()))
+            if resumed:
+                sess.type("zz")
+                back, screen = wait_until(lambda text: any(
+                    "zz" in row for row in text.splitlines()), seconds=6)
+        check("a click in the Sessions pane resumes that session and returns the keyboard "
+              "to the composer", back,
+              f"pane_row={pane_row}; frame={_tui_gap_screen_diagnostic(sess, screen)}")
+    except Exception as exc:
+        check("sessions-list TUI scenario completes", False,
+              f"exception_type={type(exc).__name__}", independent=True, prerequisite=True)
+    finally:
+        global TUI_GAP_CLEANUP_FAILED
+        cleanup_ok = True
+        if sess is not None:
+            cleanup_ok = stop_tui_session(sess, label) and cleanup_ok
+        if mock is not None:
+            cleanup_ok = stop_scripted_mock(mock, label) and cleanup_ok
+        if work is not None:
+            cleanup_ok = remove_scripted_fixture(work, label) and cleanup_ok
+        if not cleanup_ok:
+            TUI_GAP_CLEANUP_FAILED = True
+        finish_tui_gap_scenario()
+
+
 def run_tui_coverage_gap_scenarios(args, primary_mock):
     global TUI_GAP_CLEANUP_FAILED
     scenarios = (
@@ -4239,6 +4390,7 @@ def run_tui_coverage_gap_scenarios(args, primary_mock):
         ("resend-clear-notice", TUI_GAP_RESEND_CLEAR_CHECKS, _tui_gap_run_resend_clear_notice),
         ("resend-resume-notice", TUI_GAP_RESEND_RESUME_CHECKS, _tui_gap_run_resend_resume_notice),
         ("ordinary-truncated", TUI_GAP_TRUNCATED_CHECKS, _tui_gap_run_ordinary_truncated),
+        ("coverage-sessions-list", TUI_GAP_SESSIONS_LIST_CHECKS, _tui_gap_run_sessions_list),
     )
     admission_problems = _tui_gap_batch_admission_problems(primary_mock)
     if admission_problems:

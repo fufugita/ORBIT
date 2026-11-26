@@ -137,6 +137,11 @@ impl CustomizationSession {
     }
     /// Built-in panes (council, reactor) the layout currently shows and the
     /// profile does not redefine. Only these are read without being asked.
+    /// Whether `id` is a built-in pane the profile has not replaced with a
+    /// pane of its own under the same name.
+    pub fn is_builtin_pane(&self, id: &str) -> bool {
+        BUILTIN_PANE_IDS.contains(&id) && !self.resolved.profile.panes.iter().any(|p| p.id == id)
+    }
     pub fn builtin_ids_in_layout(&self) -> Vec<String> {
         fn walk(node: &LayoutNode, out: &mut Vec<String>) {
             match node {

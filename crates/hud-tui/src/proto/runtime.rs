@@ -2104,6 +2104,24 @@ fn run_proto_inner(
                             scenario.pick_tape(i);
                             tui.scroll_follow(); // the other command is read from its end
                         }
+                        // A click on a saved session resumes it, like picking
+                        // it in `/sessions`; it also moves the pane's selection.
+                        MouseOutcome::Session(i) => {
+                            scenario.saved_sessions.select_at(i);
+                            if resume_saved_session(
+                                &mut scenario,
+                                &command_sink,
+                                i,
+                                &mut toast,
+                                now_ms,
+                            ) {
+                                crate::customization::focus_conversation(&mut tui.app);
+                                tui.sync_focus();
+                            }
+                        }
+                        MouseOutcome::SessionsSelect(delta) => {
+                            scenario.saved_sessions.select(delta);
+                        }
                         // The palette is a menu: a click runs the row (⏎).
                         MouseOutcome::Palette(i) => {
                             pending_palette_click = capture_palette_click(
@@ -2416,6 +2434,7 @@ fn run_proto_inner(
                 &mut reactor_pane_ms,
                 &mut reactor_pane_dirty,
             );
+            request_saved_sessions(&tui, &mut scenario, &command_sink, now_ms);
             // External Council activity can animate even while chat is idle.
             let council_animating = !tui.reduced
                 && scenario
@@ -2953,6 +2972,26 @@ fn handle_key_with_read(
     // A key press clears the selection (the next click starts another).
     tui.selection = None;
 
+    // The Sessions pane has no scrollback to page through: its paging keys
+    // move the selection instead.
+    if tui.focus != Focus::Conversation && sessions_pane_at(tui, tui.app.focus) {
+        match k.code {
+            KeyCode::PageUp => {
+                scenario.saved_sessions.select(-4);
+                return false;
+            }
+            KeyCode::PageDown => {
+                scenario.saved_sessions.select(4);
+                return false;
+            }
+            KeyCode::End => {
+                scenario.saved_sessions.select_at(usize::MAX);
+                return false;
+            }
+            _ => {}
+        }
+    }
+
     // Scrolling belongs to the focused panel alone.
     match k.code {
         KeyCode::PageUp => {
@@ -3453,6 +3492,28 @@ fn handle_key_with_read(
         }
         KeyCode::Char('p') if tui.app.focused_view() == super::layout::View::Review => {
             scenario.move_hunk_selection(-1);
+        }
+        // The Sessions pane: j/k pick a saved session, ⏎ resumes it, r lists
+        // them again without waiting.
+        KeyCode::Char('j') | KeyCode::Down if sessions_pane_at(tui, tui.app.focus) => {
+            scenario.saved_sessions.select(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up if sessions_pane_at(tui, tui.app.focus) => {
+            scenario.saved_sessions.select(-1);
+        }
+        KeyCode::Home if sessions_pane_at(tui, tui.app.focus) => {
+            scenario.saved_sessions.select_at(0);
+        }
+        KeyCode::Enter if sessions_pane_at(tui, tui.app.focus) => {
+            let selected = scenario.saved_sessions.selected;
+            if resume_saved_session(scenario, command_sink, selected, toast, now_ms) {
+                // Back to the prompt, as after picking a row in `/sessions`.
+                crate::customization::focus_conversation(&mut tui.app);
+                tui.sync_focus();
+            }
+        }
+        KeyCode::Char('r') if sessions_pane_at(tui, tui.app.focus) => {
+            scenario.saved_sessions.refresh_now();
         }
         // The Terminal keeps a tape per command: [ ] pick one.
         KeyCode::Char('[') if tui.app.focused_view() == super::layout::View::Terminal => {
@@ -4441,6 +4502,73 @@ mod restored_transcript_projection_tests {
             time: Some("09:30".into()),
         };
         assert_eq!(original, expected);
+    }
+}
+
+/// Whether panel `index` shows the built-in Sessions pane (and not a pane
+/// of the profile's own that happens to share its id).
+fn sessions_pane_at(tui: &Tui, index: usize) -> bool {
+    tui.app.tree.custom_id_at(index).as_deref() == Some("sessions")
+        && tui
+            .customization
+            .as_ref()
+            .is_some_and(|session| session.is_builtin_pane("sessions"))
+}
+
+/// Ask the worker for the saved-sessions list when something that shows it is
+/// on screen and it is out of date. The list is listed from the newest files
+/// only and never while a turn runs; see `SavedSessions::due`.
+fn request_saved_sessions(tui: &Tui, scenario: &mut Scenario, sink: &CommandSink, now_ms: u64) {
+    scenario
+        .saved_sessions
+        .observe(&scenario.session_id, scenario.turns);
+    let visible = tui.app.sidebar
+        || (0..tui.app.tree.panel_count()).any(|index| sessions_pane_at(tui, index));
+    if !scenario
+        .saved_sessions
+        .due(visible, scenario.is_busy(), now_ms)
+    {
+        return;
+    }
+    scenario.saved_sessions.requested(now_ms);
+    if sink.send(WorkerCommand::ListSavedSessions).is_err() {
+        scenario.saved_sessions.request_failed();
+    }
+}
+
+/// Resume the saved session in row `index`, like `/resume <id>`: not while a
+/// turn runs, and a no-op on the session that is already open. Returns
+/// whether the worker was asked to resume it.
+fn resume_saved_session(
+    scenario: &mut Scenario,
+    sink: &CommandSink,
+    index: usize,
+    toast: &mut Option<Toast>,
+    now_ms: u64,
+) -> bool {
+    let Some(row) = scenario.saved_sessions.rows.get(index) else {
+        return false;
+    };
+    let id = row.id.clone();
+    let say = |text: &str, ok: bool| {
+        Some(Toast {
+            text: text.into(),
+            ok,
+            shown_ms: now_ms,
+        })
+    };
+    if crate::proto::saved_sessions::SavedSessions::is_current(row, &scenario.session_id) {
+        *toast = say("already on this session", true);
+        false
+    } else if scenario.is_busy() {
+        *toast = say("wait for this turn to finish first", false);
+        false
+    } else if let Err(message) = submit_foreground(scenario, sink, WorkerCommand::ResumeSession(id))
+    {
+        *toast = say(message, false);
+        false
+    } else {
+        true
     }
 }
 
@@ -6522,6 +6650,21 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 });
             }
         }
+        // The list the sidebar and the Sessions pane draw. Its text comes from
+        // files on disk (a name, the first words of a conversation), so it
+        // is made safe for the terminal like every other row shown.
+        Msg::SavedSessions(rows) => {
+            scenario.saved_sessions.receive(
+                rows.into_iter()
+                    .map(|row| crate::msg::SavedSession {
+                        title: clean(row.title),
+                        model: clean(row.model),
+                        age: clean(row.age),
+                        ..row
+                    })
+                    .collect(),
+            );
+        }
         Msg::SessionsListed(rows) => {
             if rows.is_empty() {
                 push_display_line(
@@ -7127,6 +7270,11 @@ enum MouseOutcome {
     Picker(usize),
     /// A click on the tab of the Terminal's tape `i`.
     Tape(usize),
+    /// A click on row `i` of the saved-sessions list (the sidebar or the
+    /// Sessions pane): resume that session.
+    Session(usize),
+    /// The wheel over the Sessions pane: move its selection by this many rows.
+    SessionsSelect(isize),
 }
 
 #[derive(Debug, Clone)]
@@ -7354,6 +7502,10 @@ fn handle_mouse_with_read(
                     focus_under(tui);
                     return MouseOutcome::Tape(i);
                 }
+                Some(Click::Session(i)) => {
+                    focus_under(tui);
+                    return MouseOutcome::Session(i);
+                }
                 Some(Click::Panel(i)) => {
                     if i < tui.app.panel_count() && i != tui.app.focus {
                         tui.app.focus = i;
@@ -7453,6 +7605,8 @@ fn handle_mouse_with_read(
                     if !modal {
                         reading.scroll_pointer(col, row, 3);
                     }
+                } else if sessions_pane_at(tui, *i) {
+                    return MouseOutcome::SessionsSelect(-1);
                 } else {
                     tui.scroll_panel(*i, 3);
                 }
@@ -7467,6 +7621,8 @@ fn handle_mouse_with_read(
                     if !modal {
                         reading.scroll_pointer(col, row, -3);
                     }
+                } else if sessions_pane_at(tui, *i) {
+                    return MouseOutcome::SessionsSelect(1);
                 } else {
                     tui.scroll_panel(*i, -3);
                 }
@@ -10962,6 +11118,612 @@ mod composer_key_tests {
         );
         k.no_send();
     }
+
+    /// The saved-sessions list: the sidebar rows, the Sessions pane, and
+    /// what a click, a key or the wheel does with them.
+    mod saved_sessions {
+        use super::*;
+        use crate::msg::{Msg, SavedSession};
+        use crate::proto::shell::hits::Click;
+        use crossterm::event::MouseEventKind;
+        use orbit_frontend_protocol::customization as protocol;
+        use std::sync::{Arc, Mutex};
+
+        struct PaneHost {
+            reads: Mutex<Vec<String>>,
+            /// Whether the saved layout already holds the Sessions pane.
+            with_pane: bool,
+        }
+
+        impl protocol::ProfileHost for PaneHost {
+            fn load(&self) -> Result<protocol::ResolvedProfile, protocol::CustomizationError> {
+                let mut profile = protocol::Profile::default();
+                profile.layout.tree = if self.with_pane {
+                    protocol::LayoutNode::Split {
+                        direction: protocol::Direction::Right,
+                        shares: vec![60, 40],
+                        children: vec![
+                            protocol::LayoutNode::panel(protocol::View::Conversation),
+                            protocol::LayoutNode::Custom {
+                                pane_id: "sessions".into(),
+                            },
+                        ],
+                    }
+                } else {
+                    protocol::LayoutNode::Split {
+                        direction: protocol::Direction::Right,
+                        shares: vec![40, 60],
+                        children: vec![
+                            protocol::LayoutNode::panel(protocol::View::Changes),
+                            protocol::LayoutNode::panel(protocol::View::Conversation),
+                        ],
+                    }
+                };
+                Ok(protocol::ResolvedProfile {
+                    profile,
+                    revision: "fixture".into(),
+                    sources: Default::default(),
+                    capabilities: Default::default(),
+                })
+            }
+            fn replace(
+                &self,
+                profile: protocol::Profile,
+                _: &str,
+            ) -> Result<protocol::ResolvedProfile, protocol::CustomizationError> {
+                Ok(protocol::ResolvedProfile {
+                    profile,
+                    revision: "saved".into(),
+                    sources: Default::default(),
+                    capabilities: Default::default(),
+                })
+            }
+            fn reset(
+                &self,
+                _: &str,
+            ) -> Result<protocol::ResolvedProfile, protocol::CustomizationError> {
+                unreachable!()
+            }
+            fn read_pane(
+                &self,
+                id: &str,
+                _: &protocol::PaneContext,
+            ) -> Result<protocol::PaneOutput, protocol::CustomizationError> {
+                self.reads.lock().unwrap().push(id.into());
+                Ok(protocol::PaneOutput {
+                    id: id.into(),
+                    title: id.into(),
+                    state: protocol::PaneState::Ready,
+                    text: "caption".into(),
+                    truncated: false,
+                    actions: vec![],
+                    council: None,
+                })
+            }
+        }
+
+        /// The open session is `session-keyboard-fixture`.
+        fn row(id: &str, title: &str, age: &str) -> SavedSession {
+            SavedSession {
+                id: id.into(),
+                title: title.into(),
+                model: "fixture-model".into(),
+                turns: 3,
+                age: age.into(),
+                current: false,
+            }
+        }
+
+        fn listed() -> Msg {
+            Msg::SavedSessions(vec![
+                row(
+                    "session-keyboard-fixture",
+                    "Fix the login redirect",
+                    "just now",
+                ),
+                row("session-b", "Rename the config keys", "2h ago"),
+                row("session-c", "Write the release notes", "3d ago"),
+            ])
+        }
+
+        /// A keyboard whose layout has the Sessions pane beside the
+        /// conversation, with the list delivered and the pane focused.
+        fn with_pane() -> Keyboard {
+            let mut k = Keyboard::new();
+            let session = crate::customization::CustomizationSession::open(Arc::new(PaneHost {
+                reads: Mutex::new(Vec::new()),
+                with_pane: true,
+            }))
+            .unwrap();
+            k.tui.app.tree = crate::customization::profile_tree(&session.resolved.profile).unwrap();
+            k.tui.customization = Some(session);
+            k.tui.app.sidebar = false;
+            k.receive(listed());
+            k.tui.app.focus = 1;
+            k.tui.sync_focus();
+            k
+        }
+
+        /// A key the way the event loop delivers it: the custom-pane handler
+        /// first, the ordinary one when that does not take it. `Keyboard::plain`
+        /// alone skips the first, which is how a pane's own keys can be
+        /// shadowed without any test noticing.
+        fn press(k: &mut Keyboard, code: KeyCode) {
+            let mut toast = None;
+            let handled = handle_custom_key_with_history(
+                crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+                &mut k.tui,
+                &mut k.scenario,
+                &mut k.draft,
+                None,
+                &mut toast,
+                10_000,
+                k.overlay.is_some(),
+                &mut k.history_draft,
+            );
+            if !handled {
+                k.plain(code);
+            }
+        }
+
+        fn mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        fn click_row(k: &mut Keyboard, size: (u16, u16), index: usize) -> MouseOutcome {
+            let hit = k
+                .tui
+                .hits
+                .iter()
+                .find(|hit| hit.click == Click::Session(index))
+                .unwrap_or_else(|| panic!("no region for session row {index}"))
+                .rect;
+            handle_mouse(
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    hit.x + 3,
+                    hit.y,
+                ),
+                &mut k.tui,
+                Rect::new(0, 0, size.0, size.1),
+                None,
+                false,
+            )
+        }
+
+        #[test]
+        fn a_listed_session_title_is_made_safe_before_it_is_drawn() {
+            let mut k = Keyboard::new();
+            k.receive(Msg::SavedSessions(vec![row(
+                "session-b",
+                "Fix \u{1b}[2J the \u{7} bug\u{1b}]0;owned\u{7}",
+                "2h ago\u{1b}[31m",
+            )]));
+            let saved = &k.scenario.saved_sessions.rows[0];
+            for text in [&saved.title, &saved.age] {
+                assert!(
+                    !text.chars().any(|c| c.is_control()),
+                    "control bytes reached the list: {text:?}"
+                );
+            }
+            assert!(saved.title.contains("Fix") && saved.title.contains("bug"));
+            assert!(k.scenario.saved_sessions.loaded());
+        }
+
+        #[test]
+        fn the_sidebar_lists_the_other_sessions_and_a_click_resumes_one() {
+            let mut k = Keyboard::new();
+            k.tui.app.sidebar = true;
+            k.receive(listed());
+            let screen = k.frame(164, 48);
+            assert!(screen.contains("SESSIONS"), "{screen}");
+            assert!(screen.contains("Rename the config keys"), "{screen}");
+            assert!(screen.contains("Write the release"), "{screen}");
+            // the open session keeps its own live row, not a second one
+            assert_eq!(
+                screen.matches("Fix the login redirect").count(),
+                0,
+                "{screen}"
+            );
+            assert_eq!(
+                click_row(&mut k, (164, 48), 1),
+                MouseOutcome::Session(1),
+                "a click on a listed session asks to resume it"
+            );
+            let mut toast = None;
+            assert!(resume_saved_session(
+                &mut k.scenario,
+                &k.tx,
+                1,
+                &mut toast,
+                10_000
+            ));
+            assert!(toast.is_none());
+            assert!(matches!(
+                k.received_command(),
+                WorkerCommand::ResumeSession(id) if id == "session-b"
+            ));
+        }
+
+        #[test]
+        fn resuming_waits_for_a_turn_and_says_so_on_the_session_already_open() {
+            let mut k = Keyboard::new();
+            k.receive(listed());
+            let mut toast = None;
+            k.scenario.turn_live = true;
+            assert!(!resume_saved_session(
+                &mut k.scenario,
+                &k.tx,
+                1,
+                &mut toast,
+                7
+            ));
+            assert_eq!(
+                toast.as_ref().map(|t| (t.text.as_str(), t.ok)),
+                Some(("wait for this turn to finish first", false))
+            );
+            k.no_send();
+            k.scenario.turn_live = false;
+            assert!(!resume_saved_session(
+                &mut k.scenario,
+                &k.tx,
+                0,
+                &mut toast,
+                8
+            ));
+            assert_eq!(
+                toast.as_ref().map(|t| t.text.as_str()),
+                Some("already on this session")
+            );
+            k.no_send();
+            // a row that vanished in a refresh asks nothing
+            assert!(!resume_saved_session(
+                &mut k.scenario,
+                &k.tx,
+                99,
+                &mut toast,
+                9
+            ));
+            k.no_send();
+        }
+
+        #[test]
+        fn arranging_names_the_pane_instead_of_calling_it_a_custom_pane() {
+            let mut k = with_pane();
+            let mut scenario = Scenario::new();
+            let (mut council, mut reactor, mut dirty) = (0, 0, false);
+            refresh_builtin_panes(
+                &mut k.tui,
+                &mut scenario,
+                1_000,
+                &mut council,
+                &mut reactor,
+                &mut dirty,
+            );
+            k.scenario.custom_panes = scenario.custom_panes.clone();
+            k.tui.app.arranging = true;
+            let screen = k.frame(164, 48);
+            assert!(
+                !screen.contains("Custom pane"),
+                "the veil labels the pane by its title:\n{screen}"
+            );
+        }
+
+        #[test]
+        fn the_sidebar_rows_are_not_clickable_while_the_layout_is_arranged() {
+            let mut k = Keyboard::new();
+            k.tui.app.sidebar = true;
+            k.receive(listed());
+            k.frame(164, 48);
+            assert!(
+                k.tui
+                    .hits
+                    .iter()
+                    .any(|h| matches!(h.click, Click::Session(_)))
+            );
+            k.tui.app.arranging = true;
+            k.frame(164, 48);
+            assert!(
+                !k.tui
+                    .hits
+                    .iter()
+                    .any(|h| matches!(h.click, Click::Session(_))),
+                "arranging only chooses panels"
+            );
+        }
+
+        #[test]
+        fn the_pane_shows_the_sessions_and_its_keys_move_resume_and_refresh() {
+            let mut k = with_pane();
+            let screen = k.frame(164, 48);
+            for needle in [
+                "Sessions",
+                "Fix the login redirect",
+                "Rename the config keys",
+                "Write the release notes",
+            ] {
+                assert!(screen.contains(needle), "missing {needle:?}\n{screen}");
+            }
+            assert_eq!(k.scenario.saved_sessions.selected, 0);
+            press(&mut k, KeyCode::Char('j'));
+            press(&mut k, KeyCode::Down);
+            assert_eq!(k.scenario.saved_sessions.selected, 2);
+            press(&mut k, KeyCode::Down);
+            assert_eq!(k.scenario.saved_sessions.selected, 2, "stops at the end");
+            press(&mut k, KeyCode::Char('k'));
+            assert_eq!(k.scenario.saved_sessions.selected, 1);
+            press(&mut k, KeyCode::Enter);
+            assert!(matches!(
+                k.received_command(),
+                WorkerCommand::ResumeSession(id) if id == "session-b"
+            ));
+            assert_eq!(
+                k.tui.focus,
+                Focus::Conversation,
+                "after resuming, the keyboard is back at the prompt"
+            );
+            // the pane is where the rest of the keys are tried
+            k.tui.app.focus = 1;
+            k.tui.sync_focus();
+            press(&mut k, KeyCode::Home);
+            assert_eq!(k.scenario.saved_sessions.selected, 0);
+            press(&mut k, KeyCode::End);
+            assert_eq!(k.scenario.saved_sessions.selected, 2);
+            press(&mut k, KeyCode::PageUp);
+            assert_eq!(
+                k.scenario.saved_sessions.selected, 0,
+                "a page up, stopping at the top"
+            );
+            press(&mut k, KeyCode::PageDown);
+            assert_eq!(k.scenario.saved_sessions.selected, 2, "and a page down");
+            // `r` skips the wait: due again at once, once nothing runs
+            k.scenario.saved_sessions.requested(0);
+            k.scenario.saved_sessions.receive(vec![]);
+            assert!(!k.scenario.saved_sessions.due(true, false, 1));
+            press(&mut k, KeyCode::Char('r'));
+            assert!(k.scenario.saved_sessions.due(true, false, 1));
+        }
+
+        #[test]
+        fn the_keys_belong_to_the_pane_only_while_it_has_focus_and_is_the_built_in() {
+            let mut k = with_pane();
+            k.tui.app.focus = 0; // the conversation
+            k.tui.sync_focus();
+            press(&mut k, KeyCode::Char('j'));
+            assert_eq!(
+                k.scenario.saved_sessions.selected, 0,
+                "j typed into the draft"
+            );
+            assert_eq!(k.draft, "j");
+            // a profile pane that takes the built-in's name keeps its own keys
+            k.tui.app.focus = 1;
+            k.tui.sync_focus();
+            press(&mut k, KeyCode::Char('j'));
+            assert_eq!(
+                k.scenario.saved_sessions.selected, 1,
+                "the built-in pane takes j"
+            );
+            let host = Arc::new(PaneHost {
+                reads: Mutex::new(Vec::new()),
+                with_pane: true,
+            });
+            let mut session = crate::customization::CustomizationSession::open(host).unwrap();
+            let mut resolved = session.resolved.clone();
+            resolved.profile.panes.push(protocol::PaneDef {
+                id: "sessions".into(),
+                title: "Mine".into(),
+                surfaces: vec![protocol::Surface::Terminal],
+                source: protocol::PaneSource::Text { text: "own".into() },
+                actions: vec![],
+            });
+            session.accept(resolved).unwrap();
+            k.tui.customization = Some(session);
+            press(&mut k, KeyCode::Char('j'));
+            assert_eq!(
+                k.scenario.saved_sessions.selected, 1,
+                "the profile's own pane is not the saved-sessions list"
+            );
+        }
+
+        #[test]
+        fn a_click_or_the_wheel_over_the_pane_acts_on_its_rows() {
+            let mut k = with_pane();
+            k.frame(164, 48);
+            assert_eq!(click_row(&mut k, (164, 48), 2), MouseOutcome::Session(2));
+            assert_eq!(
+                k.tui.app.focused_view(),
+                crate::proto::layout::View::Custom,
+                "the click focuses the pane it landed in"
+            );
+            let hit = k
+                .tui
+                .hits
+                .iter()
+                .find(|h| h.click == Click::Session(1))
+                .unwrap()
+                .rect;
+            let wheel = |k: &mut Keyboard, kind| {
+                handle_mouse(
+                    mouse(kind, hit.x + 3, hit.y),
+                    &mut k.tui,
+                    Rect::new(0, 0, 164, 48),
+                    None,
+                    false,
+                )
+            };
+            assert_eq!(
+                wheel(&mut k, MouseEventKind::ScrollDown),
+                MouseOutcome::SessionsSelect(1)
+            );
+            assert_eq!(
+                wheel(&mut k, MouseEventKind::ScrollUp),
+                MouseOutcome::SessionsSelect(-1)
+            );
+        }
+
+        #[test]
+        fn the_list_is_requested_only_while_shown_idle_and_out_of_date() {
+            let mut k = Keyboard::new();
+            k.tui.app.sidebar = false;
+            request_saved_sessions(&k.tui, &mut k.scenario, &k.tx, 100);
+            k.no_send(); // nothing shows it
+            k.tui.app.sidebar = true;
+            k.scenario.turn_live = true;
+            request_saved_sessions(&k.tui, &mut k.scenario, &k.tx, 200);
+            k.no_send(); // a turn is running
+            k.scenario.turn_live = false;
+            request_saved_sessions(&k.tui, &mut k.scenario, &k.tx, 300);
+            assert!(matches!(
+                k.rx.try_recv().unwrap(),
+                WorkerCommand::ListSavedSessions
+            ));
+            request_saved_sessions(&k.tui, &mut k.scenario, &k.tx, 400);
+            k.no_send(); // one request at a time
+            k.receive(listed());
+            request_saved_sessions(&k.tui, &mut k.scenario, &k.tx, 2_000);
+            k.no_send(); // nothing changed since
+            k.scenario.turns += 1; // a turn ended
+            request_saved_sessions(&k.tui, &mut k.scenario, &k.tx, 2_100);
+            k.no_send(); // too soon after the last ask, at 300
+            request_saved_sessions(
+                &k.tui,
+                &mut k.scenario,
+                &k.tx,
+                300 + crate::proto::saved_sessions::MIN_GAP_MS,
+            );
+            assert!(matches!(
+                k.rx.try_recv().unwrap(),
+                WorkerCommand::ListSavedSessions
+            ));
+        }
+
+        #[test]
+        fn a_worker_that_is_gone_is_not_asked_on_every_tick() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(rx);
+            let mut k = Keyboard::new();
+            k.tui.app.sidebar = true;
+            request_saved_sessions(&k.tui, &mut k.scenario, &tx, 1_000);
+            assert!(
+                !k.scenario.saved_sessions.due(true, false, 1_016),
+                "next tick"
+            );
+            assert!(!k.scenario.saved_sessions.due(true, false, 4_000));
+            assert!(k.scenario.saved_sessions.due(
+                true,
+                false,
+                1_000 + crate::proto::saved_sessions::MIN_GAP_MS
+            ));
+        }
+
+        /// A keyboard whose layout has Changes and the Conversation, and no
+        /// Sessions pane yet.
+        fn without_pane() -> Keyboard {
+            let mut k = Keyboard::new();
+            let session = crate::customization::CustomizationSession::open(Arc::new(PaneHost {
+                reads: Mutex::new(Vec::new()),
+                with_pane: false,
+            }))
+            .unwrap();
+            k.tui.app.tree = crate::customization::profile_tree(&session.resolved.profile).unwrap();
+            k.tui.customization = Some(session);
+            k.tui.app.focus = 1; // the Conversation is panel 2
+            k.tui.sync_focus();
+            k.receive(listed());
+            k
+        }
+
+        #[test]
+        fn keys_that_arrive_in_a_burst_after_picking_the_pane_still_reach_the_panel_they_name() {
+            // Esc v s i 2 can reach the app in one read when it was busy drawing:
+            // nothing ticks between the keys, so the pane has no output yet. The
+            // `2` must jump to panel 2, not be swallowed as a pane action that
+            // cannot run before that output exists.
+            let mut k = without_pane();
+            k.tui.app.arranging = true;
+            for code in [
+                KeyCode::Char('v'),
+                KeyCode::Char('s'),
+                KeyCode::Char('i'),
+                KeyCode::Char('2'),
+            ] {
+                press(&mut k, code);
+            }
+            assert_eq!(k.tui.app.tree.panel_count(), 3);
+            assert_eq!(
+                k.tui.app.focused_view(),
+                crate::proto::layout::View::Conversation,
+                "panel 2 is the Conversation: the digit was a jump, not an action"
+            );
+            assert_eq!(k.tui.focus, Focus::Conversation);
+            assert!(
+                !k.scenario.custom_panes.contains_key("sessions"),
+                "and no tick has run: the pane really had no output"
+            );
+        }
+
+        #[test]
+        fn the_digits_jump_between_panels_while_the_pane_has_focus() {
+            let mut k = with_pane(); // Conversation, Sessions: the pane is panel 2
+            press(&mut k, KeyCode::Char('1'));
+            assert_eq!(k.tui.app.focus, 0, "a digit jumps to its panel");
+            assert_eq!(k.tui.focus, Focus::Conversation);
+            assert_eq!(k.draft, "", "the digit was a jump, not typed text");
+            press(&mut k, KeyCode::Tab);
+            assert_eq!(k.tui.app.focus, 1, "Tab brings the pane back into focus");
+            press(&mut k, KeyCode::Char('1'));
+            assert_eq!(k.tui.app.focus, 0, "and the digit leaves it again");
+            assert_eq!(k.draft, "");
+        }
+
+        #[test]
+        fn the_picker_offers_the_pane_on_s_and_the_pane_reads_its_title_once() {
+            let mut k = with_pane();
+            k.tui.app.focus = 0;
+            k.tui.sync_focus();
+            k.tui.app.arranging = true;
+            k.plain(KeyCode::Char('v')); // split: the picker asks what to show
+            let screen = k.frame(100, 40);
+            assert!(
+                screen.contains("SHOW WHAT?") && screen.contains("Sessions"),
+                "{screen}"
+            );
+            k.plain(KeyCode::Char('s'));
+            assert!(k.tui.app.picker.is_none(), "the key picked the row");
+            let at = k.tui.app.focus;
+            assert_eq!(k.tui.app.tree.custom_id_at(at).as_deref(), Some("sessions"));
+
+            let (mut council, mut reactor, mut dirty) = (0, 0, false);
+            let mut scenario = Scenario::new();
+            refresh_builtin_panes(
+                &mut k.tui,
+                &mut scenario,
+                1_000,
+                &mut council,
+                &mut reactor,
+                &mut dirty,
+            );
+            assert_eq!(scenario.custom_panes["sessions"].title, "Sessions");
+            // the pane's output is only its title: later ticks do not re-read it
+            let stored = scenario.custom_panes["sessions"].clone();
+            for now in [1_100, 2_500, 9_000] {
+                refresh_builtin_panes(
+                    &mut k.tui,
+                    &mut scenario,
+                    now,
+                    &mut council,
+                    &mut reactor,
+                    &mut dirty,
+                );
+            }
+            assert_eq!(scenario.custom_panes["sessions"], stored);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11218,6 +11980,9 @@ fn refresh_builtin_panes(
                     || phase_changed
                     || (*reactor_dirty && reactor_due)
             }
+            // The saved sessions are drawn from the terminal's own state; the
+            // pane's output only carries its title, read once.
+            "sessions" => missing,
             _ => false,
         };
         if refresh {
@@ -12453,7 +13218,13 @@ fn handle_custom_key_with_history(
         tui.file_completion.sync_at_cursor(composer, 0);
         return true;
     }
-    if tui.app.focused_view() == super::layout::View::Custom {
+    // The built-in Sessions pane has keys of its own (j/k, ⏎, r, and the
+    // digits that jump between panels), so the pane-action keys below are not
+    // its: `r` lists the sessions again, and a digit must not be swallowed
+    // as an action before the pane's output even exists.
+    if tui.app.focused_view() == super::layout::View::Custom
+        && !sessions_pane_at(tui, tui.app.focus)
+    {
         match k.code {
             KeyCode::Char('r') => {
                 if let Some(id) = tui.app.tree.custom_id_at(tui.app.focus)

@@ -18,6 +18,7 @@ pub mod motion;
 pub mod overlays;
 pub mod pal;
 pub mod panes;
+pub mod sessions_list;
 pub mod side;
 pub mod tier;
 
@@ -71,8 +72,11 @@ pub const PICKER_VIEWS: [View; 8] = [
 ];
 
 /// Built-in panes the picker offers after the views: `(key, pane id, title)`.
-pub const PICKER_PANES: [(char, &str, &str); 2] =
-    [('9', "council", "Council"), ('0', "reactor", "Reactor")];
+pub const PICKER_PANES: [(char, &str, &str); 3] = [
+    ('9', "council", "Council"),
+    ('0', "reactor", "Reactor"),
+    ('s', "sessions", "Sessions"),
+];
 
 /// A snapshot of what changes the animations: taken before and after
 /// each key, so `Fx::observe` can stamp what moved.
@@ -485,6 +489,10 @@ pub(super) fn draw_with_reading(
                 width: side_w,
                 height: area.height.saturating_sub(2),
             };
+            // A session row in the sidebar is clickable only once the
+            // sidebar is fully there and the layout is not being arranged:
+            // while arranging, a click only chooses a panel.
+            let side_hits = cv.hit_mark();
             if side_reveal >= 1.0 {
                 side::draw(&mut cv, side_rect, s, inp.now_ms, red, inp.mono);
             } else {
@@ -499,6 +507,9 @@ pub(super) fn draw_with_reading(
                 cv.clipped(side_rect, |cv| {
                     side::draw(cv, side_rect, s, inp.now_ms, red, inp.mono);
                 });
+            }
+            if side_reveal < 1.0 || sh.arranging {
+                cv.truncate_hits(side_hits);
             }
         }
 
@@ -565,6 +576,22 @@ pub(super) fn draw_with_reading(
                     if reveal >= 1.0 {
                         conversation_feedback = frame;
                     }
+                } else if *view == View::Custom
+                    && sh.tree.custom_id_at(*i).as_deref() == Some("sessions")
+                    && !profile.panes.iter().any(|pane| pane.id == "sessions")
+                {
+                    // The saved sessions are the terminal's own state, drawn
+                    // here rather than from a text snapshot.
+                    sessions_list::draw_pane(
+                        cv,
+                        *r,
+                        &sessions_list::PaneIn {
+                            s,
+                            num: i + 1,
+                            focused: *i == focus,
+                            focus_fx: focus_in,
+                        },
+                    );
                 } else if *view == View::Custom {
                     let id = sh.tree.custom_id_at(*i).unwrap_or_default();
                     let builtin = matches!(id.as_str(), "council" | "reactor")
@@ -684,13 +711,16 @@ pub(super) fn draw_with_reading(
                     palette.app,
                     0.55 * nav_a,
                 );
+                // A built-in or profile pane says what it is, not "Custom pane".
+                let label = crate::customization::pane_title(&sh.tree, *i, &s.custom_panes)
+                    .unwrap_or(view.title());
                 overlays::nav_badge(
                     &mut cv,
                     *r,
                     i + 1,
                     view_colour_themed(palette, *view),
                     nav_a,
-                    view.title(),
+                    label,
                 );
             }
         }

@@ -377,6 +377,11 @@ pub enum Msg {
     SessionsListed(Vec<SessionsRow>),
     /// Terminal failure of the outstanding session-list request.
     SessionsListFailed(String),
+    /// This folder's newest saved sessions, for the sidebar and the Sessions
+    /// pane. Unlike `SessionsListed` it opens no picker and is never
+    /// refused for being unsolicited: the screen asked for it by showing
+    /// the list.
+    SavedSessions(Vec<SavedSession>),
     /// The worker restored a session on boot or via `/resume <id>` — replaces
     /// the transcript and counters in one reduce.
     TranscriptLoaded {
@@ -386,6 +391,22 @@ pub enum Msg {
         cost_microcents: u64,
         turns: u64,
     },
+}
+
+/// One saved session of this folder, as the sidebar and the Sessions pane
+/// list it. The worker only sends sessions that can be resumed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSession {
+    pub id: String,
+    /// The `/rename` name, else how the conversation began; empty when
+    /// neither is known.
+    pub title: String,
+    pub model: String,
+    pub turns: u64,
+    /// How long ago it was saved: "just now", "5m ago", "3h ago", "2d ago".
+    pub age: String,
+    /// The session this screen is on.
+    pub current: bool,
 }
 
 /// One row of the session picker (`/sessions`).

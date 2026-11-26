@@ -25,6 +25,9 @@ pub enum Click {
     Key(KeyCode, KeyModifiers),
     /// Select row `index` of the changed-files list (Changes and Review).
     File(usize),
+    /// Resume row `index` of the saved-sessions list (the sidebar and the
+    /// Sessions pane).
+    Session(usize),
     /// Pick row `index` of the `/` command list.
     Slash(usize),
     /// Complete row `index` of the workspace file picker into the draft.

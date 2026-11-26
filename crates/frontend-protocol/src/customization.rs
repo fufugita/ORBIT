@@ -319,6 +319,9 @@ pub enum SnapshotKind {
     Council,
     /// The ORBIT session's own token flow, from `PaneContext`.
     Reactor,
+    /// This folder's saved sessions. The terminal draws the list itself
+    /// from the session's own state; the snapshot text is only a caption.
+    Sessions,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -711,7 +714,7 @@ pub struct ProfileCommandResult {
 /// Panes ORBIT knows without a profile entry. They are selectable in any
 /// layout, yet `Profile::default()` keeps `panes: []`, so stored and fresh
 /// profiles stay byte-identical. A profile pane with the same id wins.
-pub const BUILTIN_PANE_IDS: [&str; 2] = ["council", "reactor"];
+pub const BUILTIN_PANE_IDS: [&str; 3] = ["council", "reactor", "sessions"];
 
 /// The definition of a built-in pane, or `None` for any other id.
 pub fn builtin_pane(id: &str) -> Option<PaneDef> {
@@ -736,12 +739,21 @@ pub fn builtin_pane(id: &str) -> Option<PaneDef> {
                 PaneAction::CycleReactorArt,
             ],
         ),
+        // No pane actions: the terminal gives this pane keys of its own (j/k,
+        // ⏎, r), and the digits keep jumping between panels.
+        "sessions" => ("Sessions", SnapshotKind::Sessions, vec![]),
         _ => return None,
+    };
+    // The saved-sessions list is drawn by the terminal only.
+    let surfaces = if id == "sessions" {
+        vec![Surface::Terminal]
+    } else {
+        vec![Surface::Terminal, Surface::Browser]
     };
     Some(PaneDef {
         id: id.into(),
         title: title.into(),
-        surfaces: vec![Surface::Terminal, Surface::Browser],
+        surfaces,
         source: PaneSource::Snapshot { snapshot },
         actions,
     })
@@ -1096,6 +1108,37 @@ mod builtin_pane_tests {
             serde_json::to_string(&SnapshotKind::Reactor).unwrap(),
             "\"reactor\""
         );
+        assert_eq!(
+            serde_json::to_string(&SnapshotKind::Sessions).unwrap(),
+            "\"sessions\""
+        );
+    }
+
+    #[test]
+    fn the_sessions_pane_is_builtin_terminal_only_and_selectable_in_a_layout() {
+        let pane = builtin_pane("sessions").expect("built-in");
+        assert_eq!(pane.title, "Sessions");
+        assert_eq!(pane.surfaces, vec![Surface::Terminal]);
+        assert!(pane.actions.is_empty(), "its keys are the terminal's own");
+        assert_eq!(
+            pane.source,
+            PaneSource::Snapshot {
+                snapshot: SnapshotKind::Sessions
+            }
+        );
+        let mut profile = Profile::default();
+        profile.layout.tree = LayoutNode::Split {
+            direction: Direction::Right,
+            shares: vec![60, 40],
+            children: vec![
+                LayoutNode::panel(View::Conversation),
+                LayoutNode::Custom {
+                    pane_id: "sessions".into(),
+                },
+            ],
+        };
+        profile.validate().expect("no profile entry needed");
+        assert!(BUILTIN_PANE_IDS.contains(&"sessions"));
     }
 }
 

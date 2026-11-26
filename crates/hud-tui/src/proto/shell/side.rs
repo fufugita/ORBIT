@@ -6,6 +6,7 @@ use super::canvas::{Cv, Rgb, Seg, clip_text, text_width, tint};
 use super::convo::kind_of;
 use super::frame::{pill, pill_width, star_frame};
 use super::motion::{flash, secs};
+use super::sessions_list;
 use crate::proto::scenario::{LineKind, Scenario, ToolState};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -39,8 +40,16 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono
         let mut yy = y + 1;
         let approval = s.approval_pending.is_some();
 
-        // SESSIONS — the open session.
-        section(cv, x, yy, w, "SESSIONS", colors.magenta, Some("1".into()));
+        // SESSIONS — the open session, then the other saved ones.
+        section(
+            cv,
+            x,
+            yy,
+            w,
+            "SESSIONS",
+            colors.magenta,
+            Some(s.saved_sessions.count_with_open(&s.session_id).to_string()),
+        );
         yy += 2;
         let bg = tint(colors.magenta, colors.sidebar, 0.1);
         cv.fill(x, yy, w, 1, bg);
@@ -85,7 +94,16 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono
                 Modifier::empty()
             },
         );
-        yy += 2;
+        yy += 1;
+        // The other saved sessions of this folder: a click resumes one.
+        yy += sessions_list::draw_sidebar_rows(
+            cv,
+            (x, yy, w),
+            &s.saved_sessions,
+            &s.session_id,
+            sessions_list::sidebar_room(h),
+        );
+        yy += 1;
 
         // AGENTS — ORBIT itself, then any subagents.
         let n_agents = 1 + s.agents.len();

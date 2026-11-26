@@ -348,6 +348,10 @@ pub enum WorkerCommand {
     ListModels,
     /// `/sessions` — list saved sessions (formatted by the worker).
     ListSessions,
+    /// Refresh the saved-sessions list the sidebar and the Sessions pane
+    /// draw. Answered with `Msg::SavedSessions`; it is not foreground work,
+    /// so it never makes the screen look busy.
+    ListSavedSessions,
     /// `/resume <id>` — load a saved session (transcript + counters).
     ResumeSession(String),
     /// `/compact` — Claude Code parity: summarize the transcript into one
@@ -422,6 +426,7 @@ impl WorkerCommand {
             | Self::ClearSession(_)
             | Self::ListModels
             | Self::ListSessions
+            | Self::ListSavedSessions
             | Self::ListInstalledMods => None,
         }
     }

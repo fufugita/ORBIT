@@ -22,6 +22,7 @@ pub mod mark;
 pub mod panels;
 pub mod ported;
 pub mod runtime;
+pub mod saved_sessions;
 pub mod scenario;
 pub mod screen;
 pub mod shell;

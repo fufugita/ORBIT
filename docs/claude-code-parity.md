@@ -116,9 +116,9 @@ from other tools, plugins and skills, subagents.
 
 | Feature | ORBIT | Notes |
 |---|---|---|
-| `--continue`, `--resume`, `/resume` picker | Present | Also `/sessions`; sessions are bound to their workspace. The picker lists every saved session except unnamed ones without a turn (the one in use stays). A row this folder cannot resume says so (`other folder`, `not bound to a folder`), and choosing it prints the reason. It has no search or filter |
+| `--continue`, `--resume`, `/resume` picker | Present | Also `/sessions`; sessions are bound to their workspace. The picker lists every saved session except unnamed ones without a turn (the one in use stays). A row this folder cannot resume says so (`other folder`, `not bound to a folder`), and choosing it prints the reason. It has no search or filter. The sidebar and the Sessions pane (`s` in "Show what?") also list this folder's newest sessions, and a click on a row resumes it |
 | Fork a session | Present | `--fork-session` at launch; `/fork` in the chat continues in a copy and keeps the original |
-| Name or rename a session | Partial | `/rename`; the name shows in `/sessions` only |
+| Name or rename a session | Partial | `/rename`; the name shows in `/sessions`, the sidebar and the Sessions pane |
 | Export or copy the transcript | Partial | `/copy` (last reply) and `/export [file]` (Markdown of what the pane shows); `orbit export --to` is an encrypted bundle, a different feature |
 | Checkpoints and rewind | Present | `/rewind`, `/undo` |
 | `/clear`, `/compact`, automatic compaction | Present | Also `orbit compact` for saved sessions. `/compact` keeps the last two exchanges whole. Within one long turn ORBIT drops old tool results instead of summarizing them |

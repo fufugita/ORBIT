@@ -1004,6 +1004,11 @@ pub fn read_pane_scoped(
                 text = reactor_snapshot(context, resolved.profile.glyphs == Glyphs::Ascii);
                 council = context.council.as_ref().map(sanitize_council_snapshot);
             }
+            // The terminal lists the saved sessions from its own state; only a
+            // caption comes from here.
+            SnapshotKind::Sessions => {
+                text = "Saved sessions of this folder. Pick one to resume it.".into();
+            }
         },
     }
     if text.is_empty() {

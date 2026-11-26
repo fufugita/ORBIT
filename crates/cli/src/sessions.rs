@@ -1819,6 +1819,66 @@ pub fn list_sessions(home: &Path) -> Result<Vec<SessionFile>, String> {
     Ok(out)
 }
 
+/// How many session files a list for the screen may read.
+pub const RECENT_SCAN_CAP: usize = 48;
+/// How many sessions that list keeps.
+pub const RECENT_KEEP: usize = 8;
+
+/// The newest saved sessions that can be resumed in `workspace`, for the
+/// sidebar and the Sessions pane.
+///
+/// `list_sessions` reads and parses every file, which is right for a picker
+/// the person opens and wrong for a list that refreshes itself: a home with
+/// hundreds of sessions would be read again after every turn. Here the
+/// directory is sorted by modification time and read from the newest file
+/// back, so the cost is at most `scan_cap` reads however many sessions exist.
+/// A session counts when it belongs to this workspace and `keep` accepts it.
+pub fn recent_in_workspace(
+    home: &Path,
+    workspace: &Path,
+    scan_cap: usize,
+    keep_n: usize,
+    keep: impl Fn(&SessionFile) -> bool,
+) -> Result<Vec<SessionFile>, String> {
+    let dir = sessions_dir(home);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let wanted = canonical_workspace(workspace).map_err(|error| error.to_string())?;
+    let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read {dir:?}: {e}"))? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        files.push((modified, id.to_owned()));
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
+    let mut out = Vec::new();
+    for (_, id) in files.into_iter().take(scan_cap) {
+        let Ok(session) = load_session(home, &id) else {
+            continue;
+        };
+        if session.workspace.as_ref() != Some(&wanted) || !keep(&session) {
+            continue;
+        }
+        out.push(session);
+        if out.len() >= keep_n {
+            break;
+        }
+    }
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1872,6 +1932,155 @@ mod tests {
         )
         .in_workspace(&current_workspace().unwrap())
         .unwrap()
+    }
+
+    /// Saved with a chosen "last updated" and file age, in the workspace given.
+    fn save_aged(home: &Path, id: &str, workspace: &Path, turns: u64, age_secs: u64) {
+        let mut session = sample(id);
+        session.workspace = Some(canonical_workspace(workspace).unwrap());
+        session.turns = turns;
+        session.updated_at = format!("{}", 2_000_000_000 - age_secs);
+        save_session(home, &session).unwrap();
+        let path = sessions_dir(home).join(format!("{id}.json"));
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn other_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("orbit-sessions-other-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn recent_sessions_are_this_workspaces_newest_in_last_updated_order() {
+        let home = test_home("recent-order");
+        let here = current_workspace().unwrap();
+        let elsewhere = other_dir("order");
+        for (id, age) in [("here-old", 900), ("here-new", 100), ("here-mid", 500)] {
+            save_aged(&home, id, &here, 2, age);
+        }
+        save_aged(&home, "away-newest", &elsewhere, 2, 10);
+        let found = recent_in_workspace(&home, &here, 48, 8, |_| true).unwrap();
+        let ids: Vec<&str> = found.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["here-new", "here-mid", "here-old"]);
+        let capped = recent_in_workspace(&home, &here, 48, 2, |_| true).unwrap();
+        let ids: Vec<&str> = capped.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["here-new", "here-mid"], "the newest two, not any two");
+    }
+
+    #[test]
+    fn recent_sessions_read_only_the_newest_files() {
+        // Twelve newer files belong to another folder; ours is older. A scan
+        // that may read ten files never gets to it, one that may read
+        // thirteen does: the cap counts files read, not sessions found.
+        let home = test_home("recent-cap");
+        let here = current_workspace().unwrap();
+        let elsewhere = other_dir("cap");
+        for n in 0..12 {
+            save_aged(&home, &format!("away-{n:02}"), &elsewhere, 1, 10 + n);
+        }
+        save_aged(&home, "here-only", &here, 1, 5_000);
+        assert!(
+            recent_in_workspace(&home, &here, 10, 8, |_| true)
+                .unwrap()
+                .is_empty()
+        );
+        let found = recent_in_workspace(&home, &here, 13, 8, |_| true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "here-only");
+    }
+
+    #[test]
+    fn recent_sessions_skip_unbound_ones_and_what_the_filter_refuses() {
+        let home = test_home("recent-filter");
+        let here = current_workspace().unwrap();
+        save_aged(&home, "kept", &here, 3, 100);
+        save_aged(&home, "empty-unnamed", &here, 0, 50);
+        let mut unbound = sample("unbound");
+        unbound.workspace = None;
+        save_session(&home, &unbound).unwrap();
+        let found = recent_in_workspace(&home, &here, 48, 8, |session| session.turns > 0).unwrap();
+        let ids: Vec<&str> = found.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["kept"],
+            "no turn and no folder are not resumable here"
+        );
+    }
+
+    /// A home like a long-lived real one: hundreds of sessions, tens of
+    /// megabytes. A measurement more than a check, so it only runs on request:
+    /// `cargo test -p orbit-cli --lib recent_sessions_listing_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run it with --ignored --nocapture"]
+    fn recent_sessions_listing_cost_with_a_large_home() {
+        let home = test_home("recent-large");
+        let here = current_workspace().unwrap();
+        let elsewhere = other_dir("large");
+        let filler = "x".repeat(70_000);
+        let mut bytes = 0u64;
+        for n in 0..458u64 {
+            let id = format!("large-{n:03}");
+            let mut session = sample(&id);
+            session.workspace =
+                Some(canonical_workspace(if n % 3 == 0 { &here } else { &elsewhere }).unwrap());
+            session.turns = 3;
+            session.updated_at = format!("{}", 2_000_000_000 - n * 60);
+            session.transcript[0].content = filler.clone();
+            save_session(&home, &session).unwrap();
+            let path = sessions_dir(&home).join(format!("{id}.json"));
+            bytes += std::fs::metadata(&path).unwrap().len();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(n * 60))
+                .unwrap();
+        }
+        let time = |work: &dyn Fn() -> usize| {
+            let mut best = std::time::Duration::MAX;
+            let mut count = 0;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                count = work();
+                best = best.min(start.elapsed());
+            }
+            (best, count)
+        };
+        let (bounded, kept) = time(&|| {
+            recent_in_workspace(&home, &here, RECENT_SCAN_CAP, RECENT_KEEP, |s| s.turns > 0)
+                .unwrap()
+                .len()
+        });
+        let (full, all) = time(&|| list_sessions(&home).unwrap().len());
+        eprintln!(
+            "home: {} files, {:.1} MB\n  bounded scan (newest {RECENT_SCAN_CAP} read, {RECENT_KEEP} kept): {kept} listed in {bounded:?}\n  full parse (list_sessions): {all} sessions in {full:?}\n  ratio: {:.1}x",
+            458,
+            bytes as f64 / 1e6,
+            full.as_secs_f64() / bounded.as_secs_f64(),
+        );
+        assert_eq!(kept, RECENT_KEEP);
+        assert!(
+            bounded * 3 < full,
+            "the bounded scan must cost a fraction of the full parse"
+        );
+    }
+
+    #[test]
+    fn recent_sessions_of_a_home_with_no_sessions_folder_is_empty() {
+        let home = test_home("recent-none");
+        let here = current_workspace().unwrap();
+        assert!(
+            recent_in_workspace(&home, &here, 48, 8, |_| true)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

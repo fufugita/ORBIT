@@ -113,6 +113,8 @@ pub struct Scenario {
     pub edit_request: Option<(std::path::PathBuf, String)>,
     pub custom_panes:
         std::collections::BTreeMap<String, orbit_frontend_protocol::customization::PaneOutput>,
+    /// This folder's saved sessions, for the sidebar and the Sessions pane.
+    pub saved_sessions: crate::proto::saved_sessions::SavedSessions,
     /// The council engine's state as the pane draws it. Filled from the
     /// session's pane context; `None` when no council has published.
     pub council: Option<crate::proto::ported::CouncilState>,

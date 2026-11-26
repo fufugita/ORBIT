@@ -775,7 +775,7 @@ pub fn picker(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduce
                 cv,
                 x + 3,
                 y + bh - 1,
-                &[("1-0", "pick"), ("esc", "cancel")],
+                &[("1-0 s", "pick"), ("esc", "cancel")],
                 Some(colors.raise),
             );
         },
