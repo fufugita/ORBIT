@@ -2005,6 +2005,149 @@ TUI_GAP_SESSIONS_LIST_CHECKS = {
 }
 
 
+TUI_GAP_MENUS_CHECKS = {
+    "menus TUI boots with a live composer": False,
+    "/mode opens a menu of the six permission modes": False,
+    "choosing a mode in the menu applies it": False,
+    "/mcp opens the manager with every configured server": False,
+    "connecting a server in the manager lists its tools": False,
+    "typing in the manager filters its rows and Esc ends the filter first": False,
+    "a mouse click on the manager's Esc hint closes it": False,
+}
+
+# An MCP server that answers what a client needs and nothing else, written
+# into the scratch folder of the scenario that uses it.
+_FAKE_MCP_SERVER = """
+import json, sys
+TOOLS = [
+    {"name": "echo", "description": "Echo the text back.", "inputSchema": {"type": "object"}},
+    {"name": "ping", "description": "Answer pong.", "inputSchema": {"type": "object"}},
+]
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}) + "\\n")
+    sys.stdout.flush()
+"""
+
+
+def _tui_gap_run_menus(args):
+    """The menus: bare `/mode` opens a menu whose row runs the mode, and
+    `/mcp` is a manager: rows with a preview, an action that starts a server
+    and lists its tools, a filter, and keys that answer a click."""
+    label = "coverage-menus"
+    begin_scenario(TUI_GAP_MENUS_CHECKS)
+    work = mock = sess = None
+    try:
+        work, mock, home, request_log = _tui_gap_fixture(
+            args, label, {"main": [{"text": "MENUS_REPLY"}]})
+        server = Path(work, "fake_mcp_server.py")
+        server.write_text(_FAKE_MCP_SERVER)
+        Path(home, "mcp.json").write_text(json.dumps({"servers": {
+            "alpha": {"command": sys.executable, "args": ["-u", str(server)]},
+            "beta": {"command": "/nonexistent/orbit-menus-scenario"},
+        }}))
+        sess = PtySession(
+            [args.binary, "--home", home, "--model", "scripted"],
+            env={"ORBIT_HOME": home}, timeout=25, rows=44, cols=140, cwd=work,
+        )
+        boot, screen = sess.wait_for("ORBIT", timeout=15)
+        boot = boot and _tui_gap_wait_composer(sess, timeout=8)[0]
+        if not check("menus TUI boots with a live composer", boot, screen[-600:],
+                     prerequisite=True):
+            return
+
+        def wait_until(done, seconds=12):
+            deadline = time.monotonic() + seconds
+            screen_text = sess.screen_text()
+            while time.monotonic() < deadline:
+                sess.read(0.3)
+                screen_text = sess.screen_text()
+                if done(screen_text):
+                    return True, screen_text
+            return False, screen_text
+
+        sess.type("/mode")
+        sess.write(b"\r")
+        opened, screen = wait_until(lambda text: "PERMISSION MODE" in text)
+        modes = ("default", "acceptEdits", "plan", "auto", "dontAsk", "bypass")
+        if not check("/mode opens a menu of the six permission modes",
+                     opened and all(mode in screen for mode in modes)
+                     and "● default" in screen, screen[-1200:], prerequisite=True):
+            return
+        sess.write(b"\x1b[B")  # Down: acceptEdits
+        sess.read(0.3)
+        sess.write(b"\r")
+        closed, screen = wait_until(lambda text: "PERMISSION MODE" not in text, seconds=6)
+        sess.type("/mode")
+        sess.write(b"\r")
+        marked, screen = wait_until(lambda text: re.search(r"● acceptEdits", text) is not None)
+        check("choosing a mode in the menu applies it", closed and marked, screen[-1200:])
+        sess.write(b"\x1b")
+        sess.read(0.5)
+
+        sess.type("/mcp")
+        sess.write(b"\r")
+        opened, screen = wait_until(lambda text: "MCP SERVERS" in text)
+        if not check("/mcp opens the manager with every configured server",
+                     opened and "alpha" in screen and "beta" in screen, screen[-1400:],
+                     prerequisite=True):
+            return
+        # alpha is first: Enter starts it, and its tools are listed.
+        sess.write(b"\r")
+        listed, screen = wait_until(lambda text: "tools (2): echo, ping" in text, seconds=15)
+        check("connecting a server in the manager lists its tools", listed, screen[-1400:])
+
+        sess.write(b"/")
+        sess.read(0.3)
+        sess.type("bet")
+        filtered, screen = wait_until(lambda text: "to filter" in text and "/ bet" in text)
+        body = screen.split("MCP SERVERS", 1)[-1]
+        only_beta = filtered and "beta" in body and "alpha" not in body
+        sess.write(b"\x1b")
+        sess.read(0.5)
+        screen = sess.screen_text()
+        both_back = "MCP SERVERS" in screen and "alpha" in screen and "beta" in screen
+        check("typing in the manager filters its rows and Esc ends the filter first",
+              only_beta and both_back, screen[-1400:])
+
+        hint = next(((row.index("esc close"), y)
+                     for y, row in enumerate(screen.splitlines()) if "esc close" in row), None)
+        gone = False
+        if hint is not None:
+            sess.click(hint[0] + 1, hint[1])
+            gone, screen = wait_until(lambda text: "MCP SERVERS" not in text, seconds=6)
+        check("a mouse click on the manager's Esc hint closes it", gone,
+              f"hint={hint}; frame={_tui_gap_screen_diagnostic(sess, screen)}")
+    except Exception as exc:
+        check("menus TUI scenario completes", False,
+              f"exception_type={type(exc).__name__}", independent=True, prerequisite=True)
+    finally:
+        global TUI_GAP_CLEANUP_FAILED
+        cleanup_ok = True
+        if sess is not None:
+            cleanup_ok = stop_tui_session(sess, label) and cleanup_ok
+        if mock is not None:
+            cleanup_ok = stop_scripted_mock(mock, label) and cleanup_ok
+        if work is not None:
+            cleanup_ok = remove_scripted_fixture(work, label) and cleanup_ok
+        if not cleanup_ok:
+            TUI_GAP_CLEANUP_FAILED = True
+        finish_tui_gap_scenario()
+
+
 def _tui_gap_skip_scenario(label, expected, reason="owned fixture cleanup was not verified"):
     begin_scenario(expected)
     check(f"{label} was not launched after unverified fixture cleanup", None,
@@ -4391,6 +4534,7 @@ def run_tui_coverage_gap_scenarios(args, primary_mock):
         ("resend-resume-notice", TUI_GAP_RESEND_RESUME_CHECKS, _tui_gap_run_resend_resume_notice),
         ("ordinary-truncated", TUI_GAP_TRUNCATED_CHECKS, _tui_gap_run_ordinary_truncated),
         ("coverage-sessions-list", TUI_GAP_SESSIONS_LIST_CHECKS, _tui_gap_run_sessions_list),
+        ("coverage-menus", TUI_GAP_MENUS_CHECKS, _tui_gap_run_menus),
     )
     admission_problems = _tui_gap_batch_admission_problems(primary_mock)
     if admission_problems:

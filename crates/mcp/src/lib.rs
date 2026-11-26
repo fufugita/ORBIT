@@ -1794,6 +1794,34 @@ impl McpPool {
         self.get_with_options(name, cfg, &cfg.options())
     }
 
+    /// Stop a server's running process, so its next use starts a new one.
+    /// `Ok(true)` when one was running. A call still in flight is waited for
+    /// a little (two seconds), then reported rather than cut short.
+    pub fn close(&self, name: &str) -> Result<bool, String> {
+        let Some(map) = self.sessions.get() else {
+            return Ok(false);
+        };
+        let slot = map
+            .lock()
+            .map_err(|_| "mcp pool lock poisoned".to_owned())?
+            .get(name)
+            .cloned();
+        let Some(slot) = slot else {
+            return Ok(false);
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match slot.try_lock() {
+                Ok(mut entry) => return Ok(entry.session.take().is_some()),
+                Err(TryLockError::Poisoned(_)) => return Err("mcp pool lock poisoned".into()),
+                Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                    return Err(format!("a call to {name} is still running"));
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(POLL_INTERVAL),
+            }
+        }
+    }
+
     /// What each running server said about itself at its handshake
     /// (`instructions`), by server name, in name order. A server that is
     /// busy with a call right now is left out rather than waited for.
@@ -2479,6 +2507,29 @@ for line in sys.stdin:
         assert!(McpConfig::try_load_at(&fixture.dir, &project, false).is_err());
         std::fs::write(fixture.dir.join("mcp.json"), "bad json").unwrap();
         assert!(McpConfig::try_load_at(&fixture.dir, &project, false).is_err());
+    }
+
+    #[test]
+    fn close_stops_the_running_server_and_the_next_use_starts_a_new_process() {
+        let fixture = Fixture::new("normal");
+        let pool = McpPool::new();
+        // Nothing has run: nothing to stop, and no error.
+        assert_eq!(pool.close("fake"), Ok(false));
+        let first = pool
+            .call_tool("fake", &fixture.cfg, "echo", serde_json::json!({}))
+            .unwrap();
+        let again = pool
+            .call_tool("fake", &fixture.cfg, "echo", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(first["pid"], again["pid"], "one process is reused");
+        assert_eq!(pool.close("fake"), Ok(true));
+        assert_eq!(pool.close("fake"), Ok(false), "already stopped");
+        // Another name is untouched, and the closed one starts afresh.
+        assert_eq!(pool.close("never-started"), Ok(false));
+        let fresh = pool
+            .call_tool("fake", &fixture.cfg, "echo", serde_json::json!({}))
+            .unwrap();
+        assert_ne!(first["pid"], fresh["pid"]);
     }
 
     #[test]

@@ -306,16 +306,13 @@ pub fn set_output_style(home: &Path, working_dir: &Path, name: Option<&str>) -> 
     known
 }
 
-/// The selected output style's instructions. The name comes from
-/// `ORBIT_OUTPUT_STYLE` (`--output-style`), else a top-level
-/// `output_style = "name"` in `$ORBIT_HOME/settings.toml`. `explanatory`
-/// and `learning` are built in; any other name is a Markdown file in
-/// `.orbit/output-styles/`, `.claude/output-styles/` or
-/// `$ORBIT_HOME/output-styles/`, used without its front matter. `default`,
-/// no name, or a name with no file adds nothing.
-fn output_style(home: &Path, working_dir: &Path) -> Option<String> {
+/// The name of the selected output style, before it is looked up: what
+/// `/output-style` chose, else `ORBIT_OUTPUT_STYLE` (`--output-style`), else a
+/// top-level `output_style = "name"` in the settings. `None` when nothing
+/// was chosen.
+fn chosen_output_style_name(home: &Path) -> Option<String> {
     let chosen = OUTPUT_STYLE.lock().ok().and_then(|slot| slot.clone());
-    let name = chosen
+    chosen
         .or_else(|| std::env::var("ORBIT_OUTPUT_STYLE").ok())
         .filter(|name| !name.trim().is_empty())
         .or_else(|| {
@@ -340,7 +337,70 @@ fn output_style(home: &Path, working_dir: &Path) -> Option<String> {
                         .ok()
                         .and_then(named)
                 })
-        })?;
+        })
+}
+
+/// The selected output style's name as `/output-style` shows it: `default`
+/// when none is chosen or the one chosen is `default`.
+pub fn selected_output_style(home: &Path) -> String {
+    chosen_output_style_name(home)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "default".to_owned())
+}
+
+/// Every name `/output-style` accepts: `default` and the two built in, then
+/// the Markdown files of the three style folders, each name once.
+pub fn output_style_names(home: &Path, working_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = ["default", "explanatory", "learning"]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    for dir in [
+        working_dir.join(".orbit/output-styles"),
+        working_dir.join(".claude/output-styles"),
+        home.join("output-styles"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // The same rule a name must meet to be selected.
+            if stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                && !stem.is_empty()
+                && !names
+                    .iter()
+                    .chain(&found)
+                    .any(|n| n.eq_ignore_ascii_case(stem))
+            {
+                found.push(stem.to_owned());
+            }
+        }
+    }
+    found.sort();
+    names.extend(found);
+    names
+}
+
+/// The selected output style's instructions. The name comes from
+/// `ORBIT_OUTPUT_STYLE` (`--output-style`), else a top-level
+/// `output_style = "name"` in `$ORBIT_HOME/settings.toml`. `explanatory`
+/// and `learning` are built in; any other name is a Markdown file in
+/// `.orbit/output-styles/`, `.claude/output-styles/` or
+/// `$ORBIT_HOME/output-styles/`, used without its front matter. `default`,
+/// no name, or a name with no file adds nothing.
+fn output_style(home: &Path, working_dir: &Path) -> Option<String> {
+    let name = chosen_output_style_name(home)?;
     let name = name.trim();
     match name.to_ascii_lowercase().as_str() {
         "" | "default" => return None,
@@ -1257,6 +1317,59 @@ mod tests {
                     .contains("TODO(human)")
             );
         }
+    }
+
+    #[test]
+    fn the_style_names_to_choose_from_and_the_one_in_use_come_from_the_same_places() {
+        let root = std::env::temp_dir().join(format!(
+            "orbit-ctx-style-names-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let (home, project) = (root.join("home"), root.join("project"));
+        for dir in [
+            home.join("output-styles"),
+            project.join(".orbit/output-styles"),
+            project.join(".claude/output-styles"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let write = |path: std::path::PathBuf| std::fs::write(path, "BODY\n").unwrap();
+        write(home.join("output-styles/terse.md"));
+        write(project.join(".orbit/output-styles/loud.md"));
+        // The same name in a second folder is one name; a name that could
+        // not be selected, a file that is not Markdown and a built-in's name
+        // are not offered again.
+        write(project.join(".claude/output-styles/terse.md"));
+        write(home.join("output-styles/not a name.md"));
+        write(home.join("output-styles/notes.txt"));
+        write(home.join("output-styles/Learning.md"));
+        if std::env::var_os("ORBIT_OUTPUT_STYLE").is_none() {
+            assert_eq!(
+                output_style_names(&home, &project),
+                ["default", "explanatory", "learning", "loud", "terse"]
+            );
+            assert_eq!(selected_output_style(&home), "default");
+            std::fs::write(home.join("settings.toml"), "output_style = \"terse\"\n").unwrap();
+            assert_eq!(selected_output_style(&home), "terse");
+            std::fs::write(home.join("settings.toml"), "output_style = \"\"\n").unwrap();
+            assert_eq!(selected_output_style(&home), "default");
+            // Every name offered is one the style lookup accepts.
+            for name in output_style_names(&home, &project) {
+                std::fs::write(
+                    home.join("settings.toml"),
+                    format!("output_style = \"{name}\"\n"),
+                )
+                .unwrap();
+                assert_eq!(selected_output_style(&home), name);
+                if name != "default" {
+                    assert!(output_style(&home, &project).is_some(), "{name}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

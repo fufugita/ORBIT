@@ -254,6 +254,125 @@ fn listed(home: &Path, project: &Path) -> Result<Vec<Value>, CliError> {
     Ok(out)
 }
 
+/// Where a server of this name is configured, in the order a session reads
+/// the files: the project's own, then the user's, then Claude Code's
+/// `.mcp.json`. A server in none of them came from `--mcp-config`.
+pub fn scope_of(home: &Path, project: &Path, trusted: bool, name: &str) -> &'static str {
+    let defines = |path: PathBuf| {
+        read(&path)
+            .ok()
+            .and_then(|document| document.get("servers").cloned())
+            .and_then(|servers| servers.as_object().map(|map| map.contains_key(name)))
+            .unwrap_or(false)
+    };
+    if trusted && defines(project.join(".orbit").join("mcp.json")) {
+        "project"
+    } else if defines(home.join("mcp.json")) {
+        "user"
+    } else if trusted
+        && std::fs::read_to_string(project.join(".mcp.json"))
+            .ok()
+            .and_then(|text| orbit_mcp::parse_claude_servers(&text).ok())
+            .is_some_and(|servers| servers.contains_key(name))
+    {
+        ".mcp.json"
+    } else {
+        "--mcp-config"
+    }
+}
+
+/// The servers the `/mcp` manager lists: the configuration a session reads,
+/// each with where it came from, how it last answered and what it offered.
+/// Nothing is started to build this.
+pub fn manager_rows(
+    home: &Path,
+    project: &Path,
+) -> Result<Vec<orbit_hud_tui::msg::McpServerRow>, String> {
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
+    let config = orbit_mcp::McpConfig::try_load_at(home, project, trusted)?;
+    Ok(config
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            let answer = crate::tools::mcp_last_answer(name);
+            let (state, tools, tool_count) = if !server.enabled {
+                ("disabled".to_owned(), Vec::new(), None)
+            } else {
+                match answer {
+                    Some(Ok(tools)) => (
+                        crate::tools::mcp_state_text(name).unwrap_or_else(|| "running".to_owned()),
+                        tools.clone(),
+                        Some(tools.len()),
+                    ),
+                    Some(Err(error)) => (format!("not available: {error}"), Vec::new(), None),
+                    None => ("starts when a prompt needs it".to_owned(), Vec::new(), None),
+                }
+            };
+            orbit_hud_tui::msg::McpServerRow {
+                name: name.clone(),
+                transport: match server.transport {
+                    McpTransport::Stdio => "stdio",
+                    McpTransport::StreamableHttp => "streamable-http",
+                    McpTransport::Sse => "sse",
+                }
+                .to_owned(),
+                scope: scope_of(home, project, trusted, name).to_owned(),
+                enabled: server.enabled,
+                target: shown_target(server),
+                state,
+                tools,
+                tool_count,
+                auth: orbit_mcp::oauth::status(home, name),
+                env: server.env.keys().cloned().collect(),
+                headers: server.headers.keys().cloned().collect(),
+            }
+        })
+        .collect())
+}
+
+/// Turn a server on or off in the file that defines it. A server that comes
+/// from Claude Code's `.mcp.json` or `--mcp-config` is not ours to edit.
+pub fn set_enabled(home: &Path, project: &Path, name: &str, enabled: bool) -> Result<(), String> {
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
+    let scope = scope_of(home, project, trusted, name);
+    if !matches!(scope, "user" | "project") {
+        return Err(format!(
+            "{name} comes from {scope}; change it there, not from here"
+        ));
+    }
+    let file = scope_file(home, project, scope).map_err(|error| error.to_string())?;
+    let mut document = read(&file).map_err(|error| error.to_string())?;
+    let entry = document
+        .get_mut("servers")
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.get_mut(name))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| format!("no MCP server named {name} in {}", file.display()))?;
+    entry.insert("enabled".into(), Value::Bool(enabled));
+    write(&file, &document).map_err(|error| error.to_string())
+}
+
+/// What the manager's action keys do to one server, then how it stands.
+/// `reconnect` and `enable` start the server so the list can say whether it
+/// answered; `disable` stops it. Only a refusal is an error: a server that
+/// does not start is a row that says why.
+pub fn manager_action(home: &Path, project: &Path, action: &str, name: &str) -> Result<(), String> {
+    match action {
+        "reconnect" => crate::tools::connect_mcp(home, project, name, true),
+        "enable" => {
+            set_enabled(home, project, name, true)?;
+            crate::tools::connect_mcp(home, project, name, false)
+        }
+        "disable" => {
+            set_enabled(home, project, name, false)?;
+            crate::tools::disconnect_mcp(name)
+        }
+        other => Err(format!("unknown MCP action {other}")),
+    }
+}
+
 /// `orbit mcp …`.
 pub fn command(home: &Path, project: &Path, args: &[String]) -> Result<Value, CliError> {
     // After `--`, every word belongs to the server's own command line.
@@ -829,6 +948,177 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ---- the /mcp manager's rows and actions ----
+
+    fn trusted(dir: &Path) {
+        orbit_tools::permissions::FolderTrust::new(dir.join("home"))
+            .trust(&dir.join("project"))
+            .unwrap();
+    }
+
+    #[test]
+    fn the_manager_lists_every_server_with_where_it_is_configured() {
+        let dir = scratch();
+        std::fs::write(
+            dir.join("home/mcp.json"),
+            r#"{"servers": {
+                "alpha": {"command": "alpha-server", "env": {"ALPHA_TOKEN": "s3cr3t"}},
+                "beta": {"command": "beta-server", "enabled": false},
+                "remote": {"transport": "streamable-http", "url": "https://mcp.example.com/mcp?key=abc", "headers": {"Authorization": "Bearer xyz"}}
+            }}"#,
+        )
+        .unwrap();
+        let rows = manager_rows(&dir.join("home"), &dir.join("project")).unwrap();
+        let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta", "remote"]);
+        let alpha = &rows[0];
+        assert_eq!(alpha.scope, "user");
+        assert_eq!(alpha.transport, "stdio");
+        assert!(alpha.enabled);
+        assert_eq!(alpha.state, "starts when a prompt needs it");
+        assert_eq!(alpha.tool_count, None);
+        assert_eq!(alpha.env, ["ALPHA_TOKEN"]);
+        // Never a secret: the environment value is not in any field.
+        assert!(!format!("{alpha:?}").contains("s3cr3t"));
+        assert!(!rows[0].target.is_empty());
+        assert_eq!(rows[1].state, "disabled");
+        assert!(!rows[1].enabled);
+        let remote = &rows[2];
+        assert_eq!(remote.transport, "streamable-http");
+        assert_eq!(remote.headers, ["Authorization"]);
+        let shown = format!("{remote:?}");
+        assert!(!shown.contains("Bearer xyz"), "{shown}");
+        assert!(!shown.contains("key=abc"), "{shown}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_servers_scope_follows_the_order_a_session_reads_the_files() {
+        let dir = scratch();
+        trusted(&dir);
+        std::fs::write(
+            dir.join("home/mcp.json"),
+            r#"{"servers": {"both": {"command": "user-copy"}, "mine": {"command": "m"}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("project/.orbit")).unwrap();
+        std::fs::write(
+            dir.join("project/.orbit/mcp.json"),
+            r#"{"servers": {"both": {"command": "project-copy"}, "local": {"command": "l"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("project/.mcp.json"),
+            r#"{"mcpServers": {"claude": {"command": "c"}, "mine": {"command": "shadowed"}}}"#,
+        )
+        .unwrap();
+        let (home, project) = (dir.join("home"), dir.join("project"));
+        for (name, scope) in [
+            ("both", "project"),
+            ("mine", "user"),
+            ("local", "project"),
+            ("claude", ".mcp.json"),
+            ("ghost", "--mcp-config"),
+        ] {
+            assert_eq!(scope_of(&home, &project, true, name), scope, "{name}");
+        }
+        // An untrusted folder's files are not read at all.
+        assert_eq!(scope_of(&home, &project, false, "both"), "user");
+        assert_eq!(scope_of(&home, &project, false, "claude"), "--mcp-config");
+        let rows = manager_rows(&home, &project).unwrap();
+        let by = |name: &str| rows.iter().find(|row| row.name == name).unwrap();
+        assert_eq!(by("both").scope, "project");
+        assert_eq!(by("claude").scope, ".mcp.json");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enabling_and_disabling_edit_only_that_server_in_its_own_file() {
+        let dir = scratch();
+        std::fs::write(
+            dir.join("home/mcp.json"),
+            r#"{"note": "mine", "servers": {"alpha": {"command": "a", "tools": ["x"]}, "beta": {"command": "b"}}}"#,
+        )
+        .unwrap();
+        let (home, project) = (dir.join("home"), dir.join("project"));
+        set_enabled(&home, &project, "alpha", false).unwrap();
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(after["servers"]["alpha"]["enabled"], false);
+        assert_eq!(after["servers"]["alpha"]["tools"], json!(["x"]), "kept");
+        assert_eq!(
+            after["servers"]["beta"],
+            json!({"command": "b"}),
+            "untouched"
+        );
+        assert_eq!(after["note"], "mine");
+        // And the session reads it that way.
+        let rows = manager_rows(&home, &project).unwrap();
+        assert!(!rows[0].enabled);
+        set_enabled(&home, &project, "alpha", true).unwrap();
+        assert!(manager_rows(&home, &project).unwrap()[0].enabled);
+        // A server nobody defined is refused, and nothing is written for it.
+        let before = std::fs::read_to_string(home.join("mcp.json")).unwrap();
+        assert!(set_enabled(&home, &project, "ghost", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.join("mcp.json")).unwrap(),
+            before
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_from_claude_codes_file_is_not_edited() {
+        let dir = scratch();
+        trusted(&dir);
+        std::fs::write(
+            dir.join("project/.mcp.json"),
+            r#"{"mcpServers": {"claude": {"command": "c"}}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(dir.join("project/.mcp.json")).unwrap();
+        let error =
+            set_enabled(&dir.join("home"), &dir.join("project"), "claude", false).unwrap_err();
+        assert!(error.contains(".mcp.json"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("project/.mcp.json")).unwrap(),
+            before
+        );
+        assert!(!dir.join("home/mcp.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconnecting_a_server_that_cannot_start_is_a_row_saying_why_not_an_error() {
+        let dir = scratch();
+        std::fs::write(
+            dir.join("home/mcp.json"),
+            r#"{"servers": {"broken-manager-fixture": {"command": "/nonexistent/orbit-mcp-fixture"}}}"#,
+        )
+        .unwrap();
+        let (home, project) = (dir.join("home"), dir.join("project"));
+        manager_action(&home, &project, "reconnect", "broken-manager-fixture").unwrap();
+        let rows = manager_rows(&home, &project).unwrap();
+        assert!(
+            rows[0].state.starts_with("not available: "),
+            "{}",
+            rows[0].state
+        );
+        assert!(rows[0].tools.is_empty());
+        // A server nobody configured is a refusal, and so is a disabled one.
+        assert!(manager_action(&home, &project, "reconnect", "ghost").is_err());
+        set_enabled(&home, &project, "broken-manager-fixture", false).unwrap();
+        let error =
+            manager_action(&home, &project, "reconnect", "broken-manager-fixture").unwrap_err();
+        assert!(error.contains("disabled"), "{error}");
+        assert!(manager_action(&home, &project, "explode", "x").is_err());
+        // Disabling stops it and forgets what it said.
+        manager_action(&home, &project, "disable", "broken-manager-fixture").unwrap();
+        let rows = manager_rows(&home, &project).unwrap();
+        assert_eq!(rows[0].state, "disabled");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

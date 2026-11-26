@@ -105,6 +105,16 @@ def main():
             def configured(model, effort):
                 return screen_has(f"Configured effort for fixture/{model}: {json.dumps(effort, ensure_ascii=False)}")
 
+            # A model that declares its levels answers a bare `/effort` with a
+            # menu: the level in force is the one marked. A model that does not
+            # is still answered in words (`configured` above).
+            def menu_marks(level):
+                return screen_has("EFFORT") and screen_has(f"● {level}") and screen_has("esc close")
+
+            def close_menu():
+                session.key("esc")
+                session.read(0.3)
+
             def command(text):
                 session.type(text)
                 session.key("enter")
@@ -120,12 +130,22 @@ def main():
             session = PtySession([binary, "--effort", "default", "--home", str(home), "--model", "fixture/a", "--resume", sid], env=env, cwd=workspace, rows=40, cols=160)
             check("terminal boots with effort flag before the other flags", lambda: screen_has("ORBIT"))
             command("/effort")
-            check("startup reset beats saved and environment values", lambda: configured("a", "low"))
+            check("startup reset beats saved and environment values", lambda: menu_marks("low"))
             check("query sends no provider request", lambda: not requests)
             # A wide glyph occupies two terminal cells; the screen keeps the
             # glyph's continuation cell, so the sixteen ideographs are not
             # contiguous text. Their presence is what this check is about.
-            check("64-byte choice and Unicode choices stay visible in the 60-cell pane", lambda: screen_has("effort_") and screen_has("_END") and session.screen_text().count("界") == 16)
+            # The Unicode choice is a row of the menu; the 64-byte one is
+            # clipped in its row, so it is selected and read in full in the
+            # preview, which names the command the row would run.
+            check("Unicode choice stays visible in the menu", lambda: session.screen_text().count("界") == 16)
+            for _ in range(3):
+                session.key("down")
+            session.read(0.3)
+            check("64-byte choice stays visible in full in the selected row's preview", lambda: screen_has("Runs /effort") and screen_has("effort_") and screen_has("_END"))
+            before_close = json.loads(path.read_text()).get("effort")
+            close_menu()
+            check("Esc closes the menu without setting anything", lambda: not screen_has("EFFORT") and not requests and json.loads(path.read_text()).get("effort") == before_close)
             session.type("/eff")
             check("effort appears in completion", lambda: screen_has("/effort") and screen_has("request effort"))
             session.key("esc")
@@ -161,7 +181,8 @@ def main():
             command("/effort default")
             command("/model b")
             command("/effort")
-            check("reset then model switch uses the new model default", lambda: configured("b", "medium"))
+            check("reset then model switch uses the new model default", lambda: menu_marks("medium"))
+            close_menu()
             turn("second fixture prompt", "b", "medium")
             command("/effort unsupported")
             check("invalid effort preserves the active selection", lambda: screen_has("Effort unchanged:") and json.loads(path.read_text()).get("effort") == {"mode": "default"})
@@ -186,7 +207,8 @@ def main():
             restore_path.chmod(0o600)
             command(f"/resume {restore_id}")
             command("/effort")
-            check("hot resume restores model and explicit effort together", lambda: configured("a", "high"))
+            check("hot resume restores model and explicit effort together", lambda: menu_marks("high"))
+            close_menu()
             turn("resumed fixture prompt", "a", "high")
             command("/effort default")
             check("explicit reset persists independently of wire value", lambda: json.loads(restore_path.read_text()).get("effort") == {"mode": "default"})

@@ -26,7 +26,9 @@ reports effective values and their source. `reset KEY` resets one preference;
 Legacy `tui.toml` remains intact. To reset the whole profile, run `orbit customize reset`.
 
 In the terminal, `/theme NAME`, `/customize ...`, and `/customize reload` use the
-same store. Settings commands do not call a model. Choose pane and layout actions
+same store. `/theme` with no name opens a menu of the themes, with the one in use
+marked; choosing a row is the same as typing `/theme NAME`. Settings commands do
+not call a model. Choose pane and layout actions
 through the existing arrange controls and command palette. Narrow terminals use
 focused panes/tabs. A profile always retains one Conversation pane and composer.
 
@@ -262,6 +264,7 @@ panes stay bound to the committed session and show unverified cost information.
 
 Use `/reactor art kwangya|shard|spine|globe|rotate`, or select the Reactor pane's
 `next art` action to cycle scenes. `/reactor art next` cycles the same sequence.
+`/reactor` with no art opens a menu of the five.
 `rotate` changes among the four scenes every 40 seconds. Reduced motion freezes
 the scene and rotation; ASCII mode keeps the text-only meter.
 

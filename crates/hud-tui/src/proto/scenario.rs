@@ -323,36 +323,13 @@ pub struct CompactionRow {
 pub const TAPE_MAX_LINES: usize = 400;
 pub const TAPE_MAX: usize = 20;
 
-/// What a picker (`/models`, `/sessions`) selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PickerKind {
-    Models,
-    Sessions,
-}
+pub use super::picker::{Picker, PickerKind, PickerRow};
 
 #[derive(Debug, Clone)]
 struct PickerRequest {
     kind: PickerKind,
     binding: Option<crate::worker::SessionBinding>,
     cancelled: bool,
-}
-
-/// One selectable row of a picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PickerRow {
-    pub label: String,
-    /// The value sent when the row is chosen (the model id or session id).
-    pub value: String,
-    pub detail: String,
-}
-
-/// The selection overlay behind `/models` and `/sessions`: arrow keys
-/// move, Enter picks, Esc closes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Picker {
-    pub kind: PickerKind,
-    pub rows: Vec<PickerRow>,
-    pub sel: usize,
 }
 
 /// One command's output in the Terminal panel. Only the lines live here;
@@ -538,6 +515,21 @@ impl Scenario {
             return Err("wait for the previous list request to finish");
         }
         self.picker = None;
+        self.frontend.picker_request = Some(PickerRequest {
+            kind,
+            binding: self.frontend.binding.clone(),
+            cancelled: false,
+        });
+        Ok(())
+    }
+
+    /// Expect a fresh list for a menu that stays open: like
+    /// `begin_picker_request`, but the menu on screen is left in place for
+    /// the reply to refresh.
+    pub fn begin_refresh_request(&mut self, kind: PickerKind) -> Result<(), &'static str> {
+        if self.frontend.picker_request.is_some() {
+            return Err("wait for the previous list request to finish");
+        }
         self.frontend.picker_request = Some(PickerRequest {
             kind,
             binding: self.frontend.binding.clone(),

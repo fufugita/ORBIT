@@ -185,6 +185,21 @@ pub enum Msg {
     Routing(Vec<String>),
     /// Configured request effort and choices, wrapped in the transcript on resize.
     EffortStatus(String),
+    /// The values one command takes, for a menu: choosing a row runs
+    /// `command value`. Sent for `/effort` and `/output-style` given nothing
+    /// to set; when there is nothing to choose from the worker answers in
+    /// words instead.
+    ChoiceList {
+        /// The heading of the menu.
+        title: String,
+        /// The command a row runs, with its slash (`/effort`).
+        command: String,
+        /// The `value` of the row in force.
+        current: String,
+        rows: Vec<ChoiceRow>,
+        /// What every row's preview says.
+        note: String,
+    },
     /// The session's permission mode changed at runtime (S5:
     /// Shift+Tab or /mode). Payload: the mode name (default,
     /// acceptEdits, plan, dontAsk, bypass).
@@ -377,6 +392,11 @@ pub enum Msg {
     SessionsListed(Vec<SessionsRow>),
     /// Terminal failure of the outstanding session-list request.
     SessionsListFailed(String),
+    /// The `/mcp` manager's rows: every configured MCP server with what is
+    /// known about it. Rendered as a selectable overlay, not text.
+    McpListed(Vec<McpServerRow>),
+    /// Terminal failure of the outstanding MCP list request.
+    McpListFailed(String),
     /// This folder's newest saved sessions, for the sidebar and the Sessions
     /// pane. Unlike `SessionsListed` it opens no picker and is never
     /// refused for being unsolicited: the screen asked for it by showing
@@ -407,6 +427,44 @@ pub struct SavedSession {
     pub age: String,
     /// The session this screen is on.
     pub current: bool,
+}
+
+/// One value a command takes, as a menu row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChoiceRow {
+    /// What follows the command when the row is chosen, as it would be typed.
+    pub value: String,
+    /// What the row is called.
+    pub label: String,
+    /// A few words about it.
+    pub detail: String,
+}
+
+/// One configured MCP server, as the `/mcp` manager lists it. Everything
+/// here is already safe to show: a command line or URL has its secrets
+/// hidden, and only the NAMES of environment variables and headers appear.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct McpServerRow {
+    pub name: String,
+    /// `stdio`, `streamable-http` or `sse`.
+    pub transport: String,
+    /// Where it is configured: `user`, `project` or `.mcp.json`.
+    pub scope: String,
+    pub enabled: bool,
+    /// What it runs or where it connects, secrets hidden.
+    pub target: String,
+    /// How it last answered: `running`, `not available: …`, or that it starts
+    /// when a prompt needs it.
+    pub state: String,
+    /// The tools it offered the last time it answered: name and the first
+    /// line of its description.
+    pub tools: Vec<(String, String)>,
+    /// How many tools it offered, when it has answered.
+    pub tool_count: Option<usize>,
+    /// The sign-in state of a remote server, when there is one to report.
+    pub auth: Option<String>,
+    pub env: Vec<String>,
+    pub headers: Vec<String>,
 }
 
 /// One row of the session picker (`/sessions`).

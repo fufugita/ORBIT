@@ -36,11 +36,13 @@ pub enum Overlay<'a> {
         hunks: &'a Option<Vec<orbit_frontend_protocol::DiffHunk>>,
         opened_ms: u64,
     },
-    /// The model/session picker: one selection bar over plain rows.
+    /// The menu: one selection bar over rows, with an optional filter line,
+    /// preview and footer of keys.
     Picker {
-        title: &'static str,
-        rows: &'a [super::super::scenario::PickerRow],
+        title: &'a str,
+        rows: std::borrow::Cow<'a, [super::super::scenario::PickerRow]>,
         sel: usize,
+        chrome: PickerChrome,
         opened_ms: u64,
     },
 }
@@ -124,13 +126,37 @@ pub fn draw(cv: &mut Cv, w: i32, h: i32, ov: &Overlay, now_ms: u64, reduced: boo
             title,
             rows,
             sel,
+            chrome,
             opened_ms,
-        } => choice_picker(cv, w, h, title, rows, *sel, *opened_ms, now_ms, reduced),
+        } => choice_picker(
+            cv, w, h, title, rows, *sel, chrome, *opened_ms, now_ms, reduced,
+        ),
     }
 }
 
-/// The model/session picker: the palette's frame and selection bar,
-/// over plain rows (no typing, no matching).
+/// What a menu draws besides its rows.
+#[derive(Default)]
+pub struct PickerChrome {
+    /// The filter line's text, when the line is open.
+    pub filter: Option<String>,
+    /// How many rows there are before the filter lets some go.
+    pub total: usize,
+    /// The keys the footer names: `(key, what it does)`.
+    pub hints: Vec<(String, String)>,
+    /// The previews of every row: room is kept under the list for the
+    /// longest once wrapped, so the box does not change height as the
+    /// selection moves.
+    pub previews: Vec<String>,
+    /// Two lines per row (a name, then what it is).
+    pub two_line: bool,
+    /// A line to show in place of the keys: what went wrong (`true`), or
+    /// what the menu is waiting on (`false`).
+    pub status: Option<(String, bool)>,
+}
+
+/// The menu: the palette's frame and selection bar over its rows, with a
+/// filter line, a preview of the selected row and the keys it answers to
+/// when it has them. With none of those it is the plain list it was.
 #[allow(clippy::too_many_arguments)]
 fn choice_picker(
     cv: &mut Cv,
@@ -139,6 +165,7 @@ fn choice_picker(
     title: &str,
     rows: &[super::super::scenario::PickerRow],
     sel: usize,
+    chrome: &PickerChrome,
     opened_ms: u64,
     now_ms: u64,
     reduced: bool,
@@ -151,7 +178,7 @@ fn choice_picker(
         return;
     }
     let colors = cv.palette;
-    let session_rows = title == "SESSIONS";
+    let session_rows = chrome.two_line || title == "SESSIONS";
     let row_height = if session_rows { 2 } else { 1 };
     let w = 76.min((sw - 8).max(8)).min(sw);
     let footer_rows = if session_rows { 1 } else { 0 };
@@ -166,21 +193,44 @@ fn choice_picker(
         4.min(sh - 4)
     };
     let x = (sw - w) / 2;
-    let available_rows = sh - y - 3 - footer_rows;
-    let rows_that_fit = available_rows / row_height;
+    // What is left for rows once the frame is drawn. The footer of keys
+    // comes out first, then the preview, each only while at least a few
+    // rows still fit above them.
+    let mut budget = sh - y - 3 - footer_rows;
+    let want_rows = (rows.len() as i32).clamp(1, 3) * row_height;
+    let hint_rows = i32::from(!chrome.hints.is_empty() && budget > want_rows);
+    budget -= hint_rows;
+    let content_width = w - 6;
+    let mut preview_rows = chrome
+        .previews
+        .iter()
+        .map(|text| preview_lines(text, content_width, usize::MAX).len())
+        .max()
+        .unwrap_or(0)
+        .min(crate::proto::picker::PREVIEW_MAX) as i32;
+    while preview_rows > 0 && budget - (preview_rows + 1) < want_rows {
+        preview_rows -= 1;
+    }
+    let preview_height = if preview_rows > 0 {
+        preview_rows + 1
+    } else {
+        0
+    };
+    budget -= preview_height;
+    let rows_that_fit = budget / row_height;
     if !rows.is_empty() && rows_that_fit == 0 {
         return;
     }
     let capacity = rows_that_fit.clamp(1, 12) as usize;
     let selected = sel.min(rows.len().saturating_sub(1));
-    let first = selected.saturating_sub(capacity - 1);
+    let first = crate::proto::picker::window_top(rows.len(), selected, capacity);
     let shown = rows.len().min(capacity) as i32;
     let content_height = if rows.is_empty() {
         1
     } else {
         shown * row_height
     };
-    let h = content_height + 3;
+    let h = content_height + 3 + hint_rows + preview_height;
     let reveal = if reduced {
         h
     } else {
@@ -197,9 +247,48 @@ fn choice_picker(
         },
         |cv| {
             cv.hit(x, y, w, h, super::hits::Click::Inert);
-            if rows.is_empty() {
-                cv.text(x + 4, y + 2, "no entries", colors.muted, Some(colors.raise));
+            if let Some(text) = &chrome.filter {
+                let typed = clip_text(&crate::bridge::safe_text(text), content_width - 14);
+                let after = cv.text(x + 3, y + 1, "/ ", colors.magenta_hi, Some(colors.raise));
+                let after = cv.text(after, y + 1, &typed, colors.ink, Some(colors.raise));
+                cv.text(after, y + 1, "▌", colors.magenta, Some(colors.raise));
+                let count = format!("{}/{}", rows.len(), chrome.total.max(rows.len()));
+                cv.text(
+                    x + w - 3 - text_width(&count),
+                    y + 1,
+                    &count,
+                    colors.muted,
+                    Some(colors.raise),
+                );
             }
+            if rows.is_empty() {
+                let none = if chrome.filter.is_some() {
+                    "nothing matches"
+                } else {
+                    "no entries"
+                };
+                cv.text(x + 4, y + 2, none, colors.muted, Some(colors.raise));
+            }
+            // Names wide enough to read, the rest of the line for what each
+            // one is; a long list keeps the old split so columns line up.
+            let widest = rows
+                .iter()
+                .map(|row| text_width(&crate::bridge::safe_text(&row.label)))
+                .max()
+                .unwrap_or(0);
+            let detail_floor = if content_width >= 30 {
+                content_width / 3
+            } else {
+                0
+            };
+            let label_width = if detail_floor == 0 {
+                content_width
+            } else {
+                (widest + 2).clamp(
+                    content_width - content_width * 2 / 3,
+                    content_width - detail_floor,
+                )
+            };
             for (i, row) in rows.iter().enumerate().skip(first).take(capacity) {
                 let ry = y + 2 + (i - first) as i32 * row_height;
                 cv.hit(x + 1, ry, w - 2, row_height, super::hits::Click::Picker(i));
@@ -214,7 +303,6 @@ fn choice_picker(
                         cv.text(x + 1, ry + 1, "▌", colors.on_accent, Some(colors.magenta));
                     }
                 }
-                let content_width = w - 6;
                 let bg = Some(if on { colors.magenta } else { colors.raise });
                 if session_rows {
                     let label = clip_text(&crate::bridge::safe_text(&row.label), content_width);
@@ -228,12 +316,7 @@ fn choice_picker(
                         bg,
                     );
                 } else {
-                    let detail_width = if content_width >= 30 {
-                        content_width / 3
-                    } else {
-                        0
-                    };
-                    let label_width = content_width - detail_width;
+                    let detail_width = content_width - label_width;
                     let label = clip_text(&crate::bridge::safe_text(&row.label), label_width);
                     cv.text(x + 3, ry, &label, fg, bg);
                     let detail = clip_text(&crate::bridge::safe_text(&row.detail), detail_width);
@@ -246,8 +329,127 @@ fn choice_picker(
                     );
                 }
             }
+            // More above or below than the window shows.
+            let more_above = first > 0;
+            let more_below = first + (shown as usize) < rows.len();
+            if more_above {
+                cv.text(x + w - 3, y + 2, "▲", colors.muted, Some(colors.raise));
+            }
+            if more_below {
+                let by = y + 2 + content_height - row_height;
+                let on_last = first + shown as usize - 1 == selected;
+                cv.text(
+                    x + w - 3,
+                    by,
+                    "▼",
+                    if on_last {
+                        colors.on_accent
+                    } else {
+                        colors.muted
+                    },
+                    Some(if on_last {
+                        colors.magenta
+                    } else {
+                        colors.raise
+                    }),
+                );
+            }
+            if preview_rows > 0 {
+                let gap = y + 2 + content_height;
+                cv.text(
+                    x + 2,
+                    gap,
+                    &"─".repeat((w - 4).max(0) as usize),
+                    colors.rule,
+                    Some(colors.raise),
+                );
+                let lines = preview_lines(
+                    rows.get(selected)
+                        .map(|row| row.preview.as_str())
+                        .unwrap_or(""),
+                    content_width,
+                    preview_rows as usize,
+                );
+                for (n, line) in lines.iter().enumerate() {
+                    cv.text(
+                        x + 3,
+                        gap + 1 + n as i32,
+                        line,
+                        colors.ink2,
+                        Some(colors.raise),
+                    );
+                }
+            }
+            if hint_rows > 0
+                && let Some((text, is_error)) = &chrome.status
+            {
+                let hy = y + h - 2;
+                let line = clip_text(&crate::bridge::safe_text(text), content_width);
+                let color = if *is_error {
+                    colors.amber
+                } else {
+                    colors.muted
+                };
+                cv.text(x + 3, hy, &line, color, Some(colors.raise));
+            } else if hint_rows > 0 {
+                let hy = y + h - 2;
+                let position = if rows.len() > capacity {
+                    format!("{}/{}", selected + 1, rows.len())
+                } else {
+                    String::new()
+                };
+                let room = content_width
+                    - if position.is_empty() {
+                        0
+                    } else {
+                        text_width(&position) + 2
+                    };
+                let pairs: Vec<(&str, &str)> = chrome
+                    .hints
+                    .iter()
+                    .map(|(key, label)| (key.as_str(), label.as_str()))
+                    .collect();
+                let fitted = super::frame::fit_hints(&pairs, room);
+                keyhints(cv, x + 3, hy, &fitted, Some(colors.raise));
+                if !position.is_empty() {
+                    cv.text(
+                        x + w - 3 - text_width(&position),
+                        hy,
+                        &position,
+                        colors.muted,
+                        Some(colors.raise),
+                    );
+                }
+            }
         },
     );
+}
+
+/// The lines of a preview, wrapped to `width` and cut to `rows`, with an
+/// ellipsis where words were left out.
+fn preview_lines(text: &str, width: i32, rows: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in text.lines() {
+        let paragraph = crate::bridge::safe_text(paragraph);
+        let chars: Vec<char> = paragraph.chars().collect();
+        for (from, to) in super::canvas::wrap_ranges(&paragraph, width) {
+            let line: String = chars[from..to].iter().collect();
+            // What is drawn is only printable text, whatever the row held.
+            let line = clip_text(line.trim_end(), width);
+            if !line.is_empty() {
+                lines.push(line);
+            }
+        }
+    }
+    if lines.len() > rows && rows > 0 {
+        lines.truncate(rows);
+        let last = lines.pop().unwrap_or_default();
+        lines.push(format!(
+            "{}…",
+            clip_text(&last, width - 1).trim_end_matches('…')
+        ));
+    }
+    lines
 }
 
 /// The diff overlay (M11): `@@` headers, `-`/`+` lines in red/green,
@@ -954,6 +1156,7 @@ mod choice_picker_tests {
                 label: format!("model-{i}"),
                 value: format!("value-{i}"),
                 detail: "configured".into(),
+                ..Default::default()
             })
             .collect()
     }
@@ -978,8 +1181,9 @@ mod choice_picker_tests {
                 i32::from(height),
                 &Overlay::Picker {
                     title,
-                    rows,
+                    rows: std::borrow::Cow::Borrowed(rows),
                     sel,
+                    chrome: PickerChrome::default(),
                     opened_ms: 0,
                 },
                 u64::MAX,
@@ -988,6 +1192,213 @@ mod choice_picker_tests {
             cv.take_hits()
         };
         (buffer, hits)
+    }
+
+    fn render_with(
+        width: u16,
+        height: u16,
+        rows: &[PickerRow],
+        sel: usize,
+        chrome: PickerChrome,
+    ) -> (Buffer, Vec<Hit>) {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let hits = {
+            let mut cv = Cv::new(&mut buffer);
+            draw(
+                &mut cv,
+                i32::from(width),
+                i32::from(height),
+                &Overlay::Picker {
+                    title: "MENU",
+                    rows: std::borrow::Cow::Borrowed(rows),
+                    sel,
+                    chrome,
+                    opened_ms: 0,
+                },
+                u64::MAX,
+                false,
+            );
+            cv.take_hits()
+        };
+        (buffer, hits)
+    }
+
+    fn whole(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| line(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn hints(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, l)| ((*k).to_owned(), (*l).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_wrapped_preview_keeps_every_line_with_room_and_ends_in_an_ellipsis_without() {
+        let preview = "First paragraph, long enough that it wraps onto a second line inside a box seventy cells wide.\nSecond paragraph ends here.";
+        let rows = vec![
+            PickerRow::new("one", "/x", "d").previewing(preview),
+            PickerRow::new("two", "/y", "d"),
+        ];
+        let chrome = |previews: Vec<String>| PickerChrome {
+            previews,
+            hints: hints(&[("esc", "close")]),
+            total: 2,
+            ..PickerChrome::default()
+        };
+        let (roomy, _) = render_with(100, 30, &rows, 0, chrome(vec![preview.into()]));
+        let text = whole(&roomy);
+        assert!(text.contains("Second paragraph ends here."), "{text}");
+        assert!(
+            text.contains("wide."),
+            "the wrapped end of the first paragraph"
+        );
+        assert!(!text.contains('…'), "nothing was cut: {text}");
+        // The box is as tall as the longest preview needs, however the
+        // selection moves.
+        let (other_row, _) = render_with(100, 30, &rows, 1, chrome(vec![preview.into()]));
+        let frame_height = |buffer: &Buffer| {
+            (0..buffer.area.height)
+                .filter(|&y| {
+                    let row = line(buffer, y);
+                    row.contains('┃') || row.contains('┏') || row.contains('┗')
+                })
+                .count()
+        };
+        assert_eq!(frame_height(&roomy), frame_height(&other_row));
+        // On a short terminal the preview shrinks first, rows keep their room,
+        // and what is cut ends in an ellipsis rather than mid-word.
+        let (tight, hits) = render_with(100, 13, &rows, 0, chrome(vec![preview.into()]));
+        assert!(
+            hits.iter()
+                .filter(|hit| matches!(hit.click, Click::Picker(_)))
+                .count()
+                == 2,
+            "both rows stay clickable"
+        );
+        let text = whole(&tight);
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+    }
+
+    #[test]
+    fn untrusted_text_in_a_row_a_preview_or_a_status_cannot_put_controls_on_the_screen() {
+        let hostile = "evil\u{1b}]52;c;YQ==\u{7}\u{1b}[31mred\u{1b}[0m end";
+        let rows = vec![PickerRow {
+            label: hostile.into(),
+            value: "/x".into(),
+            detail: hostile.into(),
+            preview: format!("{hostile}\n{hostile}"),
+            ..Default::default()
+        }];
+        let chrome = PickerChrome {
+            previews: vec![rows[0].preview.clone()],
+            hints: hints(&[("esc", "close")]),
+            filter: Some(hostile.into()),
+            status: Some((hostile.into(), true)),
+            total: 1,
+            ..PickerChrome::default()
+        };
+        let (buffer, _) = render_with(100, 30, &rows, 0, chrome);
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                assert!(
+                    !symbol.chars().any(char::is_control),
+                    "control character at {x},{y}: {symbol:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_footer_names_its_keys_and_each_single_key_is_a_click_target() {
+        let rows = vec![
+            PickerRow::new("one", "/x", "d"),
+            PickerRow::new("two", "/y", "d"),
+        ];
+        let chrome = PickerChrome {
+            hints: hints(&[
+                ("↑↓", "move"),
+                ("⏎", "choose"),
+                ("r", "retry"),
+                ("esc", "close"),
+            ]),
+            total: 2,
+            ..PickerChrome::default()
+        };
+        let (buffer, hits) = render_with(100, 24, &rows, 0, chrome);
+        let text = whole(&buffer);
+        assert!(text.contains("move") && text.contains("choose") && text.contains("retry"));
+        let keys: Vec<_> = hits
+            .iter()
+            .filter_map(|hit| match hit.click {
+                Click::Key(code, _) => Some(code),
+                _ => None,
+            })
+            .collect();
+        use crossterm::event::KeyCode;
+        assert!(keys.contains(&KeyCode::Enter));
+        assert!(keys.contains(&KeyCode::Char('r')));
+        assert!(keys.contains(&KeyCode::Esc));
+        assert_eq!(keys.len(), 3, "↑↓ names two keys and clicks neither");
+    }
+
+    #[test]
+    fn a_filter_line_a_status_line_and_a_position_count_are_drawn_where_they_belong() {
+        let rows: Vec<PickerRow> = (0..30)
+            .map(|i| PickerRow::new(format!("row-{i}"), "/x", "d"))
+            .collect();
+        let chrome = PickerChrome {
+            filter: Some("ro".into()),
+            total: 90,
+            hints: hints(&[("esc", "all rows")]),
+            status: Some(("could not write mcp.json".into(), true)),
+            ..PickerChrome::default()
+        };
+        let (buffer, _) = render_with(100, 30, &rows, 17, chrome);
+        let text = whole(&buffer);
+        assert!(text.contains("/ ro▌"), "{text}");
+        assert!(text.contains("30/90"), "how many of all rows match: {text}");
+        assert!(
+            text.contains("could not write mcp.json"),
+            "the status takes the footer's place: {text}"
+        );
+        assert!(!text.contains("all rows"), "{text}");
+        assert!(text.contains("row-17"), "the selected row is in the window");
+        assert!(
+            text.contains('▲') && text.contains('▼'),
+            "more above and below"
+        );
+    }
+
+    #[test]
+    fn nothing_matching_says_so_and_a_scroll_position_shows_for_long_lists() {
+        let rows: Vec<PickerRow> = Vec::new();
+        let chrome = PickerChrome {
+            filter: Some("zzz".into()),
+            total: 5,
+            hints: hints(&[("esc", "all rows")]),
+            ..PickerChrome::default()
+        };
+        let (buffer, hits) = render_with(80, 20, &rows, 0, chrome);
+        assert!(whole(&buffer).contains("nothing matches"));
+        assert!(!hits.iter().any(|hit| matches!(hit.click, Click::Picker(_))));
+        let many: Vec<PickerRow> = (0..40)
+            .map(|i| PickerRow::new(format!("item-{i:02}"), "/x", ""))
+            .collect();
+        let chrome = PickerChrome {
+            total: 40,
+            hints: hints(&[("esc", "close")]),
+            ..PickerChrome::default()
+        };
+        let (buffer, _) = render_with(80, 30, &many, 20, chrome);
+        let text = whole(&buffer);
+        assert!(text.contains("21/40"), "{text}");
+        assert!(text.contains("item-20"));
     }
 
     fn line(buffer: &Buffer, y: u16) -> String {
@@ -1031,6 +1442,7 @@ mod choice_picker_tests {
             label: format!("{id}  (this session)"),
             value: id.into(),
             detail: "12 turns · mock/model-with-a-long-name".into(),
+            ..Default::default()
         }];
         let (buffer, hits) = render_title(80, 24, &rows, 0, "SESSIONS");
         let row = hits
@@ -1056,6 +1468,7 @@ mod choice_picker_tests {
                 label: format!("session-{i:02}"),
                 value: format!("session-{i:02}"),
                 detail: format!("{i} turns · mock/model · updated today"),
+                ..Default::default()
             })
             .collect();
         let (_, no_capacity_hits) = render_title(80, 5, &rows[..1], 0, "SESSIONS");
@@ -1131,6 +1544,7 @@ mod choice_picker_tests {
             "MODELS",
             &rows(1),
             0,
+            &PickerChrome::default(),
             0,
             0,
             true,
@@ -1145,11 +1559,13 @@ mod choice_picker_tests {
                 label: "界".repeat(60),
                 value: "wide".into(),
                 detail: "DETAIL".into(),
+                ..Default::default()
             },
             PickerRow {
                 label: "unsafe\u{1b}]52;c;YQ==\u{7}".into(),
                 value: "untouched".into(),
                 detail: "safe".into(),
+                ..Default::default()
             },
         ];
         let (buffer, hits) = render(80, 12, &rows, 0);

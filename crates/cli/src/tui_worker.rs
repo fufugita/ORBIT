@@ -1218,6 +1218,47 @@ fn cancel_mcp_sign_in() -> String {
     }
 }
 
+/// What `/output-style` with no name offers: the built-in styles and the
+/// style files, with the one in use marked, for a menu. A name matches the
+/// one in use whatever its case, as the style lookup does.
+fn output_style_choice_list(home: &std::path::Path, working_dir: &std::path::Path) -> Msg {
+    let names = orbit_engine::context::output_style_names(home, working_dir);
+    let selected = orbit_engine::context::selected_output_style(home);
+    let current = names
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(&selected))
+        .cloned()
+        .unwrap_or(selected);
+    Msg::ChoiceList {
+        title: "OUTPUT STYLE".into(),
+        command: "/output-style".into(),
+        current,
+        rows: names
+            .into_iter()
+            .map(|name| orbit_hud_tui::msg::ChoiceRow {
+                detail: match name.as_str() {
+                    "default" => "no extra instructions".into(),
+                    "explanatory" | "learning" => "built in".into(),
+                    _ => "from a style file".into(),
+                },
+                label: name.clone(),
+                value: name,
+            })
+            .collect(),
+        note: "Applies from the next turn. A style is a built-in or a Markdown file in .orbit/output-styles, .claude/output-styles or the home's output-styles.".into(),
+    }
+}
+
+/// Whether an `Inspect` payload is one of the `/mcp` manager's actions, which
+/// are answered with a refreshed list rather than a line of text.
+fn is_mcp_manager_action(what: &str) -> bool {
+    let mut words = what.split_whitespace();
+    words.next() == Some("mcp")
+        && matches!(words.next(), Some("reconnect" | "enable" | "disable"))
+        && words.next().is_some()
+        && words.next().is_none()
+}
+
 /// `/hooks`, `/skills`, `/agents`, `/mcp`: what is configured for this home
 /// and (when trusted) this project. Read-only; nothing is started.
 fn inspect_configuration(home: &std::path::Path, what: &str) -> String {
@@ -2308,6 +2349,12 @@ fn worker_main_initialized(
                     WorkerCommand::ListSessions => {
                         ctx.sender.send(Msg::SessionsListFailed(notice.into()))
                     }
+                    // The manager waits for its list as well: for the list
+                    // request itself, and for each action that refreshes it.
+                    WorkerCommand::ListMcp => ctx.sender.send(Msg::McpListFailed(notice.into())),
+                    WorkerCommand::Inspect(what) if is_mcp_manager_action(what) => {
+                        ctx.sender.send(Msg::McpListFailed(notice.into()))
+                    }
                     _ => ctx.sender.send(Msg::SystemMessage(notice.into())),
                 };
                 continue;
@@ -3032,8 +3079,52 @@ fn worker_main_initialized(
                                 }
                                 config = candidate;
                             }
-                            turn_sender
-                                .send(Msg::EffortStatus(crate::effort_status(&config.home, &turn)));
+                            // Asked with no value, for a model that says what
+                            // it supports: the choices, for a menu. Anything
+                            // else is the status in words, which also says why
+                            // there is nothing to choose.
+                            let literal = |value: &orbit_adapter::types::EffortValue| {
+                                serde_json::to_string(value).unwrap_or_default()
+                            };
+                            match (&turn.supported_efforts, value.is_empty()) {
+                                (Some(levels), true) if !levels.is_empty() => {
+                                    // A level reads as a word (`high`), and is
+                                    // typed as the JSON literal the setting
+                                    // parser takes (`"high"`).
+                                    let mut rows: Vec<orbit_hud_tui::msg::ChoiceRow> = levels
+                                        .iter()
+                                        .map(literal)
+                                        .map(|text| orbit_hud_tui::msg::ChoiceRow {
+                                            label: serde_json::from_str::<String>(&text)
+                                                .unwrap_or_else(|_| text.clone()),
+                                            value: text,
+                                            detail: String::new(),
+                                        })
+                                        .collect();
+                                    rows.push(orbit_hud_tui::msg::ChoiceRow {
+                                        value: "default".into(),
+                                        label: "default".into(),
+                                        detail: "the model's own".into(),
+                                    });
+                                    turn_sender.send(Msg::ChoiceList {
+                                        title: "EFFORT".into(),
+                                        command: "/effort".into(),
+                                        current: turn
+                                            .effort
+                                            .as_ref()
+                                            .map_or_else(|| "default".to_owned(), literal),
+                                        rows,
+                                        note: format!(
+                                            "Asks {}/{} to work at this level from the next request.",
+                                            turn.provider_id, turn.model
+                                        ),
+                                    });
+                                }
+                                _ => turn_sender.send(Msg::EffortStatus(crate::effort_status(
+                                    &config.home,
+                                    &turn,
+                                ))),
+                            }
                         }
                         Err(e) => ctx
                             .sender
@@ -3156,6 +3247,17 @@ fn worker_main_initialized(
                         }
                     };
                     turn_sender.send(Msg::SessionsListed(rows));
+                }
+                WorkerCommand::ListMcp => {
+                    turn_sender.send(
+                        match crate::mcp_commands::manager_rows(&config.home, &tool_cx.working_dir)
+                        {
+                            Ok(rows) => Msg::McpListed(rows),
+                            Err(error) => {
+                                Msg::McpListFailed(format!("Cannot list MCP servers: {error}"))
+                            }
+                        },
+                    );
                 }
                 WorkerCommand::ListSavedSessions => {
                     // The list the sidebar and the Sessions pane draw. It
@@ -4042,6 +4144,28 @@ fn worker_main_initialized(
                             });
                             String::new()
                         }
+                        // The manager's keys, and the same words typed by hand: do
+                        // it, then send the refreshed list, which is the answer.
+                        ["mcp", action @ ("reconnect" | "enable" | "disable"), name] => {
+                            turn_sender.send(
+                                match crate::mcp_commands::manager_action(
+                                    &config.home,
+                                    &tool_cx.working_dir,
+                                    action,
+                                    name,
+                                )
+                                .and_then(|()| {
+                                    crate::mcp_commands::manager_rows(
+                                        &config.home,
+                                        &tool_cx.working_dir,
+                                    )
+                                }) {
+                                    Ok(rows) => Msg::McpListed(rows),
+                                    Err(error) => Msg::McpListFailed(error),
+                                },
+                            );
+                            String::new()
+                        }
                         ["mcp", "login", "cancel"] => cancel_mcp_sign_in(),
                         ["mcp", "login", server, rest @ ..] if rest.len() <= 1 => start_mcp_sign_in(
                             &config.home,
@@ -4232,8 +4356,12 @@ fn worker_main_initialized(
                             format!("home: {}", config.home.display()),
                         ]
                         .join("\n"),
+                        // Given nothing to set: the styles to choose from. A name
+                        // is a built-in or a file in one of three folders.
                         ["output-style"] => {
-                            "usage: /output-style <default|explanatory|learning|name> — a name is a file in .orbit/output-styles, .claude/output-styles or the home's output-styles".into()
+                            turn_sender
+                                .send(output_style_choice_list(&config.home, &tool_cx.working_dir));
+                            String::new()
                         }
                         ["output-style", name] => {
                             if orbit_engine::context::set_output_style(
@@ -4402,7 +4530,7 @@ fn worker_main_initialized(
                             }
                         }
                         ["mcp", ..] if words.len() > 1 => {
-                            "usage: /mcp · /mcp login <server> [client-id] · /mcp login cancel · /mcp logout <server> · /mcp prompts · /mcp prompt <server> <name> [key=value …]"
+                            "usage: /mcp (the manager) · /mcp list · /mcp reconnect|enable|disable <server> · /mcp login <server> [client-id] · /mcp login cancel · /mcp logout <server> · /mcp prompts · /mcp prompt <server> <name> [key=value …]"
                                 .into()
                         }
                         _ => inspect_configuration(
@@ -5784,6 +5912,87 @@ fn channel_denial_fact(result: &serde_json::Value) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
     .then(|| format!("denied by the channel {name}"))
+}
+
+#[cfg(test)]
+mod output_style_choice_tests {
+    use super::*;
+
+    #[test]
+    fn the_list_names_every_style_marks_the_one_in_use_and_details_where_each_comes_from() {
+        let root = std::env::temp_dir().join(format!("orbit-style-choices-{}", ulid::Ulid::new()));
+        let (home, project) = (root.join("home"), root.join("project"));
+        std::fs::create_dir_all(home.join("output-styles")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(home.join("output-styles/terse.md"), "ANSWER IN ONE LINE\n").unwrap();
+        // Any case the file says it in: the row in use is still found.
+        std::fs::write(home.join("settings.toml"), "output_style = \"Terse\"\n").unwrap();
+        // An environment choice would override the file: skip rather than lie.
+        if std::env::var_os("ORBIT_OUTPUT_STYLE").is_some() {
+            return;
+        }
+        let Msg::ChoiceList {
+            title,
+            command,
+            current,
+            rows,
+            note,
+        } = output_style_choice_list(&home, &project)
+        else {
+            panic!("a choice list");
+        };
+        assert_eq!(
+            (title.as_str(), command.as_str()),
+            ("OUTPUT STYLE", "/output-style")
+        );
+        assert_eq!(current, "terse");
+        let seen: Vec<_> = rows
+            .iter()
+            .map(|row| (row.value.as_str(), row.detail.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("default", "no extra instructions"),
+                ("explanatory", "built in"),
+                ("learning", "built in"),
+                ("terse", "from a style file"),
+            ]
+        );
+        assert!(rows.iter().all(|row| row.value == row.label));
+        assert!(note.contains("next turn"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod mcp_manager_action_tests {
+    use super::is_mcp_manager_action;
+
+    #[test]
+    fn only_the_three_actions_with_exactly_one_server_name_are_manager_actions() {
+        for yes in [
+            "mcp reconnect alpha",
+            "mcp enable beta",
+            "mcp disable gamma",
+            "mcp   reconnect   spaced",
+        ] {
+            assert!(is_mcp_manager_action(yes), "{yes}");
+        }
+        for no in [
+            "mcp",
+            "mcp reconnect",
+            "mcp reconnect a b",
+            "mcp login alpha",
+            "mcp logout alpha",
+            "mcp list",
+            "plugin enable alpha",
+            "mcp restart alpha",
+            "",
+        ] {
+            assert!(!is_mcp_manager_action(no), "{no}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10155,6 +10364,81 @@ default_effort = "low"
     }
 
     #[test]
+    fn a_bare_effort_offers_the_declared_levels_for_a_menu_and_words_when_there_are_none() {
+        for (model, declares) in [("m", true), ("plain", false)] {
+            // A home of its own for each: the first run saves a session, and
+            // the second would resume it, on the first run's model.
+            let home =
+                std::env::temp_dir().join(format!("orbit-effort-menu-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(
+                home.join("providers.toml"),
+                r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:1"
+[[provider.models]]
+id = "m"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+[[provider.models]]
+id = "plain"
+"#,
+            )
+            .unwrap();
+            let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+            let (commands, command_rx) = mpsc::channel();
+            commands.send(WorkerCommand::Effort(String::new())).unwrap();
+            drop(commands);
+            worker_main(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                TuiTurnConfig {
+                    model: model.into(),
+                    ..config(&home)
+                },
+                Default::default(),
+            );
+            let (mut choices, mut status) = (None, None);
+            while let Some(msg) = bus.try_recv() {
+                match msg {
+                    Msg::ChoiceList {
+                        command,
+                        current,
+                        rows,
+                        note,
+                        ..
+                    } => choices = Some((command, current, rows, note)),
+                    Msg::EffortStatus(text) => status = Some(text),
+                    _ => {}
+                }
+            }
+            if declares {
+                let (command, current, rows, note) = choices.expect("the levels are offered");
+                assert_eq!(command, "/effort");
+                let values: Vec<_> = rows.iter().map(|row| row.value.as_str()).collect();
+                assert_eq!(values, ["\"low\"", "\"high\"", "default"]);
+                let labels: Vec<_> = rows.iter().map(|row| row.label.as_str()).collect();
+                assert_eq!(labels, ["low", "high", "default"]);
+                assert_eq!(current, "\"low\"", "the model's default is in force");
+                assert!(note.contains("p/m"), "{note}");
+                assert!(status.is_none(), "no text on top of the menu");
+            } else {
+                assert!(
+                    choices.is_none(),
+                    "nothing to choose from: {choices:?} {status:?}"
+                );
+                let text = status.expect("the status says why");
+                assert!(text.contains("Declare supported_efforts"), "{text}");
+            }
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
     fn idle_effort_controls_persist_reset_and_reject_incompatible_model_and_resume() {
         use orbit_adapter::types::EffortValue;
         let home = std::env::temp_dir().join(format!("orbit-effort-worker-{}", ulid::Ulid::new()));
@@ -11405,26 +11689,28 @@ if event["hook_event_name"] == "SessionStart":
         let commands = worker.commands.as_ref().unwrap().clone();
         commands.send(WorkerCommand::ListModels).unwrap();
         commands.send(WorkerCommand::ListSessions).unwrap();
+        commands.send(WorkerCommand::ListMcp).unwrap();
         // The terminal keeps a picker request pending until it receives the
         // matching typed reply, so a refused listing must still answer.
-        let (mut models, mut sessions) = (None, None);
+        let (mut models, mut sessions, mut mcp) = (None, None, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while models.is_none() || sessions.is_none() {
+        while models.is_none() || sessions.is_none() || mcp.is_none() {
             match worker.bus.try_recv() {
                 Some(Msg::ModelsListFailed(text)) => models = Some(text),
                 Some(Msg::SessionsListFailed(text)) => sessions = Some(text),
-                Some(Msg::ModelsListed(_) | Msg::SessionsListed(_)) => {
+                Some(Msg::McpListFailed(text)) => mcp = Some(text),
+                Some(Msg::ModelsListed(_) | Msg::SessionsListed(_) | Msg::McpListed(_)) => {
                     panic!("a refused request must not list anything")
                 }
                 _ => {}
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the worker left a list request without a typed reply: {models:?} {sessions:?}"
+                "the worker left a list request without a typed reply: {models:?} {sessions:?} {mcp:?}"
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        for text in [models.unwrap(), sessions.unwrap()] {
+        for text in [models.unwrap(), sessions.unwrap(), mcp.unwrap()] {
             assert!(text.contains("requests remain paused"), "{text}");
         }
         assert_eq!(mock.request_count(), 0);

@@ -214,6 +214,13 @@ static MCP_UNTOLD: std::sync::Mutex<std::collections::BTreeMap<String, String>> 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn note_mcp_state(name: &str, state: Result<usize, String>) {
+    note_mcp_state_telling(name, state, true);
+}
+
+/// Record how a server answered. `tell` queues a failure for the one-line
+/// notice of the next turn; the `/mcp` manager shows its own failures where
+/// they happen, so it does not.
+fn note_mcp_state_telling(name: &str, state: Result<usize, String>, tell: bool) {
     let state = state.map_err(|error| {
         let line = orbit_hud::safe_text(error.lines().next().unwrap_or(""));
         line.chars().take(200).collect::<String>()
@@ -221,13 +228,107 @@ fn note_mcp_state(name: &str, state: Result<usize, String>) {
     let Ok(mut states) = MCP_STATES.lock() else {
         return;
     };
-    if let Err(error) = &state
+    if tell
+        && let Err(error) = &state
         && states.get(name) != Some(&state)
         && let Ok(mut untold) = MCP_UNTOLD.lock()
     {
         untold.insert(name.to_owned(), error.clone());
     }
     states.insert(name.to_owned(), state);
+}
+
+/// What each MCP server offered the last time it answered: every tool's name
+/// and the first line of its description.
+static MCP_TOOLS: std::sync::Mutex<std::collections::BTreeMap<String, Vec<(String, String)>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn note_mcp_tools(name: &str, listed: &Listed) {
+    let Ok(mut tools) = MCP_TOOLS.lock() else {
+        return;
+    };
+    match listed {
+        Ok(found) => {
+            tools.insert(
+                name.to_owned(),
+                found
+                    .iter()
+                    .map(|tool| {
+                        let first = tool.description.lines().next().unwrap_or("").trim();
+                        (
+                            orbit_hud::safe_text(&tool.name),
+                            orbit_hud::safe_text(first).chars().take(160).collect(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        Err(_) => {
+            tools.remove(name);
+        }
+    }
+}
+
+/// How a server last answered, for the `/mcp` manager: the tools it offered,
+/// or why it could not be reached. `None` until something has asked it.
+pub fn mcp_last_answer(name: &str) -> Option<Result<Vec<(String, String)>, String>> {
+    let answer = MCP_STATES.lock().ok()?.get(name)?.clone();
+    Some(answer.map(|_| {
+        MCP_TOOLS
+            .lock()
+            .ok()
+            .and_then(|tools| tools.get(name).cloned())
+            .unwrap_or_default()
+    }))
+}
+
+/// Start one server now (stopping a running one first when `restart`) and
+/// record how it answered. This is the manager's connect and reconnect: the
+/// answer is the row it shows next, so a server that fails to start is `Ok`
+/// here, with its reason in the state. Only a refusal to even try is an error.
+pub fn connect_mcp(
+    home: &std::path::Path,
+    project: &std::path::Path,
+    name: &str,
+    restart: bool,
+) -> Result<(), String> {
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
+    let cfg = orbit_mcp::McpConfig::try_load_at(home, project, trusted)?;
+    let server = cfg
+        .servers
+        .get(name)
+        .ok_or_else(|| format!("no MCP server named {name}"))?;
+    if !server.enabled {
+        return Err(format!("{name} is disabled · press e to enable it"));
+    }
+    if restart {
+        orbit_mcp::POOL.close(name)?;
+    }
+    let mut options =
+        orbit_mcp::McpCallOptions::new(std::time::Duration::from_millis(server.timeout_ms));
+    options.working_dir = Some(project.to_path_buf());
+    let listed = orbit_mcp::POOL.list_tools_with_options(name, server, &options);
+    note_mcp_state_telling(
+        name,
+        listed.as_ref().map(Vec::len).map_err(Clone::clone),
+        false,
+    );
+    note_mcp_tools(name, &listed);
+    Ok(())
+}
+
+/// Stop a server's process and forget what it last said. Its next use, if it
+/// is enabled, starts it again.
+pub fn disconnect_mcp(name: &str) -> Result<(), String> {
+    orbit_mcp::POOL.close(name)?;
+    if let Ok(mut states) = MCP_STATES.lock() {
+        states.remove(name);
+    }
+    if let Ok(mut tools) = MCP_TOOLS.lock() {
+        tools.remove(name);
+    }
+    Ok(())
 }
 
 /// What `/mcp` adds to a server's line: whether it answered this session.
@@ -302,6 +403,7 @@ pub fn mcp_tool_definitions(
     for (name, server, listed) in list_servers_together(&wanted, cx) {
         if !cx.cancel_check().is_some_and(|cancelled| cancelled()) {
             note_mcp_state(name, listed.as_ref().map(Vec::len).map_err(Clone::clone));
+            note_mcp_tools(name, &listed);
         }
         if let Ok(tools) = listed {
             for t in tools {

@@ -129,9 +129,22 @@ that run; every entry in it must be valid.
 
 ### See which servers are running
 
-`/mcp` in the chat lists every configured server with what happened when it
-was last asked for its tools: `running · 4 tools`, `starts when a prompt
-needs it`, or `not available:` and the reason. A server that does not come
+`/mcp` in the terminal chat opens the MCP manager: a menu with a row for every
+configured server and what happened when it was last asked for its tools:
+`running · 4 tools`, `starts when a prompt needs it`, or `not available:` and
+the reason. The selected row's preview shows what the server runs (secrets
+hidden), where it is configured, the names of its environment variables and
+headers, its sign-in, and the tools it offered. In the manager, `⏎` connects the
+server (or reconnects it, or retries one that failed), `r` does the same, `e`
+turns it off or on in the file that defines it (the file is rewritten as
+`orbit mcp add` rewrites it: indented, with its keys in alphabetical order),
+`a` and `x` sign in and out of
+a remote server, and `/` filters the rows. A server from a project's
+`.mcp.json` can be connected but not turned off from here: that file is
+Claude Code's. The same actions can be typed: `/mcp reconnect <server>`,
+`/mcp enable <server>` and `/mcp disable <server>`; `/mcp list` prints the
+configured servers as text, without their state (running, tool count, why one
+is not available), which only the manager shows. A server that does not come
 up is also named once in the conversation (on standard error in a headless
 run) with how its process ended and the last thing it wrote to standard
 error, for example `its process ended before answering (exit status: 2):
@@ -899,6 +912,28 @@ terminal; with piped input the chat names the file instead.
 `/btw` works only between turns and runs no tools. In a session with managed
 accounting its tokens are billed to the session's housekeeping subtotal; see
 [Auto mode and `/btw` accounting](#auto-mode-and-btw-accounting).
+
+### Menus
+
+A command that is given nothing to act on opens a menu instead of printing its
+usage: `/mode` (the permission modes, with what each allows), `/theme` and
+`/reactor` (the themes and the Reactor art), `/effort` (the levels the model
+declares, plus a way back to its default; a model that declares none is
+answered in words), `/output-style` (the built-in styles and your style files),
+`/model` (the same list as
+`/models`), `/resume` (the same list as `/sessions`) and `/mcp` (the manager
+above). Choosing a row runs the command a person would have typed, so every
+check that command makes still applies.
+
+In every menu, `↑`/`↓` or `j`/`k` move, `Home`/`End` or `g`/`G` jump, `PageUp`
+and `PageDown` move eight rows, the mouse wheel moves a row at a time, and a
+click on a row chooses it. `/` opens a filter line: every word typed must
+appear in a row's name or description, `Backspace` deletes, and `Esc` brings
+every row back before a second `Esc` closes the menu, and a paste goes into the
+open filter line. The footer names the keys that apply to the selected row, and
+a click on a key named there presses it. `/model`, `/resume` and `/mcp` open
+while a turn is running, since looking at a list changes nothing; choosing
+from one waits for the turn, as the typed command does.
 
 `orbit --append-system-prompt <text>` (or `--append-system-prompt-file <path>`)
 adds instructions for one run. An output style is selected with

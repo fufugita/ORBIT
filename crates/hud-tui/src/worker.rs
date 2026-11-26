@@ -348,6 +348,9 @@ pub enum WorkerCommand {
     ListModels,
     /// `/sessions` — list saved sessions (formatted by the worker).
     ListSessions,
+    /// `/mcp` — list the configured MCP servers for the manager menu.
+    /// Answered with `Msg::McpListed`.
+    ListMcp,
     /// Refresh the saved-sessions list the sidebar and the Sessions pane
     /// draw. Answered with `Msg::SavedSessions`; it is not foreground work,
     /// so it never makes the screen look busy.
@@ -426,6 +429,7 @@ impl WorkerCommand {
             | Self::ClearSession(_)
             | Self::ListModels
             | Self::ListSessions
+            | Self::ListMcp
             | Self::ListSavedSessions
             | Self::ListInstalledMods => None,
         }

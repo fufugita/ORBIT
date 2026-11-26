@@ -156,8 +156,11 @@ from other tools, plugins and skills, subagents.
 Present in both: `/clear`, `/compact`, `/effort`, `/help`, `/model`,
 `/permissions`, `/resume`, `/rewind`, `/theme`, `/usage`.
 
-Present as read-only lists: `/hooks`, `/skills`, `/agents`, `/mcp` (which also
-has `login` and `logout`). Present in
+Present as read-only lists: `/hooks`, `/skills`, `/agents`. `/mcp` is a
+manager menu (rows with a preview of each server's tools; connect, reconnect,
+turn off and on, sign in and out; `login` and `logout` also typed). Menus also
+open for `/mode`, `/theme`, `/reactor`, `/effort`, `/model` and `/resume` when
+they are given nothing to act on. Present in
 a simpler form: `/goal`, `/loop`.
 
 Also present: `/copy`, `/export`, and custom command files.
@@ -256,7 +259,7 @@ previous conversation's ID.
 | stdio, Streamable HTTP, legacy SSE | Present | |
 | Per-tool allow, ask, deny | Present | |
 | Project servers behind folder trust | Present | |
-| `mcp add/list/remove` commands, `/mcp` | Present | `orbit mcp add | list | get | remove` (and `/mcp add …` in chat for values without spaces); a trusted project's `.mcp.json` is read |
+| `mcp add/list/remove` commands, `/mcp` | Present | `orbit mcp add | list | get | remove` (and `/mcp add …` in chat for values without spaces); a trusted project's `.mcp.json` is read. `/mcp` opens a manager menu: connect, reconnect, enable and disable (written to the file that defines the server), sign in and out, a preview of each server's tools. A server from `.mcp.json` can be connected but not disabled from the menu |
 | Credentials in `orbit mcp list` and `get` | Present | URL query values and user information, the word after a credential flag, `NAME=value` arguments of a credential name and credential header values show as `<hidden>`; a command-line word is cut at 100 characters; the file keeps what it was given |
 | Servers that print a banner or answer a notification | Present | A standard-output line that is not JSON and does not begin with `{` is skipped, and a reply with no `id` is ignored, as the official clients do; a cut-off `{…` frame, JSON that is not an object and `"id": null` stay errors. The last skipped line is quoted when a server ends or never answers |
 | Large replies | Present | A server's stdio frame, HTTP body, SSE stream and `tools/list` (summed over pages) may be 16 MiB; ORBIT's own requests stay within 1 MiB; the model sees at most 64 KiB of a result |

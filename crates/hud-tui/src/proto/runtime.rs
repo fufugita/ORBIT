@@ -1230,6 +1230,34 @@ pub enum Overlay {
     ModelPicker,
     /// The session picker (`/sessions`).
     SessionPicker,
+    /// Any other menu (`/mode`, `/theme`, `/mcp`, …): its rows ride on
+    /// `scenario.picker` like the two above.
+    Menu,
+}
+
+/// Whether the overlay is one of the menus whose rows live on
+/// `scenario.picker`.
+fn is_picker_overlay(overlay: Option<Overlay>) -> bool {
+    picker_overlay_kind(overlay).is_some()
+}
+
+/// What the menu overlay chooses between.
+fn picker_overlay_kind(overlay: Option<Overlay>) -> Option<PickerKind> {
+    match overlay {
+        Some(Overlay::ModelPicker) => Some(PickerKind::Models),
+        Some(Overlay::SessionPicker) => Some(PickerKind::Sessions),
+        Some(Overlay::Menu) => Some(PickerKind::Command),
+        _ => None,
+    }
+}
+
+/// The overlay that shows a menu of this kind.
+fn overlay_for_picker(kind: PickerKind) -> Overlay {
+    match kind {
+        PickerKind::Models => Overlay::ModelPicker,
+        PickerKind::Sessions => Overlay::SessionPicker,
+        PickerKind::Command => Overlay::Menu,
+    }
 }
 
 /// A toast (§9.13): muted text, optional green ✓, 3 s.
@@ -2122,6 +2150,20 @@ fn run_proto_inner(
                         MouseOutcome::SessionsSelect(delta) => {
                             scenario.saved_sessions.select(delta);
                         }
+                        // The wheel moves a menu's selection a row at a time;
+                        // the other overlays have nothing to scroll.
+                        MouseOutcome::ModalWheel(delta) => {
+                            if is_picker_overlay(overlay) {
+                                if let Some(picker) = scenario.picker.as_mut() {
+                                    picker.move_by(delta);
+                                }
+                            } else if matches!(overlay, Some(Overlay::Palette)) {
+                                let last = super::shell::overlays::palette_items(&palette_query)
+                                    .len()
+                                    .saturating_sub(1);
+                                palette_sel = palette_sel.saturating_add_signed(delta).min(last);
+                            }
+                        }
                         // The palette is a menu: a click runs the row (⏎).
                         MouseOutcome::Palette(i) => {
                             pending_palette_click = capture_palette_click(
@@ -2645,9 +2687,15 @@ fn handle_key_with_read(
     reconcile_history_navigation(composer, history, history_idx, history_draft, scenario);
     let prev_key_ms = scenario.last_key_ms;
     scenario.last_key_ms = now_ms;
-    if k.code == KeyCode::Esc
-        || (overlay.is_some()
-            && !matches!(overlay, Some(Overlay::ModelPicker | Overlay::SessionPicker)))
+    // Esc in a menu whose filter line is open only closes the line; the
+    // menu's own key handling below does that.
+    let filtering_menu = is_picker_overlay(*overlay)
+        && scenario
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.is_filtering());
+    if (k.code == KeyCode::Esc && !filtering_menu)
+        || (overlay.is_some() && !is_picker_overlay(*overlay))
         || tui.app.arranging
         || tui.app.picker.is_some()
     {
@@ -2756,13 +2804,13 @@ fn handle_key_with_read(
             }
             return false;
         }
-        Some(Overlay::ModelPicker | Overlay::SessionPicker) => {
-            // The picker owns the keyboard: arrows move, Enter commits,
-            // Esc closes. The variant is copied out so the arm can
-            // clear `overlay` while matching on it.
-            let kind = match overlay {
-                Some(Overlay::ModelPicker) => PickerKind::Models,
-                _ => PickerKind::Sessions,
+        Some(Overlay::ModelPicker | Overlay::SessionPicker | Overlay::Menu) => {
+            // The menu owns the keyboard: arrows, paging and `/` move and
+            // filter, Enter commits, Esc closes, and a row's own keys act
+            // on it. The kind is copied out so the arm can clear `overlay`
+            // while matching on it.
+            let Some(kind) = picker_overlay_kind(*overlay) else {
+                return false;
             };
             if scenario.approval_call_id.is_some()
                 || scenario
@@ -2774,64 +2822,126 @@ fn handle_key_with_read(
                 *overlay = None;
                 return false;
             }
-            if let Some(picker) = scenario.picker.as_mut() {
-                match k.code {
-                    KeyCode::Esc => {
+            let Some(picker) = scenario.picker.as_mut() else {
+                // The rows vanished (worker restart): close.
+                *overlay = None;
+                return false;
+            };
+            picker.notice = None;
+            // What the key asks for: a command line to run, and whether the
+            // menu stays up while it does.
+            let (line, keep_open) = match menu_key(picker, k) {
+                MenuKey::Handled => return false,
+                MenuKey::Close => {
+                    scenario.picker = None;
+                    *overlay = None;
+                    return false;
+                }
+                MenuKey::Act { command, keep_open } => (command, keep_open),
+                MenuKey::Choose => {
+                    let selected = picker.selected_row().cloned();
+                    let picker_kind = picker.kind;
+                    let Some(row) = selected else {
                         scenario.picker = None;
                         *overlay = None;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        picker.sel = picker
-                            .sel
-                            .min(picker.rows.len().saturating_sub(1))
-                            .saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        picker.sel = picker
-                            .sel
-                            .saturating_add(1)
-                            .min(picker.rows.len().saturating_sub(1));
-                    }
-                    KeyCode::Enter => {
-                        let selected = picker.rows.get(picker.sel).cloned();
-                        let picker_kind = picker.kind;
-                        scenario.picker = None;
-                        *overlay = None;
-                        let Some(row) = selected else {
+                        return false;
+                    };
+                    match picker_kind {
+                        PickerKind::Command => {
+                            // A row with nothing to run is only to read.
+                            if row.value.is_empty() {
+                                return false;
+                            }
+                            (row.value, row.keep_open)
+                        }
+                        PickerKind::Models | PickerKind::Sessions => {
+                            scenario.picker = None;
+                            *overlay = None;
+                            let current_id = scenario
+                                .session_binding()
+                                .map(|b| b.session_id.clone())
+                                .unwrap_or_default();
+                            let command = match picker_kind {
+                                PickerKind::Models => {
+                                    Some(WorkerCommand::SetModel(row.value.clone()))
+                                }
+                                // Resuming the session we're already on is a
+                                // no-op: just close.
+                                _ => (row.value != current_id)
+                                    .then_some(WorkerCommand::ResumeSession(row.value.clone())),
+                            };
+                            if let Some(command) = command
+                                && let Err(message) =
+                                    submit_foreground(scenario, command_sink, command)
+                            {
+                                *toast = Some(Toast {
+                                    text: message.into(),
+                                    ok: false,
+                                    shown_ms: now_ms,
+                                });
+                            }
                             return false;
-                        };
-                        let current_id = scenario
-                            .session_binding()
-                            .map(|b| b.session_id.clone())
-                            .unwrap_or_default();
-                        let command = match (picker_kind, kind) {
-                            (PickerKind::Models, PickerKind::Models) => {
-                                Some(WorkerCommand::SetModel(row.value.clone()))
-                            }
-                            (PickerKind::Sessions, PickerKind::Sessions) => {
-                                // Resuming the session we're already on
-                                // is a no-op: just close.
-                                (row.value != current_id)
-                                    .then_some(WorkerCommand::ResumeSession(row.value.clone()))
-                            }
-                            _ => None,
-                        };
-                        if let Some(command) = command
-                            && let Err(message) = submit_foreground(scenario, command_sink, command)
-                        {
-                            *toast = Some(Toast {
-                                text: message.into(),
-                                ok: false,
-                                shown_ms: now_ms,
-                            });
                         }
                     }
-                    _ => {}
                 }
-            } else {
-                // The rows vanished (worker restart): close.
-                scenario.picker = None;
-                *overlay = None;
+            };
+            if keep_open {
+                // The menu stays, and the worker's answer refreshes it. A
+                // request is expected before anything is sent, and given
+                // back if nothing could be.
+                let refusal = if scenario.is_busy() {
+                    Some("wait for the active work to finish")
+                } else {
+                    scenario.begin_refresh_request(kind).err()
+                };
+                if let Some(message) = refusal {
+                    if let Some(picker) = scenario.picker.as_mut() {
+                        picker.notice = Some(message.into());
+                    }
+                    return false;
+                }
+                let on = scenario
+                    .picker
+                    .as_ref()
+                    .and_then(|picker| picker.selected_row())
+                    .map(|row| row.label.trim().to_owned())
+                    .unwrap_or_default();
+                let line = line.trim_start_matches('/').to_owned();
+                let sent =
+                    submit_foreground_in_menu(scenario, command_sink, WorkerCommand::Inspect(line));
+                if let Some(picker) = scenario.picker.as_mut() {
+                    match sent {
+                        Ok(()) => picker.working = Some(format!("working on {on}…")),
+                        Err(message) => picker.notice = Some(message.into()),
+                    }
+                }
+                if sent.is_err() {
+                    scenario.finish_picker_request(kind);
+                }
+                return false;
+            }
+            scenario.picker = None;
+            *overlay = None;
+            let mut fs = false;
+            if let Some(o) = run_command(
+                tui,
+                &line,
+                scenario,
+                composer,
+                command_sink,
+                sender,
+                now_ms,
+                toast,
+                queued,
+                history,
+                history_idx,
+                &mut fs,
+            ) {
+                *overlay = Some(o);
+            }
+            if fs {
+                tui.app.sidebar = true;
+                *sessions_pushed = true;
             }
             return false;
         }
@@ -3187,11 +3297,11 @@ fn handle_key_with_read(
                     }
                     // A command that has to wait for the turn stays in the
                     // composer, so Enter after the turn runs it as typed.
-                    if scenario.is_busy()
-                        && !runs_while_busy(canonical_command(
-                            text.split(' ').next().unwrap_or(""),
-                        ))
-                    {
+                    let (first, rest) = text
+                        .split_once(' ')
+                        .map_or((text.as_str(), ""), |(first, rest)| (first, rest.trim()));
+                    let named = canonical_command(first);
+                    if scenario.is_busy() && !runs_while_busy(named) && !only_listing(named, rest) {
                         *toast = Some(Toast {
                             text: "wait for the active work to finish; draft retained".into(),
                             ok: false,
@@ -3576,6 +3686,18 @@ fn handle_paste(
     history_draft: &mut Option<HistoryDraft>,
     modal_open: bool,
 ) -> bool {
+    // A paste into a menu's open filter line is typed into it; it is never
+    // the draft behind the menu.
+    if modal_open
+        && !text.is_empty()
+        && let Some(menu) = scenario.picker.as_mut()
+        && menu.is_filtering()
+    {
+        for c in text.chars() {
+            menu.push_filter(c);
+        }
+        return true;
+    }
     if text.is_empty() || modal_open || tui.app.arranging || tui.app.picker.is_some() {
         return false;
     }
@@ -4583,6 +4705,8 @@ fn request_picker(
         let command = match kind {
             PickerKind::Models => WorkerCommand::ListModels,
             PickerKind::Sessions => WorkerCommand::ListSessions,
+            // The one menu the worker fills in is the MCP manager.
+            PickerKind::Command => WorkerCommand::ListMcp,
         };
         sink.send(command).map_err(|_| {
             scenario.finish_picker_request(kind);
@@ -4602,6 +4726,26 @@ fn submit_foreground(
     scenario: &mut Scenario,
     sink: &CommandSink,
     command: WorkerCommand,
+) -> Result<(), &'static str> {
+    submit_foreground_with(scenario, sink, command, true)
+}
+
+/// [`submit_foreground`] for the keys of a menu that stays open: the menu
+/// is left on screen, and the list request that was begun for it stays
+/// pending, so the worker's refreshed list reaches it.
+fn submit_foreground_in_menu(
+    scenario: &mut Scenario,
+    sink: &CommandSink,
+    command: WorkerCommand,
+) -> Result<(), &'static str> {
+    submit_foreground_with(scenario, sink, command, false)
+}
+
+fn submit_foreground_with(
+    scenario: &mut Scenario,
+    sink: &CommandSink,
+    command: WorkerCommand,
+    dismiss_picker: bool,
 ) -> Result<(), &'static str> {
     let kind = command
         .foreground_kind()
@@ -4627,7 +4771,9 @@ fn submit_foreground(
     if let Some(intent) = intent {
         scenario.remember_ordinary_intent(intent, source);
     }
-    scenario.dismiss_picker();
+    if dismiss_picker {
+        scenario.dismiss_picker();
+    }
     Ok(())
 }
 
@@ -4858,6 +5004,13 @@ fn begin_prompt_view(scenario: &mut Scenario, text: &str, now_ms: u64) {
     }
 }
 
+/// A bare `/model`, `/resume` or `/mcp` only opens a list. Looking at a list
+/// changes nothing, so it is allowed while a turn runs; choosing from it is
+/// held to the same rule as typing the command.
+fn only_listing(cmd: &str, arg: &str) -> bool {
+    arg.is_empty() && matches!(cmd, "/model" | "/resume" | "/mcp")
+}
+
 /// Commands that only read or arrange the screen, so they run while a turn
 /// is in flight. Every other command waits for the turn to end.
 fn runs_while_busy(cmd: &str) -> bool {
@@ -4991,7 +5144,7 @@ fn run_command(
         scenario.dismiss_picker();
         return Some(Overlay::Quit);
     }
-    if scenario.is_busy() && !runs_while_busy(cmd) {
+    if scenario.is_busy() && !runs_while_busy(cmd) && !only_listing(cmd, arg) {
         *toast = Some(Toast {
             text: "wait for the active work to finish".into(),
             ok: false,
@@ -5121,7 +5274,8 @@ fn run_command(
         }
         "/model" => {
             if arg.is_empty() {
-                notice(scenario, "usage: /model <model-id>".into());
+                // Nothing to switch to yet: pick from the configured models.
+                request_picker(scenario, command_sink, PickerKind::Models, toast, now_ms);
             } else {
                 if let Err(message) = submit_foreground(
                     scenario,
@@ -5153,7 +5307,7 @@ fn run_command(
         }
         "/resume" => {
             if arg.is_empty() {
-                notice(scenario, "usage: /resume <session-id>".into());
+                request_picker(scenario, command_sink, PickerKind::Sessions, toast, now_ms);
             } else if scenario.is_busy() {
                 *toast = Some(Toast {
                     text: "wait for this turn to finish first".into(),
@@ -5222,21 +5376,17 @@ fn run_command(
             None
         }
         "/mode" => {
-            const MODES: [&str; 6] = [
-                "default",
-                "acceptEdits",
-                "plan",
-                "auto",
-                "dontAsk",
-                "bypass",
-            ];
+            let modes: Vec<&str> = super::menus::mode_names().collect();
             if arg.is_empty() {
-                let cur = scenario.permission_mode.as_deref().unwrap_or("default");
-                notice(
-                    scenario,
-                    format!("mode: {cur} · /mode <{}>", MODES.join("|")),
-                );
-            } else if MODES.contains(&arg) {
+                // The six modes as a menu, starting on the one in use.
+                let cur = scenario
+                    .permission_mode
+                    .as_deref()
+                    .unwrap_or("default")
+                    .to_owned();
+                scenario.open_picker(super::menus::mode_menu(&cur));
+                return Some(Overlay::Menu);
+            } else if modes.contains(&arg) {
                 if let Err(message) = submit_foreground(
                     scenario,
                     command_sink,
@@ -5251,7 +5401,7 @@ fn run_command(
             } else {
                 notice(
                     scenario,
-                    format!("unknown mode {arg} · /mode <{}>", MODES.join("|")),
+                    format!("unknown mode {arg} · /mode <{}>", modes.join("|")),
                 );
             }
             None
@@ -5287,6 +5437,43 @@ fn run_command(
                 },
             };
             notice(scenario, text);
+            None
+        }
+        "/mcp"
+            if matches!(
+                arg.split_whitespace().next(),
+                Some("reconnect" | "enable" | "disable")
+            ) =>
+        {
+            // Typed by hand: the answer is the manager, opened on the result.
+            match scenario.begin_picker_request(PickerKind::Command) {
+                Err(message) => {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                }
+                Ok(()) => {
+                    if let Err(message) = submit_foreground_in_menu(
+                        scenario,
+                        command_sink,
+                        WorkerCommand::Inspect(format!("mcp {arg}")),
+                    ) {
+                        scenario.finish_picker_request(PickerKind::Command);
+                        *toast = Some(Toast {
+                            text: message.into(),
+                            ok: false,
+                            shown_ms: now_ms,
+                        });
+                    }
+                }
+            }
+            None
+        }
+        "/mcp" if arg.is_empty() => {
+            // The manager: the worker lists the servers and opens the menu.
+            request_picker(scenario, command_sink, PickerKind::Command, toast, now_ms);
             None
         }
         "/hooks" | "/skills" | "/agents" | "/mcp" | "/memory" | "/config" | "/btw" | "/rename"
@@ -5366,6 +5553,24 @@ fn run_command(
             None
         }
         "/theme" | "/customize" | "/reactor" => {
+            // Bare `/theme` and `/reactor` choose from a menu; with an
+            // argument they act, as they always did.
+            let menu = tui
+                .customization
+                .as_ref()
+                .and_then(|session| match (cmd, arg) {
+                    ("/theme", "") => {
+                        Some(super::menus::theme_menu(&session.resolved.profile.theme))
+                    }
+                    ("/reactor", "" | "art") => Some(super::menus::reactor_art_menu(
+                        session.resolved.profile.reactor_art.as_str(),
+                    )),
+                    _ => None,
+                });
+            if let Some(menu) = menu {
+                scenario.open_picker(menu);
+                return Some(Overlay::Menu);
+            }
             *toast = Some(profile_command_toast(tui, scenario, text, now_ms));
             None
         }
@@ -6636,18 +6841,19 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     EditOrigin::Local,
                 );
             } else {
-                scenario.open_picker(Picker {
-                    kind: PickerKind::Models,
-                    rows: rows
-                        .into_iter()
-                        .map(|(p, m)| PickerRow {
-                            label: clean(format!("{p}/{m}")),
-                            value: format!("{p}/{m}"),
-                            detail: clean(format!("provider {p}")),
+                scenario.open_picker(Picker::new(
+                    PickerKind::Models,
+                    rows.into_iter()
+                        .map(|(p, m)| {
+                            PickerRow::new(
+                                clean(format!("{p}/{m}")),
+                                format!("{p}/{m}"),
+                                clean(format!("provider {p}")),
+                            )
                         })
                         .collect(),
-                    sel: 0,
-                });
+                    0,
+                ));
             }
         }
         // The list the sidebar and the Sessions pane draw. Its text comes from
@@ -6677,29 +6883,99 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     EditOrigin::Local,
                 );
             } else {
-                scenario.open_picker(Picker {
-                    kind: PickerKind::Sessions,
-                    rows: rows
-                        .into_iter()
-                        .map(|r| PickerRow {
-                            label: clean(if r.current {
-                                format!("{}  (this session)", r.id)
-                            } else {
-                                r.id.clone()
-                            }),
-                            value: r.id,
-                            detail: clean(if r.current {
-                                format!("{} turns · {}", r.turns, r.model)
-                            } else {
-                                format!(
-                                    "{} turns · {} · updated {}",
-                                    r.turns, r.model, r.updated_at
-                                )
-                            }),
+                scenario.open_picker(Picker::new(
+                    PickerKind::Sessions,
+                    rows.into_iter()
+                        .map(|r| {
+                            PickerRow::new(
+                                clean(if r.current {
+                                    format!("{}  (this session)", r.id)
+                                } else {
+                                    r.id.clone()
+                                }),
+                                r.id,
+                                clean(if r.current {
+                                    format!("{} turns · {}", r.turns, r.model)
+                                } else {
+                                    format!(
+                                        "{} turns · {} · updated {}",
+                                        r.turns, r.model, r.updated_at
+                                    )
+                                }),
+                            )
                         })
                         .collect(),
-                    sel: 0,
-                });
+                    0,
+                ));
+            }
+        }
+        Msg::ChoiceList {
+            title,
+            command,
+            current,
+            rows,
+            note,
+        } => {
+            let rows: Vec<crate::msg::ChoiceRow> = rows
+                .into_iter()
+                .map(|row| crate::msg::ChoiceRow {
+                    value: clean(row.value),
+                    label: clean(row.label),
+                    detail: clean(row.detail),
+                })
+                .collect();
+            if let Some(menu) = super::menus::choice_menu(
+                &clean(title),
+                &command,
+                &clean(current),
+                &rows,
+                &clean(note),
+            ) {
+                scenario.open_picker(menu);
+            }
+        }
+        Msg::McpListed(servers) => {
+            if servers.is_empty() {
+                push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::System,
+                        text: "no MCP servers — add them with `orbit mcp add` or in mcp.json"
+                            .to_string(),
+                        ..Default::default()
+                    },
+                    EditOrigin::Local,
+                );
+            } else {
+                let menu = super::menus::mcp_menu(servers);
+                match scenario.picker.as_mut() {
+                    // The manager is already open: refresh it in place.
+                    Some(open) if open.kind == menu.kind && open.title == menu.title => {
+                        open.replace_rows(menu.rows);
+                        open.notice = None;
+                        open.working = None;
+                    }
+                    _ => scenario.open_picker(menu),
+                }
+            }
+        }
+        Msg::McpListFailed(error) => {
+            let error = clean(error);
+            match scenario.picker.as_mut() {
+                // Say it where the person is looking.
+                Some(open) if open.kind == PickerKind::Command => {
+                    open.working = None;
+                    open.notice = Some(error);
+                }
+                _ => push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::System,
+                        text: error,
+                        ..Default::default()
+                    },
+                    EditOrigin::Local,
+                ),
             }
         }
         Msg::ModelsListFailed(error) | Msg::SessionsListFailed(error) => {
@@ -7111,17 +7387,12 @@ fn draw_with_hits_with_read(
                     opened_ms: tui.fx.overlay_ms,
                 })
         }
-        Some(Overlay::ModelPicker) | Some(Overlay::SessionPicker) => {
+        Some(Overlay::ModelPicker | Overlay::SessionPicker | Overlay::Menu) => {
             // The rows the reducer loaded; no rows, no overlay.
-            scenario.picker.as_ref().map(|p| Ov::Picker {
-                title: match p.kind {
-                    PickerKind::Models => "MODELS",
-                    PickerKind::Sessions => "SESSIONS",
-                },
-                rows: &p.rows,
-                sel: p.sel,
-                opened_ms: tui.fx.overlay_ms,
-            })
+            scenario
+                .picker
+                .as_ref()
+                .map(|picker| picker_overlay_view(picker, tui.fx.overlay_ms))
         }
         None => None,
     };
@@ -7275,6 +7546,8 @@ enum MouseOutcome {
     Session(usize),
     /// The wheel over the Sessions pane: move its selection by this many rows.
     SessionsSelect(isize),
+    /// The wheel while a menu or the palette is open: move its selection.
+    ModalWheel(isize),
 }
 
 #[derive(Debug, Clone)]
@@ -7363,6 +7636,108 @@ fn palette_click_key(
     ))
 }
 
+/// What the menu overlay draws for a picker: the rows the filter lets
+/// through, and the filter line, preview and footer of keys around them.
+fn picker_overlay_view(picker: &Picker, opened_ms: u64) -> super::shell::overlays::Overlay<'_> {
+    let rows = if picker.filter_text().trim().is_empty() {
+        std::borrow::Cow::Borrowed(&picker.rows[..])
+    } else {
+        std::borrow::Cow::Owned(
+            picker
+                .visible()
+                .into_iter()
+                .map(|index| picker.rows[index].clone())
+                .collect(),
+        )
+    };
+    super::shell::overlays::Overlay::Picker {
+        title: &picker.title,
+        rows,
+        sel: picker.sel,
+        chrome: super::shell::overlays::PickerChrome {
+            filter: picker
+                .is_filtering()
+                .then(|| picker.filter_text().to_owned()),
+            total: picker.rows.len(),
+            hints: picker
+                .hints()
+                .into_iter()
+                .map(|hint| (hint.key, hint.label))
+                .collect(),
+            previews: picker.previews(),
+            two_line: picker.two_line,
+            status: picker
+                .notice
+                .clone()
+                .map(|text| (text, true))
+                .or_else(|| picker.working.clone().map(|text| (text, false))),
+        },
+        opened_ms,
+    }
+}
+
+/// What a key does to an open menu.
+#[derive(Debug, PartialEq, Eq)]
+enum MenuKey {
+    /// Nothing more than moving, filtering or scrolling.
+    Handled,
+    /// Close the menu.
+    Close,
+    /// Choose the selected row.
+    Choose,
+    /// Run a row's own key: its command, and whether the menu stays open.
+    Act { command: String, keep_open: bool },
+}
+
+/// Apply a key to a menu's state. Pure: the caller carries out whatever it
+/// returns (closing, choosing, running a command), so the rules here can be
+/// tested without a terminal.
+fn menu_key(picker: &mut Picker, k: crossterm::event::KeyEvent) -> MenuKey {
+    let plain = !k
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let page = super::picker::PAGE_ROWS as isize;
+    if picker.is_filtering() {
+        match k.code {
+            KeyCode::Esc => picker.clear_filter(),
+            // With nothing left to choose, Enter does nothing: the menu
+            // stays up so the filter can be corrected.
+            KeyCode::Enter if picker.selected_row().is_some() => return MenuKey::Choose,
+            KeyCode::Backspace => {
+                picker.pop_filter();
+            }
+            KeyCode::Up => picker.move_by(-1),
+            KeyCode::Down => picker.move_by(1),
+            KeyCode::PageUp => picker.move_by(-page),
+            KeyCode::PageDown => picker.move_by(page),
+            KeyCode::Char(c) if plain => picker.push_filter(c),
+            _ => {}
+        }
+        return MenuKey::Handled;
+    }
+    match k.code {
+        KeyCode::Esc => return MenuKey::Close,
+        KeyCode::Enter => return MenuKey::Choose,
+        KeyCode::Up | KeyCode::Char('k') if plain => picker.move_by(-1),
+        KeyCode::Down | KeyCode::Char('j') if plain => picker.move_by(1),
+        KeyCode::PageUp => picker.move_by(-page),
+        KeyCode::PageDown => picker.move_by(page),
+        KeyCode::Home | KeyCode::Char('g') if plain => picker.home(),
+        KeyCode::End | KeyCode::Char('G') if plain => picker.end(),
+        KeyCode::Char('/') if plain && picker.rows.len() > 1 => picker.start_filter(),
+        KeyCode::Char(c) if plain => {
+            if let Some(key) = picker.row_key(c) {
+                return MenuKey::Act {
+                    command: key.command.clone(),
+                    keep_open: key.keep_open,
+                };
+            }
+        }
+        _ => {}
+    }
+    MenuKey::Handled
+}
+
 #[derive(Debug, Clone)]
 struct PickerClick {
     binding: Option<crate::worker::SessionBinding>,
@@ -7375,13 +7750,9 @@ fn capture_picker_click(
     overlay: Option<Overlay>,
     index: usize,
 ) -> Option<PickerClick> {
-    let kind = match overlay {
-        Some(Overlay::ModelPicker) => PickerKind::Models,
-        Some(Overlay::SessionPicker) => PickerKind::Sessions,
-        _ => return None,
-    };
+    let kind = picker_overlay_kind(overlay)?;
     let picker = scenario.picker.as_ref()?;
-    if picker.kind != kind || index >= picker.rows.len() || scenario.approval_call_id.is_some() {
+    if picker.kind != kind || index >= picker.visible_len() || scenario.approval_call_id.is_some() {
         return None;
     }
     Some(PickerClick {
@@ -7562,6 +7933,8 @@ fn handle_mouse_with_read(
             }
             MouseOutcome::None
         }
+        MouseEventKind::ScrollUp if modal => MouseOutcome::ModalWheel(-1),
+        MouseEventKind::ScrollDown if modal => MouseOutcome::ModalWheel(1),
         _ if modal => MouseOutcome::None,
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(sel) = &mut tui.selection {
@@ -7813,6 +8186,7 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
         Some(Overlay::Diff) => 4,
         Some(Overlay::ModelPicker) => 5,
         Some(Overlay::SessionPicker) => 6,
+        Some(Overlay::Menu) => 7,
     }
 }
 
@@ -9829,12 +10203,14 @@ mod composer_key_tests {
             self.type_text(match kind {
                 PickerKind::Models => "/models",
                 PickerKind::Sessions => "/sessions",
+                PickerKind::Command => "/mcp",
             });
             self.plain(KeyCode::Enter);
             assert!(matches!(
                 (kind, self.rx.try_recv().unwrap()),
                 (PickerKind::Models, WorkerCommand::ListModels)
                     | (PickerKind::Sessions, WorkerCommand::ListSessions)
+                    | (PickerKind::Command, WorkerCommand::ListMcp)
             ));
         }
 
@@ -11724,6 +12100,622 @@ mod composer_key_tests {
             assert_eq!(scenario.custom_panes["sessions"], stored);
         }
     }
+
+    // ---- menus: /mode, /model, /resume, the filter, the wheel and /mcp ----
+
+    fn mcp_servers(names: &[&str]) -> Vec<crate::msg::McpServerRow> {
+        names
+            .iter()
+            .map(|name| crate::msg::McpServerRow {
+                name: (*name).into(),
+                transport: "stdio".into(),
+                scope: "user".into(),
+                enabled: true,
+                target: "npx -y server".into(),
+                state: "starts when a prompt needs it".into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn open_mcp(k: &mut Keyboard, names: &[&str]) {
+        k.list(PickerKind::Command);
+        k.receive(crate::msg::Msg::McpListed(mcp_servers(names)));
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+    }
+
+    fn picker_labels(k: &Keyboard) -> Vec<String> {
+        let picker = k.scenario.picker.as_ref().unwrap();
+        picker
+            .visible()
+            .into_iter()
+            .map(|i| picker.rows[i].label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn bare_mode_opens_a_menu_and_choosing_a_row_runs_that_mode() {
+        let mut k = Keyboard::new();
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        k.no_send();
+        let picker = k.scenario.picker.as_ref().unwrap();
+        assert_eq!(picker.title, "PERMISSION MODE");
+        assert_eq!(picker.rows.len(), 6);
+        // It starts on the mode in use, and Down moves to the next.
+        assert_eq!(picker.selected_row().unwrap().value, "/mode default");
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, None);
+        assert!(k.scenario.picker.is_none());
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::SetMode(mode) if mode == "acceptEdits"
+        ));
+    }
+
+    #[test]
+    fn escape_closes_a_menu_without_running_anything() {
+        let mut k = Keyboard::new();
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, None);
+        assert!(k.scenario.picker.is_none());
+        k.no_send();
+    }
+
+    #[test]
+    fn the_lists_can_be_opened_mid_turn_but_a_choice_made_from_them_still_waits() {
+        for (typed, expect) in [
+            ("/model", "models"),
+            ("/resume", "sessions"),
+            ("/mcp", "mcp"),
+        ] {
+            let mut k = Keyboard::new();
+            k.scenario.turn_live = true;
+            k.type_text(typed);
+            k.plain(KeyCode::Enter);
+            let sent = k.rx.try_recv().expect(typed);
+            assert!(
+                matches!(
+                    (&sent, expect),
+                    (WorkerCommand::ListModels, "models")
+                        | (WorkerCommand::ListSessions, "sessions")
+                        | (WorkerCommand::ListMcp, "mcp")
+                ),
+                "{typed}: {sent:?}"
+            );
+        }
+        // With an argument the command still waits for the turn, as before.
+        let mut k = Keyboard::new();
+        k.scenario.turn_live = true;
+        k.type_text("/model other");
+        k.plain(KeyCode::Enter);
+        k.no_send();
+        // And `/mode` has no list that does not change anything: it waits too.
+        let mut k = Keyboard::new();
+        k.scenario.turn_live = true;
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, None);
+        k.no_send();
+    }
+
+    #[test]
+    fn bare_model_and_bare_resume_ask_for_their_lists() {
+        let mut k = Keyboard::new();
+        k.type_text("/model");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.rx.try_recv().unwrap(),
+            WorkerCommand::ListModels
+        ));
+        k.receive(listed_models(2));
+        assert_eq!(k.overlay, Some(Overlay::ModelPicker));
+        k.plain(KeyCode::Esc);
+        k.type_text("/resume");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.rx.try_recv().unwrap(),
+            WorkerCommand::ListSessions
+        ));
+        // No usage line was printed for either.
+        assert!(
+            !k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.text.starts_with("usage: /model")
+                    || line.text.starts_with("usage: /resume"))
+        );
+    }
+
+    #[test]
+    fn slash_starts_a_filter_that_narrows_the_rows_and_enter_chooses_the_match() {
+        let mut k = Keyboard::new();
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        k.plain(KeyCode::Char('/'));
+        assert!(k.scenario.picker.as_ref().unwrap().is_filtering());
+        // `j` and `k` are letters now, not movement.
+        k.type_text("dontask");
+        assert_eq!(picker_labels(&k), vec!["  dontAsk".to_string()]);
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, None);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::SetMode(mode) if mode == "dontAsk"
+        ));
+    }
+
+    #[test]
+    fn a_paste_goes_into_an_open_filter_line_and_never_into_the_draft_behind_the_menu() {
+        let mut k = Keyboard::new();
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        // A draft someone left behind the menu.
+        k.draft = "keep me".into();
+        let paste = |k: &mut Keyboard, text: &str| {
+            handle_paste(
+                text,
+                &mut k.tui,
+                &mut k.scenario,
+                &mut k.draft,
+                &k.history,
+                &mut k.history_idx,
+                &mut k.history_draft,
+                true,
+            )
+        };
+        // The filter line is closed: the paste is ignored, the draft untouched.
+        assert!(!paste(&mut k, "plan"));
+        assert_eq!(k.draft, "keep me");
+        k.plain(KeyCode::Char('/'));
+        // Open: the text lands in the filter, newlines and controls dropped.
+        assert!(paste(&mut k, "dont\nAsk\u{1b}"));
+        assert_eq!(k.scenario.picker.as_ref().unwrap().filter_text(), "dontAsk");
+        assert_eq!(picker_labels(&k), vec!["  dontAsk".to_string()]);
+        assert_eq!(k.draft, "keep me");
+    }
+
+    #[test]
+    fn escape_ends_the_filter_first_and_the_next_escape_closes_the_menu() {
+        let mut k = Keyboard::new();
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        k.plain(KeyCode::Char('/'));
+        k.type_text("zzz");
+        assert!(picker_labels(&k).is_empty());
+        // Enter with nothing matching does nothing, and keeps the menu.
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        k.no_send();
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert_eq!(picker_labels(&k).len(), 6, "every row is back");
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, None);
+        k.no_send();
+    }
+
+    #[test]
+    fn paging_and_the_ends_move_the_selection_in_a_long_list() {
+        let mut k = Keyboard::new();
+        k.list(PickerKind::Models);
+        k.receive(listed_models(30));
+        k.plain(KeyCode::PageDown);
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 8);
+        k.plain(KeyCode::End);
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 29);
+        k.plain(KeyCode::PageUp);
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 21);
+        k.plain(KeyCode::Home);
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 0);
+        k.plain(KeyCode::Char('G'));
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 29);
+        k.plain(KeyCode::Char('g'));
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 0);
+    }
+
+    #[test]
+    fn the_wheel_moves_a_menus_selection_and_not_the_page_behind() {
+        let mut k = Keyboard::new();
+        k.list(PickerKind::Models);
+        k.receive(listed_models(5));
+        let area = Rect::new(0, 0, 100, 30);
+        let wheel = |kind| crossterm::event::MouseEvent {
+            kind,
+            column: 50,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..2 {
+            let outcome = handle_mouse(
+                wheel(crossterm::event::MouseEventKind::ScrollDown),
+                &mut k.tui,
+                area,
+                None,
+                true,
+            );
+            assert!(matches!(outcome, MouseOutcome::ModalWheel(1)));
+            if let MouseOutcome::ModalWheel(delta) = outcome {
+                k.scenario.picker.as_mut().unwrap().move_by(delta);
+            }
+        }
+        assert_eq!(k.scenario.picker.as_ref().unwrap().sel, 2);
+        let outcome = handle_mouse(
+            wheel(crossterm::event::MouseEventKind::ScrollUp),
+            &mut k.tui,
+            area,
+            None,
+            true,
+        );
+        assert!(matches!(outcome, MouseOutcome::ModalWheel(-1)));
+        // With no modal open the wheel still scrolls the panel under it.
+        assert!(!matches!(
+            handle_mouse(
+                wheel(crossterm::event::MouseEventKind::ScrollDown),
+                &mut k.tui,
+                area,
+                None,
+                false
+            ),
+            MouseOutcome::ModalWheel(_)
+        ));
+    }
+
+    #[test]
+    fn a_click_chooses_the_row_the_filter_left_in_that_place() {
+        let mut k = Keyboard::new();
+        k.type_text("/mode");
+        k.plain(KeyCode::Enter);
+        k.plain(KeyCode::Char('/'));
+        k.type_text("plan");
+        // One row is left; row 0 of the FILTERED list is `plan`, and index 1
+        // is out of range for the click.
+        assert_eq!(picker_labels(&k), vec!["  plan".to_string()]);
+        let click = capture_picker_click(&k.scenario, k.overlay, 0).unwrap();
+        assert!(capture_picker_click(&k.scenario, k.overlay, 1).is_none());
+        let key = picker_click_key(click, &mut k.scenario, k.overlay, 10_000).unwrap();
+        assert_eq!(key.code, KeyCode::Enter);
+        k.key(key.code, key.modifiers);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::SetMode(mode) if mode == "plan"
+        ));
+    }
+
+    #[test]
+    fn bare_mcp_asks_the_worker_and_its_rows_open_the_manager() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha", "beta"]);
+        let picker = k.scenario.picker.as_ref().unwrap();
+        assert_eq!(picker.title, "MCP SERVERS");
+        assert_eq!(picker.rows.len(), 2);
+        k.no_send();
+        // An empty answer opens nothing and says so.
+        let mut k = Keyboard::new();
+        k.list(PickerKind::Command);
+        k.receive(crate::msg::Msg::McpListed(Vec::new()));
+        assert_eq!(k.overlay, None);
+        assert!(
+            k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.text.starts_with("no MCP servers"))
+        );
+    }
+
+    #[test]
+    fn a_keep_open_key_leaves_the_menu_up_and_the_answer_refreshes_it_in_place() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha", "beta"]);
+        k.plain(KeyCode::Down);
+        let opened_at = k.tui.fx.overlay_ms;
+        k.plain(KeyCode::Char('r'));
+        // The menu stays; the worker is asked to reconnect that server.
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "mcp reconnect beta"
+        ));
+        // A second action while the first is still running is refused, not
+        // queued, and says why inside the menu.
+        k.plain(KeyCode::Char('r'));
+        k.no_send();
+        assert_eq!(
+            k.scenario.picker.as_ref().unwrap().notice.as_deref(),
+            Some("wait for the active work to finish")
+        );
+        // The worker finishes the command, but its list has not arrived: the
+        // request for it is still outstanding, and a new action waits for it.
+        k.scenario.frontend.foreground = None;
+        k.plain(KeyCode::Char('r'));
+        k.no_send();
+        assert_eq!(
+            k.scenario.picker.as_ref().unwrap().notice.as_deref(),
+            Some("wait for the previous list request to finish")
+        );
+        // The answer arrives: rows are refreshed, `beta` stays selected, the
+        // drop-in does not replay, and the notice is gone.
+        let mut servers = mcp_servers(&["alpha", "beta"]);
+        servers[1].state = "running · 4 tools".into();
+        servers[1].tool_count = Some(4);
+        k.receive(crate::msg::Msg::McpListed(servers));
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        let picker = k.scenario.picker.as_ref().unwrap();
+        assert_eq!(picker.selected_row().unwrap().label, "beta");
+        assert!(picker.selected_row().unwrap().detail.contains("4 tools"));
+        assert!(picker.notice.is_none());
+        assert_eq!(k.tui.fx.overlay_ms, opened_at);
+        // And the next action is accepted again.
+        k.scenario.frontend.foreground = None;
+        k.plain(KeyCode::Char('r'));
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "mcp reconnect beta"
+        ));
+    }
+
+    fn effort_list(current: &str) -> crate::msg::Msg {
+        let row = |value: &str, label: &str, detail: &str| crate::msg::ChoiceRow {
+            value: value.into(),
+            label: label.into(),
+            detail: detail.into(),
+        };
+        crate::msg::Msg::ChoiceList {
+            title: "EFFORT".into(),
+            command: "/effort".into(),
+            current: current.into(),
+            rows: vec![
+                row("\"low\"", "low", ""),
+                row("\"high\"", "high", ""),
+                row("default", "default", "the model's own"),
+            ],
+            note: "Applies from the next request.".into(),
+        }
+    }
+
+    #[test]
+    fn a_choice_list_opens_a_menu_and_choosing_a_row_sets_the_value() {
+        let mut k = Keyboard::new();
+        k.type_text("/effort");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Effort(value) if value.is_empty()
+        ));
+        assert_eq!(k.overlay, None, "nothing opens until the worker answers");
+        k.scenario.frontend.foreground = None;
+        k.receive(effort_list("\"low\""));
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        let picker = k.scenario.picker.as_ref().unwrap();
+        assert_eq!(picker.title, "EFFORT");
+        assert_eq!(picker.selected_row().unwrap().value, "/effort \"low\"");
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, None);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Effort(value) if value == "\"high\""
+        ));
+    }
+
+    #[test]
+    fn bare_output_style_asks_the_worker_and_its_list_runs_the_same_command() {
+        let mut k = Keyboard::new();
+        k.type_text("/output-style");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "output-style"
+        ));
+        k.scenario.frontend.foreground = None;
+        k.receive(crate::msg::Msg::ChoiceList {
+            title: "OUTPUT STYLE".into(),
+            command: "/output-style".into(),
+            current: "default".into(),
+            rows: ["default", "explanatory", "learning"]
+                .iter()
+                .map(|name| crate::msg::ChoiceRow {
+                    value: (*name).into(),
+                    label: (*name).into(),
+                    detail: String::new(),
+                })
+                .collect(),
+            note: "Applies from the next turn.".into(),
+        });
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "output-style explanatory"
+        ));
+    }
+
+    #[test]
+    fn a_choice_list_for_a_command_the_terminal_does_not_know_opens_nothing() {
+        let mut k = Keyboard::new();
+        k.receive(crate::msg::Msg::ChoiceList {
+            title: "X".into(),
+            command: "/quit".into(),
+            current: "a".into(),
+            rows: vec![crate::msg::ChoiceRow {
+                value: "a".into(),
+                label: "a".into(),
+                detail: String::new(),
+            }],
+            note: String::new(),
+        });
+        assert_eq!(k.overlay, None);
+        assert!(k.scenario.picker.is_none());
+    }
+
+    #[test]
+    fn a_choice_list_that_arrives_after_something_else_took_the_screen_is_dropped() {
+        let mut k = Keyboard::new();
+        k.overlay = Some(Overlay::Help);
+        k.receive(effort_list("default"));
+        assert_eq!(k.overlay, Some(Overlay::Help));
+        assert!(k.scenario.picker.is_none());
+    }
+
+    #[test]
+    fn the_menu_says_what_it_is_waiting_on_until_the_list_comes_back() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha", "beta"]);
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Char('r'));
+        let _ = k.received_command();
+        assert_eq!(
+            k.scenario.picker.as_ref().unwrap().working.as_deref(),
+            Some("working on beta…")
+        );
+        let screen = k.frame(100, 30);
+        assert!(screen.contains("working on beta…"), "{screen}");
+        k.receive(crate::msg::Msg::McpListed(mcp_servers(&["alpha", "beta"])));
+        assert!(k.scenario.picker.as_ref().unwrap().working.is_none());
+        let screen = k.frame(100, 30);
+        assert!(!screen.contains("working on"), "{screen}");
+        assert!(screen.contains("esc"), "the keys are back");
+    }
+
+    #[test]
+    fn a_refused_send_leaves_no_waiting_state_behind() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha"]);
+        // The worker is gone: nothing can be sent.
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        k.tx = tx;
+        k.plain(KeyCode::Char('r'));
+        let picker = k.scenario.picker.as_ref().unwrap();
+        assert!(picker.working.is_none());
+        assert_eq!(picker.notice.as_deref(), Some("worker is unavailable"));
+        assert_eq!(k.scenario.pending_picker_kind(), None, "no request is left");
+    }
+
+    #[test]
+    fn typed_mcp_actions_open_the_manager_on_the_workers_answer() {
+        let mut k = Keyboard::new();
+        k.type_text("/mcp reconnect alpha");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "mcp reconnect alpha"
+        ));
+        assert_eq!(k.overlay, None, "nothing opens until the worker answers");
+        k.receive(crate::msg::Msg::McpListed(mcp_servers(&["alpha", "beta"])));
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert_eq!(k.scenario.picker.as_ref().unwrap().title, "MCP SERVERS");
+        // A refused send (busy) says so and leaves nothing waiting.
+        let mut busy = Keyboard::new();
+        busy.scenario.turn_live = true;
+        busy.type_text("/mcp enable alpha");
+        busy.plain(KeyCode::Enter);
+        busy.no_send();
+        assert_eq!(busy.scenario.pending_picker_kind(), None);
+    }
+
+    #[test]
+    fn a_failed_action_is_said_inside_the_menu_not_in_the_transcript() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha"]);
+        k.plain(KeyCode::Char('e'));
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "mcp disable alpha"
+        ));
+        let lines_before = k.scenario.transcript.len();
+        k.receive(crate::msg::Msg::McpListFailed(
+            "could not write mcp.json: permission denied".into(),
+        ));
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert_eq!(
+            k.scenario.picker.as_ref().unwrap().notice.as_deref(),
+            Some("could not write mcp.json: permission denied")
+        );
+        assert_eq!(k.scenario.transcript.len(), lines_before);
+        // Any key clears it.
+        k.plain(KeyCode::Down);
+        assert!(k.scenario.picker.as_ref().unwrap().notice.is_none());
+    }
+
+    #[test]
+    fn escape_while_an_action_is_pending_drops_the_late_answer() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha"]);
+        k.plain(KeyCode::Char('r'));
+        let _ = k.received_command();
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, None);
+        // (The worker finishes the command either way.)
+        k.scenario.frontend.foreground = None;
+        k.receive(crate::msg::Msg::McpListed(mcp_servers(&["alpha"])));
+        assert_eq!(k.overlay, None, "the late list must not reopen the menu");
+        assert!(k.scenario.picker.is_none());
+        // And a new request is possible once the stale answer has landed.
+        k.type_text("/mcp");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(k.rx.try_recv().unwrap(), WorkerCommand::ListMcp));
+    }
+
+    #[test]
+    fn a_keep_open_key_while_a_turn_runs_is_refused_in_the_menu() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha"]);
+        k.scenario.turn_live = true;
+        k.plain(KeyCode::Char('r'));
+        k.no_send();
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert_eq!(
+            k.scenario.picker.as_ref().unwrap().notice.as_deref(),
+            Some("wait for the active work to finish")
+        );
+        // No request is left pending to block the next one.
+        assert_eq!(k.scenario.pending_picker_kind(), None);
+    }
+
+    #[test]
+    fn a_row_key_that_closes_runs_its_command_like_typing_it() {
+        let mut k = Keyboard::new();
+        k.list(PickerKind::Command);
+        let mut servers = mcp_servers(&["remote"]);
+        servers[0].transport = "streamable-http".into();
+        k.receive(crate::msg::Msg::McpListed(servers));
+        k.plain(KeyCode::Char('a'));
+        assert_eq!(k.overlay, None);
+        assert!(k.scenario.picker.is_none());
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "mcp login remote"
+        ));
+    }
+
+    #[test]
+    fn a_menu_draws_its_rows_preview_and_footer_and_stays_inside_a_small_screen() {
+        let mut k = Keyboard::new();
+        open_mcp(&mut k, &["alpha", "beta"]);
+        for (width, height) in [(100u16, 30u16), (60, 16), (40, 11), (24, 8)] {
+            let screen = k.frame(width, height);
+            assert!(
+                screen.contains("MCP SERVERS") || width < 30,
+                "{width}x{height}"
+            );
+        }
+        let screen = k.frame(100, 30);
+        assert!(screen.contains("alpha"), "{screen}");
+        assert!(
+            screen.contains("npx -y server"),
+            "the preview of the selected row"
+        );
+        assert!(screen.contains("connect"), "the footer names Enter's verb");
+        assert!(screen.contains("filter"), "{screen}");
+    }
 }
 
 #[cfg(test)]
@@ -12766,6 +13758,8 @@ fn source_affects_transcript(msg: &crate::msg::Msg) -> bool {
     match msg {
         Msg::ModelsListed(rows) => rows.is_empty(),
         Msg::SessionsListed(rows) => rows.is_empty(),
+        Msg::McpListed(rows) => rows.is_empty(),
+        Msg::McpListFailed(_) => true,
         Msg::Status(text) => !text.starts_with("┃ "),
         _ => matches!(
             msg,
@@ -12903,7 +13897,8 @@ fn reduce_runtime_message_with_view(
 ) -> Option<String> {
     use crate::msg::Msg;
     let previous_overlay = *overlay;
-    let picker_overlay = matches!(overlay, Some(Overlay::ModelPicker | Overlay::SessionPicker));
+    let picker_overlay = is_picker_overlay(*overlay);
+    let choice_menu = matches!(&msg, Msg::ChoiceList { .. });
     if (overlay.is_some() && !picker_overlay)
         || tui.app.picker.is_some()
         || tui.app.arranging
@@ -12918,6 +13913,8 @@ fn reduce_runtime_message_with_view(
     let reply = match &msg {
         Msg::ModelsListed(_) => Some((PickerKind::Models, true)),
         Msg::SessionsListed(_) => Some((PickerKind::Sessions, true)),
+        Msg::McpListed(_) => Some((PickerKind::Command, true)),
+        Msg::McpListFailed(_) => Some((PickerKind::Command, false)),
         Msg::ModelsListFailed(_) => Some((PickerKind::Models, false)),
         Msg::SessionsListFailed(_) => Some((PickerKind::Sessions, false)),
         _ => None,
@@ -12939,11 +13936,22 @@ fn reduce_runtime_message_with_view(
     if let Some((kind, true)) = reply
         && s.picker.is_some()
     {
-        *overlay = Some(match kind {
-            PickerKind::Models => Overlay::ModelPicker,
-            PickerKind::Sessions => Overlay::SessionPicker,
-        });
-        tui.fx.overlay_ms = now;
+        // A refresh of a menu that is already open must not replay its
+        // drop-in.
+        if *overlay != Some(overlay_for_picker(kind)) {
+            tui.fx.overlay_ms = now;
+        }
+        *overlay = Some(overlay_for_picker(kind));
+    }
+    if choice_menu && s.picker.is_some() {
+        // Asked for by the command just sent: it opens the menu unless
+        // something else has the screen by now.
+        if overlay.is_none() {
+            *overlay = Some(Overlay::Menu);
+            tui.fx.overlay_ms = now;
+        } else {
+            s.dismiss_picker();
+        }
     }
     if picker_overlay && s.picker.is_none() {
         *overlay = None;
@@ -13211,6 +14219,8 @@ fn handle_custom_key_with_history(
             composer.split_whitespace().next(),
             Some("/theme" | "/customize" | "/reactor")
         )
+        // Bare `/theme` and `/reactor` open their menus instead.
+        && !matches!(composer.trim(), "/theme" | "/reactor" | "/reactor art")
     {
         *toast = Some(profile_command_toast(tui, s, composer, now));
         composer.clear();
@@ -16382,9 +17392,9 @@ mod bound_projection_tests {
     fn palette_customization_preserves_failed_intent_binding_notice_and_report() {
         use crate::msg::{OrdinaryEnd, OrdinaryPublication};
         for (command, available) in [
-            ("/theme", false),
+            ("/theme midnight", false),
             ("/customize", false),
-            ("/theme", true),
+            ("/theme midnight", true),
             ("/customize", true),
         ] {
             let (mut s, operation, registration) =
@@ -16874,12 +17884,13 @@ mod palette_review_tests {
                     .any(|row| row.contains("▌") && row.contains("/mode"))
             );
             keys.press(KeyCode::Enter);
-            assert!(
-                keys.s
-                    .transcript
-                    .iter()
-                    .any(|line| line.text.starts_with("mode: default"))
-            );
+            // Bare `/mode` opens its menu, on the mode in use, instead of
+            // printing a line of options.
+            assert_eq!(keys.overlay, Some(Overlay::Menu));
+            let menu = keys.s.picker.as_ref().expect("the mode menu");
+            assert_eq!(menu.title, "PERMISSION MODE");
+            assert_eq!(menu.rows.len(), 6);
+            assert_eq!(menu.selected_row().unwrap().value, "/mode default");
             assert!(
                 !keys
                     .s
@@ -16887,7 +17898,6 @@ mod palette_review_tests {
                     .iter()
                     .any(|line| line.text.contains("usage: /resume"))
             );
-            assert_eq!(keys.overlay, None);
             keys.no_worker_command();
         }
     }
@@ -16960,12 +17970,18 @@ mod palette_review_tests {
             assert!(!rows[hit.rect.y as usize].contains("/models"));
             let click = keys.click("/model", width, height).unwrap();
             assert!(keys.activate(click));
+            // Bare `/model` asks for the list to choose from, not a usage line.
             assert!(
-                keys.s
+                !keys
+                    .s
                     .transcript
                     .iter()
-                    .any(|line| line.text == "usage: /model <model-id>")
+                    .any(|line| line.text.starts_with("usage: /model"))
             );
+            assert!(matches!(
+                keys.received.try_recv(),
+                Ok(WorkerCommand::ListModels)
+            ));
             keys.no_worker_command();
         }
     }
@@ -17125,7 +18141,8 @@ mod palette_review_tests {
 
     #[test]
     fn palette_and_typed_customization_reach_the_same_real_consumer_and_toast() {
-        for (query, command) in [("th", "/theme"), ("cust", "/customize")] {
+        // Bare `/theme` opens a menu instead (see the theme menu test below).
+        for (query, command) in [("cust", "/customize")] {
             for busy in [false, true] {
                 let source = Arc::new(RecordingHost(Mutex::new(Vec::new())));
                 for route in ["palette-key", "palette-click", "typed"] {
@@ -17168,6 +18185,55 @@ mod palette_review_tests {
                     ]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bare_theme_opens_a_menu_on_every_route_and_choosing_a_row_reaches_the_host() {
+        for route in ["palette-key", "palette-click", "typed"] {
+            let source = Arc::new(RecordingHost(Mutex::new(Vec::new())));
+            let mut keys = Keys::new("th");
+            keys.bind();
+            keys.tui.customization =
+                Some(crate::customization::CustomizationSession::open(source.clone()).unwrap());
+            if route == "typed" {
+                keys.overlay = None;
+                keys.draft = "/theme".into();
+            }
+            if route == "palette-click" {
+                keys.frame(110, 30);
+                let click = keys.click("/theme", 110, 30).unwrap();
+                assert!(keys.activate(click));
+            } else {
+                keys.press(KeyCode::Enter);
+            }
+            // Opening the menu changes nothing yet.
+            assert_eq!(keys.overlay, Some(Overlay::Menu), "{route}");
+            assert!(source.0.lock().unwrap().is_empty(), "{route}");
+            let menu = keys.s.picker.as_ref().unwrap();
+            assert_eq!(menu.title, "THEME", "{route}");
+            assert_eq!(
+                menu.selected_row().unwrap().value,
+                "/theme orbit",
+                "{route}"
+            );
+            // Down once, Enter: `/theme midnight` reaches the same consumer
+            // typing it would, and the menu is gone.
+            keys.press(KeyCode::Down);
+            keys.press(KeyCode::Enter);
+            assert_eq!(keys.overlay, None, "{route}");
+            assert!(keys.s.picker.is_none(), "{route}");
+            assert_eq!(
+                *source.0.lock().unwrap(),
+                [ProfileCommand::Theme {
+                    name: "midnight".into()
+                }],
+                "{route}"
+            );
+            let toast = keys.toast.as_ref().unwrap();
+            assert!(toast.ok, "{route}");
+            assert_eq!(toast.text, "actual customization consumer", "{route}");
+            keys.no_worker_command();
         }
     }
 
