@@ -4561,6 +4561,26 @@ fn worker_main_initialized(
                             "usage: /mcp (the manager) · /mcp list · /mcp reconnect|enable|disable <server> · /mcp login <server> [client-id] · /mcp login cancel · /mcp logout <server> · /mcp prompts · /mcp prompt <server> <name> [key=value …]"
                                 .into()
                         }
+                        // The lists as menus to read. With a word after them
+                        // (`/hooks list`) they print as text, as before.
+                        ["hooks"] => {
+                            turn_sender.send(crate::browse_lists::hooks_menu(&config.home));
+                            String::new()
+                        }
+                        ["skills"] => {
+                            turn_sender.send(crate::browse_lists::skills_menu(
+                                &config.home,
+                                &tool_cx.working_dir,
+                            ));
+                            String::new()
+                        }
+                        ["agents"] => {
+                            turn_sender.send(crate::browse_lists::agents_menu(
+                                &config.home,
+                                &tool_cx.working_dir,
+                            ));
+                            String::new()
+                        }
                         _ => inspect_configuration(
                             &config.home,
                             words.first().copied().unwrap_or(""),
@@ -10390,6 +10410,90 @@ default_effort = "low"
         assert!(SessionLease::acquire(&home, "session-test", "after").is_ok());
         drop(busy);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn the_bare_lists_open_menus_and_a_word_after_them_prints_the_text() {
+        let home = std::env::temp_dir().join(format!("orbit-browse-worker-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(home.join("skills/release-notes")).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ncommand = \"check-it\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("skills/release-notes/SKILL.md"),
+            "---\nname: release-notes\ndescription: Draft release notes\n---\nbody\n",
+        )
+        .unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        for what in [
+            "hooks",
+            "hooks list",
+            "skills",
+            "skills list",
+            "agents",
+            "agents list",
+        ] {
+            commands.send(WorkerCommand::Inspect(what.into())).unwrap();
+        }
+        drop(commands);
+        worker_main(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            config(&home),
+            Default::default(),
+        );
+        // What reached the screen, in order: a menu is a `BrowseList`, the
+        // text form is a line.
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(msg) = bus.try_recv() {
+            match msg {
+                Msg::BrowseList { title, rows, .. } => {
+                    seen.push(format!("menu {}", title.split(' ').next().unwrap_or("")));
+                    if title.starts_with("SKILLS") {
+                        assert!(
+                            rows.iter().any(|row| row.label == "/release-notes"
+                                && row.complete == "/release-notes")
+                        );
+                    }
+                    if title.starts_with("HOOKS") {
+                        assert_eq!(rows[0].label, "PreToolUse Bash");
+                    }
+                }
+                Msg::SystemMessage(line) if line.starts_with("hooks (") => {
+                    seen.push("text hooks".into());
+                    assert!(line.contains("PreToolUse [Bash] check-it"), "{line}");
+                }
+                Msg::SystemMessage(line) if line.starts_with("skills (") => {
+                    seen.push("text skills".into());
+                    assert!(
+                        line.contains("/release-notes — Draft release notes"),
+                        "{line}"
+                    );
+                }
+                Msg::SystemMessage(line) if line.starts_with("agents (") => {
+                    seen.push("text agents".into());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "menu HOOKS",
+                "text hooks",
+                "menu SKILLS",
+                "text skills",
+                "menu AGENTS",
+                "text agents"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

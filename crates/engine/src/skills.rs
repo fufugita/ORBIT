@@ -316,11 +316,29 @@ impl ContentBinding {
     }
 }
 
+/// Where a skill or subagent definition was found, for a listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentOrigin {
+    /// One of ORBIT's own subagents.
+    BuiltIn,
+    /// The operator's own folders (`$ORBIT_HOME/skills`, `agents`): the skill's
+    /// folder or the agent's file.
+    User(std::path::PathBuf),
+    /// The trusted project's `.orbit/` folder.
+    Project(std::path::PathBuf),
+    /// Claude Code's folders: the project's `.claude/` or `~/.claude/`.
+    Claude(std::path::PathBuf),
+    /// An imported plugin, by name.
+    Plugin(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct CatalogSkill {
     pub skill: Skill,
     pub policy: Option<orbit_plugin_compat::SkillSpec>,
     pub binding: Option<ContentBinding>,
+    /// Where the definition was found.
+    pub origin: ContentOrigin,
     /// A skill folder of the operator's own (`$ORBIT_HOME/skills`,
     /// `.orbit/skills`, Claude Code's): where its `SKILL.md` lives, so the
     /// files it refers to can be found. `None` for a plugin's skill, whose
@@ -407,6 +425,8 @@ pub struct CatalogAgent {
     /// None inherits the parent; Some([]) denies every tool.
     pub allowed_tools: Option<Vec<String>>,
     pub binding: Option<ContentBinding>,
+    /// Where the definition was found.
+    pub origin: ContentOrigin,
 }
 
 /// A plugin's command file: a prompt a person starts with
@@ -445,22 +465,30 @@ pub fn load_catalog(
             agent,
             allowed_tools,
             binding: None,
+            origin: ContentOrigin::BuiltIn,
         });
     }
     // ORBIT's own folders first, then Claude Code's: the project's
     // `.claude/` when the folder is trusted, the operator's `~/.claude/`
     // when they turned on `claude_compat`. A name already taken is kept.
-    let mut bases = vec![
-        (home.to_path_buf(), false, false),
-        (project.join(".orbit"), true, false),
-        (project.join(".claude"), true, true),
+    // Each folder says what to call where its definitions came from.
+    type Base = (
+        std::path::PathBuf,
+        bool,
+        bool,
+        fn(std::path::PathBuf) -> ContentOrigin,
+    );
+    let mut bases: Vec<Base> = vec![
+        (home.to_path_buf(), false, false, ContentOrigin::User),
+        (project.join(".orbit"), true, false, ContentOrigin::Project),
+        (project.join(".claude"), true, true, ContentOrigin::Claude),
     ];
     if crate::hooks::claude_compat(home)
         && let Some(claude) = crate::hooks::claude_config_dir()
     {
-        bases.push((claude, false, true));
+        bases.push((claude, false, true, ContentOrigin::Claude));
     }
-    for (base, needs_trust, borrowed) in bases {
+    for (base, needs_trust, borrowed, origin_of) in bases {
         if needs_trust && !trusted {
             continue;
         }
@@ -479,6 +507,7 @@ pub fn load_catalog(
                         skill,
                         policy: Some(policy),
                         binding: None,
+                        origin: origin_of(entry.path()),
                         dir: entry.path().canonicalize().ok(),
                         grants,
                     });
@@ -501,6 +530,7 @@ pub fn load_catalog(
                         agent,
                         allowed_tools,
                         binding: None,
+                        origin: origin_of(entry.path()),
                     });
                 }
             }
@@ -608,6 +638,7 @@ pub fn load_catalog(
                         data_root: active.data_root.clone(),
                         options: active.plugin.options.clone(),
                     });
+                    let origin = ContentOrigin::Plugin(active.plugin.id.name.clone());
                     match &component.kind {
                         ComponentKind::Skill(spec) => catalog.skills.push(CatalogSkill {
                             skill: Skill {
@@ -617,6 +648,7 @@ pub fn load_catalog(
                             },
                             policy: Some(spec.clone()),
                             binding,
+                            origin,
                             dir: None,
                             grants: Vec::new(),
                         }),
@@ -663,6 +695,7 @@ pub fn load_catalog(
                                 },
                                 allowed_tools: spec.tools.clone(),
                                 binding,
+                                origin,
                             });
                         }
                         ComponentKind::Command(spec) => {
@@ -990,5 +1023,79 @@ Body text.
             "ORBIT's copy wins"
         );
         assert!(trusted.agents.iter().any(|a| a.agent.name == "reviewer"));
+    }
+
+    #[test]
+    fn a_catalog_entry_says_where_it_was_found() {
+        let root = std::env::temp_dir().join(format!("orbit-origin-catalog-{}", ulid::Ulid::new()));
+        let (home, project) = (root.join("home"), root.join("project"));
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let definition = |name: &str| format!("---\nname: {name}\ndescription: d\n---\nbody\n");
+        write(
+            home.join("skills/mine/SKILL.md"),
+            &definition("origin-mine"),
+        );
+        write(home.join("agents/helper.md"), &definition("origin-helper"));
+        write(
+            project.join(".orbit/skills/proj/SKILL.md"),
+            &definition("origin-proj"),
+        );
+        write(
+            project.join(".claude/skills/theirs/SKILL.md"),
+            &definition("origin-theirs"),
+        );
+        write(
+            project.join(".claude/agents/reviewer.md"),
+            &definition("origin-reviewer"),
+        );
+        orbit_tools::permissions::FolderTrust::new(home.clone())
+            .trust(&project)
+            .unwrap();
+        let catalog = load_catalog(&home, &project, false).unwrap();
+        let skill = |name: &str| {
+            catalog
+                .skills
+                .iter()
+                .find(|entry| entry.skill.name == name)
+                .unwrap()
+                .origin
+                .clone()
+        };
+        let agent = |name: &str| {
+            catalog
+                .agents
+                .iter()
+                .find(|entry| entry.agent.name == name)
+                .unwrap()
+                .origin
+                .clone()
+        };
+        assert_eq!(
+            skill("origin-mine"),
+            ContentOrigin::User(home.join("skills/mine"))
+        );
+        assert_eq!(
+            skill("origin-proj"),
+            ContentOrigin::Project(project.join(".orbit/skills/proj"))
+        );
+        assert_eq!(
+            skill("origin-theirs"),
+            ContentOrigin::Claude(project.join(".claude/skills/theirs"))
+        );
+        assert_eq!(
+            agent("origin-helper"),
+            ContentOrigin::User(home.join("agents/helper.md"))
+        );
+        assert_eq!(
+            agent("origin-reviewer"),
+            ContentOrigin::Claude(project.join(".claude/agents/reviewer.md"))
+        );
+        for builtin in ["Explore", "Plan", "general-purpose"] {
+            assert_eq!(agent(builtin), ContentOrigin::BuiltIn, "{builtin}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

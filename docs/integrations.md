@@ -923,7 +923,8 @@ answered in words), `/output-style` (the built-in styles and your style files),
 `/model` (the same list as
 `/models`), `/resume` (the same list as `/sessions`) and `/mcp` (the manager
 above). Choosing a row runs the command a person would have typed, so every
-check that command makes still applies.
+check that command makes still applies. `/hooks`, `/skills` and `/agents` open
+menus to read (below).
 
 In every menu, `↑`/`↓` or `j`/`k` move, `Home`/`End` or `g`/`G` jump, `PageUp`
 and `PageDown` move eight rows, the mouse wheel moves a row at a time, and a
@@ -934,6 +935,24 @@ open filter line. The footer names the keys that apply to the selected row, and
 a click on a key named there presses it. `/model`, `/resume` and `/mcp` open
 while a turn is running, since looking at a list changes nothing; choosing
 from one waits for the turn, as the typed command does.
+
+`/hooks`, `/skills` and `/agents` list what is configured, one row each, with
+the rest in a preview under the list. A hook's row names its event and matcher
+and says what it runs; its preview says whether ORBIT waits for its answer, its `if`
+condition and timeout, which file or plugin it came from, and the whole of what
+it runs: a command, an HTTP address (with the names of its headers, never their
+values), a prompt, an agent, or an MCP tool. `/skills` and `/agents` list what
+the runtime offers, the same set `/name`, the Skill tool and the Agent tool
+resolve against, so an imported plugin's skills and agents are in them, and a
+skill only a person may start is shown too (marked `you only`, or `model only`
+when it cannot be typed). A skill's preview adds what it may use and about how
+many tokens it costs when loaded; an agent's, its tools, model and turn limit.
+Text taken from a file passes through the same secret scanner as everything
+else shown. A row has nothing to run: `⏎` on a hook or an agent does nothing,
+and on a skill it puts `/name` in the composer, for you to add arguments and
+send, when the composer is empty. A word after the command (`/hooks list`)
+prints the plain text instead, which for skills and agents covers only the
+folders of your own, not a plugin's.
 
 `orbit --append-system-prompt <text>` (or `--append-system-prompt-file <path>`)
 adds instructions for one run. An output style is selected with

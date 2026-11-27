@@ -156,7 +156,10 @@ from other tools, plugins and skills, subagents.
 Present in both: `/clear`, `/compact`, `/effort`, `/help`, `/model`,
 `/permissions`, `/resume`, `/rewind`, `/theme`, `/usage`.
 
-Present as read-only lists: `/hooks`, `/skills`, `/agents`. `/mcp` is a
+`/hooks`, `/skills` and `/agents` open menus to read (a preview of each row
+says where it came from and what it may do; `/skills` also lists an imported
+plugin's skills, and `⏎` on a skill puts its name in the composer; `list` after
+the name prints the plain text). `/mcp` is a
 manager menu (rows with a preview of each server's tools; connect, reconnect,
 turn off and on, sign in and out; `login` and `logout` also typed). Menus also
 open for `/mode`, `/theme`, `/reactor`, `/effort`, `/model` and `/resume` when

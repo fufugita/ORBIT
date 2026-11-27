@@ -50,6 +50,9 @@ pub struct PickerRow {
     /// Whether choosing the row leaves the menu open (it refreshes when the
     /// command is done) instead of closing it.
     pub keep_open: bool,
+    /// Choosing the row puts `value` in the composer for the person to finish
+    /// and send, instead of running it: what the `/` list does with a name.
+    pub completes: bool,
     pub keys: Vec<RowKey>,
 }
 
@@ -80,6 +83,12 @@ impl PickerRow {
     /// Choosing this row runs its command but leaves the menu open.
     pub fn keeping_open(mut self) -> Self {
         self.keep_open = true;
+        self
+    }
+
+    /// Choosing this row puts its value in the composer instead of running it.
+    pub fn completing(mut self) -> Self {
+        self.completes = true;
         self
     }
 

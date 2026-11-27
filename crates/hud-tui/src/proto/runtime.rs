@@ -2954,6 +2954,26 @@ fn handle_key_with_read(
                             if row.value.is_empty() {
                                 return false;
                             }
+                            if row.completes {
+                                // A name for the composer, not a command to
+                                // run. It goes in only while the composer is
+                                // empty, so a draft is never written over.
+                                scenario.picker = None;
+                                *overlay = None;
+                                if composer.trim().is_empty() {
+                                    *composer = format!("{} ", row.value);
+                                    tui.composer_cursor = super::composer::grapheme_count(composer);
+                                    crate::customization::focus_conversation(&mut tui.app);
+                                    tui.sync_focus();
+                                } else {
+                                    *toast = Some(Toast {
+                                        text: "finish or clear what you are typing first".into(),
+                                        ok: false,
+                                        shown_ms: now_ms,
+                                    });
+                                }
+                                return false;
+                            }
                             (row.value, row.keep_open)
                         }
                         PickerKind::Models | PickerKind::Sessions => {
@@ -7063,6 +7083,29 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 &rows,
                 &clean(note),
             ) {
+                scenario.open_picker(menu);
+            }
+        }
+        Msg::BrowseList { title, rows, note } => {
+            // A preview is lines: each is cleaned on its own so the breaks
+            // between them stay.
+            let lines = |text: String| -> String {
+                text.lines()
+                    .map(|line| clean(line.to_owned()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let rows: Vec<crate::msg::BrowseRow> = rows
+                .into_iter()
+                .map(|row| crate::msg::BrowseRow {
+                    label: clean(row.label),
+                    detail: clean(row.detail),
+                    preview: lines(row.preview),
+                    // Held to a slash and one word where the menu is built.
+                    complete: row.complete,
+                })
+                .collect();
+            if let Some(menu) = super::menus::browse_menu(&clean(title), &rows, &lines(note)) {
                 scenario.open_picker(menu);
             }
         }
@@ -12866,6 +12909,209 @@ mod composer_key_tests {
         assert!(k.scenario.picker.is_none());
     }
 
+    fn browse_list() -> crate::msg::Msg {
+        let row =
+            |label: &str, detail: &str, preview: &str, complete: &str| crate::msg::BrowseRow {
+                label: label.into(),
+                detail: detail.into(),
+                preview: preview.into(),
+                complete: complete.into(),
+            };
+        crate::msg::Msg::BrowseList {
+            title: "SKILLS".into(),
+            rows: vec![
+                row(
+                    "PreToolUse Bash",
+                    "check-edit",
+                    "check-edit --strict\nfrom your settings.toml",
+                    "",
+                ),
+                row(
+                    "/release-notes",
+                    "Draft release notes",
+                    "Draft release notes\nfrom your skills folder",
+                    "/release-notes",
+                ),
+                row("/review", "Review a diff", "Review a diff", "/review"),
+            ],
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_browse_list_opens_a_menu_that_is_only_to_read() {
+        let mut k = Keyboard::new();
+        k.type_text("/hooks");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Inspect(line) if line == "hooks"
+        ));
+        k.scenario.frontend.foreground = None;
+        k.receive(browse_list());
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert_eq!(k.scenario.picker.as_ref().unwrap().title, "SKILLS");
+        // Enter on a row with nothing to do changes nothing: the menu stays
+        // open, the composer is untouched and nothing is sent.
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert!(k.draft.is_empty());
+        k.no_send();
+        k.plain(KeyCode::Down);
+        assert_eq!(
+            k.scenario
+                .picker
+                .as_ref()
+                .unwrap()
+                .selected_row()
+                .unwrap()
+                .label,
+            "/release-notes"
+        );
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, None);
+        assert!(k.scenario.picker.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_skill_puts_its_name_in_the_composer_and_runs_nothing() {
+        let mut k = Keyboard::new();
+        k.receive(browse_list());
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, None);
+        assert!(k.scenario.picker.is_none());
+        assert_eq!(k.draft, "/release-notes ");
+        assert_eq!(
+            k.tui.composer_cursor,
+            super::super::composer::grapheme_count(&k.draft),
+            "the cursor sits after the name"
+        );
+        k.no_send();
+    }
+
+    #[test]
+    fn a_skill_is_never_put_over_a_draft() {
+        let mut k = Keyboard::new();
+        k.type_text("half a thought");
+        k.receive(browse_list());
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        k.plain(KeyCode::Down);
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, "half a thought");
+        assert_eq!(k.overlay, None);
+        assert_eq!(
+            k.toast.as_ref().map(|t| (t.text.as_str(), t.ok)),
+            Some(("finish or clear what you are typing first", false))
+        );
+        k.no_send();
+    }
+
+    #[test]
+    fn a_click_on_a_skill_row_completes_it_as_enter_does() {
+        let mut k = Keyboard::new();
+        k.receive(browse_list());
+        k.frame(100, 30);
+        let hit = k
+            .tui
+            .hits
+            .iter()
+            .find(|hit| hit.click == super::super::shell::hits::Click::Picker(2))
+            .copied()
+            .unwrap();
+        let outcome = handle_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: hit.rect.x,
+                row: hit.rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut k.tui,
+            Rect::new(0, 0, 100, 30),
+            None,
+            true,
+        );
+        assert!(matches!(outcome, MouseOutcome::Picker(2)));
+        let click = capture_picker_click(&k.scenario, k.overlay, 2).unwrap();
+        let key = picker_click_key(click, &mut k.scenario, k.overlay, 10_000).unwrap();
+        k.key(key.code, key.modifiers);
+        assert_eq!(k.draft, "/review ");
+        assert_eq!(k.overlay, None);
+        k.no_send();
+    }
+
+    #[test]
+    fn the_filter_narrows_a_browse_menu_and_escape_leaves_it_in_two_steps() {
+        let mut k = Keyboard::new();
+        k.receive(browse_list());
+        k.plain(KeyCode::Char('/'));
+        k.type_text("diff");
+        let picker = k.scenario.picker.as_ref().unwrap();
+        assert_eq!(picker.visible_len(), 1);
+        assert_eq!(picker.selected_row().unwrap().label, "/review");
+        // The first Esc ends the filter and the menu stays; the second closes.
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, Some(Overlay::Menu));
+        assert_eq!(k.scenario.picker.as_ref().unwrap().visible_len(), 3);
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.overlay, None);
+    }
+
+    #[test]
+    fn a_browse_list_that_arrives_after_something_else_took_the_screen_is_dropped() {
+        let mut k = Keyboard::new();
+        k.overlay = Some(Overlay::Help);
+        k.receive(browse_list());
+        assert_eq!(k.overlay, Some(Overlay::Help));
+        assert!(k.scenario.picker.is_none());
+    }
+
+    #[test]
+    fn the_open_browse_menu_draws_the_selected_rows_preview_and_its_own_footer() {
+        let mut k = Keyboard::new();
+        k.receive(browse_list());
+        let frame = k.frame(100, 30);
+        assert!(frame.contains("SKILLS"), "{frame}");
+        assert!(
+            frame.contains("PreToolUse Bash") && frame.contains("/release-notes"),
+            "{frame}"
+        );
+        // The first row is selected: its preview is under the list, the
+        // others' is not, and Enter is not offered on a row with no action.
+        assert!(frame.contains("from your settings.toml"), "{frame}");
+        assert!(!frame.contains("from your skills folder"), "{frame}");
+        assert!(!frame.contains("complete"), "{frame}");
+        k.plain(KeyCode::Down);
+        let frame = k.frame(100, 30);
+        assert!(frame.contains("from your skills folder"), "{frame}");
+        assert!(!frame.contains("from your settings.toml"), "{frame}");
+        assert!(frame.contains("complete"), "{frame}");
+    }
+
+    #[test]
+    fn terminal_control_text_in_a_browse_list_is_never_kept() {
+        let mut k = Keyboard::new();
+        k.receive(crate::msg::Msg::BrowseList {
+            title: "T\x1b[2J".into(),
+            rows: vec![crate::msg::BrowseRow {
+                label: "evil\x1b[31m".into(),
+                detail: "\x07bell".into(),
+                preview: "line one\x1b]0;title\x07\nline two".into(),
+                complete: String::new(),
+            }],
+            note: "n\x1b[0m".into(),
+        });
+        let picker = k.scenario.picker.as_ref().unwrap();
+        let row = &picker.rows[0];
+        for text in [&picker.title, &row.label, &row.detail, &row.preview] {
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n'),
+                "{text:?}"
+            );
+        }
+        assert!(row.preview.contains("line one") && row.preview.contains("line two"));
+    }
+
     #[test]
     fn the_menu_says_what_it_is_waiting_on_until_the_list_comes_back() {
         let mut k = Keyboard::new();
@@ -14205,7 +14451,7 @@ fn reduce_runtime_message_with_view(
     use crate::msg::Msg;
     let previous_overlay = *overlay;
     let picker_overlay = is_picker_overlay(*overlay);
-    let choice_menu = matches!(&msg, Msg::ChoiceList { .. });
+    let choice_menu = matches!(&msg, Msg::ChoiceList { .. } | Msg::BrowseList { .. });
     if (overlay.is_some() && !picker_overlay)
         || tui.app.picker.is_some()
         || tui.app.arranging

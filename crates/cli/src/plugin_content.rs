@@ -198,6 +198,7 @@ pub fn invoke_skill(
             },
             allowed_tools: None,
             binding: resolved.binding.clone(),
+            origin: resolved.origin.clone(),
         }
     };
     if let Some(model) = &policy.model {

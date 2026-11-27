@@ -886,6 +886,29 @@ mod tests {
     }
 
     #[test]
+    fn a_plugins_hook_is_listed_under_the_plugin_it_came_with() {
+        use crate::hooks::HookSource;
+        let fixture = Fixture::new("sourced");
+        fixture.plugin("hookify", ONE_HOOK, &[]);
+        fixture.settings("plugin_hooks = [\"hookify\"]\n");
+        let sourced = Hooks::inspect_sourced(&fixture.home, None);
+        assert_eq!(
+            sourced
+                .iter()
+                .filter(|(source, _)| *source == HookSource::Plugin("hookify".into()))
+                .count(),
+            1
+        );
+        // Only a plugin's own hook carries that source.
+        assert!(
+            sourced
+                .iter()
+                .all(|(source, hook)| matches!(source, HookSource::Plugin(_))
+                    == hook.origin.is_some())
+        );
+    }
+
+    #[test]
     fn the_setting_is_read_from_the_top_of_a_settings_file_and_its_faults_are_named() {
         let named = |text: &str| allowed_in(text);
         let (list, problems) = named("plugin_hooks = [\"a\", \"b@12345678\"]\n");

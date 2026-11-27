@@ -185,6 +185,21 @@ pub struct PluginOrigin {
     pub data: PathBuf,
 }
 
+/// Where a configured hook was read from, so a listing can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookSource {
+    /// `$ORBIT_HOME/settings.toml`.
+    User,
+    /// The file named with `--settings`.
+    SettingsFlag(PathBuf),
+    /// The trusted project's `.orbit/settings.toml`.
+    Project,
+    /// A Claude Code settings file, read because `claude_compat` is on.
+    Claude(PathBuf),
+    /// An imported plugin named in `plugin_hooks`.
+    Plugin(String),
+}
+
 /// Claude Code's `prompt`, `agent` and `mcp_tool` hook types.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -907,10 +922,31 @@ impl Hooks {
                 ..Self::default()
             };
         }
-        let mut hooks = Vec::new();
+        Hooks {
+            hooks: Self::inspect_sourced(home, project)
+                .into_iter()
+                .map(|(_, hook)| hook)
+                .collect(),
+            project_trusted,
+            context_limit: Some(context_limit_with_problems(home).0),
+        }
+    }
+
+    /// [`Hooks::inspect`] with the place each hook was read from, in the
+    /// order they are read: what a listing needs to say where a hook comes
+    /// from.
+    pub fn inspect_sourced(home: &Path, project: Option<&Path>) -> Vec<(HookSource, HookConfig)> {
+        if crate::bare_mode() {
+            return Vec::new();
+        }
+        let mut hooks: Vec<(HookSource, HookConfig)> = Vec::new();
         // User scope: $ORBIT_HOME/settings.toml [[hooks]] entries.
         if let Ok(text) = std::fs::read_to_string(home.join("settings.toml")) {
-            hooks.extend(parse_hooks_toml(&text));
+            hooks.extend(
+                parse_hooks_toml(&text)
+                    .into_iter()
+                    .map(|hook| (HookSource::User, hook)),
+            );
         }
         // `--settings <file>`: more of the operator's own, for this run.
         // Named explicitly, so Claude Code's JSON form is read without the
@@ -918,17 +954,26 @@ impl Hooks {
         if let Some(file) = orbit_tools::executor::extra_settings_file()
             && let Some(text) = read_bounded(&file)
         {
-            hooks.extend(if orbit_tools::executor::is_json(&file) {
+            let found = if orbit_tools::executor::is_json(&file) {
                 parse_claude_settings(&text)
             } else {
                 parse_hooks_toml(&text)
-            });
+            };
+            hooks.extend(
+                found
+                    .into_iter()
+                    .map(|hook| (HookSource::SettingsFlag(file.clone()), hook)),
+            );
         }
         // Project scope (trusted only).
         if let Some(dir) = project
             && let Ok(text) = std::fs::read_to_string(dir.join(".orbit/settings.toml"))
         {
-            hooks.extend(parse_hooks_toml(&text));
+            hooks.extend(
+                parse_hooks_toml(&text)
+                    .into_iter()
+                    .map(|hook| (HookSource::Project, hook)),
+            );
         }
         // Claude Code's own hook files, when the operator opted in.
         if claude_compat(home) {
@@ -942,17 +987,28 @@ impl Hooks {
             }
             for file in files {
                 if let Some(text) = read_bounded(&file) {
-                    hooks.extend(parse_claude_settings(&text));
+                    hooks.extend(
+                        parse_claude_settings(&text)
+                            .into_iter()
+                            .map(|hook| (HookSource::Claude(file.clone()), hook)),
+                    );
                 }
             }
         }
         // The command hooks of the imported plugins the operator named in `plugin_hooks`.
-        hooks.extend(crate::plugin_hooks::resolve(home).hooks);
-        Hooks {
-            hooks,
-            project_trusted,
-            context_limit: Some(context_limit_with_problems(home).0),
-        }
+        hooks.extend(
+            crate::plugin_hooks::resolve(home)
+                .hooks
+                .into_iter()
+                .map(|hook| {
+                    let source = match &hook.origin {
+                        Some(origin) => HookSource::Plugin(origin.name.clone()),
+                        None => HookSource::User,
+                    };
+                    (source, hook)
+                }),
+        );
+        hooks
     }
 
     /// The most text hooks may add to the model's context at one event.
@@ -4423,5 +4479,89 @@ mcp_input = "{"allow":false}"
         assert_eq!(ran(".env"), 2);
         assert_eq!(ran("Cargo.toml"), 1);
         assert_eq!(ran("README.md"), 0);
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    /// A home and a project with one hook in each file a listing can name.
+    fn fixture(name: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("orbit-hook-source-{name}-{}", ulid::Ulid::new()));
+        let (home, project) = (root.join("home"), root.join("project"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".orbit")).unwrap();
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "claude_compat = true\n\n[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ncommand = \"user-guard\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".orbit/settings.toml"),
+            "[[hooks]]\nevent = \"Stop\"\ncommand = \"project-stop\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"claude-start"}]}]}}"#,
+        )
+        .unwrap();
+        (home, project)
+    }
+
+    /// Only this fixture's hooks: the machine's own Claude Code settings join
+    /// when `claude_compat` is on where the test runs.
+    const OURS: [&str; 3] = ["user-guard", "project-stop", "claude-start"];
+
+    #[test]
+    fn each_hook_says_which_file_it_was_read_from() {
+        let (home, project) = fixture("files");
+        let seen: Vec<(HookSource, String)> = Hooks::inspect_sourced(&home, Some(&project))
+            .into_iter()
+            .filter(|(_, hook)| OURS.contains(&hook.command.as_str()))
+            .map(|(source, hook)| (source, hook.command))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (HookSource::User, "user-guard".to_owned()),
+                (HookSource::Project, "project-stop".to_owned()),
+                (
+                    HookSource::Claude(project.join(".claude/settings.json")),
+                    "claude-start".to_owned()
+                ),
+            ]
+        );
+        // A folder that is not trusted brings nothing of its own.
+        let untrusted: Vec<String> = Hooks::inspect_sourced(&home, None)
+            .into_iter()
+            .map(|(_, hook)| hook.command)
+            .filter(|command| OURS.contains(&command.as_str()))
+            .collect();
+        assert_eq!(untrusted, ["user-guard"]);
+    }
+
+    #[test]
+    fn inspect_is_the_sourced_list_without_the_sources() {
+        let (home, project) = fixture("same");
+        let plain = Hooks::inspect(&home, Some(&project));
+        let from_sourced: Vec<HookConfig> = Hooks::inspect_sourced(&home, Some(&project))
+            .into_iter()
+            .map(|(_, hook)| hook)
+            .collect();
+        let json = |hooks: &[HookConfig]| -> Vec<serde_json::Value> {
+            hooks
+                .iter()
+                .map(|hook| serde_json::to_value(hook).unwrap())
+                .collect()
+        };
+        // The same hooks, in the same order, whatever else this machine adds.
+        assert_eq!(json(&plain.hooks), json(&from_sourced));
+        assert!(plain.project_trusted);
+        assert!(plain.hooks.iter().any(|hook| hook.command == "user-guard"));
+        assert!(!Hooks::inspect(&home, None).project_trusted);
     }
 }

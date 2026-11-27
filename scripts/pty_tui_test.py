@@ -2021,6 +2021,12 @@ TUI_GAP_MENUS_CHECKS = {
     "connecting a server in the manager lists its tools": False,
     "typing in the manager filters its rows and Esc ends the filter first": False,
     "a mouse click on the manager's Esc hint closes it": False,
+    "/hooks opens a menu of the hooks with their source, and Enter leaves it open": False,
+    "a secret in a hook command or header is not drawn on any frame": False,
+    "/hooks list still prints the text": False,
+    "/skills opens a menu and Enter on a skill puts its name in the composer": False,
+    "choosing a skill sends nothing to the model": False,
+    "/agents lists ORBIT's own agents first, then the home's by name": False,
 }
 
 # An MCP server that answers what a client needs and nothing else, written
@@ -2067,6 +2073,24 @@ def _tui_gap_run_menus(args):
             "alpha": {"command": sys.executable, "args": ["-u", str(server)]},
             "beta": {"command": "/nonexistent/orbit-menus-scenario"},
         }}))
+        # What /hooks, /skills and /agents list: two hooks (one holding a
+        # secret, one an HTTP hook whose header value is one), a skill and
+        # an agent of the home's own.
+        secret = "ghp_" + "a1B2c3D4e5" * 4
+        settings = Path(home, "settings.toml")
+        settings.write_text(
+            (settings.read_text() if settings.exists() else "")
+            + '\n[[hooks]]\nevent = "PreToolUse"\nmatcher = "Write|Edit"\n'
+            + 'command = "check-edit --strict"\ntimeout_secs = 30\n'
+            + '\n[[hooks]]\nevent = "PostToolUse"\n'
+            + f'url = "https://hooks.example.com/post"\nheader = "Authorization: Bearer {secret}"\n'
+            + f'\n[[hooks]]\nevent = "Stop"\ncommand = "curl -H \'Authorization: token {secret}\' https://example.com"\n')
+        Path(home, "skills", "release-notes").mkdir(parents=True)
+        Path(home, "skills", "release-notes", "SKILL.md").write_text(
+            "---\nname: release-notes\ndescription: Draft release notes\n---\nStep one.\n")
+        Path(home, "agents").mkdir(exist_ok=True)
+        Path(home, "agents", "alpha.md").write_text(
+            "---\nname: alpha\ndescription: Does anything\n---\nbody\n")
         sess = PtySession(
             [args.binary, "--home", home, "--model", "scripted"],
             env={"ORBIT_HOME": home}, timeout=25, rows=44, cols=140, cwd=work,
@@ -2139,6 +2163,67 @@ def _tui_gap_run_menus(args):
             gone, screen = wait_until(lambda text: "MCP SERVERS" not in text, seconds=6)
         check("a mouse click on the manager's Esc hint closes it", gone,
               f"hint={hint}; frame={_tui_gap_screen_diagnostic(sess, screen)}")
+
+        # The read-only lists open menus as well. A hook has nothing to run,
+        # so Enter leaves its menu as it is; a skill's Enter puts its name in
+        # the composer for the person to finish and sends nothing.
+        def secret_seen():
+            return secret.encode() in bytes(sess.raw_log)
+
+        sess.type("/hooks")
+        sess.write(b"\r")
+        opened, screen = wait_until(lambda text: "HOOKS (3)" in text)
+        shown = (opened and "PreToolUse Write|Edit" in screen and "waits for its answer" in screen
+                 and "settings.toml" in screen and "check-edit --strict" in screen)
+        sess.read(1.2)  # the drop-in has played out
+        before = sess.screen_text()
+        sess.write(b"\r")
+        sess.read(0.5)
+        stays = sess.screen_text() == before and "HOOKS (3)" in before
+        if not check("/hooks opens a menu of the hooks with their source, and Enter leaves it open",
+                     shown and stays, screen[-1400:], prerequisite=True):
+            return
+        sess.write(b"\x1b[B")  # the HTTP hook
+        sess.read(0.5)
+        screen = sess.screen_text()
+        sess.write(b"\x1b[B")  # the command that holds a token
+        sess.read(0.5)
+        check("a secret in a hook command or header is not drawn on any frame",
+              "headers Authorization" in screen and "Bearer" not in screen and not secret_seen(),
+              screen[-1200:])
+        sess.write(b"\x1b")
+        sess.read(0.5)
+        sess.type("/hooks list")
+        sess.write(b"\r")
+        listed, screen = wait_until(lambda text: "hooks (3)" in text)
+        check("/hooks list still prints the text",
+              listed and "HOOKS (3)" not in screen and not secret_seen(), screen[-1200:])
+
+        sent_before = len(_tui_gap_requests(request_log))
+        sess.type("/skills")
+        sess.write(b"\r")
+        opened, screen = wait_until(lambda text: "SKILLS (1)" in text)
+        sess.read(1.2)
+        sess.write(b"\r")
+        composed, screen = wait_until(
+            lambda text: re.search(r"›[^\n]*/release-notes ", text) is not None
+            and "SKILLS (1)" not in text, seconds=6)
+        check("/skills opens a menu and Enter on a skill puts its name in the composer",
+              opened and composed, screen[-1400:])
+        check("choosing a skill sends nothing to the model",
+              len(_tui_gap_requests(request_log)) == sent_before, "")
+        sess.write(b"\x15")  # clear the composer
+        sess.read(0.4)
+
+        sess.type("/agents")
+        sess.write(b"\r")
+        opened, screen = wait_until(lambda text: "AGENTS (4)" in text)
+        body = screen.split("AGENTS (4)", 1)[-1]
+        order = [body.find(name) for name in ("Explore", "Plan", "general-purpose", "alpha")]
+        check("/agents lists ORBIT's own agents first, then the home's by name",
+              opened and all(at >= 0 for at in order) and order == sorted(order), screen[-1400:])
+        sess.write(b"\x1b")
+        sess.read(0.4)
     except Exception as exc:
         check("menus TUI scenario completes", False,
               f"exception_type={type(exc).__name__}", independent=True, prerequisite=True)

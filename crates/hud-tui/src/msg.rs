@@ -200,6 +200,18 @@ pub enum Msg {
         /// What every row's preview says.
         note: String,
     },
+    /// A list a command shows as a menu to read: `/hooks`, `/skills`,
+    /// `/agents`. Choosing a row runs nothing; a row that names text to
+    /// `complete` puts it in the composer for the person to finish. A list
+    /// with nothing in it is answered in words instead.
+    BrowseList {
+        /// The heading of the menu.
+        title: String,
+        rows: Vec<BrowseRow>,
+        /// What every row's preview ends with: something true of the whole
+        /// list, such as a folder that is not trusted.
+        note: String,
+    },
     /// The session's permission mode changed at runtime (S5:
     /// Shift+Tab or /mode). Payload: the mode name (default,
     /// acceptEdits, plan, dontAsk, bypass).
@@ -446,6 +458,21 @@ pub struct ChoiceRow {
     pub label: String,
     /// A few words about it.
     pub detail: String,
+}
+
+/// One item of a list a command shows to read (`/hooks`, `/skills`,
+/// `/agents`). The worker has already hidden secrets in all of it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowseRow {
+    /// What the item is called.
+    pub label: String,
+    /// A line about it, shown beside the name.
+    pub detail: String,
+    /// More about it, shown under the list while the row is selected.
+    pub preview: String,
+    /// What Enter puts in the composer (`/release-notes`). Empty: the row is
+    /// only to read.
+    pub complete: String,
 }
 
 /// One configured MCP server, as the `/mcp` manager lists it. Everything

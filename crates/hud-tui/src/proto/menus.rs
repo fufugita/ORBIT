@@ -5,7 +5,7 @@
 //! apply and there is no second code path to keep in step.
 
 use super::picker::{Picker, PickerKind, PickerRow};
-use crate::msg::{ChoiceRow, McpServerRow};
+use crate::msg::{BrowseRow, ChoiceRow, McpServerRow};
 
 /// The permission modes, as `(name, what it settles, who it is for)`.
 pub const MODES: [(&str, &str, &str); 6] = [
@@ -180,6 +180,44 @@ pub fn choice_menu(
 /// as one word. Anything else is shown but left without actions.
 fn addressable(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// What a row may ask Enter to put in the composer: a slash and one word, and
+/// nothing else, so a list from the worker cannot type anything it likes.
+fn completion(text: &str) -> Option<String> {
+    let name = text.strip_prefix('/')?;
+    (addressable(name) && name.chars().count() <= 128).then(|| text.to_owned())
+}
+
+/// A list a command opens as a menu to read (`/hooks`, `/skills`, `/agents`).
+/// A row has nothing to run: Enter does nothing on it, or, for a row that
+/// names a command to `complete`, puts that name in the composer. The note is
+/// added to every preview. `None` for a list with nothing in it.
+pub fn browse_menu(title: &str, rows: &[BrowseRow], note: &str) -> Option<Picker> {
+    if rows.is_empty() {
+        return None;
+    }
+    let menu_rows = rows
+        .iter()
+        .map(|row| {
+            let preview = match (row.preview.is_empty(), note.is_empty()) {
+                (_, true) => row.preview.clone(),
+                (true, false) => note.to_owned(),
+                (false, false) => format!("{}\n{note}", row.preview),
+            };
+            let picker_row =
+                PickerRow::new(row.label.clone(), "", row.detail.clone()).previewing(preview);
+            match completion(&row.complete) {
+                Some(text) => {
+                    let mut picker_row = picker_row.completing().with_verb("complete");
+                    picker_row.value = text;
+                    picker_row
+                }
+                None => picker_row,
+            }
+        })
+        .collect();
+    Some(Picker::new(PickerKind::Command, menu_rows, 0).titled(title))
 }
 
 /// The rows of the MCP manager.
@@ -537,5 +575,101 @@ mod tests {
             assert!(row.value.is_empty(), "{name:?}");
             assert!(row.keys.is_empty(), "{name:?}");
         }
+    }
+
+    fn browse(label: &str, detail: &str, preview: &str, complete: &str) -> BrowseRow {
+        BrowseRow {
+            label: label.into(),
+            detail: detail.into(),
+            preview: preview.into(),
+            complete: complete.into(),
+        }
+    }
+
+    #[test]
+    fn a_browse_menu_is_only_to_read_and_adds_the_note_to_every_preview() {
+        let rows = [
+            browse("Stop", "echo done", "runs at the end", ""),
+            browse("Start", "echo hi", "", ""),
+        ];
+        let picker = browse_menu("HOOKS", &rows, "this folder is not trusted").unwrap();
+        assert_eq!(picker.title, "HOOKS");
+        assert_eq!(picker.kind, PickerKind::Command);
+        assert_eq!(picker.rows.len(), 2);
+        for row in &picker.rows {
+            // Nothing to run, nothing to complete: Enter does nothing here.
+            assert!(row.value.is_empty() && !row.completes, "{}", row.label);
+            assert!(row.keys.is_empty() && !row.keep_open, "{}", row.label);
+            assert!(row.preview.ends_with("this folder is not trusted"));
+        }
+        assert_eq!(
+            picker.rows[0].preview,
+            "runs at the end\nthis folder is not trusted"
+        );
+        // A row with no preview of its own still shows the note, and no
+        // note leaves the preview as it was.
+        assert_eq!(picker.rows[1].preview, "this folder is not trusted");
+        let plain = browse_menu("HOOKS", &rows, "").unwrap();
+        assert_eq!(plain.rows[0].preview, "runs at the end");
+        assert_eq!(plain.rows[1].preview, "");
+        // The footer offers no Enter on a row that has no action.
+        let hints: Vec<String> = picker.hints().into_iter().map(|h| h.key).collect();
+        assert!(!hints.contains(&"⏎".to_owned()), "{hints:?}");
+        assert!(hints.contains(&"/".to_owned()), "{hints:?}");
+    }
+
+    #[test]
+    fn nothing_to_list_opens_no_menu() {
+        assert!(browse_menu("HOOKS", &[], "").is_none());
+    }
+
+    #[test]
+    fn a_row_may_complete_a_command_name_and_nothing_else() {
+        let rows = [
+            browse("/notes", "write notes", "", "/notes"),
+            browse("/plugin:skill", "namespaced", "", "/plugin:skill"),
+            // None of these may reach the composer.
+            browse("bare", "", "", "no-slash"),
+            browse("two words", "", "", "/two words"),
+            browse("newline", "", "", "/a\nb"),
+            browse("tab", "", "", "/a\tb"),
+            browse("empty", "", "", "/"),
+            browse("long", "", "", &format!("/{}", "x".repeat(129))),
+        ];
+        let picker = browse_menu("SKILLS", &rows, "").unwrap();
+        let completing: Vec<&str> = picker
+            .rows
+            .iter()
+            .filter(|row| row.completes)
+            .map(|row| row.value.as_str())
+            .collect();
+        assert_eq!(completing, ["/notes", "/plugin:skill"]);
+        for row in picker.rows.iter().filter(|row| !row.completes) {
+            assert!(row.value.is_empty(), "{}", row.label);
+        }
+        // The footer says what Enter does on a row that completes.
+        let first = Picker::new(PickerKind::Command, vec![picker.rows[0].clone()], 0);
+        let enter = first.hints().into_iter().find(|h| h.key == "⏎").unwrap();
+        assert_eq!(enter.label, "complete");
+    }
+
+    #[test]
+    fn the_filter_finds_a_browse_row_by_what_it_says_beside_its_name() {
+        let rows = [
+            browse(
+                "/release-notes",
+                "draft the changelog",
+                "",
+                "/release-notes",
+            ),
+            browse("/review", "review a diff", "", "/review"),
+        ];
+        let mut picker = browse_menu("SKILLS", &rows, "").unwrap();
+        picker.start_filter();
+        for c in "change".chars() {
+            picker.push_filter(c);
+        }
+        assert_eq!(picker.visible(), [0]);
+        assert_eq!(picker.selected_row().unwrap().label, "/release-notes");
     }
 }

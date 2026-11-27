@@ -414,6 +414,7 @@ pub fn validate_owner_arguments(command: &str, args: &[String]) -> Result<(), Cl
 
 pub mod attach;
 pub mod auto_mode;
+pub mod browse_lists;
 pub mod channels;
 pub mod claude_permissions;
 pub mod cli_release_commands;
